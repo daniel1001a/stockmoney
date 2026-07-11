@@ -30,7 +30,7 @@
 | **催化劑深度推理**(`catalyst_synthesis`) | ✅ **自動化上線**(2026-07-11) | 新腳本 `fetch_catalyst_evidence.py`/`record_catalyst_signal.py` 走 OpenClaw cron(`stockmoney-scan-catalyst-synthesis`,每晚 01:00,claude-cli/Sonnet),已用真實資料端到端驗證(META 傳導鏈推理寫進 `catalyst_signals`)。舊的 `synthesize_catalysts.py`(付費API版本)保留當備援參考 |
 | **FastAPI 後端**(`stockmoney.api`) | ✅ 完成、已用真實資料驗證過 | 取代Streamlit當資料來源,read-only,4組endpoint全部接上真資料 |
 | **React 前端**(`frontend/`) | ✅ **四個核心視圖全部完成**、已用preview工具實測驗證 | 取代Streamlit,Vite+React+TS+Tailwind,深色交易員視角。「今日機會」「標的詳情」「消息雷達」「戰績」「持倉風控」五頁(含頂部導覽列)全部可用,真實資料渲染正確、零console錯誤 |
-| 測試 | ✅ 331個Python全過 + 23個前端(Vitest)全過 | `./scripts/check_all.sh` 一鍵跑齊(後端pytest+前端vitest+tsc) |
+| 測試 | ✅ 335個Python全過 + 23個前端(Vitest)全過 | `./scripts/check_all.sh` 一鍵跑齊(後端pytest+前端vitest+tsc) |
 | **每日歸因覆盤引擎**(新,CLAUDE.md §11) | ✅ v1完成、真實資料驗證過 | `attribution.py`:因子拆解+三verdict分類,`wrong_signal_existed`案例才產出`feature_candidates`,只提案不促生產 |
 | **週末校準戰役**(新) | ✅ **核心邏輯+OpenClaw排程全部上線**,真實驗證過 | `calibration_campaign.py`:三層漏斗+search/confirm holdout分離,防過擬合設計,真實對SOXL跑過完整網格驗證。narrator cron job已註冊並實測跑過一次,WhatsApp送達成功 |
 
@@ -392,6 +392,14 @@ HANDOFF「跑全部測試」原本是三個獨立手動指令(`uv run pytest`/`n
 - **🟡 Finding 3(已文件化,設計上處理)——confirm 階段本身有多重比較**:每檔 top-3 × 11 檔 = 最多 33 次 holdout 檢定 @α=0.05,holdout 解決的是 search 的 winner's-curse 點估計偏差,不是 confirm 自己的多重性。緩解:seed 掃描(跨 seed 重複才可信)+ 候選只「提案」不「促生產」、人工審查。已在 docstring 明確記錄為已知殘留限制,沒有假裝不存在
 - **🟢 Finding 4(已修)——`run_confirmation` 兩次寫入非原子**:中途 crash 會留下「有 confirm run 無 candidate」的孤兒,而 idempotency guard 又擋住重跑修復。包成 `BEGIN/COMMIT/ROLLBACK` transaction
 - **🟢 Finding 5(已修)——params 的 `seed` 只影響 regime track**:doc 補一句說明(direction model 永遠 seed=0)
+
+Merge 進 main 後(PR #2,commit 37ca32a)使用者又指出兩個實際 WhatsApp 訊息「看起來樣式無效」——查過 cron run 紀錄,兩則訊息本身**都沒有 bug**(digest 那則是先前 session 測試留下的手動觸發紀錄,誠實回報候選佇列是空的;narrator 那則是這次 session 驗證時手動觸發,`campaign_id: null` 完全正確因為驗證資料已清掉),但使用者順勢要求把審查時順口提到、還沒做的兩個強化補齊:
+
+### 31. 補強 narrator 報告層(使用者要求「把找到的bug都補齊」)
+- **`best_ev_gate` 零通過時不該報假的「最佳」**:`calibration_report_query.py` 原本用 `max(ev_grid, key=passed_win_rate or 0)`,當全部 16 組 EV 閘門都 0 筆交易通過時仍會選一個出來標成「最佳」(`passed_n:0` 卻叫 best)。改成:只有存在 `passed_n>0` 的組合才輸出 `best_ev_gate`,否則整個欄位省略,narrator 據此誠實說「這組沒有找到乾淨的交易」而不是報一個沒意義的數字
+- **seed 穩健性直接寫進 narrator 看得到的欄位**(操作化 Finding 3 的殘留多重比較風險):新增 `seed_robustness: {seeds_tried, seeds_passed}`,對每個 proposed candidate 統計它的 `(method,n_regimes,band_k)` 在全部 5 個 seed 裡有幾個也通過 search 判準。SKILL.md 第4段 pass 明確要求 narrator 把這個數字講出來(「只通過1/5個seed」跟「4/5都通過」給人的可信度天差地遠,不該讓人自己去猜)
+- **真實資料驗證**:對 SOXL 重跑完整流程,唯一通過的候選(`gmm,n_regimes=4,band_k=0.7,seed=3`)正確顯示 `seed_robustness: {seeds_tried:5, seeds_passed:1}`,且因為沒有EV閘門組合有交易通過,`best_ev_gate` 正確被省略(不再出現 `passed_n:0` 卻叫 best 的誤導)
+- 新增 4 個測試(`tests/scripts/test_calibration_report_query.py`):no-campaign、seed_robustness 正確計數、best_ev_gate 在零通過時省略、best_ev_gate 在有通過時正確挑選。`uv run pytest tests/ -q` = **335 passed**
 
 ### 明確不做(計畫本身寫的範圍界線)
 - 不掃`options_risk.py`停損/停利參數(沒有歷史選擇權報價可回測)
