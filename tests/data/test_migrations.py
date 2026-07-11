@@ -37,13 +37,22 @@ EXPECTED_TABLES = {
     "catalyst_signals",
     "calibration_runs",
     "calibration_candidates",
+    # Trader League Arena (worker-1)
+    "traders",
+    "trader_predictions",
+    "trader_method_versions",
+    "trader_method_proposals",
+    "trader_review_log",
+    "trader_divergence_log",
 }
 
 # 15 base migrations + 3 Tier1 tables + 1 ALTER + 3 round-6 tables + 1 options-risk table
 # + 1 predictions table + 1 scan_classifications table + 1 symbol_backtest_snapshot table
 # + 1 catalyst_signals table + 1 event_news_gdelt weighting-columns ALTER
 # + 1 calibration_campaign migration (2 tables) = 29
-EXPECTED_MIGRATION_COUNT = 29
+# + 4 Trader League migrations (030 traders, 031 trader_predictions,
+#   032 trader_methods [2 tables], 033 trader_review [2 tables]) = 33
+EXPECTED_MIGRATION_COUNT = 33
 
 
 def _table_names(conn: duckdb.DuckDBPyConnection) -> set[str]:

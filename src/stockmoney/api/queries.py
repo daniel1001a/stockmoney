@@ -24,6 +24,10 @@ import duckdb
 from stockmoney.data.catalyst_signals import get_latest_catalyst_for_symbol, list_recent_catalysts
 from stockmoney.data.daily_predictions import win_rate_history
 from stockmoney.data.positions import list_open_positions
+from stockmoney.data.trader_predictions import predictions_on_date
+from stockmoney.data.trader_review import recent_divergence_rows
+from stockmoney.data.traders import list_all_traders
+from stockmoney.league.league_table import league_table as _compute_league_table
 from stockmoney.models.options_risk import MarketSnapshot, assess_position
 
 ROLLING_WIN_RATE_WINDOW = 20
@@ -377,3 +381,65 @@ def catalysts(conn: duckdb.DuckDBPyConnection, *, hours: int = 48) -> dict:
             for s in signals
         ],
     }
+
+
+# --- Trader League Arena (Worker 1) -----------------------------------------
+# Read-only contract for the Worker-2 React frontend. All three read only
+# already-computed trader_predictions / trader_review outputs -- no live fit,
+# same discipline as the rest of this module.
+
+def league_table(conn: duckdb.DuckDBPyConnection, *, window: int = 20, cost_bps: float = 0.0) -> list[dict]:
+    """Per-trader scorecard (rolling + per-regime): hit rate / Brier / avg PnL
+    / high-conviction precision. The "誰最近準" league standings."""
+    return _compute_league_table(conn, window=window, cost_bps=cost_bps)
+
+
+def traders(conn: duckdb.DuckDBPyConnection) -> list[dict]:
+    """The trader roster (active + retired) for the league view's legend."""
+    return [
+        {
+            "trader_id": t.trader_id, "name": t.name, "philosophy": t.philosophy,
+            "engine_key": t.engine_key, "active": t.active,
+            "added_date": t.added_date, "removed_date": t.removed_date,
+        }
+        for t in list_all_traders(conn)
+    ]
+
+
+def _prediction_row(p) -> dict:
+    return {
+        "trader_id": p.trader_id, "trade_date": p.trade_date, "direction": p.direction,
+        "conviction": p.conviction, "rationale": p.rationale, "invalidation": p.invalidation,
+        "regime": p.regime, "horizon": p.horizon, "label_end_date": p.label_end_date,
+        "status": p.status, "outcome": p.outcome, "method_version": p.method_version,
+    }
+
+
+def latest_trader_predictions(conn: duckdb.DuckDBPyConnection, symbol: str) -> dict | None:
+    """Each trader's most recent call for one symbol (the latest league day it
+    was covered), plus a consensus/divergence summary. Powers the per-ticker
+    "各交易員的判斷 + 共識 + 分歧" panel. None if the symbol has no calls yet."""
+    row = conn.execute(
+        "SELECT max(trade_date) FROM trader_predictions WHERE symbol = ?", [symbol.upper()]
+    ).fetchone()
+    if row is None or row[0] is None:
+        return None
+    trade_date = row[0]
+    preds = predictions_on_date(conn, trade_date, symbol=symbol)
+    directions = {p.direction for p in preds}
+    return {
+        "symbol": symbol.upper(),
+        "trade_date": trade_date,
+        "traders": [_prediction_row(p) for p in preds],
+        "consensus": {
+            "agree": len(directions) == 1,
+            "directions": sorted(directions),
+            "n_traders": len(preds),
+        },
+    }
+
+
+def recent_divergence(conn: duckdb.DuckDBPyConnection, *, hours: int = 168) -> list[dict]:
+    """Recent cross-trader disagreements (CLAUDE.md section 8), disagreements
+    first. `was_right` is filled once graded (who ultimately called it)."""
+    return recent_divergence_rows(conn, hours=hours)

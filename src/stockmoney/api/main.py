@@ -84,3 +84,32 @@ def positions() -> list[dict]:
 def catalysts() -> dict:
     with ro_connection() as conn:
         return queries.catalysts(conn)
+
+
+# --- Trader League Arena (Worker 1) -----------------------------------------
+
+@app.get("/api/league")
+def league(window: int = 20, cost_bps: float = 0.0) -> list[dict]:
+    with ro_connection() as conn:
+        return queries.league_table(conn, window=window, cost_bps=cost_bps)
+
+
+@app.get("/api/traders")
+def traders() -> list[dict]:
+    with ro_connection() as conn:
+        return queries.traders(conn)
+
+
+@app.get("/api/ticker/{symbol}/traders")
+def ticker_traders(symbol: str) -> dict:
+    with ro_connection() as conn:
+        result = queries.latest_trader_predictions(conn, symbol)
+    if result is None:
+        raise HTTPException(status_code=404, detail=f"no trader predictions for {symbol.upper()}")
+    return result
+
+
+@app.get("/api/divergence")
+def divergence(hours: int = 168) -> list[dict]:
+    with ro_connection() as conn:
+        return queries.recent_divergence(conn, hours=hours)

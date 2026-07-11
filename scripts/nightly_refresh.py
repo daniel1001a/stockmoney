@@ -47,6 +47,8 @@ from stockmoney.data.db import DEFAULT_DB_PATH, get_connection, run_migrations
 from stockmoney.data.ingestion.fred_macro import ingest_macro_series
 from stockmoney.data.ingestion.options_chain import ingest_watchlist_options
 from stockmoney.data.ingestion.yfinance_ohlcv import ingest_watchlist_ohlcv
+from stockmoney.league.orchestration import run_predictions
+from stockmoney.league.review import run_review
 
 OHLCV_LOOKBACK_DAYS = 10
 MACRO_LOOKBACK_DAYS = 30
@@ -90,6 +92,22 @@ def main(db_path: str = DEFAULT_DB_PATH) -> None:
         print(f"  attribution: {summary}")
     except Exception as exc:
         print(f"  attribution FAILED: {exc}")
+
+    # Trader League: every active trader makes today's calls, then the review
+    # side-branch attributes any newly-graded ones + refreshes divergence.
+    # Grading stays a manual step (scripts/league_cli.py grade), so review
+    # is idempotent and safely no-ops when nothing new has been graded.
+    try:
+        summary = run_predictions(conn)
+        print(f"  league predict: { {k: v for k, v in summary.items() if k != 'skips'} }")
+    except Exception as exc:
+        print(f"  league predict FAILED: {exc}")
+
+    try:
+        summary = run_review(conn)
+        print(f"  league review: {summary}")
+    except Exception as exc:
+        print(f"  league review FAILED: {exc}")
 
     conn.close()
     print(f"[{today}] nightly refresh done")
