@@ -17,6 +17,7 @@ directly, so a request is always just a DuckDB read.
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
 
 import duckdb
 
@@ -29,8 +30,31 @@ ROLLING_WIN_RATE_WINDOW = 20
 RECENT_PREDICTIONS_LIMIT = 15
 PRICE_HISTORY_DAYS = 90
 
+# Per-table max acceptable lag before pipeline_health flags it stale, in
+# calendar days. Grounded in what actually runs on a recurring schedule
+# (nightly_refresh.py + the OpenClaw stockmoney-scan-ingest cron) -- a table
+# with no recurring ingester (e.g. event_news_gdelt, a one-time BigQuery
+# backfill, see HANDOFF's "GDELT 歷史回填" section) maps to None so it's
+# never flagged, since "stale" has no meaning for something not scheduled to
+# refresh. This is the automated version of the manual check that caught the
+# FRED DXY lag (HANDOFF's "FRED macro 資料落後修復") -- that incident is
+# exactly the failure mode this exists to surface without a human noticing
+# by hand.
+STALENESS_MAX_LAG_DAYS: dict[str, int | None] = {
+    "ohlcv_daily": 3,
+    "macro_series_daily": 4,
+    "iv_surface_daily": 3,
+    "options_derived_daily": 3,
+    "put_call_ratio_daily": 3,
+    "news_articles_raw": 2,
+    "social_posts_raw": 2,
+    "event_news_gdelt": None,
+}
+DEFAULT_MAX_LAG_DAYS = 3
 
-def pipeline_health(conn: duckdb.DuckDBPyConnection) -> list[dict]:
+
+def pipeline_health(conn: duckdb.DuckDBPyConnection, *, now: datetime | None = None) -> list[dict]:
+    now = now or datetime.now(timezone.utc)
     rows = conn.execute(
         """
         SELECT target_table, status, started_at, rows_written
@@ -39,10 +63,17 @@ def pipeline_health(conn: duckdb.DuckDBPyConnection) -> list[dict]:
         ORDER BY target_table
         """
     ).fetchall()
-    return [
-        {"table": r[0], "last_status": r[1], "last_run_at": r[2], "rows_written": r[3]}
-        for r in rows
-    ]
+    result = []
+    for table, status, started_at, rows_written in rows:
+        max_lag = STALENESS_MAX_LAG_DAYS.get(table, DEFAULT_MAX_LAG_DAYS)
+        days_since = (now - started_at).days
+        is_stale = status != "success" or (max_lag is not None and days_since > max_lag)
+        result.append({
+            "table": table, "last_status": status, "last_run_at": started_at,
+            "rows_written": rows_written, "days_since_last_run": days_since,
+            "is_stale": is_stale,
+        })
+    return result
 
 
 def watchlist_core(conn: duckdb.DuckDBPyConnection) -> list[dict]:

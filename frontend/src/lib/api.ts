@@ -146,6 +146,8 @@ export interface PipelineHealthEntry {
   last_status: string
   last_run_at: string
   rows_written: number
+  days_since_last_run: number
+  is_stale: boolean
 }
 
 async function getJson<T>(path: string): Promise<T> {
