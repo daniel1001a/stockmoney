@@ -152,6 +152,70 @@ def test_ffill_momentum_does_not_affect_original_non_ffill_feature():
     assert old_rows[0][1] == pytest.approx(0.02)
 
 
+def test_yield_curve_ffill_reads_flat_on_no_print_days_and_true_level_on_print_day():
+    """Same publication-lag bug as dxy/oil, but for the curve LEVEL: DGS10/
+    DGS2 have a T-1 publication delay, which used to stall build_feature_
+    matrix's (and the trader league's) "today" by that same delay. Unlike the
+    momentum features, this one carries forward the level itself -- no
+    differencing step -- so a no-print day reads the last known spread
+    unchanged, not zero."""
+    conn = _conn()
+    start = date(2026, 1, 1)
+    trading_days = [start, start + timedelta(days=1), start + timedelta(days=4),
+                     start + timedelta(days=5), start + timedelta(days=6)]
+    _seed_trading_days(conn, trading_days)
+    # DGS10/DGS2 only print on the first two days, then go quiet.
+    _seed_series(conn, "DGS10", [4.5, 4.6], start)
+    _seed_series(conn, "DGS2", [4.0, 4.2], start)
+
+    compute_macro_features(conn)
+
+    rows = dict(conn.execute(
+        "SELECT feature_date, feature_value FROM feature_store WHERE feature_name = 'yield_curve_10y2y_ffill'"
+    ).fetchall())
+    assert rows[trading_days[0]] == pytest.approx(0.5)   # real print: 4.5 - 4.0
+    assert rows[trading_days[1]] == pytest.approx(0.4)   # real print: 4.6 - 4.2
+    assert rows[trading_days[2]] == pytest.approx(0.4)   # no print yet -- carried forward, unchanged
+    assert rows[trading_days[3]] == pytest.approx(0.4)   # still no print -- unchanged
+    assert rows[trading_days[4]] == pytest.approx(0.4)   # never printed again in this fixture
+
+
+def test_yield_curve_ffill_available_at_pinned_to_when_value_was_actually_known():
+    conn = _conn()
+    start = date(2026, 1, 1)
+    trading_days = [start, start + timedelta(days=1), start + timedelta(days=2)]
+    _seed_trading_days(conn, trading_days)
+    _seed_series(conn, "DGS10", [4.5, 4.6], start)
+    _seed_series(conn, "DGS2", [4.0, 4.2], start)
+
+    compute_macro_features(conn)
+
+    available_at = dict(conn.execute(
+        "SELECT feature_date, available_at FROM feature_store WHERE feature_name = 'yield_curve_10y2y_ffill'"
+    ).fetchall())
+    # the carried-forward day (start+2) must use start+1's print timestamp, not its own date
+    assert available_at[trading_days[2]] == available_at[trading_days[1]]
+    assert available_at[trading_days[2]].date() < trading_days[2]
+
+
+def test_yield_curve_ffill_does_not_affect_original_non_ffill_feature():
+    conn = _conn()
+    start = date(2026, 1, 1)
+    trading_days = [start, start + timedelta(days=1), start + timedelta(days=4)]
+    _seed_trading_days(conn, trading_days)
+    _seed_series(conn, "DGS10", [4.5, 4.6], start)
+    _seed_series(conn, "DGS2", [4.0, 4.2], start)
+
+    compute_macro_features(conn)
+
+    old_rows = conn.execute(
+        "SELECT feature_date, feature_value FROM feature_store "
+        "WHERE feature_name = 'yield_curve_10y2y' ORDER BY feature_date"
+    ).fetchall()
+    assert len(old_rows) == 2  # only the two real print days; no entry for the gap day
+    assert [r[1] for r in old_rows] == pytest.approx([0.5, 0.4])
+
+
 def test_later_revision_does_not_change_historical_feature_value():
     """The core anti-leakage property for this module: a later-arriving
     revision (a second, later vintage for a past observation_date) must not

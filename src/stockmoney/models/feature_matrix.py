@@ -30,13 +30,17 @@ from stockmoney.data.db import MARKET_SYMBOL, sector_symbol
 
 FEATURE_COLUMNS = [
     "realized_vol_20d", "adx_14", "xsec_dispersion",
-    "yield_curve_10y2y", "dxy_chg_1d_ffill", "oil_chg_1d_ffill",
+    "yield_curve_10y2y_ffill", "dxy_chg_1d_ffill", "oil_chg_1d_ffill",
 ]
 # CLAUDE.md section 4 (regime detection): "觀測特徵:已實現波動率、趨勢強度(如
 # ADX)、跨股離散度指標" -- regime clustering (regime.py) may observe ONLY these
-# 3 columns. The other 3 FEATURE_COLUMNS (yield_curve_10y2y, dxy_chg_1d_ffill,
-# oil_chg_1d_ffill) are macro features for the per-regime direction model
-# (direction.py) only -- see Dataset.X vs Dataset.regime_X below.
+# 3 columns. The other 3 FEATURE_COLUMNS (yield_curve_10y2y_ffill,
+# dxy_chg_1d_ffill, oil_chg_1d_ffill) are macro features for the per-regime
+# direction model (direction.py) only -- see Dataset.X vs Dataset.regime_X
+# below. yield_curve_10y2y_ffill forward-fills the DGS10/DGS2 level onto every
+# trading day (same publication-lag fix as the dxy/oil momentum features, see
+# macro.py) so production's anchor reaches the latest price day instead of
+# lagging by the Treasury series' T-1 publication delay.
 REGIME_COLUMNS = ["realized_vol_20d", "adx_14", "xsec_dispersion"]
 assert all(c in FEATURE_COLUMNS for c in REGIME_COLUMNS)
 # rsi_14 / volume_zscore_20d are computed and stored in feature_store (see
@@ -197,7 +201,7 @@ def _load_features(
         "realized_vol_20d": target_symbol,
         "adx_14": target_symbol,
         "xsec_dispersion": sector_symbol(sector),
-        "yield_curve_10y2y": MARKET_SYMBOL,
+        "yield_curve_10y2y_ffill": MARKET_SYMBOL,
         "dxy_chg_1d_ffill": MARKET_SYMBOL,
         "oil_chg_1d_ffill": MARKET_SYMBOL,
         "rsi_14": target_symbol,

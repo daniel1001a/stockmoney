@@ -25,6 +25,14 @@ reads 0 on no-print days and the true cumulative move on the day a fresh
 print lands. The original dxy_chg_1d/oil_chg_1d feature names are left
 untouched in feature_store (immutable, per write_features's contract) but are
 no longer read by feature_matrix.FEATURE_COLUMNS -- see that module.
+
+Same fix applies to yield_curve_10y2y_ffill (found 2026-07-11): DGS10/DGS2
+themselves have a T-1 publication delay, which was lagging
+feature_matrix.build_feature_matrix's "today" -- and, downstream, the trader
+league's shared trade_date anchor (league/context.py) -- by that same delay.
+Unlike the momentum features this one carries forward a *level* (the curve
+itself, v10 - v2), not a day-over-day change, so no differencing step is
+needed after the forward-fill.
 """
 from __future__ import annotations
 
@@ -37,6 +45,7 @@ from stockmoney.data.features.base import FeatureValue, write_features
 
 FEATURE_VERSION = "v1"
 YIELD_CURVE_FEATURE = "yield_curve_10y2y"
+YIELD_CURVE_FFILL_FEATURE = "yield_curve_10y2y_ffill"
 MOMENTUM_FEATURES = {"DTWEXBGS": "dxy_chg_1d", "DCOILWTICO": "oil_chg_1d"}
 FFILL_MOMENTUM_FEATURES = {"DTWEXBGS": "dxy_chg_1d_ffill", "DCOILWTICO": "oil_chg_1d_ffill"}
 FFILL_FEATURE_VERSION = "v1"
@@ -101,16 +110,29 @@ def compute_macro_features(conn: duckdb.DuckDBPyConnection) -> int:
 
     dgs10 = {d: (v, ia) for d, v, ia in by_series.get("DGS10", [])}
     dgs2 = {d: (v, ia) for d, v, ia in by_series.get("DGS2", [])}
-    curve_values = []
+    curve_series: list[tuple[date, float, datetime]] = []
     for d in sorted(set(dgs10) & set(dgs2)):
         v10, ia10 = dgs10[d]
         v2, ia2 = dgs2[d]
-        curve_values.append(
-            FeatureValue(feature_date=d, symbol=MARKET_SYMBOL, value=v10 - v2, available_at=max(ia10, ia2))
-        )
+        curve_series.append((d, v10 - v2, max(ia10, ia2)))
+    curve_values = [
+        FeatureValue(feature_date=d, symbol=MARKET_SYMBOL, value=level, available_at=ia)
+        for d, level, ia in curve_series
+    ]
     total += write_features(
         conn, feature_name=YIELD_CURVE_FEATURE, feature_version=FEATURE_VERSION,
         source_table="macro_series_daily", values=curve_values,
+    )
+
+    trading_days = _trading_days(conn)
+    filled_curve = _forward_fill_onto_calendar(trading_days, curve_series)
+    curve_ffill_values = [
+        FeatureValue(feature_date=d, symbol=MARKET_SYMBOL, value=level, available_at=ia)
+        for d, level, ia in filled_curve
+    ]
+    total += write_features(
+        conn, feature_name=YIELD_CURVE_FFILL_FEATURE, feature_version=FFILL_FEATURE_VERSION,
+        source_table="macro_series_daily", values=curve_ffill_values,
     )
 
     for series_id, feature_name in MOMENTUM_FEATURES.items():
@@ -128,7 +150,6 @@ def compute_macro_features(conn: duckdb.DuckDBPyConnection) -> int:
             source_table="macro_series_daily", values=values,
         )
 
-    trading_days = _trading_days(conn)
     for series_id, feature_name in FFILL_MOMENTUM_FEATURES.items():
         filled = _forward_fill_onto_calendar(trading_days, by_series.get(series_id, []))
         values = []

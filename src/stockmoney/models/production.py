@@ -48,7 +48,13 @@ DEFAULT_COST_BPS = 5.0
 # fixed to observe only the 3 CLAUDE.md section 4 columns (REGIME_COLUMNS).
 # Same historical dates can now get different regime assignments, so old and
 # new rows must not be silently pooled in the daily_predictions win-rate ledger.
-MODEL_VERSION = "gmm-logistic-v2"
+# v2 -> v3 (2026-07-11): yield_curve_10y2y (raw, T-1 publication lag) swapped
+# for yield_curve_10y2y_ffill (forward-filled level) in FEATURE_COLUMNS -- the
+# league's shared trade_date anchor (league/context.py) was lagging the latest
+# price day by the Treasury series' publication delay, which spuriously
+# blocked the Analyst trader's same-day catalyst signals via the look-ahead
+# guard. Regime clustering is unaffected (yield curve isn't a REGIME_COLUMN).
+MODEL_VERSION = "gmm-logistic-v3"
 
 
 @dataclass

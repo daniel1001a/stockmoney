@@ -52,7 +52,7 @@ def _seed(conn, n=90, seed=0):
                    source_table="ohlcv_daily", values=_fv(TARGET, adx))
     write_features(conn, feature_name="xsec_dispersion", feature_version="v1",
                    source_table="ohlcv_daily", values=_fv(sector_symbol(SECTOR), disp))
-    write_features(conn, feature_name="yield_curve_10y2y", feature_version="v1",
+    write_features(conn, feature_name="yield_curve_10y2y_ffill", feature_version="v1",
                    source_table="macro_series_daily", values=_fv(MARKET_SYMBOL, curve))
     write_features(conn, feature_name="dxy_chg_1d_ffill", feature_version="v1",
                    source_table="macro_series_daily", values=_fv(MARKET_SYMBOL, dxy))

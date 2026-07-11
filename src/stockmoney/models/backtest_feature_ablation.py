@@ -35,7 +35,7 @@ COST_BPS = 5.0
 N_FOLDS = 5
 BASELINE_COLUMNS = [
     "realized_vol_20d", "adx_14", "xsec_dispersion",
-    "yield_curve_10y2y", "dxy_chg_1d_ffill", "oil_chg_1d_ffill",
+    "yield_curve_10y2y_ffill", "dxy_chg_1d_ffill", "oil_chg_1d_ffill",
 ]
 
 

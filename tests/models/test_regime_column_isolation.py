@@ -108,7 +108,7 @@ def _seed(conn, n=90, seed=0):
                    source_table="ohlcv_daily", values=_fv(TARGET, rng.uniform(10, 40, size=n)))
     write_features(conn, feature_name="xsec_dispersion", feature_version="v1",
                    source_table="ohlcv_daily", values=_fv(sector_symbol(SECTOR), rng.uniform(0.005, 0.02, size=n)))
-    write_features(conn, feature_name="yield_curve_10y2y", feature_version="v1",
+    write_features(conn, feature_name="yield_curve_10y2y_ffill", feature_version="v1",
                    source_table="macro_series_daily", values=_fv(MARKET_SYMBOL, rng.normal(size=n)))
     write_features(conn, feature_name="dxy_chg_1d_ffill", feature_version="v1",
                    source_table="macro_series_daily", values=_fv(MARKET_SYMBOL, rng.normal(scale=0.01, size=n)))
