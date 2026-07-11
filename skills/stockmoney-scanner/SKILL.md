@@ -236,9 +236,14 @@ all). The same HARD RULE applies: only the one query below, nothing else.
    of those were checked against the held-out confirmation window and how
    many actually held up), and `proposed_candidates_awaiting_review` (the
    short list of configs that survived confirmation and are waiting on a
-   human to review before anyone manually changes a production constant). If
-   `campaign_id` is `null`, no campaign has run yet this cycle — say so
-   plainly and stop.
+   human to review before anyone manually changes a production constant).
+   Each entry in that list may include `seed_robustness`
+   (`seeds_tried`/`seeds_passed` — how many of the random seeds tried for
+   that exact method/n_regimes/band_k combination also passed the
+   search-phase criteria) and `best_ev_gate` (only present when at least one
+   EV-gate window/quantile setting actually let a trade through for this
+   config). If `campaign_id` is `null`, no campaign has run yet this cycle —
+   say so plainly and stop.
 
 2. Write a short, plain-language progress update as your final reply text
    (not a database write — nothing here is ever auto-promoted into
@@ -247,8 +252,13 @@ all). The same HARD RULE applies: only the one query below, nothing else.
    row): how many configurations were searched, how many looked promising
    before the confirmation check, how many survived it (this gap is
    expected and healthy — it's the multiple-comparison filter working, not
-   a failure), and what's now sitting in the review queue. If nothing is
-   waiting for review, say that plainly too — a campaign finding nothing
-   worth promoting is a normal, honest outcome, not a problem to talk
-   around. Keep it concise — a few sentences, not an essay. Do not run any
-   further commands to "enrich" this summary.
+   a failure), and what's now sitting in the review queue. For each proposed
+   candidate, explicitly call out its `seed_robustness` if present — a
+   config that only passed on 1 of 5 seeds is much weaker evidence than one
+   that passed on 4 of 5, and the person reading this should not have to dig
+   for that distinction. If `best_ev_gate` is missing for a candidate, don't
+   invent one — say the EV gate found no clean trades for it rather than
+   staying silent. If nothing is waiting for review, say that plainly too —
+   a campaign finding nothing worth promoting is a normal, honest outcome,
+   not a problem to talk around. Keep it concise — a few sentences, not an
+   essay. Do not run any further commands to "enrich" this summary.

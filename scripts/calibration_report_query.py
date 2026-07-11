@@ -47,20 +47,50 @@ def build_report(conn: duckdb.DuckDBPyConnection) -> dict:
         [campaign_id],
     ).fetchone()[0]
 
+    # (symbol, method, n_regimes, band_k) -> [seeds tried, seeds that passed search]
+    # -- surfaces the seed-robustness signal directly (CLAUDE.md section 12
+    # discipline extended to this module's own confirm-step multiplicity: a
+    # config that only passed on one of five seeds is far more likely to be
+    # noise than one that passed on most of them, and a human reviewing a
+    # proposed candidate should see that at a glance, not have to infer it).
+    seed_stats: dict[tuple, dict[str, int]] = {}
+    for symbol, params_json, passed in conn.execute(
+        "SELECT symbol, params, criteria_passes FROM calibration_runs "
+        "WHERE campaign_id = ? AND phase = 'search'",
+        [campaign_id],
+    ).fetchall():
+        p = json.loads(params_json)
+        key = (symbol, p["method"], p["n_regimes"], p["band_k"])
+        stats = seed_stats.setdefault(key, {"seeds_tried": 0, "seeds_passed": 0})
+        stats["seeds_tried"] += 1
+        if passed:
+            stats["seeds_passed"] += 1
+
     proposed = []
     for symbol, params_json, ev_kelly_json in conn.execute(
         "SELECT symbol, params, ev_kelly_json FROM calibration_candidates "
         "WHERE campaign_id = ? AND status = 'proposed'",
         [campaign_id],
     ).fetchall():
-        entry = {"symbol": symbol, "params": json.loads(params_json)}
+        params = json.loads(params_json)
+        entry = {"symbol": symbol, "params": params}
+
+        key = (symbol, params["method"], params["n_regimes"], params["band_k"])
+        if key in seed_stats:
+            entry["seed_robustness"] = seed_stats[key]
+
         if ev_kelly_json:
             ev_grid = json.loads(ev_kelly_json)["ev_grid"]
-            best = max(ev_grid, key=lambda g: (g["passed_win_rate"] or 0))
-            entry["best_ev_gate"] = {
-                "window": best["window"], "quantile": best["quantile"],
-                "passed_win_rate": best["passed_win_rate"], "passed_n": best["passed_n"],
-            }
+            candidates_with_trades = [g for g in ev_grid if g["passed_n"]]
+            if candidates_with_trades:
+                best = max(candidates_with_trades, key=lambda g: g["passed_win_rate"] or 0)
+                entry["best_ev_gate"] = {
+                    "window": best["window"], "quantile": best["quantile"],
+                    "passed_win_rate": best["passed_win_rate"], "passed_n": best["passed_n"],
+                }
+            # else: no (window, quantile) in the grid ever let a trade through
+            # for this config -- omit best_ev_gate rather than reporting a
+            # misleading "best" pick with zero trades behind it.
         proposed.append(entry)
 
     return {
