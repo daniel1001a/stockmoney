@@ -1,0 +1,23 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# DuckDB data files
+data/*.duckdb
+data/*.duckdb.wal
+
+# pytest
+.pytest_cache/
+
+# macOS
+.DS_Store
+
+# Secrets
+.env

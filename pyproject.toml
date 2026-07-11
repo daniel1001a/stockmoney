@@ -1,0 +1,39 @@
+[project]
+name = "stockmoney"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "danielisgod", email = "danielisgod" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "anthropic>=0.116.0",
+    "duckdb>=1.1",
+    "fastapi>=0.139.0",
+    "feedparser>=6.0.12",
+    "google-cloud-bigquery>=3.27.0",
+    "hmmlearn>=0.3.3",
+    "lightgbm>=4.6.0",
+    "polars>=1.9",
+    "praw>=8.0.2",
+    "pyarrow>=24.0.0",
+    "python-dotenv>=1.2.2",
+    "pytz>=2026.2",
+    "requests>=2.34.2",
+    "scikit-learn>=1.9.0",
+    "uvicorn[standard]>=0.51.0",
+    "yfinance>=1.5.1",
+]
+
+[project.scripts]
+stockmoney-migrate = "stockmoney.data.db:migrate_cli"
+
+[build-system]
+requires = ["uv_build>=0.11.28,<0.12.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]

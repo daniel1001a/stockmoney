@@ -1,0 +1,17 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "fastapi-backend",
+      "runtimeExecutable": "uv",
+      "runtimeArgs": ["run", "uvicorn", "stockmoney.api.main:app", "--reload", "--port", "8000"],
+      "port": 8000
+    },
+    {
+      "name": "frontend-vite",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": ["--prefix", "frontend", "run", "dev", "--", "--port", "5173", "--strictPort"],
+      "port": 5173
+    }
+  ]
+}
