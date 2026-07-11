@@ -19,11 +19,18 @@ therefore stockmoney.models.production's daily predictions) would keep
 lagging ohlcv_daily indefinitely, which is exactly what happened before this
 step was wired in here.
 
-Dashboard snapshot build (scripts/build_dashboard_snapshot.py) runs last,
-after features are current -- it records today's live prediction for every
+Dashboard snapshot build (scripts/build_dashboard_snapshot.py) runs after
+features are current -- it records today's live prediction for every
 watchlist symbol and caches their walk-forward backtest summaries, which is
 what lets the FastAPI backend (src/stockmoney/api) answer requests with a
 DuckDB read instead of fitting/backtesting live on every call.
+
+Attribution (stockmoney.data.attribution) runs last, the read-only review
+side-branch (CLAUDE.md section 11): it attributes every *graded* prediction
+into attribution_log and proposes feature candidates. It's idempotent and
+depends only on already-resolved predictions, so it safely no-ops when
+nothing new has been graded (grading itself stays a deliberate manual step,
+see scripts/daily_prediction_cli.py).
 
 Usage:
     uv run python scripts/nightly_refresh.py
@@ -35,6 +42,7 @@ from datetime import date, timedelta
 from build_dashboard_snapshot import run_snapshot_build
 from compute_features import run_feature_recompute
 
+from stockmoney.data.attribution import run_attribution
 from stockmoney.data.db import DEFAULT_DB_PATH, get_connection, run_migrations
 from stockmoney.data.ingestion.fred_macro import ingest_macro_series
 from stockmoney.data.ingestion.options_chain import ingest_watchlist_options
@@ -76,6 +84,12 @@ def main(db_path: str = DEFAULT_DB_PATH) -> None:
         print(f"  dashboard snapshot: {summary}")
     except Exception as exc:
         print(f"  dashboard snapshot FAILED: {exc}")
+
+    try:
+        summary = run_attribution(conn)
+        print(f"  attribution: {summary}")
+    except Exception as exc:
+        print(f"  attribution FAILED: {exc}")
 
     conn.close()
     print(f"[{today}] nightly refresh done")

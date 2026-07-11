@@ -305,6 +305,55 @@ uv run python scripts/backfill_gdelt.py --start 2015-01-01 --end 2026-07-10
 
 ---
 
+## 2026-07-11:A4 每日歸因與覆盤引擎(✅ 已完成,經 plan mode 規劃)
+
+使用者選定的下一步。`attribution_log`(migration 016)+`feature_candidates`(migration 017)兩張表 schema 早就建好但**一直是空的**——從沒有引擎寫進去。這是 CLAUDE.md §11 的「只讀分析側支」,也是**新特徵候選的正規來源**(模組A 兩條顯而易見的訊號強化路徑 LightGBM/RSI+Volume 都誠實驗證過沒用,要找更根本訊號需要一個有紀律的機制去發現「模型錯了、但事後看訊號確實存在」的案例)。屬 look-ahead 敏感模組,先 plan mode 規劃(計畫文件 `~/.claude/plans/frolicking-wishing-cook.md`)再動手。
+
+### 24. 新引擎 `src/stockmoney/data/attribution.py`(新)+ `scripts/attribution_cli.py`(新)
+三層(全部只用同視窗已實現報酬,無前視):
+- **事實層 `decompose_return`**:把已 grade 預測的報酬拆成 macro/sector/idiosyncratic。**沿用 dispersion.py 的等權/排除槓桿ETF(SOXL/SOXS)/idio=殘差 同一套哲學**,不做 rolling-β(留 v2)。三項**可加性恆等式** `macro+sector+idio ≡ actual_return`(有測試斷言,實測誤差 0)
+- **事件層 `match_events`**:誠實貼標——市場級 GDELT 語氣異常(唯一目前有真資料的事件源)+ 個股級 `scan_classifications` 命中;財報(`event_calendar` 空)不塞假資料。無匹配回空,絕不編造
+- **模型對帳層 `classify_verdict`**:win→`right_reason_right`;loss 且實際落在模型自己 band 內(actual_label=range)→`wrong_noise`;loss 且是真實方向性 miss 且 idio 主導(或個股事件命中)→`wrong_signal_existed`→**產出一筆 `feature_candidates`(status='proposed')**
+- **Idempotent**:PK `(attribution_date,symbol,model_version)`,重跑只 skip;候選 idempotent per (source_date,symbol)
+- **只處理已 grade 的預測**,`attribution_log` 存的是「已完成的事實」,永不為 pending 寫入
+
+### look-ahead / 資料隔離把關
+- `attribution_log`/`feature_candidates` **永遠不被任何訓練路徑讀取**——有 canary 測試(`test_training_paths_never_read_attribution_tables`)靜態掃 feature_matrix/walk_forward/regime/direction/production 五個檔案確認沒有反向讀取(§7 discretion/meta 隔離)
+- 引擎讀 graded 預測是允許的(只讀側支),產出只進歸因表,不回寫 daily_predictions/feature_store
+- 候選只能 `proposed`,人工審核才可能 `accepted`——引擎沒有促生產的權限(§11 + §17)
+
+### 接線 + 驗證(真實資料端到端)
+- 接進 `scripts/nightly_refresh.py` **最後一步**(snapshot 之後);grade 仍是**刻意的手動步驟**,歸因 idempotent 依賴已 grade 結果,沒新東西就乾淨 no-op
+- **真實跑過**:對現有 11 筆 graded 預測(07-02 那批)跑 `attribution_cli.py run` → 10 筆 `right_reason_right`、NVDA(預測 up 實際 range、−0.66% 微小)正確判 `wrong_noise` **不產候選**(這是正確結果:那是雜訊不是漏掉的訊號)。再跑一次 11 筆全 skip(idempotent 驗證)
+- 10 個新測試(可加性/三 verdict/候選只在 wrong_signal_existed 產出/idempotency/pending 不歸因/注入安全/隔離 canary)。`uv run pytest tests/ -q` = **316 passed**(306+10)
+- 看法:`uv run python scripts/attribution_cli.py list [--verdict ...]` / `candidates [--status ...]`
+
+**下一步(不在這次)**:等預測累積更多、出現真的 `wrong_signal_existed` 案例後,`feature_candidates` 會長出待人工審核的假設;是否加前端「歸因/覆盤」視圖列為可選。
+
+---
+
+## 2026-07-11(續):整體穩定性提升(第一批)
+
+使用者要求的平行第二軌。這次做了計畫文件裡列的三項(第四項 OpenClaw cron 失敗告警**故意延後**,見下方理由),都是「repo 內、無架構爭議、能立刻驗證」的項目。
+
+### 25. Pipeline health 資料新鮮度紅線(`src/stockmoney/api/queries.py`)
+`pipeline_health()` 原本只回傳最後一次 ingestion 的狀態/時間,不會主動標示「這已經落後太久」——FRED DXY 落後將近一週那次(見上方「FRED macro 資料落後修復」)完全是人工發現的,沒有自動化訊號。現在每張表依**實際有排程在跑的來源**(`ingestion_runs` 裡真實出現過的 8 個 target_table)分配一個「可接受落後天數」門檻(`STALENESS_MAX_LAG_DAYS`):日更表(ohlcv/options/新聞等)3 天內、`macro_series_daily` 4 天(FRED 發布本身有 lag,見第15點)、**`event_news_gdelt` 故意設 `None`**——它是一次性 BigQuery 回填,沒有排程中的常態 ingester,不該被標紅。回傳新增 `days_since_last_run`/`is_stale` 兩欄;`last_status != 'success'` 也一律視為 stale,不管多新。`frontend/src/lib/api.ts` 的 `PipelineHealthEntry` 型別同步更新(**目前前端沒有頁面渲染這個 endpoint**,只有型別/client 存在,列為之後可選的 UI 缺口,不在這次範圍)。6個新測試(`tests/api/test_queries.py`)。
+
+### 26. 統一測試檢查腳本(`scripts/check_all.sh`,新)
+HANDOFF「跑全部測試」原本是三個獨立手動指令(`uv run pytest`/`npm test`/`tsc --noEmit`),沒人保證每次改動前都三個一起跑。新增一鍵、fail-fast 腳本跑完整三項,`chmod +x` 可直接執行:`./scripts/check_all.sh`。
+
+### 27. `nightly_refresh.py` 端到端 smoke test(`tests/scripts/test_nightly_refresh.py`,新)
+在此之前**完全沒有任何測試跑過 nightly_refresh 的完整鏈路**——這正是「FRED 落後一週」那個 bug 能夠存在的根本原因:`compute_features.py` 從沒被排程呼叫過,而所有既有測試都是逐一測試單一步驟(`build_dashboard_snapshot`/`compute_features`各自的測試),沒有任何東西驗證「這些步驟接在一起真的會跑」。新增兩個 smoke test:
+- 完整鏈路(ingest 用 stub 取代真實網路呼叫)接到 feature recompute → dashboard snapshot → attribution,驗證 `symbol_backtest_snapshot`/`daily_predictions`/`attribution_log` 三張表都被正確寫入,且串接不中斷
+- 其中一個 ingestion 來源刻意讓它 raise,驗證 `nightly_refresh.main()` 既有的逐步 try/except 設計真的擋住了(其他步驟仍完整跑完),不是紙上談兵
+
+**驗證結果**:`./scripts/check_all.sh` 全過——**323 個 Python 測試**(316+2 個 smoke test+5 個 pipeline-health 測試)、**23 個前端測試**、`tsc --noEmit` 乾淨。
+
+### 明確延後:OpenClaw cron 失敗告警
+計畫文件列的第四項。延後原因:這塊主要在 repo 外(`~/.openclaw/`),而且「告警管道」本身是一個需要使用者拍板的架構決定(重用晨間摘要已經在用的 WhatsApp?閾值多嚴格?誤報耐受度?),跟前三項「repo 內、規格明確、能立刻寫測試驗證」的性質不同,不該在沒有明確範圍確認下動手。下一次要展開這塊,先問使用者告警管道跟門檻。
+
+---
+
 ## 給新手:現在就能看到什麼、怎麼看
 
 ### 0. 開新前端(React,最直觀,推薦從這裡開始)
@@ -418,7 +467,7 @@ openclaw cron runs --id 32580184-bc44-44ac-9b51-e7768eb9a70f --limit 3
 1. ~~接手 OpenClaw scanner 交接文件~~ **✅ 已完成**(見上方「OpenClaw 自動化真正打通」小節):三段 pass 全部排程上線、真實資料端到端驗證過。
 2. **消息面資料現在會持續累積,等資料夠長後**:
    - **A3**:催化劑訊號填進歷史夠長後,跑`backtest_feature_ablation.py`式的顯著性檢定,通過才能促生產(目前剛開始累積,還不夠)
-   - **A4(stretch)**:每日歸因覆盤引擎(`attribution_log`,CLAUDE.md第11節,目前這張表還是空的)
+   - ~~**A4(stretch)**:每日歸因覆盤引擎~~ **✅ 已完成**(2026-07-11,見上方「A4 每日歸因與覆盤引擎」小節):`attribution.py` 引擎 + CLI,三層拆解、三 verdict、feature_candidates 只提案不促生產,已接進 nightly_refresh、真實 11 筆端到端驗證過。等 `wrong_signal_existed` 案例累積才會長出待審候選
 3. ~~FRED總經資料落後~~ **✅ 已修復**(見下方「FRED macro 資料落後修復」小節):`dxy_chg_1d_ffill`/`oil_chg_1d_ffill` 取代原本的 `dxy_chg_1d`/`oil_chg_1d`,"今天" 從 07-02 追上到 07-08(剩下的1天落後是正常的T-1申報延遲,不是bug)。
 4. **模組A訊號強化,下一步**:LightGBM試過了比邏輯回歸差(第7點);RSI/Volume Z-score兩個新特徵也試過了,顯著讓Brier分數變差(第8點)。兩個「顯而易見」的升級路徑都已經誠實驗證過、沒有用。下一步可能要換更根本的方向:
    - (a) **另類數據特徵**(GEX/skew、put-call ratio)雖然已經在收集,但目前只有2天歷史(`options_derived_daily`/`put_call_ratio_daily` 都是從2026-07-09才開始),要等資料庫累積足夠長才能做有意義的樣本外驗證,不能現在硬塞進去

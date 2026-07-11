@@ -1,4 +1,4 @@
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 
 import duckdb
 import polars as pl
@@ -59,9 +59,64 @@ def test_watchlist_candidates_empty_by_default():
     assert queries.watchlist_candidates(conn) == []
 
 
+def _seed_ingestion_run(conn, *, target_table, status="success", started_at, source="test"):
+    conn.execute(
+        """
+        INSERT INTO ingestion_runs (run_id, source, target_table, status, started_at)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        [f"{target_table}-{started_at.isoformat()}", source, target_table, status, started_at],
+    )
+
+
 def test_pipeline_health_empty_when_no_ingestion_runs():
     conn = _conn()
     assert queries.pipeline_health(conn) == []
+
+
+def test_pipeline_health_flags_stale_table_past_its_lag_threshold():
+    conn = _conn()
+    now = datetime(2026, 7, 11, tzinfo=timezone.utc)
+    # ohlcv_daily's threshold is 3 days; this run is 5 days old -> stale.
+    _seed_ingestion_run(conn, target_table="ohlcv_daily", started_at=now - timedelta(days=5))
+    [entry] = queries.pipeline_health(conn, now=now)
+    assert entry["days_since_last_run"] == 5
+    assert entry["is_stale"] is True
+
+
+def test_pipeline_health_fresh_table_not_flagged():
+    conn = _conn()
+    now = datetime(2026, 7, 11, tzinfo=timezone.utc)
+    _seed_ingestion_run(conn, target_table="ohlcv_daily", started_at=now - timedelta(days=1))
+    [entry] = queries.pipeline_health(conn, now=now)
+    assert entry["is_stale"] is False
+
+
+def test_pipeline_health_failed_run_is_stale_even_if_recent():
+    conn = _conn()
+    now = datetime(2026, 7, 11, tzinfo=timezone.utc)
+    _seed_ingestion_run(conn, target_table="ohlcv_daily", status="failed", started_at=now)
+    [entry] = queries.pipeline_health(conn, now=now)
+    assert entry["is_stale"] is True
+
+
+def test_pipeline_health_table_with_no_recurring_schedule_never_stale():
+    conn = _conn()
+    now = datetime(2026, 7, 11, tzinfo=timezone.utc)
+    # event_news_gdelt is a one-time BigQuery backfill with no recurring
+    # ingester -- an old run here must never be flagged stale.
+    _seed_ingestion_run(conn, target_table="event_news_gdelt", started_at=now - timedelta(days=90))
+    [entry] = queries.pipeline_health(conn, now=now)
+    assert entry["days_since_last_run"] == 90
+    assert entry["is_stale"] is False
+
+
+def test_pipeline_health_unknown_table_uses_default_lag_threshold():
+    conn = _conn()
+    now = datetime(2026, 7, 11, tzinfo=timezone.utc)
+    _seed_ingestion_run(conn, target_table="some_new_table", started_at=now - timedelta(days=10))
+    [entry] = queries.pipeline_health(conn, now=now)
+    assert entry["is_stale"] is True
 
 
 # --- opportunities ---------------------------------------------------------
