@@ -1,32 +1,33 @@
 ---
 name: stockmoney-scanner
-description: Classify freshly-scraped Reddit/RSS financial content into per-ticker sentiment or new-ticker/theme candidates for the stockmoney project, and write a morning digest.
+description: Classify freshly-scraped Reddit/RSS financial content into per-ticker sentiment or new-ticker/theme candidates for the stockmoney project, write a morning digest, and narrate weekend calibration-campaign progress.
 ---
 
 # stockmoney Scanner
 
-Three independent passes over data in `/Users/danielisgod/Projects/stockmoney`. The
+Four independent passes over data in `/Users/danielisgod/Projects/stockmoney`. The
 message that invokes this skill tells you which pass to run — do only that one.
 
-## HARD RULE: exactly three commands, nothing else, ever
+## HARD RULE: only the fixed commands listed per pass, nothing else, ever
 
 This skill runs unattended on a cron schedule. There is no human watching to
 approve anything. Your exec policy requires approval for any command that
-isn't pre-allowlisted — if you run ANYTHING outside the three commands below
-(even something read-only and harmless-seeming, like `find`, `ls`, `cat`,
-`grep`, a different `python -c` one-liner, or an extra `uv run` invocation),
-the approval request has nobody to answer it, the whole run fails, and
-tonight's classification pass silently doesn't happen. **This has already
+isn't pre-allowlisted — if you run ANYTHING outside the fixed commands listed
+for your pass (even something read-only and harmless-seeming, like `find`,
+`ls`, `cat`, `grep`, a different `python -c` one-liner, or an extra `uv run`
+invocation), the approval request has nobody to answer it, the whole run
+fails, and tonight's pass silently doesn't happen. **This has already
 happened once** — a previous run tried `find files named "*scan*"` out of
 curiosity and broke the entire pass.
 
 You are not being asked to be thorough or to explore the codebase. You are
-being asked to run three fixed commands, in the shapes given, and nothing
-more:
+being asked to run the fixed commands for whichever pass you were told to
+run, in the shapes given, and nothing more:
 
 1. `fetch_unclassified.py` (command 1 below) to get content
 2. `record_classification.py` (command 2 below) to write a verdict
 3. the one-liner watchlist query (command 3 below) to check tracked symbols
+4. `calibration_report_query.py` (calibration narrator pass only) to read campaign progress
 
 If at any point you feel the urge to inspect a file, list a directory,
 search for something, or run any command not shown verbatim below: **do not
@@ -216,3 +217,38 @@ commands below, nothing else.
 3. When you've called command 2 once for every symbol from command 1's
    output, stop. Do not run command 1 again "to double check" and do not run
    any other command to enrich the evidence or verify your own work.
+
+## Calibration campaign narrator pass
+
+Run when the message says to run the calibration narrator pass (scheduled a
+few times across weekends, Sonnet-tier via claude-cli subscription — this is
+a low-volume, read-and-summarize step, deliberately no database writes at
+all). The same HARD RULE applies: only the one query below, nothing else.
+
+1. **Read the latest campaign's progress** (read-only, the only command this
+   pass ever runs):
+   ```
+   /opt/homebrew/bin/uv run python scripts/calibration_report_query.py
+   ```
+   Prints one compact JSON object summarizing the most recent weekend
+   calibration campaign: `search` (how many hyperparameter configs were
+   tried and how many passed the search-phase criteria), `confirm` (how many
+   of those were checked against the held-out confirmation window and how
+   many actually held up), and `proposed_candidates_awaiting_review` (the
+   short list of configs that survived confirmation and are waiting on a
+   human to review before anyone manually changes a production constant). If
+   `campaign_id` is `null`, no campaign has run yet this cycle — say so
+   plainly and stop.
+
+2. Write a short, plain-language progress update as your final reply text
+   (not a database write — nothing here is ever auto-promoted into
+   production, CLAUDE.md section 16's parameters only ever change by a human
+   manually editing the constant after reviewing a `calibration_candidates`
+   row): how many configurations were searched, how many looked promising
+   before the confirmation check, how many survived it (this gap is
+   expected and healthy — it's the multiple-comparison filter working, not
+   a failure), and what's now sitting in the review queue. If nothing is
+   waiting for review, say that plainly too — a campaign finding nothing
+   worth promoting is a normal, honest outcome, not a problem to talk
+   around. Keep it concise — a few sentences, not an essay. Do not run any
+   further commands to "enrich" this summary.

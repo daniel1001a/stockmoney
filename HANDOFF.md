@@ -1,4 +1,4 @@
-# stockmoney — Session Handoff (2026-07-10 深夜)
+# stockmoney — Session Handoff (2026-07-11)
 
 把這份檔案的內容貼給新對話,或直接說「讀 HANDOFF.md 跟 CLAUDE.md,幫我測試一下現狀,然後繼續進度」。
 
@@ -30,7 +30,9 @@
 | **催化劑深度推理**(`catalyst_synthesis`) | ✅ **自動化上線**(2026-07-11) | 新腳本 `fetch_catalyst_evidence.py`/`record_catalyst_signal.py` 走 OpenClaw cron(`stockmoney-scan-catalyst-synthesis`,每晚 01:00,claude-cli/Sonnet),已用真實資料端到端驗證(META 傳導鏈推理寫進 `catalyst_signals`)。舊的 `synthesize_catalysts.py`(付費API版本)保留當備援參考 |
 | **FastAPI 後端**(`stockmoney.api`) | ✅ 完成、已用真實資料驗證過 | 取代Streamlit當資料來源,read-only,4組endpoint全部接上真資料 |
 | **React 前端**(`frontend/`) | ✅ **四個核心視圖全部完成**、已用preview工具實測驗證 | 取代Streamlit,Vite+React+TS+Tailwind,深色交易員視角。「今日機會」「標的詳情」「消息雷達」「戰績」「持倉風控」五頁(含頂部導覽列)全部可用,真實資料渲染正確、零console錯誤 |
-| 測試 | ✅ 303個Python全過 + 23個前端(Vitest)全過 | `uv run pytest`(後端)、`npm --prefix frontend test`(前端) |
+| 測試 | ✅ 331個Python全過 + 23個前端(Vitest)全過 | `./scripts/check_all.sh` 一鍵跑齊(後端pytest+前端vitest+tsc) |
+| **每日歸因覆盤引擎**(新,CLAUDE.md §11) | ✅ v1完成、真實資料驗證過 | `attribution.py`:因子拆解+三verdict分類,`wrong_signal_existed`案例才產出`feature_candidates`,只提案不促生產 |
+| **週末校準戰役**(新) | ✅ **核心邏輯+OpenClaw排程全部上線**,真實驗證過 | `calibration_campaign.py`:三層漏斗+search/confirm holdout分離,防過擬合設計,真實對SOXL跑過完整網格驗證。narrator cron job已註冊並實測跑過一次,WhatsApp送達成功 |
 
 **白話總結**:Phase 0/1/2 的前端+API骨架已經全部做完並用真實資料驗證過——四個視圖(今日機會/消息雷達/戰績/持倉風控)都能跑,誠實顯示「尚無資料」而不是造假。**這次(2026-07-11)最大的進展**:「消息分類/催化劑推理」的自動化路徑(OpenClaw agent + claude-cli訂閱)**完全打通並上線**——過程中在 OpenClaw 核心裡發現並修好兩個真正的架構bug(`toolsAllow` 會把 skill 內容一起拿掉、CLI backend 完全不支援 `toolsAllow`),讓「絕不用付費API、只用訂閱額度」這個使用者的硬性要求第一次真正可行,三段 pass(分類/晨間摘要/催化劑推理)全部排程上線並用真實資料端到端驗證過。
 
@@ -354,6 +356,58 @@ HANDOFF「跑全部測試」原本是三個獨立手動指令(`uv run pytest`/`n
 
 ---
 
+## 2026-07-11(續2):週末校準戰役(Weekend Calibration Campaign)
+
+使用者的想法:8年歷史資料都在,週末沒有新交易日,是閒置算力時間,想系統性掃描 CLAUDE.md §16「待優化」參數(regime數量、band_k、EV閘門視窗/分位數、Kelly係數),誠實記錄每次樣本外表現,追蹤「進步了多少」。核心風險(計畫裡明確處理):週末不會產生新樣本外資料,單純瘋狂試參數挑好看的就是 CLAUDE.md §12 禁止的「全樣本回測後挑贏家」。完整計畫見 `~/.claude/plans/frolicking-wishing-cook.md`。計畫由 Sonnet 5 撰寫,**事後已用 Opus 4.8 完整審查過核心邏輯(CLAUDE.md §15 建議的 opusplan 把關)**,審出一個 merge-blocking 的方法論漏洞並修好——見下方第 30 點「Opus 審查發現與修正」。
+
+### 28. 核心引擎(`src/stockmoney/models/calibration_campaign.py`,新)+ CLI(`scripts/run_calibration_campaign.py`,新)
+三層漏斗,search/confirm 兩階段分離:
+- **Tier 1(貴,~2200 fit)**:`method∈{gmm,hmm}`×`n_regimes∈{2,3,4,5}`×`band_k∈{0.3~0.7}`×`seed∈{0~4}`×11檔標的,全部複用既有 `walk_forward.run_walk_forward`/`metrics.report_by_regime`,不重新發明統計邏輯
+- **Tier 2/3(便宜,後製,不重新fit)**:只對 Tier1 每檔標的 top-3 shortlist 做 EV閘門(`ev_gate.run_ev_gate`)+ Kelly係數(`kelly.position_size`)網格,資訊性質,不當第二道統計關卡
+- **防過擬合核心機制**:`_truncate_dataset()` 在 search 階段把最新 `HOLDOUT_FRAC=15%` 的歷史**整個從資料集裡切掉**,search 網格結構上看不到那段資料,不管重跑幾次都一樣。只有 shortlist 能對這段保留資料跑**一次**`confirm`(`n_folds=1` 精準對應那段區間),而且 `confirm` 對同一個 `(campaign_id, symbol, params)` **設計成不能重跑**(比照 `attribution_log` PK 不可變精神)——不能靠「多試幾次確認集」製造假的樣本外驗證
+- **判準**:用候選**自己的**regime標籤分段(不是baseline的——不同n_regimes之間regime編號沒有自然對應),對每個regime做`bootstrap_paired_diff_ci`比對固定生產baseline(`gmm,n_regimes=3,band_k=0.5,seed=0`),**至少一個regime顯著變好、沒有任何regime顯著變差**才算通過——CLAUDE.md §12「不合併regime」在這裡是硬性關卡,不只是報告習慣。**⚠️ 比較的是「Brier skill over climatology」不是原始 Brier**(Opus 審查修正,見第30點)——原始 Brier 跨 band_k 不可比
+- 資料層(`029_calibration_campaign.sql`):`calibration_runs`(append-only原始結果)+ `calibration_candidates`(比照`feature_candidates`,只提案不促生產,human審查後才手動改常數)——兩張表跟`attribution_log`/`feature_candidates`同一條隔離紀律,**永遠不被任何訓練路徑讀取**(有canary測試把關)
+
+### 29. 敘事層:OpenClaw narrator pass(`scripts/calibration_report_query.py`,新 + `skills/stockmoney-scanner/SKILL.md` 第4段)
+算力層(Tier1/2/3網格搜索)刻意**不**包進OpenClaw——純Python確定性計算不需要LLM判斷力,包進agent只多一層開銷沒有好處。跑法就是 `caffeinate -i uv run python scripts/run_calibration_campaign.py search --symbols all`,手動或排程跑一次。敘事層(讀結果、寫進度摘要)才是OpenClaw+Sonnet該做的事:SKILL.md新增第4段pass,固定讀`calibration_report_query.py`(唯讀、無參數,仿照既有`scanner_check_watchlist.py`的可精準allowlist模式),輸出濃縮JSON給narrator寫成人看得懂的摘要,回覆文字透過既有WhatsApp `--announce`管道送達手機——不新開管道。
+
+**✅ narrator排程已上線並實測驗證過**(2026-07-11):`~/.openclaw/exec-approvals.json`加了`scanner-calibration-report`條目(使用者明確核准後才動手,因為這類「機器層級無人值守執行權限」變更觸發了Claude Code auto-mode權限分類器的額外確認關卡,即使plan mode計畫已核准也一樣)。cron job id `46f6c748-1f4f-48d3-b3bc-ead3e2213788`,週六週日各12:00/20:00跑,`claude-cli/claude-sonnet-4-6`+`toolsAllow: exec,read`,delivery走既有WhatsApp管道。
+
+**真實跑過一次**(`openclaw cron run 46f6c748-1f4f-48d3-b3bc-ead3e2213788 --wait`):11.6秒完成,只跑了允許的那一個指令(沒有探索性命令,符合SKILL.md HARD RULE),誠實回報「目前沒有campaign跑過,campaign_id是null」並成功送達WhatsApp——這是正確行為,因為驗證用的`verify-run-1`資料已經清掉了,這次跑的是空狀態的誠實回報,不是造假。
+
+**注意**:實際註冊時CLI旗標跟原本計畫寫的不一樣(`openclaw cron add --help`才是唯一準確來源)——真正的旗標是`--cron`(不是`--schedule`)、`--message`(不是`--instruction`)、`--tools`(不是`--toolsAllow`)、`--announce --channel whatsapp --to <號碼>`(不是`--announce whatsapp:<號碼>`這種單一字串)、`--name`給job名稱。之後如果要再註冊新cron job,直接照抄`openclaw cron get <既有job-id>`的輸出格式最保險,不要照抄舊文件裡的指令字串。
+
+### 驗證結果(修正 Finding 1 之後,以 skill score 重跑)
+- **真實資料端到端跑過**:對SOXL跑滿完整網格(200 fit,~2分鐘,單次fit約0.55秒——算力不是瓶頸)。修正前(原始Brier)42/200通過,全是band_k=0.7的label汙染;**修正後(skill score)只有1/200通過**,而且是單一seed——這1個正好落在噪聲底線(200次α=0.05檢定靠運氣出現1個完全預期),跟專案一貫的「訊號很弱」誠實結論一致。這是Opus審查最有力的證據:修正前系統會製造幾十個假「進步」,修正後誠實回報幾乎沒有
+- **JSON保真度驗證**:`calibration_runs.per_regime_json`跟直接呼叫`metrics.report_by_regime()`逐字段bit-for-bit一致
+- confirm→narrator→cleanup 全鏈路實測跑過(那1個單seed候選也通過了confirm holdout,但narrator輸出會標明它只有seed 3——人工審查看到單seed會正確打折,這正是Finding 3多重比較殘留風險靠「人在迴圈+seed重複性」處理的設計)
+- `uv run pytest tests/ -q`:**331 個全過**(含band_k汙染回歸測試 `test_wider_band_k_confound_would_fool_raw_brier_but_not_skill_score`)
+- 驗證用的`skill-verify`/`verify-run-1` campaign資料都已從正式資料庫清除
+
+### 30. Opus 審查發現與修正(2026-07-11,切 Opus 4.8 後完整過一遍核心邏輯)
+使用者要求切 Opus 審查所有邏輯再 merge。審出五個問題,最重要的一個是 merge-blocking:
+
+- **🔴 Finding 1(必修,已修)——band_k 掃描讓 Brier 比較失去意義**:`compare_to_baseline` 原本比原始 Brier,但 band_k 是「標籤定義」的旋鈕,band_k 越大→越多天落在佔多數的 RANGE 類→分類問題機械性變簡單→原始 Brier 底線變低。所以跨 band_k 比原始 Brier 是「拿不同難度的考卷比分數」,系統性獎勵最寬的 band 而非最好的模型。**用真實資料證明過**:同一個模型(gmm,3,seed0)只改 band_k 0.5→0.7,原始 Brier 從 0.666 降到 0.628,舊判準判定「2/3 regime 顯著變好」——但這是同一個模型。holdout confirm 也抓不到(band_k=0.7 標籤在 holdout 上一樣好猜)。**修法(使用者選的)**:改用 Brier skill over climatology——每個設定對比「自己的多數類基線預測」的技巧分數,把 label 難度的 confound 除掉。修正後同一個 band_k=0.7 模型 skill_diff 變 −0.0056(正確地不算進步)。新增回歸測試釘死這個行為(斷言舊 raw-Brier 邏輯會被騙、新 skill 邏輯不會)
+- **🟡 Finding 2(已修)——shortlist 排序偏袒小樣本 regime**:原本用「單一最佳 regime 的 diff」排序,小樣本 regime 噪聲大、易出現假的大改善。改成用 `overall_skill_diff`(pool 全部 OOS 列、天生 n 加權)排序
+- **🟡 Finding 3(已文件化,設計上處理)——confirm 階段本身有多重比較**:每檔 top-3 × 11 檔 = 最多 33 次 holdout 檢定 @α=0.05,holdout 解決的是 search 的 winner's-curse 點估計偏差,不是 confirm 自己的多重性。緩解:seed 掃描(跨 seed 重複才可信)+ 候選只「提案」不「促生產」、人工審查。已在 docstring 明確記錄為已知殘留限制,沒有假裝不存在
+- **🟢 Finding 4(已修)——`run_confirmation` 兩次寫入非原子**:中途 crash 會留下「有 confirm run 無 candidate」的孤兒,而 idempotency guard 又擋住重跑修復。包成 `BEGIN/COMMIT/ROLLBACK` transaction
+- **🟢 Finding 5(已修)——params 的 `seed` 只影響 regime track**:doc 補一句說明(direction model 永遠 seed=0)
+
+### 明確不做(計畫本身寫的範圍界線)
+- 不掃`options_risk.py`停損/停利參數(沒有歷史選擇權報價可回測)
+- 不掃每日虧損熔斷門檻(使用者風險承受度,不是模型參數)
+- 不建新的人工歷史事件分段機制(regime detection已是CLAUDE.md認可的分段機制)
+- 不自動把掃描結果寫回`production.py`/`ev_gate.py`/`kelly.py`預設值
+- 不在這次展開使用者提到的「消息多跳推理鏈」強化(見下方「核心交易理念」小節,是完全不同性質的工作)
+
+---
+
+## 2026-07-11(續3):核心交易理念記錄(供之後催化劑層強化參考)
+
+使用者原話(要求「記在所有東西之上」):**股市是在反映尚未消化的訊息,消息往往是經由前面一個消息作為推演,越聰明、能推斷越多層的人,往往越早拿到最準確最新的資訊**。已存成獨立memory `trading-philosophy-info-cascade`(user類型)。**這次沒有展開實作**(使用者明確把這次範圍劃在「數值層校準」),但這是下一步強化`catalyst_synthesis.py`該走的方向:現在的傳導鏈推理是**單跳**(catalyst→mechanism→為什麼影響這檔),理念要求的是**多跳**(消息A→暗示B會發生→B發生後誰受益→這個受益還沒被市場定價的程度)。A4歸因引擎的`wrong_signal_existed`案例天生是「我們沒推論到那一層」的證據庫,兩者之後可以串起來——但這是獨立的下一個計畫,不是這次的一部分。
+
+---
+
 ## 給新手:現在就能看到什麼、怎麼看
 
 ### 0. 開新前端(React,最直觀,推薦從這裡開始)
@@ -447,7 +501,8 @@ uv run python scripts/compute_features.py
 ### 7. 跑全部測試
 
 ```bash
-uv run pytest tests/ -q             # Python,應該顯示 `306 passed`
+./scripts/check_all.sh              # 一鍵跑齊下面三項,fail-fast
+uv run pytest tests/ -q             # Python,應該顯示 `330 passed`
 npm --prefix frontend test          # 前端 Vitest,應該顯示 `23 passed`
 cd frontend && npx tsc -b --noEmit  # 前端型別檢查,應該無輸出(乾淨)
 ```
@@ -477,6 +532,8 @@ openclaw cron runs --id 32580184-bc44-44ac-9b51-e7768eb9a70f --limit 3
 5. ~~前端測試覆蓋~~ **✅ 已補上**:Vitest + React Testing Library,23個測試涵蓋所有頁面+元件的載入/空狀態/錯誤狀態,見下方「前端測試」小節。
 6. ~~Streamlit dashboard 退役~~ **✅ 已完成**:`scripts/dashboard.py`跟`streamlit`依賴都拆掉了,`.claude/launch.json`也移除了對應設定。
 7. Phase 3規劃(個股論點追蹤系統、日內即時交易層):現在都還不用碰。
+8. ~~週末校準戰役OpenClaw narrator排程~~ **✅ 已完成**(2026-07-11,見上方「週末校準戰役」小節):exec-approvals條目+cron job都已註冊並實測驗證過,WhatsApp送達成功。真正的第一次「週末」跑法還沒發生過(這次驗證是平日手動觸發的空狀態測試),等到真的週六/週日才會看到有內容的摘要。**核心邏輯已用Opus 4.8完整審查過**(見上方第30點),審出並修好一個merge-blocking的方法論漏洞(band_k/Brier confound)。
+9. **消息多跳推理鏈強化**:使用者核心交易理念(見上方「核心交易理念記錄」小節)要求的下一步,把`catalyst_synthesis.py`的單跳傳導鏈推理加深成多跳。這次故意沒展開(範圍劃在數值層校準),是獨立的下一個計畫。
 
 ---
 
