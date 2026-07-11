@@ -5,6 +5,7 @@ const NAV_ITEMS = [
   { to: '/catalysts', label: '消息雷達', end: false },
   { to: '/predictions', label: '戰績', end: false },
   { to: '/positions', label: '持倉風控', end: false },
+  { to: '/league', label: '聯賽', end: false },
 ]
 
 export default function Layout() {

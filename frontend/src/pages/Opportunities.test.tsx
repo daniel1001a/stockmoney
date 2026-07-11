@@ -32,13 +32,15 @@ function renderPage() {
 }
 
 describe('Opportunities', () => {
-  it('shows a loading state, then renders opportunity cards', async () => {
+  it('shows a loading state, then renders a dense watchlist table row', async () => {
     vi.mocked(api.opportunities).mockResolvedValue([mockOpportunity])
     renderPage()
 
     expect(screen.getByText('載入中…')).toBeInTheDocument()
-    await waitFor(() => expect(screen.getByText('SOXL')).toBeInTheDocument())
-    expect(screen.getByText('semiconductor · regime 2')).toBeInTheDocument()
+    await waitFor(() => expect(screen.getByRole('table')).toBeInTheDocument())
+    expect(screen.getByText('SOXL')).toBeInTheDocument()
+    expect(screen.getByText('semiconductor')).toBeInTheDocument()
+    expect(screen.getAllByRole('row')).toHaveLength(2) // header + one data row
   })
 
   it('shows an honest empty state when there is no cached prediction data', async () => {
@@ -50,11 +52,11 @@ describe('Opportunities', () => {
     )
   })
 
-  it('shows a placeholder instead of a headline when no catalyst data exists', async () => {
+  it('derives a one-line thesis from regime/direction when no catalyst headline exists', async () => {
     vi.mocked(api.opportunities).mockResolvedValue([mockOpportunity])
     renderPage()
 
-    await waitFor(() => expect(screen.getByText('尚無消息面催化劑資料')).toBeInTheDocument())
+    await waitFor(() => expect(screen.getByText(/regime 2 下模型判斷盤整/)).toBeInTheDocument())
   })
 
   it('shows an error message when the API call fails', async () => {

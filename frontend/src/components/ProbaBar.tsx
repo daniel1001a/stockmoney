@@ -1,5 +1,6 @@
 import type { Proba } from '../lib/api'
 import { pct } from '../lib/format'
+import Tooltip from './Tooltip'
 
 const ROWS: { key: keyof Proba; label: string; barClass: string }[] = [
   { key: 'up', label: '漲', barClass: 'bg-emerald-500' },
@@ -7,7 +8,26 @@ const ROWS: { key: keyof Proba; label: string; barClass: string }[] = [
   { key: 'down', label: '跌', barClass: 'bg-rose-500' },
 ]
 
-export default function ProbaBar({ proba }: { proba: Proba }) {
+interface Props {
+  proba: Proba
+  compact?: boolean
+}
+
+// compact=true renders a single stacked bar (for dense table rows) with the
+// three percentages available on hover, instead of three labeled rows.
+export default function ProbaBar({ proba, compact = false }: Props) {
+  if (compact) {
+    return (
+      <Tooltip label={ROWS.map((row) => `${row.label} ${pct(proba[row.key])}`).join('　')}>
+        <div className="flex h-2 w-24 overflow-hidden rounded bg-neutral-800">
+          {ROWS.map((row) => (
+            <div key={row.key} className={row.barClass} style={{ width: `${proba[row.key] * 100}%` }} />
+          ))}
+        </div>
+      </Tooltip>
+    )
+  }
+
   return (
     <div className="space-y-2">
       {ROWS.map((row) => (

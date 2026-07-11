@@ -4,6 +4,7 @@ import { useApi } from '../lib/useApi'
 import { DIRECTION_CLASSES, DIRECTION_LABEL, num, pct } from '../lib/format'
 import ProbaBar from '../components/ProbaBar'
 import Sparkline from '../components/Sparkline'
+import GlossaryTerm from '../components/GlossaryTerm'
 
 const OUTCOME_CLASSES: Record<string, string> = {
   win: 'text-emerald-400',
@@ -13,6 +14,11 @@ const OUTCOME_CLASSES: Record<string, string> = {
 export default function TickerDetail() {
   const { symbol = '' } = useParams()
   const { data, loading, error } = useApi(() => api.ticker(symbol), [symbol])
+  const {
+    data: tradersData,
+    loading: tradersLoading,
+    error: tradersError,
+  } = useApi(() => api.tickerTraders(symbol), [symbol])
 
   return (
     <div>
@@ -61,10 +67,18 @@ export default function TickerDetail() {
             <ProbaBar proba={data.proba} />
             {data.backtest ? (
               <p className="mt-3 text-xs text-neutral-500">
-                回測（GMM，樣本外）：準確率 {pct(data.backtest.overall_accuracy)}（n={data.backtest.overall_n}） · Brier{' '}
-                {num(data.backtest.overall_brier, 3)} · Sharpe {num(data.backtest.overall_sharpe, 2)}
+                回測（GMM，樣本外）：
+                <GlossaryTerm term="overall_accuracy">準確率 {pct(data.backtest.overall_accuracy)}</GlossaryTerm>
+                （n={data.backtest.overall_n}） ·{' '}
+                <GlossaryTerm term="overall_brier">Brier {num(data.backtest.overall_brier, 3)}</GlossaryTerm> ·{' '}
+                <GlossaryTerm term="overall_sharpe">Sharpe {num(data.backtest.overall_sharpe, 2)}</GlossaryTerm>
                 {data.backtest.ev_of_continuing_now !== null && (
-                  <> · 目前續抱EV {num(data.backtest.ev_of_continuing_now, 4)}</>
+                  <>
+                    {' · '}
+                    <GlossaryTerm term="ev_of_continuing_now">
+                      目前續抱EV {num(data.backtest.ev_of_continuing_now, 4)}
+                    </GlossaryTerm>
+                  </>
                 )}
               </p>
             ) : (
@@ -77,7 +91,9 @@ export default function TickerDetail() {
             <div className="grid grid-cols-2 sm:grid-cols-3 gap-3 text-sm">
               {Object.entries(data.feature_values).map(([k, v]) => (
                 <div key={k} className="flex justify-between border-b border-neutral-800 pb-1">
-                  <span className="text-neutral-500">{k}</span>
+                  <GlossaryTerm term={k} className="text-neutral-500">
+                    {k}
+                  </GlossaryTerm>
                   <span className="text-neutral-200 tabular-nums">{num(v, 4)}</span>
                 </div>
               ))}
@@ -132,6 +148,58 @@ export default function TickerDetail() {
                   ))}
                 </tbody>
               </table>
+            )}
+          </section>
+
+          <section className="rounded-lg border border-neutral-800 bg-neutral-900 p-4">
+            <h2 className="text-sm font-medium text-neutral-300 mb-3">各交易員判斷</h2>
+            {tradersLoading && <p className="text-neutral-500 text-sm">載入中…</p>}
+            {tradersError && (
+              <p className="text-rose-400 text-sm">載入失敗：{tradersError}</p>
+            )}
+            {!tradersLoading && !tradersError && tradersData === null && (
+              <p className="text-neutral-600 italic text-sm">
+                此標的尚無交易員判斷紀錄 —— Analyst 消息薄時多為 skip，Chartist 需有技術型態才出判斷。
+              </p>
+            )}
+            {tradersData && tradersData.traders.length === 0 && (
+              <p className="text-neutral-600 italic text-sm">此交易日無交易員判斷。</p>
+            )}
+            {tradersData && tradersData.traders.length > 0 && (
+              <div className="space-y-3">
+                {tradersData.consensus.n_traders > 1 && (
+                  <p className="text-xs text-neutral-500 mb-1">
+                    {tradersData.consensus.agree
+                      ? `${tradersData.consensus.n_traders} 位交易員共識：${tradersData.consensus.directions.map((d) => DIRECTION_LABEL[d] ?? d).join('、')}`
+                      : `${tradersData.consensus.n_traders} 位交易員有分歧：${tradersData.consensus.directions.map((d) => DIRECTION_LABEL[d] ?? d).join(' vs ')}`}
+                  </p>
+                )}
+                {tradersData.traders.map((t) => (
+                  <div
+                    key={t.trader_id}
+                    className="border-b border-neutral-800 pb-3 last:border-0 last:pb-0"
+                  >
+                    <div className="flex items-start justify-between mb-1">
+                      <span className="text-sm text-neutral-200">{t.trader_id}</span>
+                      <span
+                        className={`text-xs font-medium px-2 py-0.5 rounded border ${
+                          DIRECTION_CLASSES[t.direction] ?? DIRECTION_CLASSES.range
+                        }`}
+                      >
+                        {DIRECTION_LABEL[t.direction] ?? t.direction} {pct(t.conviction)}
+                      </span>
+                    </div>
+                    {t.rationale && (
+                      <p className="text-xs text-neutral-400">{t.rationale}</p>
+                    )}
+                    {t.invalidation && (
+                      <p className="text-xs text-neutral-600 mt-0.5">
+                        失效條件：{t.invalidation}
+                      </p>
+                    )}
+                  </div>
+                ))}
+              </div>
             )}
           </section>
         </div>

@@ -53,4 +53,12 @@ describe('CatalystRadar', () => {
 
     await waitFor(() => expect(screen.getByText(/載入失敗/)).toBeInTheDocument())
   })
+
+  it('always shows an honest empty state for the known-events section (no calendar API exists)', async () => {
+    vi.mocked(api.catalysts).mockResolvedValue(populated)
+    renderPage()
+
+    await waitFor(() => expect(screen.getByText('已知大事 / 未來排程消息')).toBeInTheDocument())
+    expect(screen.getByText('尚未串接事件日曆')).toBeInTheDocument()
+  })
 })

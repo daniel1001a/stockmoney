@@ -25,3 +25,10 @@ export const RISK_LIGHT_CLASSES: Record<string, string> = {
   yellow: 'bg-amber-400',
   red: 'bg-rose-500',
 }
+
+// CLAUDE.md §4: regime detection fixes 3 states (0/1/2), not yet given
+// canonical labels by the model layer -- this is a display-only convention,
+// not a claim about which index means what.
+export function regimeLabel(regime: number): string {
+  return `regime ${regime}`
+}

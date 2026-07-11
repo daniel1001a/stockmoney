@@ -16,4 +16,12 @@ describe('ProbaBar', () => {
     expect(screen.getByText('盤整')).toBeInTheDocument()
     expect(screen.getByText('跌')).toBeInTheDocument()
   })
+
+  it('renders a single stacked bar with a tooltip in compact mode', () => {
+    render(<ProbaBar proba={{ up: 0.21, range: 0.59, down: 0.2 }} compact />)
+    expect(screen.queryByText('漲')).not.toBeInTheDocument()
+    expect(screen.getByRole('tooltip')).toHaveTextContent('21%')
+    expect(screen.getByRole('tooltip')).toHaveTextContent('59%')
+    expect(screen.getByRole('tooltip')).toHaveTextContent('20%')
+  })
 })

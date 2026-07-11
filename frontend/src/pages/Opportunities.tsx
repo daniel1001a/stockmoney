@@ -2,52 +2,54 @@ import { Link } from 'react-router-dom'
 import { api, type Opportunity } from '../lib/api'
 import { useApi } from '../lib/useApi'
 import { DIRECTION_CLASSES, DIRECTION_LABEL, num, pct } from '../lib/format'
+import ProbaBar from '../components/ProbaBar'
+import GlossaryTerm from '../components/GlossaryTerm'
 
-function OpportunityCard({ item }: { item: Opportunity }) {
+function thesisFor(item: Opportunity): string {
+  if (item.catalyst_headline) return item.catalyst_headline
+  return `regime ${item.regime} 下模型判斷${DIRECTION_LABEL[item.predicted_direction] ?? item.predicted_direction}`
+}
+
+function driverFor(item: Opportunity): string {
+  if (!item.backtest) return '回測快取尚未就緒'
+  return `準確率 ${pct(item.backtest.overall_accuracy)}（n=${item.backtest.overall_n}） · Brier ${num(item.backtest.overall_brier, 3)}`
+}
+
+function invalidationFor(item: Opportunity): string {
+  return `regime 判斷改變，或至 ${item.label_end_date} 未達目標價區間`
+}
+
+function OpportunityRow({ item }: { item: Opportunity }) {
   const directionClass = DIRECTION_CLASSES[item.predicted_direction] ?? DIRECTION_CLASSES.range
   const directionLabel = DIRECTION_LABEL[item.predicted_direction] ?? item.predicted_direction
 
   return (
-    <Link
-      to={`/ticker/${item.symbol}`}
-      className="block rounded-lg border border-neutral-800 bg-neutral-900 p-4 hover:border-neutral-600 transition-colors"
-    >
-      <div className="flex items-start justify-between">
-        <div>
-          <div className="text-xl font-semibold text-neutral-50">{item.symbol}</div>
-          <div className="text-xs text-neutral-500">{item.sector} · regime {item.regime}</div>
+    <tr className="border-b border-neutral-900 hover:bg-neutral-900/60">
+      <td className="py-2.5 pl-3 pr-3">
+        <Link to={`/ticker/${item.symbol}`} className="font-semibold text-neutral-50 hover:text-neutral-300">
+          {item.symbol}
+        </Link>
+        <div className="text-xs text-neutral-500">{item.sector}</div>
+      </td>
+      <td className="py-2.5 pr-3">
+        <div className="flex items-center gap-2">
+          <span className={`text-xs font-medium px-2 py-0.5 rounded border whitespace-nowrap ${directionClass}`}>
+            {directionLabel}
+          </span>
+          <GlossaryTerm term="conviction" className="text-xs text-neutral-300 tabular-nums">
+            {pct(item.conviction)}
+          </GlossaryTerm>
         </div>
-        <span className={`text-xs font-medium px-2 py-1 rounded border ${directionClass}`}>
-          {directionLabel} {pct(item.conviction)}
-        </span>
-      </div>
-
-      <div className="mt-3 flex gap-4 text-xs text-neutral-400">
-        <span>進場 ${num(item.entry_price)}</span>
-        <span>
-          目標 ${num(item.target_price_down, 0)}–${num(item.target_price_up, 0)}
-        </span>
-      </div>
-
-      <div className="mt-2 text-xs text-neutral-500">
-        {item.backtest ? (
-          <>
-            回測準確率 {pct(item.backtest.overall_accuracy)}（n={item.backtest.overall_n}） · Brier{' '}
-            {num(item.backtest.overall_brier, 3)}
-          </>
-        ) : (
-          '回測快取尚未就緒'
-        )}
-      </div>
-
-      <div className="mt-3 pt-3 border-t border-neutral-800 text-sm">
-        {item.catalyst_headline ? (
-          <p className="text-neutral-200 line-clamp-2">{item.catalyst_headline}</p>
-        ) : (
-          <p className="text-neutral-600 italic">尚無消息面催化劑資料</p>
-        )}
-      </div>
-    </Link>
+        <div className="mt-1">
+          <ProbaBar proba={item.proba} compact />
+        </div>
+      </td>
+      <td className="py-2.5 pr-3 max-w-xs">
+        <p className="text-sm text-neutral-200 line-clamp-2">{thesisFor(item)}</p>
+      </td>
+      <td className="py-2.5 pr-3 text-xs text-neutral-400 max-w-48">{driverFor(item)}</td>
+      <td className="py-2.5 pr-3 text-xs text-neutral-500 max-w-56">{invalidationFor(item)}</td>
+    </tr>
   )
 }
 
@@ -69,10 +71,25 @@ export default function Opportunities() {
       )}
 
       {data && data.length > 0 && (
-        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
-          {data.map((item) => (
-            <OpportunityCard key={item.symbol} item={item} />
-          ))}
+        <div className="overflow-x-auto rounded-lg border border-neutral-800">
+          <table className="w-full text-sm">
+            <thead>
+              <tr className="text-neutral-500 text-left border-b border-neutral-800 bg-neutral-900/40">
+                <th className="py-2 px-3 font-normal">標的</th>
+                <th className="py-2 px-3 font-normal">方向 / 信心</th>
+                <th className="py-2 px-3 font-normal">一句話論點</th>
+                <th className="py-2 px-3 font-normal">
+                  <GlossaryTerm term="overall_accuracy">驅動因子</GlossaryTerm>
+                </th>
+                <th className="py-2 px-3 font-normal">失效條件</th>
+              </tr>
+            </thead>
+            <tbody>
+              {data.map((item) => (
+                <OpportunityRow key={item.symbol} item={item} />
+              ))}
+            </tbody>
+          </table>
         </div>
       )}
     </div>

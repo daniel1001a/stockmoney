@@ -2,6 +2,16 @@ import { Link } from 'react-router-dom'
 import { api, type PositionRisk } from '../lib/api'
 import { useApi } from '../lib/useApi'
 import { RISK_LIGHT_CLASSES, num } from '../lib/format'
+import GlossaryTerm from '../components/GlossaryTerm'
+
+const TRIGGER_LABEL: Record<string, string> = {
+  price_stop: '價格停損',
+  premium_stop: '權利金停損',
+  take_profit: '固定停利',
+  dynamic_ev_take_profit: '動態EV停利',
+  seller_early_close: '賣方提前平倉',
+  regime_invalidation: '邏輯失效（regime改變）',
+}
 
 const TRIGGER_LIGHT_CLASSES: Record<string, string> = {
   yellow: 'text-amber-300 border-amber-800 bg-amber-950',
@@ -37,7 +47,10 @@ function PositionCard({ position }: { position: PositionRisk }) {
               key={i}
               className={`text-xs px-2 py-1 rounded border ${TRIGGER_LIGHT_CLASSES[t.light] ?? TRIGGER_LIGHT_CLASSES.yellow}`}
             >
-              <span className="font-medium">[{t.kind}]</span> {t.detail}
+              <GlossaryTerm term={t.kind} className="font-medium">
+                [{TRIGGER_LABEL[t.kind] ?? t.kind}]
+              </GlossaryTerm>{' '}
+              {t.detail}
             </div>
           ))}
         </div>

@@ -1,10 +1,15 @@
-import { describe, expect, it, vi } from 'vitest'
+import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { render, screen, waitFor } from '@testing-library/react'
 import { MemoryRouter, Route, Routes } from 'react-router-dom'
 import TickerDetail from './TickerDetail'
 import { api, type TickerDetail as TickerDetailData } from '../lib/api'
 
 vi.mock('../lib/api')
+
+// Default: no trader predictions (honest null / 404 state)
+beforeEach(() => {
+  vi.mocked(api.tickerTraders).mockResolvedValue(null)
+})
 
 const mockDetail: TickerDetailData = {
   symbol: 'SOXL', sector: 'semiconductor', trade_date: '2026-07-02', horizon: 5,
@@ -72,5 +77,14 @@ describe('TickerDetail', () => {
     renderPage()
 
     await waitFor(() => expect(screen.getByText(/載入失敗/)).toBeInTheDocument())
+  })
+
+  it('shows an honest empty state for the per-trader section when no predictions exist', async () => {
+    vi.mocked(api.ticker).mockResolvedValue(mockDetail)
+    vi.mocked(api.tickerTraders).mockResolvedValue(null)
+    renderPage()
+
+    await waitFor(() => expect(screen.getByText('各交易員判斷')).toBeInTheDocument())
+    expect(screen.getByText(/此標的尚無交易員判斷紀錄/)).toBeInTheDocument()
   })
 })

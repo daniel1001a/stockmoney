@@ -5,6 +5,7 @@ import TickerDetail from './pages/TickerDetail'
 import CatalystRadar from './pages/CatalystRadar'
 import TrackRecord from './pages/TrackRecord'
 import PositionsRisk from './pages/PositionsRisk'
+import League from './pages/League'
 
 export default function App() {
   return (
@@ -16,6 +17,7 @@ export default function App() {
           <Route path="catalysts" element={<CatalystRadar />} />
           <Route path="predictions" element={<TrackRecord />} />
           <Route path="positions" element={<PositionsRisk />} />
+          <Route path="league" element={<League />} />
         </Route>
       </Routes>
     </BrowserRouter>

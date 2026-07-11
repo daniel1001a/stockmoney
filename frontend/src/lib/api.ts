@@ -150,11 +150,96 @@ export interface PipelineHealthEntry {
   is_stale: boolean
 }
 
+// --- Trader League Arena ---
+
+export interface Trader {
+  trader_id: string
+  name: string
+  philosophy: string
+  engine_key: string
+  active: boolean
+  added_date: string
+  removed_date: string | null
+}
+
+// Output of league_table.compute_stats
+export interface TraderStats {
+  n_graded: number
+  n_directional: number
+  hit_rate: number | null
+  brier: number | null
+  avg_pnl: number | null
+  cum_pnl: number
+  high_conviction_threshold: number
+  high_conviction_n: number
+  high_conviction_precision: number | null
+}
+
+export interface RollingStats extends TraderStats {
+  window: number
+}
+
+export interface LeagueEntry {
+  trader_id: string
+  name: string
+  philosophy: string
+  active: boolean
+  overall: TraderStats
+  rolling: RollingStats
+  by_regime: Record<string, TraderStats>
+}
+
+export interface TraderPredictionEntry {
+  trader_id: string
+  trade_date: string
+  direction: 'up' | 'down' | 'range'
+  conviction: number
+  rationale: string
+  invalidation: string
+  regime: number | null
+  horizon: number
+  label_end_date: string
+  status: 'pending' | 'graded'
+  outcome: 'win' | 'loss' | null
+  method_version: string
+}
+
+export interface TickerTradersConsensus {
+  agree: boolean
+  directions: string[]
+  n_traders: number
+}
+
+export interface TickerTradersResponse {
+  symbol: string
+  trade_date: string
+  traders: TraderPredictionEntry[]
+  consensus: TickerTradersConsensus
+}
+
+export interface DivergenceRow {
+  trade_date: string
+  symbol: string
+  trader_id: string
+  direction: string
+  conviction: number
+  disagreed: boolean
+  was_right: boolean | null
+}
+
 async function getJson<T>(path: string): Promise<T> {
   const res = await fetch(`/api${path}`)
   if (!res.ok) {
     throw new Error(`${path} -> HTTP ${res.status}`)
   }
+  return res.json() as Promise<T>
+}
+
+// Returns null on 404 (honest "no data yet") instead of throwing.
+async function getJsonOrNull<T>(path: string): Promise<T | null> {
+  const res = await fetch(`/api${path}`)
+  if (res.status === 404) return null
+  if (!res.ok) throw new Error(`${path} -> HTTP ${res.status}`)
   return res.json() as Promise<T>
 }
 
@@ -166,4 +251,11 @@ export const api = {
   catalysts: () => getJson<CatalystsResponse>('/catalysts'),
   watchlist: () => getJson<WatchlistResponse>('/watchlist'),
   pipelineHealth: () => getJson<PipelineHealthEntry[]>('/pipeline-health'),
+  league: (window?: number) =>
+    getJson<LeagueEntry[]>(`/league${window !== undefined ? `?window=${window}` : ''}`),
+  traders: () => getJson<Trader[]>('/traders'),
+  tickerTraders: (symbol: string) =>
+    getJsonOrNull<TickerTradersResponse>(`/ticker/${encodeURIComponent(symbol)}/traders`),
+  divergence: (hours?: number) =>
+    getJson<DivergenceRow[]>(`/divergence${hours !== undefined ? `?hours=${hours}` : ''}`),
 }
