@@ -47,6 +47,7 @@ from stockmoney.data.db import DEFAULT_DB_PATH, get_connection, run_migrations
 from stockmoney.data.ingestion.fred_macro import ingest_macro_series
 from stockmoney.data.ingestion.options_chain import ingest_watchlist_options
 from stockmoney.data.ingestion.yfinance_ohlcv import ingest_watchlist_ohlcv
+from stockmoney.data.news_synthesis import refresh_news_items
 from stockmoney.league.orchestration import run_predictions
 from stockmoney.league.review import run_review
 
@@ -78,6 +79,15 @@ def main(db_path: str = DEFAULT_DB_PATH) -> None:
         print(f"  options snapshot: {written}")
     except Exception as exc:
         print(f"  options snapshot FAILED: {exc}")
+
+    # Live news feed (消息雷達): general finance RSS + per-symbol Google News,
+    # classified into news_items. Display-only discretion layer (no model
+    # feature), so a network hiccup here never blocks the rest of the refresh.
+    try:
+        summary = refresh_news_items(conn)
+        print(f"  news_items: {summary}")
+    except Exception as exc:
+        print(f"  news_items FAILED: {exc}")
 
     run_feature_recompute(conn)
 
