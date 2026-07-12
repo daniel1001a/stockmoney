@@ -40,6 +40,27 @@ def bs_gamma(spot: float, strike: float, t: float, sigma: float, r: float) -> fl
     return norm_pdf(d1) / (spot * sigma * math.sqrt(t))
 
 
+def bs_price(
+    spot: float, strike: float, t: float, sigma: float, r: float, *, is_call: bool
+) -> float:
+    """Black-Scholes price of a European option (per share, not per contract).
+
+    Used by `stockmoney.models.options_pnl` to reprice a hypothetical option
+    forward in the options-P&L backtest -- the delta/gamma above only bucket a
+    chain, they never value a position. Deliberately the European BS value: US
+    equity/ETF options carry a small early-exercise premium this ignores, an
+    approximation on the same footing as `naive_gex` (CLAUDE.md section 2 flags
+    the whole self-estimated options layer as a v1 to validate before paying for
+    ORATS/CBOE). Multiply by CONTRACT_MULTIPLIER for a per-contract dollar value.
+    """
+    d1 = _d1(spot, strike, t, sigma, r)
+    d2 = d1 - sigma * math.sqrt(t)
+    discount = math.exp(-r * t)
+    if is_call:
+        return spot * norm_cdf(d1) - strike * discount * norm_cdf(d2)
+    return strike * discount * norm_cdf(-d2) - spot * norm_cdf(-d1)
+
+
 def is_valid_option(spot: float, strike: float, t: float, sigma: float) -> bool:
     """Guard against the junk rows options snapshots are full of (zero/NaN IV,
     expired contracts, nonsensical strikes) before feeding the BS formulas."""

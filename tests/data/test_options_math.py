@@ -5,6 +5,7 @@ import pytest
 from stockmoney.data.options_math import (
     bs_delta,
     bs_gamma,
+    bs_price,
     is_valid_option,
     naive_gex,
     norm_cdf,
@@ -42,6 +43,29 @@ def test_gamma_positive_and_peaks_near_atm():
     wing = bs_gamma(100.0, 150.0, 0.25, 0.3, 0.045)
     assert atm > 0
     assert atm > wing
+
+
+def test_bs_price_put_call_parity():
+    # C - P == spot - strike * exp(-r t) for the same contract.
+    args = dict(spot=100.0, strike=105.0, t=0.5, sigma=0.35, r=0.045)
+    call = bs_price(**args, is_call=True)
+    put = bs_price(**args, is_call=False)
+    parity = args["spot"] - args["strike"] * math.exp(-args["r"] * args["t"])
+    assert call - put == pytest.approx(parity, abs=1e-9)
+
+
+def test_bs_price_above_intrinsic_value():
+    # A long option is worth at least its (discounted) intrinsic value.
+    call = bs_price(120.0, 100.0, 0.5, 0.3, 0.045, is_call=True)
+    assert call >= 120.0 - 100.0  # intrinsic for an ITM call
+    put = bs_price(80.0, 100.0, 0.5, 0.3, 0.045, is_call=False)
+    assert put >= 100.0 * math.exp(-0.045 * 0.5) - 80.0
+
+
+def test_bs_price_higher_vol_costs_more():
+    lo = bs_price(100.0, 100.0, 0.5, 0.2, 0.045, is_call=True)
+    hi = bs_price(100.0, 100.0, 0.5, 0.5, 0.045, is_call=True)
+    assert hi > lo > 0
 
 
 def test_is_valid_option_rejects_junk():

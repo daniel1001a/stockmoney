@@ -23,7 +23,6 @@ rather than hidden.
 from __future__ import annotations
 
 import numpy as np
-from lightgbm import LGBMClassifier
 from sklearn.calibration import CalibratedClassifierCV
 from sklearn.linear_model import LogisticRegression
 from sklearn.preprocessing import StandardScaler
@@ -102,6 +101,11 @@ class LightGBMDirectionModel:
         self.seed = seed
 
     def fit(self, X: np.ndarray, y: np.ndarray, regimes: np.ndarray) -> None:
+        # Imported lazily (like regime.py's hmmlearn) so callers using only the
+        # logistic model don't need LightGBM's system dependency (libomp on macOS)
+        # installed just to import this module.
+        from lightgbm import LGBMClassifier
+
         self.global_prior = _prior(y)
         self.per_regime: dict[int, tuple] = {}
         for r in np.unique(regimes):
