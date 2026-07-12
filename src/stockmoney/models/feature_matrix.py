@@ -50,6 +50,14 @@ assert all(c in FEATURE_COLUMNS for c in REGIME_COLUMNS)
 # CLAUDE.md section 12 they stay in the feature store for later re-testing
 # rather than being promoted into the production feature set.
 #
+# gex_estimate/skew_25delta_chg_1d/put_call_ratio: candidates from the options
+# microstructure layer (CLAUDE.md section 2's "選擇權微結構" row), untested --
+# no promotion decision has been made either way, unlike rsi_14/volume_zscore_20d
+# above which already failed their bootstrap test. See
+# backtest_options_feature_ablation.py, which is the harness for testing them
+# once options_derived_daily/put_call_ratio_daily have real history (they
+# don't in a fresh, unbackfilled DB).
+#
 # dxy_chg_1d_ffill/oil_chg_1d_ffill (not dxy_chg_1d/oil_chg_1d): DTWEXBGS in
 # particular can go 5+ trading days between FRED prints (a real publication-
 # lag characteristic, not an ingestion bug -- see stockmoney.data.features.
@@ -83,7 +91,15 @@ def build_feature_matrix(
     sector: str = "semiconductor",
     horizon: int = 5,
     band_k: float = 0.5,
+    feature_columns: list[str] | None = None,
 ) -> pl.DataFrame:
+    """`feature_columns` defaults to the production FEATURE_COLUMNS; pass an
+    extended list (baseline + a candidate) to test a not-yet-promoted feature
+    without touching the production constant -- see
+    backtest_options_feature_ablation.py, the reusable version of the pattern
+    backtest_feature_ablation.py used (temporarily editing FEATURE_COLUMNS by
+    hand, then reverting) to test rsi_14/volume_zscore_20d."""
+    feature_columns = feature_columns if feature_columns is not None else FEATURE_COLUMNS
     feats = _load_features(conn, target_symbol, sector)
     closes = _load_closes(conn, target_symbol)  # sorted [(date, close)]
     close_idx = {d: i for i, (d, _) in enumerate(closes)}
@@ -93,7 +109,7 @@ def build_feature_matrix(
         if d not in feats:
             continue
         f = feats[d]
-        if any(f.get(c) is None for c in FEATURE_COLUMNS):
+        if any(f.get(c) is None for c in feature_columns):
             continue
         if i + horizon >= len(closes):  # no full forward window yet
             continue
@@ -115,19 +131,19 @@ def build_feature_matrix(
 
         row = {
             "trade_date": d,
-            "available_at": max(f["_available_at"][c] for c in FEATURE_COLUMNS),
+            "available_at": max(f["_available_at"][c] for c in feature_columns),
             "fwd_return": fwd_return,
             "label": label,
             "label_end_date": closes[i + horizon][0],
         }
-        row.update({c: f[c] for c in FEATURE_COLUMNS})
+        row.update({c: f[c] for c in feature_columns})
         rows.append(row)
 
     if not rows:
         schema = {
             "trade_date": pl.Date, "available_at": pl.Datetime,
             "fwd_return": pl.Float64, "label": pl.Int64, "label_end_date": pl.Date,
-        } | {c: pl.Float64 for c in FEATURE_COLUMNS}
+        } | {c: pl.Float64 for c in feature_columns}
         return pl.DataFrame(schema=schema)
     return pl.DataFrame(rows).sort("trade_date")
 
@@ -182,9 +198,10 @@ def latest_unresolved_feature_rows(
     return pl.DataFrame(rows).sort("trade_date").tail(n)
 
 
-def to_dataset(matrix: pl.DataFrame) -> Dataset:
+def to_dataset(matrix: pl.DataFrame, feature_columns: list[str] | None = None) -> Dataset:
+    feature_columns = feature_columns if feature_columns is not None else FEATURE_COLUMNS
     return Dataset(
-        X=matrix.select(FEATURE_COLUMNS).to_numpy(),
+        X=matrix.select(feature_columns).to_numpy(),
         regime_X=matrix.select(REGIME_COLUMNS).to_numpy(),
         y=matrix["label"].to_numpy(),
         trade_dates=matrix["trade_date"].to_list(),
@@ -211,6 +228,11 @@ def _load_features(
         # volume_zscore_20d above.
         "gdelt_avgtone_1d": MARKET_SYMBOL,
         "gdelt_goldstein_1d": MARKET_SYMBOL,
+        # Options-microstructure candidates (per-underlying, not per-sector/
+        # market -- see backtest_options_feature_ablation.py).
+        "gex_estimate": target_symbol,
+        "skew_25delta_chg_1d": target_symbol,
+        "put_call_ratio": target_symbol,
     }
     out: dict[date, dict] = {}
     for feature_name, symbol in symbol_by_feature.items():
