@@ -1,4 +1,4 @@
-from datetime import date
+from datetime import date, timedelta
 
 import duckdb
 import pandas as pd
@@ -52,6 +52,25 @@ def test_fetch_ohlcv_reshapes_multi_symbol(monkeypatch):
     aapl_row = df.filter(df["symbol"] == "AAPL").sort("trade_date").row(0, named=True)
     assert aapl_row["trade_date"] == date(2026, 1, 2)
     assert aapl_row["close"] == 101.0
+
+
+def test_fetch_ohlcv_end_is_inclusive(monkeypatch):
+    """yfinance's own `end` kwarg is exclusive (confirmed empirically against
+    the live API: end=2026-07-10 returns rows only through 2026-07-09) -- this
+    function's `end` argument must NOT be, or a caller passing "today" as end
+    (nightly_refresh's rolling window, build_live's backfill) would silently
+    never receive that day's own close. Assert the one-day compensation is
+    actually applied to what's passed to yfinance."""
+    captured = {}
+
+    def _capture_download(symbols, start, end, auto_adjust, group_by, progress):
+        captured["end"] = end
+        return _fake_download(symbols, start, end, auto_adjust, group_by, progress)
+
+    monkeypatch.setattr("yfinance.download", _capture_download)
+    requested_end = date(2026, 1, 5)
+    fetch_ohlcv(["AAPL"], date(2026, 1, 1), requested_end)
+    assert captured["end"] == requested_end + timedelta(days=1)
 
 
 def test_fetch_ohlcv_returns_empty_frame_with_correct_schema(monkeypatch):

@@ -3,9 +3,10 @@
 Unlike scripts/seed_demo_data.py (synthetic fixture), this runs the genuine
 production pipeline on real data so the frontend shows real model output:
 
-  yfinance OHLCV (≈2y)  ->  FRED macro  ->  feature_store  ->  per-symbol
-  GMM regime + logistic direction + walk-forward backtest snapshot  ->  league
-  trader calls  ->  live RSS/Google-News feed.
+  yfinance OHLCV (≈2y)  ->  FRED macro  ->  VIX term structure (≈2.5y)  ->
+  today's options-chain snapshot  ->  feature_store  ->  per-symbol GMM regime
+  + logistic direction + walk-forward backtest snapshot  ->  league trader
+  calls  ->  live RSS/Google-News feed.
 
 Runs into a SEPARATE db by default (data/stockmoney_live.duckdb) so it never
 clobbers the demo. Point the API at it with STOCKMONEY_DB / by copying it over
@@ -13,8 +14,14 @@ data/stockmoney.duckdb once you're happy.
 
 Honest caveats (see also IMPROVEMENT_PLAN.md):
   * Signal is currently WEAK -- OOS directional accuracy ≈0.35-0.45, barely
-    above the ~1/3 random baseline. The real lever is alpha (options-
-    microstructure / VRP features, S1/S2), not more plumbing.
+    above the ~1/3 random baseline. VIX-term-structure shape was tested
+    (models/backtest_vix_term_ablation.py) and did NOT pass the significance
+    gate (95% CI straddles 0) -- not promoted. The per-underlying options
+    candidates (gex_estimate/skew_25delta/put_call_ratio) can't be tested at
+    all yet: yfinance option chains are snapshot-only, no free history, so
+    every run of this script only adds ONE more day to that series. Either
+    run this daily for months, or subscribe to ORATS/CBOE DataShop to unlock
+    those candidates immediately (CLAUDE.md section 16's paid-upgrade path).
   * Regime cluster ids from a live GMM fit are arbitrary; the plain-language
     regime_label mapping in api/queries.py is a demo convention and should be
     replaced with per-cluster characterisation before real regimes are trusted.
@@ -41,6 +48,7 @@ from compute_features import run_feature_recompute  # noqa: E402
 
 from stockmoney.data.db import get_connection, run_migrations  # noqa: E402
 from stockmoney.data.ingestion.fred_macro import ingest_macro_series  # noqa: E402
+from stockmoney.data.ingestion.options_chain import ingest_watchlist_options  # noqa: E402
 from stockmoney.data.ingestion.vix_term import ingest_vix_term  # noqa: E402
 from stockmoney.data.ingestion.yfinance_ohlcv import ingest_watchlist_ohlcv  # noqa: E402
 from stockmoney.data.news_synthesis import refresh_news_items  # noqa: E402
@@ -75,6 +83,12 @@ def main() -> None:
     _step("ohlcv (yfinance)", lambda: ingest_watchlist_ohlcv(conn, start, end))
     _step("macro (FRED)", lambda: ingest_macro_series(conn, start, end))
     _step("vix term structure", lambda: ingest_vix_term(conn, start, end))
+    # Options chains are snapshot-only (no free history) -- this banks TODAY's
+    # snapshot as the first day of a series that can never be backfilled, so it
+    # runs on every build_live invocation even though the other steps above
+    # cover the full historical window. No explicit trade_date: it resolves
+    # to the latest real trading day just ingested above, not wall-clock date.
+    _step("options snapshot (starts today's series)", lambda: ingest_watchlist_options(conn))
     _step("feature recompute", lambda: run_feature_recompute(conn) or "done")
     _step("model snapshot", lambda: run_snapshot_build(conn))
     _step("league predict", lambda: {k: v for k, v in (run_predictions(conn) or {}).items() if k != "skips"})

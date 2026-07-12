@@ -247,12 +247,27 @@ def _resolve_spot(ticker) -> float | None:
     return None
 
 
+def _latest_trading_day(conn: duckdb.DuckDBPyConnection) -> date | None:
+    row = conn.execute("SELECT max(trade_date) FROM ohlcv_daily").fetchone()
+    return row[0] if row else None
+
+
 def ingest_watchlist_options(
     conn: duckdb.DuckDBPyConnection, *, trade_date: date | None = None
 ) -> dict[str, int]:
     """Ingest an options-chain snapshot for every active watchlist symbol into
-    iv_surface_daily, put_call_ratio_daily and options_derived_daily."""
-    trade_date = trade_date or datetime.now(timezone.utc).date()
+    iv_surface_daily, put_call_ratio_daily and options_derived_daily.
+
+    ``trade_date`` defaults to the latest real trading day already recorded in
+    ``ohlcv_daily`` -- NOT wall-clock "today". yfinance always serves *some*
+    chain (spot/IV reflecting the last close) even when called on a weekend or
+    holiday, so blindly stamping `date.today()` would silently mint a snapshot
+    dated a day no other table ever has a row for. Since this data is
+    snapshot-only and can never be backfilled (see fetch_options_snapshot's
+    docstring), an orphaned trade_date isn't just a cosmetic label -- it's a
+    permanently lost day of the one options signal that's actually free.
+    """
+    trade_date = trade_date or _latest_trading_day(conn) or datetime.now(timezone.utc).date()
     symbols = [
         row[0]
         for row in conn.execute(

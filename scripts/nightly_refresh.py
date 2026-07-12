@@ -82,7 +82,11 @@ def main(db_path: str = DEFAULT_DB_PATH) -> None:
         print(f"  vix_term_structure_daily FAILED: {exc}")
 
     try:
-        written = ingest_watchlist_options(conn, trade_date=today)
+        # No explicit trade_date: ingest_watchlist_options resolves the latest
+        # REAL trading day from ohlcv_daily itself, so a run on a weekend/
+        # holiday (wall-clock `today`) never orphans this irreplaceable,
+        # non-backfillable snapshot under a date nothing else ever has.
+        written = ingest_watchlist_options(conn)
         print(f"  options snapshot: {written}")
     except Exception as exc:
         print(f"  options snapshot FAILED: {exc}")

@@ -18,10 +18,21 @@ candidates only, following rsi_14/volume_zscore_20d's exact precedent (tested
 via backtest_feature_ablation.py, which paired-bootstrap-tested them and
 rejected both). CLAUDE.md section 12 requires the same discipline for these.
 
-Not implemented: a VIX-term-structure feature. vix_term_structure_daily has a
-migration (005) but no ingestion connector was ever written for it -- same gap
-as alt_developer_daily -- so there is no real data to featurize; adding a
-connector is a separate, out-of-scope data-engineering task.
+Unlike the candidates in this module, the VIX-term-structure gap this
+docstring used to describe has since been closed: see
+data/ingestion/vix_term.py (a free connector -- the constant-maturity VIX
+indices, unlike per-underlying option chains, DO have full historical data)
+and data/features/vix_term.py. It was tested via
+models/backtest_vix_term_ablation.py and did NOT pass the significance gate
+(95% CI straddled 0) -- not promoted, kept as a candidate for re-testing.
+
+The candidates in THIS module (gex_estimate/skew_25delta_chg_1d/
+put_call_ratio) remain genuinely untestable for now: yfinance option chains
+are snapshot-only (fetch_options_snapshot's docstring), so
+options_derived_daily/put_call_ratio_daily can only accumulate one day at a
+time going forward (scripts/capture_options_snapshot.py) -- there is no way to
+backfill history for them short of a paid ORATS/CBOE DataShop subscription
+(CLAUDE.md section 16).
 """
 from __future__ import annotations
 
