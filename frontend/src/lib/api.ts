@@ -28,6 +28,8 @@ export interface Opportunity {
   horizon: number
   label_end_date: string
   regime: number
+  regime_label: string
+  thesis: string
   proba: Proba
   predicted_direction: 'up' | 'down' | 'range'
   conviction: number
@@ -64,10 +66,151 @@ export interface PricePoint {
   close: number
 }
 
+export interface NewsItem {
+  item_id: string
+  symbol: string | null
+  item_type: 'catalyst' | 'analyst_rating' | 'earnings' | 'macro' | 'headline'
+  headline: string
+  summary: string | null
+  url: string | null
+  source_name: string | null
+  published_at: string
+  sentiment_score: number | null
+  importance: number | null
+  novelty_score: number | null
+  priced_in_estimate: number | null
+  transmission_chain: string | null
+  source_refs: string[]
+}
+
 export interface TickerDetail extends Omit<Opportunity, 'catalyst_headline'> {
   history: PredictionHistoryEntry[]
   price_history: PricePoint[]
   catalyst: CatalystDetail | null
+  news: NewsItem[]
+}
+
+export interface MarketMover {
+  symbol: string
+  close: number
+  change_pct: number
+}
+
+export interface MarketSummary {
+  as_of_date: string | null
+  n_symbols: number
+  direction_counts: Record<string, number>
+  regime_counts: Record<string, number>
+  dominant_regime: string | null
+  avg_conviction: number | null
+  vix: number | null
+  vix_term_slope: number | null
+  top_gainers: MarketMover[]
+  top_losers: MarketMover[]
+}
+
+export interface MarketEvent {
+  event_id: string
+  symbol: string | null
+  event_type: string
+  event_type_label: string
+  scheduled_at: string
+  status: string | null
+  days_until: number
+}
+
+export interface LeaderboardEntry {
+  rank: number
+  trader_id: string
+  name: string
+  philosophy: string
+  active: boolean
+  starting_capital: number
+  realized_pnl: number
+  unrealized_pnl: number
+  equity: number
+  total_return_pct: number | null
+  realized_return_pct: number | null
+  n_closed: number
+  n_open: number
+  trade_win_rate: number | null
+  best_trade: number | null
+  worst_trade: number | null
+  hit_rate: number | null
+  brier: number | null
+  n_directional: number
+}
+
+export interface TraderTrade {
+  trade_id: string
+  symbol: string
+  option_right: 'call' | 'put'
+  side: 'long' | 'short'
+  strike: number
+  expiry_date: string
+  contracts: number
+  entry_at: string
+  entry_underlying: number
+  entry_premium: number
+  exit_at: string | null
+  exit_underlying: number | null
+  exit_premium: number | null
+  realized_pnl: number | null
+  status: 'open' | 'closed'
+  thesis: string | null
+  exit_reason: string | null
+  current_underlying?: number | null
+  current_premium_est?: number | null
+  unrealized_pnl?: number | null
+}
+
+export interface ContestRules {
+  starting_capital: number
+  instrument: string
+  max_position_pct: number
+  scoring: string
+  note: string
+}
+
+export interface TraderProfile {
+  trader_id: string
+  name: string
+  philosophy: string
+  active: boolean
+  method_version: string | null
+  method_spec: string | null
+  portfolio: {
+    starting_capital: number
+    cash: number
+    max_position_pct: number
+    instrument_scope: string
+    inception_date: string
+    realized_pnl: number
+    unrealized_pnl: number
+    equity: number
+    total_return_pct: number | null
+    realized_return_pct: number | null
+    n_closed: number
+    n_open: number
+    trade_win_rate: number | null
+    best_trade: number | null
+    worst_trade: number | null
+  }
+  rules: ContestRules
+  open_positions: TraderTrade[]
+  closed_trades: TraderTrade[]
+  recent_predictions: {
+    trade_date: string
+    symbol: string
+    direction: string
+    conviction: number
+    rationale: string
+    regime: number | null
+    regime_label: string
+    status: string
+    outcome: string | null
+    label_end_date: string
+  }[]
 }
 
 export interface CatalystSignal {
@@ -249,6 +392,12 @@ export const api = {
   predictions: () => getJson<PredictionsOverview>('/predictions'),
   positions: () => getJson<PositionRisk[]>('/positions'),
   catalysts: () => getJson<CatalystsResponse>('/catalysts'),
+  marketSummary: () => getJson<MarketSummary>('/market-summary'),
+  news: (limit?: number) => getJson<NewsItem[]>(`/news${limit !== undefined ? `?limit=${limit}` : ''}`),
+  newsItem: (id: string) => getJsonOrNull<NewsItem>(`/news/${encodeURIComponent(id)}`),
+  events: () => getJson<MarketEvent[]>('/events'),
+  leaderboard: () => getJson<LeaderboardEntry[]>('/leaderboard'),
+  traderProfile: (id: string) => getJsonOrNull<TraderProfile>(`/traders/${encodeURIComponent(id)}`),
   watchlist: () => getJson<WatchlistResponse>('/watchlist'),
   pipelineHealth: () => getJson<PipelineHealthEntry[]>('/pipeline-health'),
   league: (window?: number) =>

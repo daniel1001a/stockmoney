@@ -17,7 +17,7 @@ directly, so a request is always just a DuckDB read.
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 
 import duckdb
 
@@ -33,6 +33,24 @@ from stockmoney.models.options_risk import MarketSnapshot, assess_position
 ROLLING_WIN_RATE_WINDOW = 20
 RECENT_PREDICTIONS_LIMIT = 15
 PRICE_HISTORY_DAYS = 90
+
+# Plain-language names for the GMM regime cluster ids so the UI never shows a
+# bare "regime 0" (the user's feedback: an integer is meaningless to a human).
+# The mapping is a demo/serving convention -- in production it would come from
+# characterising each cluster's feature centroid; the seed writes ids that match
+# this convention (up-biased days -> 1, down -> 2, choppy -> 0).
+REGIME_LABELS = {0: "震盪盤整", 1: "趨勢多頭", 2: "趨勢空頭"}
+DIRECTION_CN = {"up": "看漲", "down": "看跌", "range": "區間"}
+
+
+def regime_label(regime: int | None) -> str:
+    if regime is None:
+        return "未分類"
+    return REGIME_LABELS.get(regime, f"regime {regime}")
+
+
+def _plain_thesis(direction: str, regime: int | None, conviction: float) -> str:
+    return f"{regime_label(regime)}格局下,模型偏向{DIRECTION_CN.get(direction, direction)},信心 {round(conviction * 100)}%。"
 
 # Per-table max acceptable lag before pipeline_health flags it stale, in
 # calendar days. Grounded in what actually runs on a recurring schedule
@@ -154,6 +172,8 @@ def _prediction_row_to_dict(row: tuple, snapshot: dict | None) -> dict:
     return {
         "symbol": symbol, "sector": sector, "trade_date": trade_date, "horizon": horizon,
         "label_end_date": label_end_date, "regime": regime,
+        "regime_label": regime_label(regime),
+        "thesis": _plain_thesis(predicted_direction, regime, conviction),
         "proba": {"down": proba_down, "range": proba_range, "up": proba_up},
         "predicted_direction": predicted_direction, "conviction": conviction,
         "entry_price": entry_price, "target_price_up": target_price_up,
@@ -248,6 +268,8 @@ def ticker_detail(conn: duckdb.DuckDBPyConnection, symbol: str) -> dict | None:
         }
         if catalyst is not None else None
     )
+
+    prediction["news"] = news_for_symbol(conn, symbol, limit=8)
 
     return prediction
 
@@ -443,3 +465,342 @@ def recent_divergence(conn: duckdb.DuckDBPyConnection, *, hours: int = 168) -> l
     """Recent cross-trader disagreements (CLAUDE.md section 8), disagreements
     first. `was_right` is filled once graded (who ultimately called it)."""
     return recent_divergence_rows(conn, hours=hours)
+
+
+# --- Redesign: news feed, events, market summary, trader arena ---------------
+# All read-only, all reading nightly/seed-written tables. Nothing here fits a
+# model or writes -- same discipline as the rest of this module.
+
+EVENT_TYPE_CN = {"earnings": "財報", "fomc": "FOMC 利率決議", "cpi": "CPI 通膨", "nfp": "非農就業"}
+
+
+def _news_row_to_dict(r: tuple) -> dict:
+    (item_id, symbol, item_type, headline, summary, url, source_name, published_at,
+     sentiment, importance, novelty, priced_in, chain, refs) = r
+    return {
+        "item_id": item_id, "symbol": symbol, "item_type": item_type, "headline": headline,
+        "summary": summary, "url": url, "source_name": source_name, "published_at": published_at,
+        "sentiment_score": sentiment, "importance": importance, "novelty_score": novelty,
+        "priced_in_estimate": priced_in, "transmission_chain": chain,
+        "source_refs": json.loads(refs) if refs else [],
+    }
+
+
+_NEWS_COLS = (
+    "item_id, symbol, item_type, headline, summary, url, source_name, published_at, "
+    "sentiment_score, importance, novelty_score, priced_in_estimate, transmission_chain, source_refs"
+)
+
+
+def news_feed(conn: duckdb.DuckDBPyConnection, *, limit: int = 60) -> list[dict]:
+    """The 消息雷達 feed: every kind of market-relevant news in one normalised
+    stream, newest first. The frontend filters by type/symbol/search on top of
+    this -- kept server-side simple so the list stays one honest query."""
+    rows = conn.execute(
+        f"SELECT {_NEWS_COLS} FROM news_items ORDER BY published_at DESC LIMIT ?", [limit]
+    ).fetchall()
+    return [_news_row_to_dict(r) for r in rows]
+
+
+def news_item(conn: duckdb.DuckDBPyConnection, item_id: str) -> dict | None:
+    rows = conn.execute(
+        f"SELECT {_NEWS_COLS} FROM news_items WHERE item_id = ?", [item_id]
+    ).fetchall()
+    return _news_row_to_dict(rows[0]) if rows else None
+
+
+def news_for_symbol(conn: duckdb.DuckDBPyConnection, symbol: str, *, limit: int = 8) -> list[dict]:
+    """Per-ticker news list for the detail page (Robinhood-style): the symbol's
+    own items plus market-wide macro items that move everything."""
+    rows = conn.execute(
+        f"SELECT {_NEWS_COLS} FROM news_items "
+        "WHERE symbol = ? OR (symbol IS NULL AND item_type = 'macro') "
+        "ORDER BY published_at DESC LIMIT ?",
+        [symbol.upper(), limit],
+    ).fetchall()
+    return [_news_row_to_dict(r) for r in rows]
+
+
+def events(conn: duckdb.DuckDBPyConnection, *, now: datetime | None = None) -> list[dict]:
+    """Upcoming scheduled market events (earnings / FOMC / CPI / NFP), soonest
+    first. Real, public, everyone-knows-it news -- the calm counterpart to the
+    catalyst feed's "market may not have priced this in yet"."""
+    now = now or datetime.now(timezone.utc)
+    rows = conn.execute(
+        """
+        WITH latest AS (
+            SELECT event_id, symbol, event_type, scheduled_at, status,
+                   row_number() OVER (PARTITION BY event_id ORDER BY ingested_at DESC) AS rn
+            FROM event_calendar
+        )
+        SELECT event_id, symbol, event_type, scheduled_at, status FROM latest
+        WHERE rn = 1 AND scheduled_at >= ? ORDER BY scheduled_at
+        """,
+        [now - timedelta(days=1)],
+    ).fetchall()
+    out = []
+    for event_id, symbol, event_type, scheduled_at, status in rows:
+        out.append({
+            "event_id": event_id, "symbol": symbol, "event_type": event_type,
+            "event_type_label": EVENT_TYPE_CN.get(event_type, event_type),
+            "scheduled_at": scheduled_at, "status": status,
+            "days_until": (scheduled_at - now).days,
+        })
+    return out
+
+
+def market_summary(conn: duckdb.DuckDBPyConnection) -> dict:
+    """The morning-briefing strip: one glance at 'what is the market doing'.
+    Regime mix + directional breadth + VIX + biggest movers across the
+    watchlist, all from the latest cached rows."""
+    preds = _latest_prediction_rows(conn)
+    as_of = max((r[2] for r in preds), default=None)
+    dir_counts = {"up": 0, "down": 0, "range": 0}
+    regime_counts: dict[str, int] = {}
+    convictions = []
+    for r in preds:
+        direction = r[9]
+        dir_counts[direction] = dir_counts.get(direction, 0) + 1
+        regime_counts[regime_label(r[5])] = regime_counts.get(regime_label(r[5]), 0) + 1
+        convictions.append(max(r[6], r[7], r[8]))
+
+    # dominant regime = the one the most symbols are in right now
+    dominant_regime = max(regime_counts.items(), key=lambda kv: kv[1])[0] if regime_counts else None
+
+    vix_row = conn.execute(
+        """
+        WITH latest AS (SELECT max(trade_date) AS d FROM vix_term_structure_daily)
+        SELECT tenor_days, vix_value FROM vix_term_structure_daily
+        WHERE trade_date = (SELECT d FROM latest)
+        """
+    ).fetchall()
+    vix_by_tenor = {t: v for t, v in vix_row}
+    vix_spot = vix_by_tenor.get(30)
+    vix_slope = (
+        vix_by_tenor.get(90) - vix_by_tenor.get(9)
+        if vix_by_tenor.get(90) is not None and vix_by_tenor.get(9) is not None else None
+    )
+
+    movers = conn.execute(
+        """
+        WITH latest AS (
+            SELECT symbol, trade_date, close,
+                   row_number() OVER (PARTITION BY symbol ORDER BY trade_date DESC) AS rn
+            FROM ohlcv_daily WHERE close IS NOT NULL
+        )
+        SELECT symbol,
+               max(CASE WHEN rn = 1 THEN close END) AS c0,
+               max(CASE WHEN rn = 2 THEN close END) AS c1
+        FROM latest WHERE rn <= 2 GROUP BY symbol
+        """
+    ).fetchall()
+    moves = [
+        {"symbol": s, "close": c0, "change_pct": (c0 - c1) / c1}
+        for s, c0, c1 in movers if c0 is not None and c1 is not None and c1
+    ]
+    moves.sort(key=lambda m: m["change_pct"], reverse=True)
+
+    return {
+        "as_of_date": as_of,
+        "n_symbols": len(preds),
+        "direction_counts": dir_counts,
+        "regime_counts": regime_counts,
+        "dominant_regime": dominant_regime,
+        "avg_conviction": sum(convictions) / len(convictions) if convictions else None,
+        "vix": vix_spot,
+        "vix_term_slope": vix_slope,
+        "top_gainers": moves[:3],
+        "top_losers": list(reversed(moves[-3:])) if len(moves) >= 3 else [],
+    }
+
+
+# --- Trader Arena: leaderboard + per-trader profile -------------------------
+
+CONTEST_RULES = {
+    "starting_capital": 25000.0,
+    "instrument": "短天期選擇權(買/賣 call & put,對應核心 1-9 個月風向)",
+    "max_position_pct": 0.20,
+    "scoring": "以總報酬率排名;方向命中率、Brier、每日對帳為輔助指標。",
+    "note": "全部為模擬倉位,系統永遠不下真實訂單(CLAUDE.md 硬邊界)。",
+}
+
+
+def _current_underlying(conn: duckdb.DuckDBPyConnection) -> dict[str, float]:
+    return {
+        r[0]: r[1]
+        for r in conn.execute(
+            """
+            WITH latest AS (
+                SELECT symbol, close, row_number() OVER (PARTITION BY symbol ORDER BY trade_date DESC) AS rn
+                FROM ohlcv_daily WHERE close IS NOT NULL
+            )
+            SELECT symbol, close FROM latest WHERE rn = 1
+            """
+        ).fetchall()
+    }
+
+
+def _rough_mark(trade: dict, spot: float | None) -> tuple[float | None, float | None]:
+    """A transparent delta~=0.5 mark for an open option so the UI can show an
+    approximate current value. NOT a real quote (CLAUDE.md/HANDOFF: no options
+    quote store) -- labelled '粗估' in the UI. Returns (current_premium_est,
+    unrealized_pnl_dollars)."""
+    if spot is None:
+        return None, None
+    move = spot - trade["entry_underlying"]
+    if trade["option_right"] == "put":
+        move = -move
+    entry = trade["entry_premium"]
+    # delta~=0.5 mark, clamped to a sane short-dated option range: it can decay
+    # toward ~0 or roughly triple over the holding window, but this is an
+    # approximation for display only (no real quote store), so it must not
+    # manufacture an implausible mark-to-market swing.
+    est = min(3.0 * entry, max(0.05 * entry, entry + 0.5 * move))
+    per_share = (est - entry) if trade["side"] == "long" else (entry - est)
+    unreal = per_share * 100 * trade["contracts"]
+    return round(est, 2), round(unreal, 2)
+
+
+def _trader_trades(conn: duckdb.DuckDBPyConnection, trader_id: str) -> list[dict]:
+    rows = conn.execute(
+        """
+        SELECT trade_id, symbol, option_right, side, strike, expiry_date, contracts,
+               entry_at, entry_underlying, entry_premium, exit_at, exit_underlying,
+               exit_premium, realized_pnl, status, thesis, exit_reason
+        FROM trader_trades WHERE trader_id = ? ORDER BY entry_at DESC
+        """,
+        [trader_id],
+    ).fetchall()
+    cols = ["trade_id", "symbol", "option_right", "side", "strike", "expiry_date", "contracts",
+            "entry_at", "entry_underlying", "entry_premium", "exit_at", "exit_underlying",
+            "exit_premium", "realized_pnl", "status", "thesis", "exit_reason"]
+    return [dict(zip(cols, r)) for r in rows]
+
+
+def _portfolio_row(conn: duckdb.DuckDBPyConnection, trader_id: str) -> dict | None:
+    row = conn.execute(
+        "SELECT starting_capital, cash, max_position_pct, instrument_scope, inception_date "
+        "FROM trader_portfolios WHERE trader_id = ?",
+        [trader_id],
+    ).fetchone()
+    if row is None:
+        return None
+    return {
+        "starting_capital": row[0], "cash": row[1], "max_position_pct": row[2],
+        "instrument_scope": row[3], "inception_date": row[4],
+    }
+
+
+def _portfolio_stats(portfolio: dict, trades: list[dict], spot: dict[str, float]) -> dict:
+    closed = [t for t in trades if t["status"] == "closed"]
+    open_trades = [t for t in trades if t["status"] == "open"]
+    realized = sum(t["realized_pnl"] or 0.0 for t in closed)
+    wins = [t for t in closed if (t["realized_pnl"] or 0.0) > 0]
+    unrealized = 0.0
+    for t in open_trades:
+        _, unreal = _rough_mark(t, spot.get(t["symbol"]))
+        unrealized += unreal or 0.0
+    start = portfolio["starting_capital"]
+    # Equity from first principles: bankroll + booked P&L + open mark-to-market.
+    # (Avoids the cash-vs-cost-basis double-count -- cash is shown separately.)
+    equity = start + realized + unrealized
+    return {
+        "realized_pnl": round(realized, 2),
+        "unrealized_pnl": round(unrealized, 2),
+        "equity": round(equity, 2),
+        "total_return_pct": (equity - start) / start if start else None,
+        "realized_return_pct": realized / start if start else None,
+        "n_closed": len(closed),
+        "n_open": len(open_trades),
+        "trade_win_rate": (len(wins) / len(closed)) if closed else None,
+        "best_trade": max((t["realized_pnl"] or 0.0 for t in closed), default=None),
+        "worst_trade": min((t["realized_pnl"] or 0.0 for t in closed), default=None),
+    }
+
+
+def leaderboard(conn: duckdb.DuckDBPyConnection, *, window: int = 20) -> list[dict]:
+    """Contest standings: every trader's virtual-account return, ranked. This is
+    the merged Arena's headline board -- the 'who is actually making money'
+    view, with the league hit-rate/Brier folded in as secondary detail."""
+    spot = _current_underlying(conn)
+    league_by_id = {r["trader_id"]: r for r in _compute_league_table(conn, window=window)}
+    out = []
+    for trader in list_all_traders(conn):
+        portfolio = _portfolio_row(conn, trader.trader_id)
+        if portfolio is None:
+            continue
+        trades = _trader_trades(conn, trader.trader_id)
+        stats = _portfolio_stats(portfolio, trades, spot)
+        league = league_by_id.get(trader.trader_id, {})
+        rolling = league.get("rolling", {})
+        out.append({
+            "trader_id": trader.trader_id, "name": trader.name, "philosophy": trader.philosophy,
+            "active": trader.active,
+            "starting_capital": portfolio["starting_capital"],
+            **stats,
+            "hit_rate": rolling.get("hit_rate"),
+            "brier": rolling.get("brier"),
+            "n_directional": rolling.get("n_directional", 0),
+        })
+    # Ranked on REALIZED (booked) return -- a contest is scored on closed
+    # results; open positions are marked-to-market for display but their rough
+    # mark shouldn't decide the standings.
+    out.sort(key=lambda r: r["realized_return_pct"] if r["realized_return_pct"] is not None else -1e9, reverse=True)
+    for i, r in enumerate(out):
+        r["rank"] = i + 1
+    return out
+
+
+def trader_profile(conn: duckdb.DuckDBPyConnection, trader_id: str) -> dict | None:
+    """One trader's full account: contest stats, current open positions (with a
+    rough live mark), full trade history, and their recent league calls -- the
+    'click into a trader and see a real account' view."""
+    trader = next((t for t in list_all_traders(conn) if t.trader_id == trader_id), None)
+    portfolio = _portfolio_row(conn, trader_id)
+    if trader is None or portfolio is None:
+        return None
+    spot = _current_underlying(conn)
+    trades = _trader_trades(conn, trader_id)
+    stats = _portfolio_stats(portfolio, trades, spot)
+
+    open_positions = []
+    for t in trades:
+        if t["status"] != "open":
+            continue
+        s = spot.get(t["symbol"])
+        est, unreal = _rough_mark(t, s)
+        open_positions.append({**t, "current_underlying": s, "current_premium_est": est, "unrealized_pnl": unreal})
+    closed_trades = [t for t in trades if t["status"] == "closed"]
+
+    method = conn.execute(
+        "SELECT method_version, spec FROM trader_method_versions "
+        "WHERE trader_id = ? AND status = 'active' ORDER BY effective_date DESC LIMIT 1",
+        [trader_id],
+    ).fetchone()
+
+    recent_preds = conn.execute(
+        """
+        SELECT trade_date, symbol, direction, conviction, rationale, regime, status, outcome, label_end_date
+        FROM trader_predictions WHERE trader_id = ? ORDER BY trade_date DESC, symbol LIMIT 15
+        """,
+        [trader_id],
+    ).fetchall()
+
+    return {
+        "trader_id": trader.trader_id, "name": trader.name, "philosophy": trader.philosophy,
+        "active": trader.active,
+        "method_version": method[0] if method else None,
+        "method_spec": method[1] if method else None,
+        "portfolio": {**portfolio, **stats},
+        "rules": CONTEST_RULES,
+        "open_positions": open_positions,
+        "closed_trades": closed_trades,
+        "recent_predictions": [
+            {
+                "trade_date": r[0], "symbol": r[1], "direction": r[2], "conviction": r[3],
+                "rationale": r[4], "regime": r[5], "regime_label": regime_label(r[5]),
+                "status": r[6], "outcome": r[7], "label_end_date": r[8],
+            }
+            for r in recent_preds
+        ],
+    }

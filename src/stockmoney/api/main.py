@@ -86,6 +86,48 @@ def catalysts() -> dict:
         return queries.catalysts(conn)
 
 
+@app.get("/api/market-summary")
+def market_summary() -> dict:
+    with ro_connection() as conn:
+        return queries.market_summary(conn)
+
+
+@app.get("/api/news")
+def news(limit: int = 60) -> list[dict]:
+    with ro_connection() as conn:
+        return queries.news_feed(conn, limit=limit)
+
+
+@app.get("/api/news/{item_id}")
+def news_detail(item_id: str) -> dict:
+    with ro_connection() as conn:
+        result = queries.news_item(conn, item_id)
+    if result is None:
+        raise HTTPException(status_code=404, detail=f"no news item {item_id}")
+    return result
+
+
+@app.get("/api/events")
+def events() -> list[dict]:
+    with ro_connection() as conn:
+        return queries.events(conn)
+
+
+@app.get("/api/leaderboard")
+def leaderboard(window: int = 20) -> list[dict]:
+    with ro_connection() as conn:
+        return queries.leaderboard(conn, window=window)
+
+
+@app.get("/api/traders/{trader_id}")
+def trader_profile(trader_id: str) -> dict:
+    with ro_connection() as conn:
+        result = queries.trader_profile(conn, trader_id)
+    if result is None:
+        raise HTTPException(status_code=404, detail=f"no trader {trader_id}")
+    return result
+
+
 # --- Trader League Arena (Worker 1) -----------------------------------------
 
 @app.get("/api/league")
