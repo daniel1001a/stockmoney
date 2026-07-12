@@ -41,6 +41,7 @@ from compute_features import run_feature_recompute  # noqa: E402
 
 from stockmoney.data.db import get_connection, run_migrations  # noqa: E402
 from stockmoney.data.ingestion.fred_macro import ingest_macro_series  # noqa: E402
+from stockmoney.data.ingestion.vix_term import ingest_vix_term  # noqa: E402
 from stockmoney.data.ingestion.yfinance_ohlcv import ingest_watchlist_ohlcv  # noqa: E402
 from stockmoney.data.news_synthesis import refresh_news_items  # noqa: E402
 from stockmoney.league.orchestration import run_predictions  # noqa: E402
@@ -73,6 +74,7 @@ def main() -> None:
 
     _step("ohlcv (yfinance)", lambda: ingest_watchlist_ohlcv(conn, start, end))
     _step("macro (FRED)", lambda: ingest_macro_series(conn, start, end))
+    _step("vix term structure", lambda: ingest_vix_term(conn, start, end))
     _step("feature recompute", lambda: run_feature_recompute(conn) or "done")
     _step("model snapshot", lambda: run_snapshot_build(conn))
     _step("league predict", lambda: {k: v for k, v in (run_predictions(conn) or {}).items() if k != "skips"})

@@ -233,6 +233,11 @@ def _load_features(
         "gex_estimate": target_symbol,
         "skew_25delta_chg_1d": target_symbol,
         "put_call_ratio": target_symbol,
+        # VIX term-structure shape candidates (market-wide, historical, free --
+        # unlike the per-underlying options candidates above these ARE
+        # backtestable; see backtest_vix_term_ablation.py).
+        "vix_term_slope": MARKET_SYMBOL,
+        "vix_term_slope_back": MARKET_SYMBOL,
     }
     out: dict[date, dict] = {}
     for feature_name, symbol in symbol_by_feature.items():

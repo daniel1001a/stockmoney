@@ -46,6 +46,7 @@ from stockmoney.data.attribution import run_attribution
 from stockmoney.data.db import DEFAULT_DB_PATH, get_connection, run_migrations
 from stockmoney.data.ingestion.fred_macro import ingest_macro_series
 from stockmoney.data.ingestion.options_chain import ingest_watchlist_options
+from stockmoney.data.ingestion.vix_term import ingest_vix_term
 from stockmoney.data.ingestion.yfinance_ohlcv import ingest_watchlist_ohlcv
 from stockmoney.data.news_synthesis import refresh_news_items
 from stockmoney.league.orchestration import run_predictions
@@ -73,6 +74,12 @@ def main(db_path: str = DEFAULT_DB_PATH) -> None:
         print(f"  macro_series_daily: +{n} rows")
     except Exception as exc:
         print(f"  macro_series_daily FAILED: {exc}")
+
+    try:
+        n = ingest_vix_term(conn, today - timedelta(days=OHLCV_LOOKBACK_DAYS), today)
+        print(f"  vix_term_structure_daily: +{n} rows")
+    except Exception as exc:
+        print(f"  vix_term_structure_daily FAILED: {exc}")
 
     try:
         written = ingest_watchlist_options(conn, trade_date=today)
