@@ -82,10 +82,52 @@ def gen_prices(symbol: str) -> list[tuple[date, float, float, float, float, int]
     return rows
 
 
-def seed_prices(conn) -> dict[str, list[tuple[date, float]]]:
+def fetch_real_prices() -> dict[str, list[tuple[date, float, float, float, float, int]]]:
+    """Real ~90-trading-day OHLCV from yfinance for the whole watchlist. Returns
+    {} on any failure so the caller falls back to the synthetic walk -- the seed
+    must still work fully offline."""
+    import warnings
+
+    warnings.filterwarnings("ignore")
+    try:
+        import yfinance as yf
+    except ImportError:
+        return {}
+    out: dict[str, list] = {}
+    try:
+        raw = yf.download(
+            list(UNIVERSE), period="140d", interval="1d",
+            group_by="ticker", auto_adjust=False, progress=False, threads=True,
+        )
+    except Exception:
+        return {}
+    for symbol in UNIVERSE:
+        try:
+            sub = raw[symbol].dropna(subset=["Close"])
+        except Exception:
+            continue
+        rows = []
+        for ts, r in sub.iterrows():
+            d = ts.date()
+            if d > TODAY:
+                continue
+            rows.append((
+                d, round(float(r["Open"]), 2), round(float(r["High"]), 2),
+                round(float(r["Low"]), 2), round(float(r["Close"]), 2),
+                int(r["Volume"]) if r["Volume"] == r["Volume"] else 0,
+            ))
+        if len(rows) >= 30:  # need enough history for charts/features
+            out[symbol] = rows[-90:]
+    return out
+
+
+def seed_prices(conn, *, use_real: bool = True) -> dict[str, list[tuple[date, float]]]:
+    real = fetch_real_prices() if use_real else {}
+    if real:
+        print(f"  using REAL yfinance prices for {len(real)}/{len(UNIVERSE)} symbols")
     closes: dict[str, list[tuple[date, float]]] = {}
     for symbol in UNIVERSE:
-        rows = gen_prices(symbol)
+        rows = real.get(symbol) or gen_prices(symbol)
         closes[symbol] = [(d, c) for (d, o, h, l, c, v) in rows]
         conn.executemany(
             "INSERT INTO ohlcv_daily (symbol, trade_date, open, high, low, close, adj_close, volume, source, ingested_at) "
@@ -132,13 +174,14 @@ def seed_daily_predictions(conn, closes) -> None:
     snap_rows = []
     for symbol, (sector, base, drift, vol) in UNIVERSE.items():
         px = closes[symbol]
-        last_close = px[-1][1]
         # a per-symbol "skill" so backtest numbers differ but stay honest (~0.4-0.52)
         acc = round(RNG.uniform(0.41, 0.54), 3)
-        pred_days = business_days(TODAY, 12)
-        for i, d in enumerate(pred_days):
-            is_today = i == len(pred_days) - 1
-            close_on = next((c for (dd, c) in px if dd == d), last_close)
+        # Iterate over the actual trading-day indices in the (possibly real,
+        # holiday-aware) price series -- the last 12 sessions.
+        pred_indices = list(range(max(0, len(px) - 12), len(px)))
+        for idx in pred_indices:
+            d, close_on = px[idx]
+            is_today = idx == len(px) - 1
             # bias direction by drift so it looks coherent
             direction = RNG.choices(
                 DIRECTIONS,
@@ -158,8 +201,8 @@ def seed_daily_predictions(conn, closes) -> None:
                     "pending", None, None, None, None, None,
                 )
             else:
-                # grade against the realised close `horizon` days later
-                fut = min(len(px) - 1, [j for j, (dd, _) in enumerate(px) if dd == d][0] + 5)
+                # grade against the realised close `horizon` sessions later
+                fut = min(len(px) - 1, idx + 5)
                 actual_price = px[fut][1]
                 actual_return = round((actual_price - close_on) / close_on, 4)
                 if actual_return > band / close_on:
@@ -274,6 +317,12 @@ def seed_traders(conn) -> None:
 def seed_trader_predictions(conn, closes) -> None:
     all_traders = ["chartist", "analyst"] + [t[0] for t in EXTRA_TRADERS]
     symbols = list(UNIVERSE)
+    # Per-symbol date -> (index, close), and a canonical trading calendar taken
+    # from the longest series (all US equities share the same sessions).
+    idx_by_date = {s: {d: (i, c) for i, (d, c) in enumerate(closes[s])} for s in symbols}
+    reference = max(symbols, key=lambda s: len(closes[s]))
+    calendar = [d for (d, _) in closes[reference]]
+    today_d = calendar[-1]
     rows = []
     for tid in all_traders:
         win_bias, _ = TRADER_SKILL[tid]
@@ -281,15 +330,17 @@ def seed_trader_predictions(conn, closes) -> None:
             "analyst:catalyst-v1" if tid == "analyst" else f"{tid}:v1")
         # each trader covers 6 symbols across the last 8 sessions
         covered = RNG.sample(symbols, 6)
-        pred_days = business_days(TODAY, 8)
+        pred_days = calendar[-8:]
         for d in pred_days:
-            is_today = d == TODAY
+            is_today = d == today_d
             for symbol in covered:
                 if RNG.random() < 0.35:
                     continue  # traders skip when they have no edge
                 sector, base, drift, vol = UNIVERSE[symbol]
                 px = closes[symbol]
-                close_on = next((c for (dd, c) in px if dd == d), px[-1][1])
+                if d not in idx_by_date[symbol]:
+                    continue  # symbol wasn't trading that session
+                idx, close_on = idx_by_date[symbol][d]
                 band = close_on * vol * 1.6
                 pid = f"tp-{tid}-{symbol}-{d.isoformat()}"
                 if is_today:
@@ -556,6 +607,8 @@ def seed_ingestion_runs(conn) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--db", default=DEFAULT_DB_PATH)
+    parser.add_argument("--synthetic", action="store_true",
+                        help="force the synthetic random-walk prices instead of live yfinance")
     args = parser.parse_args()
 
     conn = get_connection(args.db)
@@ -571,7 +624,7 @@ def main() -> None:
     conn.execute("DELETE FROM trader_method_versions WHERE trader_id NOT IN ('chartist','analyst')")
     conn.execute("DELETE FROM traders WHERE trader_id NOT IN ('chartist','analyst')")
 
-    closes = seed_prices(conn)
+    closes = seed_prices(conn, use_real=not args.synthetic)
     seed_vix(conn)
     seed_daily_predictions(conn, closes)
     seed_traders(conn)
