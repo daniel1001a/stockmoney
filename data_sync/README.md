@@ -17,13 +17,25 @@ key, not on the name.
 
 ## Tables and primary keys (must match the migration definitions)
 
-| table                  | primary key                                                        |
-|------------------------|--------------------------------------------------------------------|
-| `iv_surface_daily`     | symbol, trade_date, expiry_date, delta_bucket, ingested_at         |
-| `put_call_ratio_daily` | symbol, trade_date, ingested_at                                    |
-| `options_derived_daily`| symbol, trade_date, metric_name, method_version, ingested_at       |
-| `catalyst_signals`     | signal_id                                                          |
-| `news_items`           | item_id                                                            |
+The importer's `TABLE_PRIMARY_KEYS` must stay a **superset** of what
+`scripts/export_for_sync.py` ships, or exported rows silently never reach the
+live DB.
+
+| table                      | primary key                                                    |
+|----------------------------|----------------------------------------------------------------|
+| `iv_surface_daily`         | symbol, trade_date, expiry_date, delta_bucket, ingested_at     |
+| `put_call_ratio_daily`     | symbol, trade_date, ingested_at                                |
+| `options_derived_daily`    | symbol, trade_date, metric_name, method_version, ingested_at   |
+| `catalyst_signals`         | signal_id                                                      |
+| `news_items`               | item_id                                                        |
+| `news_articles_raw`        | article_id, ingested_at                                       |
+| `scan_classifications`     | item_id, item_type                                            |
+| `ohlcv_daily`              | symbol, trade_date, ingested_at                               |
+| `vix_term_structure_daily` | trade_date, tenor_days, ingested_at                           |
+| `macro_series_daily`       | series_id, observation_date, vintage_date                     |
+| `alt_social_hourly`        | symbol, platform, hour_bucket, ingested_at                    |
+| `watchlist_candidates`     | candidate_id                                                  |
+| `ingestion_runs`           | run_id                                                        |
 
 ## Rules for the exporter
 

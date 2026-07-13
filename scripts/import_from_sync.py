@@ -49,15 +49,30 @@ from stockmoney.data.db import get_connection, run_migrations
 DEFAULT_LIVE_DB = "data/stockmoney_live.duckdb"
 DEFAULT_EXPORTS_DIR = "data_sync/exports"
 
-# The only tables Agent 3 exports, each mapped to its primary key. The PK is
-# what makes the row-level insert idempotent (anti-join), so it must exactly
-# match the migration definitions. Adding a new synced table = add it here.
+# Every table Agent 3's scripts/export_for_sync.py ships, each mapped to its
+# primary key. The PK is what makes the row-level insert idempotent (anti-join),
+# so it must exactly match the migration definitions. This list is the import
+# side of the export contract (data_sync/README.md) -- it must stay a superset
+# of the exporter's table list, or exported data silently never reaches the live
+# DB. Adding a new synced table = add it here.
 TABLE_PRIMARY_KEYS: dict[str, list[str]] = {
+    # options snapshots -- the irreplaceable, per-day-or-lost-forever data
     "iv_surface_daily": ["symbol", "trade_date", "expiry_date", "delta_bucket", "ingested_at"],
     "put_call_ratio_daily": ["symbol", "trade_date", "ingested_at"],
     "options_derived_daily": ["symbol", "trade_date", "metric_name", "method_version", "ingested_at"],
+    # LLM catalyst chain + unified news feed
     "catalyst_signals": ["signal_id"],
     "news_items": ["item_id"],
+    "news_articles_raw": ["article_id", "ingested_at"],
+    "scan_classifications": ["item_id", "item_type"],
+    # market / macro / alt time series
+    "ohlcv_daily": ["symbol", "trade_date", "ingested_at"],
+    "vix_term_structure_daily": ["trade_date", "tenor_days", "ingested_at"],
+    "macro_series_daily": ["series_id", "observation_date", "vintage_date"],
+    "alt_social_hourly": ["symbol", "platform", "hour_bucket", "ingested_at"],
+    # discovery + ingestion bookkeeping
+    "watchlist_candidates": ["candidate_id"],
+    "ingestion_runs": ["run_id"],
 }
 
 
