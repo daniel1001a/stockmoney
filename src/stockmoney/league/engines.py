@@ -45,6 +45,12 @@ class EngineCall:
     invalidation: str
     method_version: str
     engine_payload: dict
+    # Filled by orchestration.py AFTER predict() returns (league/option_bridge.py),
+    # never set by an engine itself -- instrument selection is mechanical and
+    # must be identical across every trader for the league to stay comparable,
+    # not a per-engine judgment call. None for 'range' calls or when no usable
+    # entry IV exists that day.
+    option_structure: dict | None = None
 
 
 class TraderEngine(Protocol):

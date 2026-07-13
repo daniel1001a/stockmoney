@@ -14,6 +14,15 @@ leaks in:
   short on 'down'; 'range' has no directional exposure). Optional cost_bps.
 - high_conviction_precision: hit rate among calls with conviction >= threshold
   -- CLAUDE.md section 12's "high-confidence-interval precision".
+- option_win_rate / avg_option_pnl / cum_option_pnl (Wave D, IMPROVEMENT_PLAN.md
+  §S3): the REAL option P&L of the concrete instrument option_bridge.py chose
+  at entry (league/grading_options.py), scored alongside the underlying-return
+  pnl above so a trader who is directionally right but loses to theta/IV-crush
+  is visibly different from one who is right AND makes money as an option --
+  exactly the gap a pure directional hit-rate can't see. Computed only over
+  rows with a non-None option_pnl (a 'range' call, or a day with no usable
+  entry IV, has none) -- honest None/0 when that bucket is empty, same as
+  every other stat here.
 """
 from __future__ import annotations
 
@@ -59,6 +68,14 @@ def compute_stats(
     high_conv = [p for p in graded if p.conviction >= high_conviction]
     high_conv_wins = sum(1 for p in high_conv if p.outcome == "win")
 
+    option_pnls = [p.option_pnl for p in graded if p.option_pnl is not None]
+    option_wins = sum(1 for pnl in option_pnls if pnl > 0)
+    # "Right on direction but the option lost" -- theta/IV-crush, the exact
+    # gap this wave closes (IMPROVEMENT_PLAN.md §S3's acceptance case).
+    directional_wins_option_losses = sum(
+        1 for p in directional if p.outcome == "win" and p.option_pnl is not None and p.option_pnl <= 0
+    )
+
     return {
         "n_graded": n_graded,
         "n_directional": n_dir,
@@ -69,6 +86,11 @@ def compute_stats(
         "high_conviction_threshold": high_conviction,
         "high_conviction_n": len(high_conv),
         "high_conviction_precision": (high_conv_wins / len(high_conv)) if high_conv else None,
+        "n_option_graded": len(option_pnls),
+        "option_win_rate": (option_wins / len(option_pnls)) if option_pnls else None,
+        "avg_option_pnl": (sum(option_pnls) / len(option_pnls)) if option_pnls else None,
+        "cum_option_pnl": sum(option_pnls) if option_pnls else 0.0,
+        "directional_win_option_loss_n": directional_wins_option_losses,
     }
 
 

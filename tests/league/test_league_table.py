@@ -11,13 +11,13 @@ from stockmoney.data.trader_predictions import TraderPrediction
 from stockmoney.league.league_table import compute_stats, league_table
 
 
-def _p(direction, conviction, outcome, actual_return, regime, *, status="graded") -> TraderPrediction:
+def _p(direction, conviction, outcome, actual_return, regime, *, status="graded", option_pnl=None) -> TraderPrediction:
     return TraderPrediction(
         prediction_id="x", trader_id="t", method_version="m", trade_date=date(2026, 6, 1),
         symbol="S", sector="semiconductor", horizon=5, label_end_date=date(2026, 6, 8),
         direction=direction, conviction=conviction, rationale="r", invalidation="i",
         entry_price=100.0, band_k=0.5, grade_vol=0.4, regime=regime, status=status,
-        actual_return=actual_return, outcome=outcome,
+        actual_return=actual_return, outcome=outcome, option_pnl=option_pnl,
     )
 
 
@@ -49,6 +49,40 @@ def test_compute_stats_empty_is_honest_not_crash():
 def test_pnl_cost_bps_applied():
     s = compute_stats([_p("up", 0.7, "win", 0.10, 0)], cost_bps=50)  # 50bps = 0.005
     assert s["avg_pnl"] == pytest.approx(0.10 - 0.005)
+
+
+def test_compute_stats_option_pnl_honest_empty_when_no_option_graded():
+    preds = [_p("up", 0.7, "win", 0.10, 0)]  # option_pnl=None (no structure that day)
+    s = compute_stats(preds)
+    assert s["n_option_graded"] == 0
+    assert s["option_win_rate"] is None
+    assert s["avg_option_pnl"] is None
+    assert s["cum_option_pnl"] == 0.0
+    assert s["directional_win_option_loss_n"] == 0
+
+
+def test_compute_stats_option_pnl_math():
+    preds = [
+        _p("up", 0.8, "win", 0.10, 0, option_pnl=0.5),
+        _p("down", 0.7, "loss", 0.05, 0, option_pnl=-0.3),
+        _p("up", 0.4, "loss", -0.03, 1, option_pnl=-0.9),
+    ]
+    s = compute_stats(preds)
+    assert s["n_option_graded"] == 3
+    assert s["option_win_rate"] == pytest.approx(1 / 3)
+    assert s["avg_option_pnl"] == pytest.approx((0.5 - 0.3 - 0.9) / 3)
+    assert s["cum_option_pnl"] == pytest.approx(0.5 - 0.3 - 0.9)
+
+
+def test_compute_stats_flags_directional_win_option_loss():
+    """The exact §S3 case: right on direction, lost money as an option."""
+    preds = [
+        _p("up", 0.8, "win", 0.02, 0, option_pnl=-0.4),   # win + option loss -> flagged
+        _p("up", 0.8, "win", 0.30, 0, option_pnl=0.9),    # win + option win -> not flagged
+        _p("down", 0.6, "loss", 0.05, 0, option_pnl=-0.2),  # not a directional win at all
+    ]
+    s = compute_stats(preds)
+    assert s["directional_win_option_loss_n"] == 1
 
 
 def test_league_table_integration_and_per_regime():
