@@ -2,6 +2,7 @@ from datetime import date, datetime, timedelta, timezone
 
 import duckdb
 import polars as pl
+import pytest
 
 from stockmoney.api import queries
 from stockmoney.data.daily_predictions import grade_prediction, record_prediction
@@ -142,24 +143,48 @@ def test_opportunities_prediction_without_snapshot_has_none_backtest():
     assert items[0]["backtest"] is None
 
 
-def test_opportunities_sorted_by_conviction_desc():
+def _fv():
+    return {"realized_vol_20d": 0.3, "adx_14": 20.0, "xsec_dispersion": 0.01,
+            "yield_curve_10y2y": 0.5, "dxy_chg_1d": 0.0, "oil_chg_1d": 0.0}
+
+
+def test_opportunities_directional_calls_ranked_by_directional_conviction():
     conn = _conn()
     record_prediction(
         conn, trade_date=date(2026, 7, 9), symbol="NVDA", sector="semiconductor", horizon=5,
-        label_end_date=date(2026, 7, 16), regime=1, proba=(0.1, 0.8, 0.1),
-        entry_price=100.0, feature_values={"realized_vol_20d": 0.3, "adx_14": 20.0, "xsec_dispersion": 0.01,
-                                            "yield_curve_10y2y": 0.5, "dxy_chg_1d": 0.0, "oil_chg_1d": 0.0},
-        model_version="test-v1",
+        label_end_date=date(2026, 7, 16), regime=1, proba=(0.1, 0.2, 0.7),  # up, dir_conv 0.7
+        entry_price=100.0, feature_values=_fv(), model_version="test-v1",
     )
     record_prediction(
         conn, trade_date=date(2026, 7, 9), symbol="AMD", sector="semiconductor", horizon=5,
-        label_end_date=date(2026, 7, 16), regime=1, proba=(0.05, 0.1, 0.85),
-        entry_price=100.0, feature_values={"realized_vol_20d": 0.3, "adx_14": 20.0, "xsec_dispersion": 0.01,
-                                            "yield_curve_10y2y": 0.5, "dxy_chg_1d": 0.0, "oil_chg_1d": 0.0},
-        model_version="test-v1",
+        label_end_date=date(2026, 7, 16), regime=1, proba=(0.05, 0.1, 0.85),  # up, dir_conv 0.85
+        entry_price=100.0, feature_values=_fv(), model_version="test-v1",
     )
     items = queries.opportunities(conn)
     assert [it["symbol"] for it in items] == ["AMD", "NVDA"]
+
+
+def test_opportunities_high_conviction_range_sinks_below_directional_call():
+    """The core 精選 fix: a high-conviction RANGE call (confidence in going
+    nowhere = no options money) must never outrank a lower-conviction but
+    genuinely directional call."""
+    conn = _conn()
+    record_prediction(
+        conn, trade_date=date(2026, 7, 9), symbol="MSFT", sector="big_tech", horizon=5,
+        label_end_date=date(2026, 7, 16), regime=1, proba=(0.05, 0.90, 0.05),  # range, conv 0.90
+        entry_price=100.0, feature_values=_fv(), model_version="test-v1",
+    )
+    record_prediction(
+        conn, trade_date=date(2026, 7, 9), symbol="AMD", sector="semiconductor", horizon=5,
+        label_end_date=date(2026, 7, 16), regime=1, proba=(0.05, 0.40, 0.55),  # up, dir_conv 0.55
+        entry_price=100.0, feature_values=_fv(), model_version="test-v1",
+    )
+    items = queries.opportunities(conn)
+    # AMD (directional, conv 0.55) leads MSFT (range, conv 0.90) despite lower raw conviction.
+    assert [it["symbol"] for it in items] == ["AMD", "MSFT"]
+    amd, msft = items[0], items[1]
+    assert amd["actionable"] is True and amd["directional_conviction"] == pytest.approx(0.55)
+    assert msft["actionable"] is False and msft["directional_conviction"] is None
 
 
 def test_opportunities_uses_only_the_latest_row_per_symbol():

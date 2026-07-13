@@ -227,13 +227,34 @@ def _prediction_row_to_dict(
         feature_values_json, model_version,
     ) = row
     conviction = max(proba_down, proba_range, proba_up)
+    # A 'range' call has no tradeable directional edge: we trade short-dated
+    # options, where a flat underlying just bleeds theta (CLAUDE.md section 0/6).
+    # So "how confident is the model in a MONEY-MAKING move" is the probability
+    # of the *directional* call, NOT max(...) -- a high-conviction 'range' is
+    # confidence in going nowhere, useless for an options entry. directional_
+    # conviction is None for 'range' precisely so it can't masquerade as an
+    # opportunity in the ranking below.
+    actionable = predicted_direction in ("up", "down")
+    directional_conviction = (
+        proba_up if predicted_direction == "up"
+        else proba_down if predicted_direction == "down"
+        else None
+    )
+    label = regime_label(regime, label_map)
     return {
         "symbol": symbol, "sector": sector, "trade_date": trade_date, "horizon": horizon,
         "label_end_date": label_end_date, "regime": regime,
-        "regime_label": regime_label(regime, label_map),
+        "regime_label": label,
+        # Regimes measure vol/trend STRENGTH, not direction (Wave A2). A
+        # directional bet inside a *trending* regime is with-the-current; the
+        # same call inside a low-vol/range regime is likely chop-noise -- the
+        # "up in an uptrend vs up in choppy-but-currently-up" distinction the
+        # human should weigh (surfaced, never blended into the probability).
+        "regime_is_trending": "趨勢" in (label or ""),
         "thesis": _plain_thesis(predicted_direction, regime, conviction, label_map),
         "proba": {"down": proba_down, "range": proba_range, "up": proba_up},
         "predicted_direction": predicted_direction, "conviction": conviction,
+        "actionable": actionable, "directional_conviction": directional_conviction,
         "entry_price": entry_price, "target_price_up": target_price_up,
         "target_price_down": target_price_down, "feature_values": json.loads(feature_values_json),
         "model_version": model_version, "backtest": snapshot,
@@ -256,12 +277,22 @@ def _latest_catalyst_headlines(conn: duckdb.DuckDBPyConnection) -> dict[str, str
 
 def opportunities(conn: duckdb.DuckDBPyConnection) -> list[dict]:
     """Today's (or most-recently-cached) call for every watchlist symbol that
-    has one, ranked by conviction. This is a v1 heuristic sort -- CLAUDE.md
-    section 12's honesty requirement means this must not be read as a
-    validated ranking of trade quality, just "the model's most confident
-    calls first". Symbols with no cached prediction yet (e.g.
-    scripts/build_dashboard_snapshot.py hasn't run, or the symbol lacks the
-    sector feature production.py needs) are simply absent, not zero-filled.
+    has one, ranked so the money-making calls come first.
+
+    "精選" means "most likely to actually make money after analysis", NOT "most
+    confident about anything". We trade short-dated options, so a call only
+    earns unless the underlying MOVES: a 'range' prediction -- however high its
+    softmax confidence -- is a no-trade (theta bleed), so it must never outrank
+    a genuine directional call. The sort is therefore, in order:
+      1. actionable (a directional up/down call) before 'range',
+      2. then by directional_conviction (confidence in the DIRECTIONAL move,
+         not max(...)), so among tradeable calls the strongest edge leads.
+    This is a heuristic ordering of the model's own confidence, still NOT a
+    validated ranking of realized trade quality (CLAUDE.md section 12) -- the
+    backtested win rate rides along in each item's `backtest` for the human to
+    weigh. 'range' rows are still returned (the UI shows "analysed, no edge
+    today"), just always last -- an empty opportunity board hides the fact that
+    the watchlist WAS scanned.
 
     `catalyst_headline` is the model judgment's side-by-side companion
     (CLAUDE.md section 1: discretion input, never blended into the
@@ -277,7 +308,15 @@ def opportunities(conn: duckdb.DuckDBPyConnection) -> list[dict]:
         item = _prediction_row_to_dict(r, snapshots.get(r[0]), label_map)
         item["catalyst_headline"] = headlines.get(r[0])
         items.append(item)
-    return sorted(items, key=lambda it: it["conviction"], reverse=True)
+    return sorted(
+        items,
+        key=lambda it: (
+            it["actionable"],
+            it["directional_conviction"] if it["actionable"] else -1.0,
+            it["conviction"],
+        ),
+        reverse=True,
+    )
 
 
 def ticker_detail(conn: duckdb.DuckDBPyConnection, symbol: str) -> dict | None:
@@ -802,6 +841,12 @@ def leaderboard(conn: duckdb.DuckDBPyConnection, *, window: int = 20) -> list[di
             "hit_rate": rolling.get("hit_rate"),
             "brier": rolling.get("brier"),
             "n_directional": rolling.get("n_directional", 0),
+            # Wave D (IMPROVEMENT_PLAN.md §S3): real option P&L alongside the
+            # directional hit-rate above -- a trader can be right on direction
+            # and still lose money as an option (theta/IV-crush), which
+            # hit_rate alone can't show.
+            "option_win_rate": rolling.get("option_win_rate"),
+            "avg_option_pnl": rolling.get("avg_option_pnl"),
         })
     # Ranked on REALIZED (booked) return -- a contest is scored on closed
     # results; open positions are marked-to-market for display but their rough
@@ -841,7 +886,8 @@ def trader_profile(conn: duckdb.DuckDBPyConnection, trader_id: str) -> dict | No
 
     recent_preds = conn.execute(
         """
-        SELECT trade_date, symbol, direction, conviction, rationale, regime, status, outcome, label_end_date
+        SELECT trade_date, symbol, direction, conviction, rationale, regime, status, outcome,
+               label_end_date, option_pnl
         FROM trader_predictions WHERE trader_id = ? ORDER BY trade_date DESC, symbol LIMIT 15
         """,
         [trader_id],
@@ -861,7 +907,7 @@ def trader_profile(conn: duckdb.DuckDBPyConnection, trader_id: str) -> dict | No
             {
                 "trade_date": r[0], "symbol": r[1], "direction": r[2], "conviction": r[3],
                 "rationale": r[4], "regime": r[5], "regime_label": regime_label(r[5], label_map),
-                "status": r[6], "outcome": r[7], "label_end_date": r[8],
+                "status": r[6], "outcome": r[7], "label_end_date": r[8], "option_pnl": r[9],
             }
             for r in recent_preds
         ],

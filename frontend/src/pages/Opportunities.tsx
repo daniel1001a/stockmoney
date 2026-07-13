@@ -2,6 +2,7 @@ import { useMemo, useState } from 'react'
 import { Link } from 'react-router-dom'
 import { api, type Opportunity, type MarketSummary } from '../lib/api'
 import { useApi } from '../lib/useApi'
+import { refreshIntervalMs } from '../lib/refreshCadence'
 import {
   DIRECTION_CLASSES, DIRECTION_LABEL, regimeClass, pct, signedPct,
 } from '../lib/format'
@@ -81,6 +82,9 @@ function MarketStrip({ m }: { m: MarketSummary }) {
 // --- Top-5 precision picks (今日最有信心) -----------------------------------
 
 function PickCard({ item }: { item: Opportunity }) {
+  // Directional (money-making) confidence headlines the card, NOT max(...),
+  // which for a 'range' call would be confidence in going nowhere.
+  const conv = item.directional_conviction ?? item.conviction
   return (
     <Link
       to={`/ticker/${item.symbol}`}
@@ -94,10 +98,13 @@ function PickCard({ item }: { item: Opportunity }) {
         <DirectionChip d={item.predicted_direction} />
       </div>
       <div className="mt-3 flex items-baseline gap-2">
-        <span className="text-3xl font-bold tabular-nums text-neutral-50">{pct(item.conviction)}</span>
-        <span className="text-xs text-neutral-500">信心</span>
-        <div className="ml-auto"><RegimeChip label={item.regime_label} /></div>
+        <span className="text-3xl font-bold tabular-nums text-neutral-50">{pct(conv)}</span>
+        <span className="text-xs text-neutral-500">方向信心</span>
+        {item.regime_is_trending && (
+          <Chip className="ml-auto border-sky-500/30 bg-sky-500/10 text-sky-300">順勢</Chip>
+        )}
       </div>
+      <div className="mt-1"><RegimeChip label={item.regime_label} /></div>
       <p className="mt-3 line-clamp-2 text-sm text-neutral-300">
         {item.catalyst_headline ?? item.thesis}
       </p>
@@ -120,8 +127,11 @@ function WatchlistTable({ items }: { items: Opportunity[] }) {
 
   const sorted = useMemo(() => {
     const acc = (o: Opportunity) => o.backtest?.overall_accuracy ?? -1
+    // Default "信心" ordering ranks tradeable directional calls first (by
+    // directional conviction); a high-confidence 'range' can't jump the queue.
+    const dconv = (o: Opportunity) => (o.actionable ? (o.directional_conviction ?? 0) : -1)
     const cmp: Record<SortKey, (a: Opportunity, b: Opportunity) => number> = {
-      conviction: (a, b) => a.conviction - b.conviction,
+      conviction: (a, b) => dconv(a) - dconv(b),
       symbol: (a, b) => a.symbol.localeCompare(b.symbol),
       accuracy: (a, b) => acc(a) - acc(b),
     }
@@ -160,21 +170,37 @@ function WatchlistTable({ items }: { items: Opportunity[] }) {
         </thead>
         <tbody>
           {sorted.map((item) => (
-            <tr key={item.symbol} className="border-b border-neutral-900 last:border-0 hover:bg-neutral-900/50">
+            <tr
+              key={item.symbol}
+              className={`border-b border-neutral-900 last:border-0 hover:bg-neutral-900/50 ${
+                item.actionable ? '' : 'opacity-55'
+              }`}
+            >
               <td className="px-3 py-2.5">
                 <Link to={`/ticker/${item.symbol}`} className="font-semibold text-neutral-50 hover:text-neutral-300">
                   {item.symbol}
                 </Link>
                 <div className="text-xs text-neutral-600">{item.sector}</div>
               </td>
-              <td className="px-3 py-2.5"><DirectionChip d={item.predicted_direction} /></td>
-              <td className="px-3 py-2.5 text-right">
-                <div className="flex items-center justify-end gap-2">
-                  <div className="h-1.5 w-14 overflow-hidden rounded bg-neutral-800">
-                    <div className="h-full bg-neutral-400" style={{ width: `${item.conviction * 100}%` }} />
-                  </div>
-                  <span className="tabular-nums text-neutral-200">{pct(item.conviction)}</span>
+              <td className="px-3 py-2.5">
+                <div className="flex items-center gap-1.5">
+                  <DirectionChip d={item.predicted_direction} />
+                  {item.actionable && item.regime_is_trending && (
+                    <Chip className="border-sky-500/30 bg-sky-500/10 text-sky-300">順勢</Chip>
+                  )}
                 </div>
+              </td>
+              <td className="px-3 py-2.5 text-right">
+                {item.actionable ? (
+                  <div className="flex items-center justify-end gap-2">
+                    <div className="h-1.5 w-14 overflow-hidden rounded bg-neutral-800">
+                      <div className="h-full bg-neutral-400" style={{ width: `${(item.directional_conviction ?? 0) * 100}%` }} />
+                    </div>
+                    <span className="tabular-nums text-neutral-200">{pct(item.directional_conviction)}</span>
+                  </div>
+                ) : (
+                  <span className="text-xs text-neutral-600">盤整 · 無方向</span>
+                )}
               </td>
               <td className="px-3 py-2.5"><RegimeChip label={item.regime_label} /></td>
               <td className="max-w-xs px-3 py-2.5">
@@ -192,17 +218,24 @@ function WatchlistTable({ items }: { items: Opportunity[] }) {
 }
 
 export default function Opportunities() {
-  const { data, loading, error } = useApi(api.opportunities)
-  const { data: market } = useApi(api.marketSummary)
+  // Market-hours-aware silent refresh (see refreshCadence.ts): fastest in the
+  // open's first two hours, slower midday, paused overnight/when tab hidden.
+  const cadence = { refreshMs: () => refreshIntervalMs() }
+  const { data, loading, error } = useApi(api.opportunities, [], cadence)
+  const { data: market } = useApi(api.marketSummary, [], cadence)
 
-  const picks = useMemo(() => (data ? [...data].sort((a, b) => b.conviction - a.conviction).slice(0, 5) : []), [data])
+  // Backend already ranks actionable-first by directional conviction. "精選"
+  // = the tradeable directional calls only; a 'range' call makes no options
+  // money no matter how confident, so it is never a "pick".
+  const picks = useMemo(() => (data ? data.filter((o) => o.actionable).slice(0, 5) : []), [data])
+  const rangeCount = useMemo(() => (data ? data.filter((o) => !o.actionable).length : 0), [data])
 
   return (
     <div>
       <div className="mb-5">
         <h1 className="text-2xl font-bold text-neutral-50">今日機會</h1>
         <p className="mt-1 text-sm text-neutral-500">
-          早晨一眼掌握全局:大盤風向、最有信心的精選,以及完整核心觀察清單。排序為模型信心啟發式,非已驗證的交易品質排名。
+          早晨一眼掌握全局:大盤風向、最有機會賺錢的方向性精選,以及完整核心觀察清單。精選 = 有明確漲/跌方向的可交易機會(盤整不列入,短期期權賺不到錢);排序為模型方向信心啟發式,非已驗證的交易品質排名。
         </p>
       </div>
 
@@ -215,16 +248,25 @@ export default function Opportunities() {
       {data && data.length > 0 && (
         <>
           <section className="mb-8">
-            <SectionTitle title="本日精選 · 最有信心的 5 檔" hint="依模型信心挑出的今日重點,點卡片看完整分析。" />
-            <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-5">
-              {picks.map((item) => (
-                <PickCard key={item.symbol} item={item} />
-              ))}
-            </div>
+            <SectionTitle
+              title={`本日精選 · ${picks.length} 個方向性機會`}
+              hint="有明確漲/跌方向、可用短期期權表達的機會,依模型方向信心排序。點卡片看完整分析。"
+            />
+            {picks.length > 0 ? (
+              <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-5">
+                {picks.map((item) => (
+                  <PickCard key={item.symbol} item={item} />
+                ))}
+              </div>
+            ) : (
+              <Card className="p-4 text-sm text-neutral-400">
+                今日核心清單裡沒有明確方向性機會 — {rangeCount} 檔都判為盤整。短期期權在盤整中賺不到錢,因此這是「觀望」訊號,不是清單壞了。完整分析見下方。
+              </Card>
+            )}
           </section>
 
           <section>
-            <SectionTitle title="核心觀察清單" hint="固定深度追蹤的核心標的,點欄位標題可排序。" />
+            <SectionTitle title="核心觀察清單" hint="固定深度追蹤的全部核心標的(含盤整),點欄位標題可排序。盤整標的代表已分析但今日無方向性交易機會。" />
             <WatchlistTable items={data} />
           </section>
         </>

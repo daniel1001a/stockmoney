@@ -33,6 +33,9 @@ export interface Opportunity {
   proba: Proba
   predicted_direction: 'up' | 'down' | 'range'
   conviction: number
+  actionable: boolean
+  directional_conviction: number | null
+  regime_is_trending: boolean
   entry_price: number
   target_price_up: number
   target_price_down: number

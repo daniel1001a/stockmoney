@@ -11,6 +11,9 @@ const opp = (symbol: string, conviction: number, direction: Opportunity['predict
   label_end_date: '2026-07-17', regime: 2, regime_label: '高波動趨勢',
   thesis: `高波動趨勢格局下,模型偏向看漲,信心 ${Math.round(conviction * 100)}%。`,
   proba: { down: 0.2, range: 0.2, up: 0.6 }, predicted_direction: direction, conviction,
+  actionable: direction !== 'range',
+  directional_conviction: direction === 'range' ? null : conviction,
+  regime_is_trending: true,
   entry_price: 178, target_price_up: 190, target_price_down: 166,
   feature_values: { realized_vol_20d: 0.5 }, model_version: 'gmm-logistic-v2',
   backtest: {
@@ -40,7 +43,24 @@ describe('Opportunities', () => {
     expect(screen.getAllByText('高波動趨勢').length).toBeGreaterThan(0)
     // both the picks section and the watchlist show the symbols
     expect(screen.getAllByText('NVDA').length).toBeGreaterThan(0)
-    expect(screen.getByText('本日精選 · 最有信心的 5 檔')).toBeInTheDocument()
+    // both are directional -> 2 picks featured
+    expect(screen.getByText('本日精選 · 2 個方向性機會')).toBeInTheDocument()
     expect(screen.getByText('核心觀察清單')).toBeInTheDocument()
+  })
+
+  it('excludes high-conviction range calls from the featured picks', async () => {
+    // A range call with HIGHER conviction than the directional call must not be
+    // featured -- 精選 is money-making directional edge, not raw confidence.
+    vi.mocked(api.opportunities).mockResolvedValue([opp('AMD', 0.55, 'up'), opp('MSFT', 0.92, 'range')])
+    vi.mocked(api.marketSummary).mockResolvedValue(market)
+
+    render(<MemoryRouter><Opportunities /></MemoryRouter>)
+
+    await waitFor(() => expect(screen.getByRole('table')).toBeInTheDocument())
+    // Only the one directional call is featured.
+    expect(screen.getByText('本日精選 · 1 個方向性機會')).toBeInTheDocument()
+    // The range symbol still appears (analysed, in the watchlist), just not featured.
+    expect(screen.getAllByText('MSFT').length).toBeGreaterThan(0)
+    expect(screen.getAllByText('盤整 · 無方向').length).toBeGreaterThan(0)
   })
 })
