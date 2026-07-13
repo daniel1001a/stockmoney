@@ -57,7 +57,7 @@ EXPECTED_TABLES = {
 # + 2 redesign migrations (034 news_items, 035 trader_portfolios [2 tables]) = 35
 # + 1 Wave C migration (036 market_index_ohlcv_daily) = 36
 # + 1 Wave D migration (037 trader_predictions option_structure/option_pnl ALTER) = 37
-EXPECTED_MIGRATION_COUNT = 37
+EXPECTED_MIGRATION_COUNT = 38
 
 
 def _table_names(conn: duckdb.DuckDBPyConnection) -> set[str]:
@@ -89,13 +89,18 @@ def test_watchlist_seed_data():
     conn = _migrated_conn()
 
     rows = conn.execute("SELECT symbol, tier FROM watchlist_members").fetchall()
-    assert len(rows) == 11
-    assert all(tier == "core" for _, tier in rows)
+    # 11 original core names (migration 001) + 20 added by migration 038.
+    assert len(rows) == 31
     symbols = {symbol for symbol, _ in rows}
-    assert symbols == {
+    original_11 = {
         "NVDA", "AVGO", "AMD", "TSM", "SOXL", "SOXS",
         "AAPL", "MSFT", "GOOGL", "META", "AMZN",
     }
+    assert original_11 <= symbols
+    # the expansion adds new sectors + names (e.g. financials/energy) in both tiers
+    assert {"JPM", "XOM", "TSLA", "SOXX", "QQQ"} <= symbols
+    tiers = {tier for _, tier in rows}
+    assert tiers == {"core", "secondary"}
 
 
 def test_run_migrations_is_idempotent():
@@ -106,7 +111,7 @@ def test_run_migrations_is_idempotent():
         len(conn.execute("SELECT * FROM _schema_migrations").fetchall())
         == EXPECTED_MIGRATION_COUNT
     )
-    assert len(conn.execute("SELECT * FROM watchlist_members").fetchall()) == 11
+    assert len(conn.execute("SELECT * FROM watchlist_members").fetchall()) == 31
 
 
 def test_feature_store_has_value_text_column():

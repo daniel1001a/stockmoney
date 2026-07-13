@@ -7,8 +7,8 @@ def test_describe_regimes_labels_from_centroid_not_id():
     # (realized_vol, adx, dispersion): calm / neutral / stormy. The id ordering
     # is deliberately scrambled to prove the label follows the centroid, not id.
     labels = describe_regimes({2: (0.14, 13.0, 0.35), 0: (0.48, 36.0, 1.2), 1: (0.25, 21.0, 0.7)})
-    assert labels[0] == "高波動趨勢"   # highest vol + highest adx
-    assert labels[2] == "低波動盤整"   # lowest vol + lowest adx
+    assert labels[0] == "高波動趨勢盤"   # highest vol + highest adx
+    assert labels[2] == "低波動震盪盤"   # lowest vol + lowest adx
     assert labels[1] == "中波動"       # middle vol, non-extreme adx
     # Never up/down direction words -- regimes measure strength, not direction.
     assert not any("多頭" in v or "空頭" in v for v in labels.values())
@@ -16,7 +16,7 @@ def test_describe_regimes_labels_from_centroid_not_id():
 
 def test_describe_regimes_two_clusters_and_empty():
     two = describe_regimes({5: (0.2, 20.0, 0.5), 9: (0.4, 30.0, 0.9)})
-    assert two == {5: "低波動盤整", 9: "高波動趨勢"}
+    assert two == {5: "低波動震盪盤", 9: "高波動趨勢盤"}
     assert describe_regimes({}) == {}
 
 

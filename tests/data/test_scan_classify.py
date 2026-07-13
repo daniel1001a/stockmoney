@@ -177,7 +177,7 @@ def test_prompt_injection_content_is_stored_as_inert_data_never_executed():
         "SELECT table_name FROM information_schema.tables WHERE table_schema='main'"
     ).fetchall()}
     assert "watchlist_members" in tables
-    assert conn.execute("SELECT count(*) FROM watchlist_members").fetchone()[0] == 11
+    assert conn.execute("SELECT count(*) FROM watchlist_members").fetchone()[0] == 31
 
 
 def test_malicious_symbol_string_cannot_create_new_watchlist_member():
@@ -188,7 +188,7 @@ def test_malicious_symbol_string_cannot_create_new_watchlist_member():
         "sentiment": [{"symbol": "NVDA'; DROP TABLE watchlist_members; --", "score": 0.5}],
     })
     assert outcome == "error"
-    assert conn.execute("SELECT count(*) FROM watchlist_members").fetchone()[0] == 11
+    assert conn.execute("SELECT count(*) FROM watchlist_members").fetchone()[0] == 31
     assert conn.execute("SELECT count(*) FROM alt_social_hourly").fetchone()[0] == 0
 
 

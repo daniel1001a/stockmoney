@@ -19,11 +19,15 @@ from stockmoney.data.features.base import FeatureValue, write_features
 FEATURE_NAME = "xsec_dispersion"
 FEATURE_VERSION = "v1"
 
-# Semiconductor single names (excludes the leveraged ETFs SOXL/SOXS, whose
-# 3x mechanics would distort a cross-sectional idiosyncratic spread).
+# Single names only per sector (excludes leveraged/sector ETFs like SOXL/SOXS/
+# SOXX/QQQ, whose basket mechanics would distort a cross-sectional idiosyncratic
+# spread). Each group needs >=2 members with OHLCV for the dispersion feature to
+# be computable for every symbol mapped to that sector.
 SECTOR_MEMBERS: dict[str, list[str]] = {
-    "semiconductor": ["NVDA", "AVGO", "AMD", "TSM"],
-    "big_tech": ["AAPL", "MSFT", "GOOGL", "META", "AMZN"],
+    "semiconductor": ["NVDA", "AVGO", "AMD", "TSM", "MU", "QCOM", "MRVL", "INTC"],
+    "big_tech": ["AAPL", "MSFT", "GOOGL", "META", "AMZN", "TSLA", "NFLX", "ORCL", "CRM", "PLTR"],
+    "financials": ["JPM", "BAC", "GS", "MS", "WFC"],
+    "energy": ["XOM", "CVX", "COP", "SLB"],
 }
 
 
