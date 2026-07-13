@@ -1,7 +1,8 @@
 import { Link, useParams } from 'react-router-dom'
 import { api } from '../lib/api'
 import { useApi } from '../lib/useApi'
-import { DIRECTION_CLASSES, DIRECTION_LABEL, regimeClass, num, pct, sentimentLabel, relTime } from '../lib/format'
+import { refreshIntervalMs } from '../lib/refreshCadence'
+import { DIRECTION_CLASSES, DIRECTION_LABEL, regimeClass, num, pct, signedPct, sentimentLabel, relTime } from '../lib/format'
 import ProbaBar from '../components/ProbaBar'
 import Sparkline from '../components/Sparkline'
 import GlossaryTerm from '../components/GlossaryTerm'
@@ -14,6 +15,8 @@ export default function TickerDetail() {
   const { symbol = '' } = useParams()
   const { data, loading, error } = useApi(() => api.ticker(symbol), [symbol])
   const { data: tradersData } = useApi(() => api.tickerTraders(symbol), [symbol])
+  const { data: quotes } = useApi(api.quotes, [], { refreshMs: () => refreshIntervalMs() })
+  const quote = quotes?.[symbol.toUpperCase()]
 
   const last = data?.price_history?.at(-1)?.close
   const prev = data?.price_history?.at(-2)?.close
@@ -45,6 +48,17 @@ export default function TickerDetail() {
                 )}
               </div>
               <p className="mt-1 text-sm text-neutral-500">{data.sector} · 資料日期 {data.trade_date}</p>
+              {quote?.price != null && (
+                <p className="mt-0.5 text-xs text-neutral-500">
+                  即時 <span className="tabular-nums text-neutral-300">{`$${num(quote.price)}`}</span>
+                  {quote.change_pct !== null && (
+                    <span className={`ml-1 tabular-nums ${quote.change_pct >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
+                      {signedPct(quote.change_pct, 1)}
+                    </span>
+                  )}
+                  {quote.as_of && <span className="ml-1 text-neutral-600">· {relTime(quote.as_of)}(約15分鐘延遲)</span>}
+                </p>
+              )}
             </div>
             <div className="flex items-center gap-2">
               <Chip className={regimeClass(data.regime_label)}>

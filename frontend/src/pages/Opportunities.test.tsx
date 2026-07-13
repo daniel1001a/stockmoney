@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from 'vitest'
 import { render, screen, waitFor } from '@testing-library/react'
 import { MemoryRouter } from 'react-router-dom'
 import Opportunities from './Opportunities'
-import { api, type Opportunity, type MarketSummary } from '../lib/api'
+import { api, type Opportunity, type MarketSummary, type Quote } from '../lib/api'
 
 vi.mock('../lib/api')
 
@@ -38,6 +38,7 @@ describe('Opportunities', () => {
   it('renders the market strip, top picks and the sortable watchlist', async () => {
     vi.mocked(api.opportunities).mockResolvedValue([opp('NVDA', 0.77, 'up'), opp('AMD', 0.55, 'down')])
     vi.mocked(api.marketSummary).mockResolvedValue(market)
+    vi.mocked(api.quotes).mockResolvedValue({})
 
     render(<MemoryRouter><Opportunities /></MemoryRouter>)
 
@@ -51,11 +52,26 @@ describe('Opportunities', () => {
     expect(screen.getByText('核心觀察清單')).toBeInTheDocument()
   })
 
+  it('shows a live price + change% badge once a quote is available', async () => {
+    vi.mocked(api.opportunities).mockResolvedValue([opp('NVDA', 0.77, 'up')])
+    vi.mocked(api.marketSummary).mockResolvedValue(market)
+    const quote: Quote = { price: 185.5, prev_close: 178.0, change_pct: 0.0421, as_of: '2026-07-13T14:00:00Z' }
+    vi.mocked(api.quotes).mockResolvedValue({ NVDA: quote })
+
+    render(<MemoryRouter><Opportunities /></MemoryRouter>)
+
+    // NVDA appears in both the picks section and the watchlist table -> the
+    // live-price badge legitimately renders twice.
+    await waitFor(() => expect(screen.getAllByText('$185.50').length).toBeGreaterThan(0))
+    expect(screen.getAllByText('+4.2%').length).toBeGreaterThan(0)
+  })
+
   it('excludes high-conviction range calls from the featured picks', async () => {
     // A range call with HIGHER conviction than the directional call must not be
     // featured -- 精選 is money-making directional edge, not raw confidence.
     vi.mocked(api.opportunities).mockResolvedValue([opp('AMD', 0.55, 'up'), opp('MSFT', 0.92, 'range')])
     vi.mocked(api.marketSummary).mockResolvedValue(market)
+    vi.mocked(api.quotes).mockResolvedValue({})
 
     render(<MemoryRouter><Opportunities /></MemoryRouter>)
 

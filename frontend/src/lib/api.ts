@@ -417,8 +417,16 @@ async function getJsonOrNull<T>(path: string): Promise<T | null> {
   return res.json() as Promise<T>
 }
 
+export interface Quote {
+  price: number | null
+  prev_close: number | null
+  change_pct: number | null
+  as_of: string | null
+}
+
 export const api = {
   opportunities: () => getJson<Opportunity[]>('/opportunities'),
+  quotes: () => getJson<Record<string, Quote>>('/quotes'),
   ticker: (symbol: string) => getJson<TickerDetail>(`/ticker/${encodeURIComponent(symbol)}`),
   predictions: () => getJson<PredictionsOverview>('/predictions'),
   positions: () => getJson<PositionRisk[]>('/positions'),

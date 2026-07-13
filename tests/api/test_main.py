@@ -50,6 +50,25 @@ def test_watchlist_route(client):
     assert body["candidates"] == []
 
 
+def test_quotes_route_wires_watchlist_symbols_into_get_quotes(client, monkeypatch):
+    # Stub get_quotes entirely -- this route must never hit real yfinance or
+    # the shared process-lifetime cache during tests (would be slow, flaky,
+    # and could leak state across tests via the module-level default_cache).
+    captured = {}
+
+    def fake_get_quotes(symbols):
+        captured["symbols"] = symbols
+        return {s: {"price": 1.0, "prev_close": 1.0, "change_pct": 0.0, "as_of": None} for s in symbols}
+
+    monkeypatch.setattr("stockmoney.api.main.get_quotes", fake_get_quotes)
+
+    resp = client.get("/api/quotes")
+
+    assert resp.status_code == 200
+    assert "NVDA" in captured["symbols"]
+    assert resp.json()["NVDA"]["price"] == 1.0
+
+
 def test_opportunities_route(client):
     resp = client.get("/api/opportunities")
     assert resp.status_code == 200

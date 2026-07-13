@@ -1,10 +1,10 @@
 import { useMemo, useState } from 'react'
 import { Link } from 'react-router-dom'
-import { api, type Opportunity, type MarketSummary } from '../lib/api'
+import { api, type Opportunity, type MarketSummary, type Quote } from '../lib/api'
 import { useApi } from '../lib/useApi'
 import { refreshIntervalMs } from '../lib/refreshCadence'
 import {
-  DIRECTION_CLASSES, DIRECTION_LABEL, regimeClass, pct, signedPct, sentimentLabel,
+  DIRECTION_CLASSES, DIRECTION_LABEL, regimeClass, pct, signedPct, sentimentLabel, num, relTime,
 } from '../lib/format'
 import { Card, Chip, SectionTitle, Loading, ErrorMsg, Empty } from '../components/ui'
 import GlossaryTerm from '../components/GlossaryTerm'
@@ -34,6 +34,28 @@ function WhyLine({ item }: { item: Opportunity }) {
     )
   }
   return <p className="line-clamp-2 text-sm text-neutral-400">{item.thesis}</p>
+}
+
+// Live (yfinance free tier, ~15min-delayed) price overlay -- clearly labelled
+// as "即時" and visually distinct from the model's own EOD entry price, so
+// the two are never confused as the same number. Silently renders nothing
+// when no quote is available yet (still loading, market fully closed with no
+// cached session, or the symbol isn't covered) rather than showing a
+// misleading "--".
+function LivePrice({ quote }: { quote: Quote | undefined }) {
+  if (!quote || quote.price === null) return null
+  const positive = quote.change_pct !== null && quote.change_pct >= 0
+  return (
+    <div className="mt-1 flex items-baseline gap-1.5 text-xs">
+      <span className="tabular-nums text-neutral-300">{`$${num(quote.price)}`}</span>
+      {quote.change_pct !== null && (
+        <span className={`tabular-nums ${positive ? 'text-emerald-400' : 'text-rose-400'}`}>
+          {signedPct(quote.change_pct, 1)}
+        </span>
+      )}
+      <span className="text-neutral-600">即時{quote.as_of ? ` · ${relTime(quote.as_of)}` : ''}</span>
+    </div>
+  )
 }
 
 // --- Market briefing strip --------------------------------------------------
@@ -114,7 +136,7 @@ function MarketStrip({ m }: { m: MarketSummary }) {
 
 // --- Top-5 precision picks (今日最有信心) -----------------------------------
 
-function PickCard({ item }: { item: Opportunity }) {
+function PickCard({ item, quote }: { item: Opportunity; quote: Quote | undefined }) {
   // Directional (money-making) confidence headlines the card, NOT max(...),
   // which for a 'range' call would be confidence in going nowhere.
   const conv = item.directional_conviction ?? item.conviction
@@ -127,6 +149,7 @@ function PickCard({ item }: { item: Opportunity }) {
         <div>
           <div className="text-lg font-bold text-neutral-50">{item.symbol}</div>
           <div className="text-xs text-neutral-500">{item.sector}</div>
+          <LivePrice quote={quote} />
         </div>
         <DirectionChip d={item.predicted_direction} />
       </div>
@@ -152,7 +175,7 @@ function PickCard({ item }: { item: Opportunity }) {
 
 type SortKey = 'conviction' | 'symbol' | 'accuracy'
 
-function WatchlistTable({ items }: { items: Opportunity[] }) {
+function WatchlistTable({ items, quotes }: { items: Opportunity[]; quotes: Record<string, Quote> }) {
   const [sort, setSort] = useState<SortKey>('conviction')
   const [dir, setDir] = useState<'asc' | 'desc'>('desc')
 
@@ -212,6 +235,7 @@ function WatchlistTable({ items }: { items: Opportunity[] }) {
                   {item.symbol}
                 </Link>
                 <div className="text-xs text-neutral-600">{item.sector}</div>
+                <LivePrice quote={quotes[item.symbol]} />
               </td>
               <td className="px-3 py-2.5">
                 <div className="flex items-center gap-1.5">
@@ -252,6 +276,7 @@ export default function Opportunities() {
   const cadence = { refreshMs: () => refreshIntervalMs() }
   const { data, loading, error } = useApi(api.opportunities, [], cadence)
   const { data: market } = useApi(api.marketSummary, [], cadence)
+  const { data: quotes } = useApi(api.quotes, [], cadence)
 
   // Backend already ranks actionable-first by directional conviction. "精選"
   // = the tradeable directional calls only; a 'range' call makes no options
@@ -284,7 +309,7 @@ export default function Opportunities() {
             {picks.length > 0 ? (
               <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-5">
                 {picks.map((item) => (
-                  <PickCard key={item.symbol} item={item} />
+                  <PickCard key={item.symbol} item={item} quote={quotes?.[item.symbol]} />
                 ))}
               </div>
             ) : (
@@ -296,7 +321,7 @@ export default function Opportunities() {
 
           <section>
             <SectionTitle title="核心觀察清單" hint="固定深度追蹤的全部核心標的(含盤整),點欄位標題可排序。盤整標的代表已分析但今日無方向性交易機會。" />
-            <WatchlistTable items={data} />
+            <WatchlistTable items={data} quotes={quotes ?? {}} />
           </section>
         </>
       )}
