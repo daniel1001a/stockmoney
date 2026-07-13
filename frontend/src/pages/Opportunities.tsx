@@ -4,7 +4,7 @@ import { api, type Opportunity, type MarketSummary } from '../lib/api'
 import { useApi } from '../lib/useApi'
 import { refreshIntervalMs } from '../lib/refreshCadence'
 import {
-  DIRECTION_CLASSES, DIRECTION_LABEL, regimeClass, pct, signedPct,
+  DIRECTION_CLASSES, DIRECTION_LABEL, regimeClass, pct, signedPct, sentimentLabel,
 } from '../lib/format'
 import { Card, Chip, SectionTitle, Loading, ErrorMsg, Empty } from '../components/ui'
 import GlossaryTerm from '../components/GlossaryTerm'
@@ -15,6 +15,25 @@ function DirectionChip({ d }: { d: string }) {
 
 function RegimeChip({ label }: { label: string }) {
   return <Chip className={regimeClass(label)}>{label}</Chip>
+}
+
+// The card's "why" line: prefer our own catalyst thesis, then the freshest real
+// headline for the symbol (so every card reflects the news radar, not just the
+// few with an LLM catalyst), falling back to the generic model thesis.
+function WhyLine({ item }: { item: Opportunity }) {
+  if (item.catalyst_headline) {
+    return <p className="line-clamp-2 text-sm text-neutral-300">{item.catalyst_headline}</p>
+  }
+  if (item.top_news) {
+    const s = sentimentLabel(item.top_news.sentiment_score)
+    return (
+      <p className="line-clamp-2 text-sm text-neutral-300">
+        <span className={`mr-1.5 text-xs font-medium ${s.cls}`}>{s.label}</span>
+        {item.top_news.headline}
+      </p>
+    )
+  }
+  return <p className="line-clamp-2 text-sm text-neutral-400">{item.thesis}</p>
 }
 
 // --- Market briefing strip --------------------------------------------------
@@ -105,9 +124,7 @@ function PickCard({ item }: { item: Opportunity }) {
         )}
       </div>
       <div className="mt-1"><RegimeChip label={item.regime_label} /></div>
-      <p className="mt-3 line-clamp-2 text-sm text-neutral-300">
-        {item.catalyst_headline ?? item.thesis}
-      </p>
+      <div className="mt-3"><WhyLine item={item} /></div>
       {item.backtest && (
         <p className="mt-2 text-xs text-neutral-500">
           回測方向準確率 {pct(item.backtest.overall_accuracy)}
@@ -203,9 +220,7 @@ function WatchlistTable({ items }: { items: Opportunity[] }) {
                 )}
               </td>
               <td className="px-3 py-2.5"><RegimeChip label={item.regime_label} /></td>
-              <td className="max-w-xs px-3 py-2.5">
-                <p className="line-clamp-1 text-neutral-300">{item.catalyst_headline ?? item.thesis}</p>
-              </td>
+              <td className="max-w-xs px-3 py-2.5"><WhyLine item={item} /></td>
               <td className="px-3 py-2.5 text-right tabular-nums text-neutral-400">
                 {item.backtest ? pct(item.backtest.overall_accuracy) : '—'}
               </td>

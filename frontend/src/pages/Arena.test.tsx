@@ -11,7 +11,7 @@ const entry = (rank: number, id: string, name: string, ret: number): Leaderboard
   realized_pnl: ret * 25000, unrealized_pnl: 0, equity: 25000 * (1 + ret),
   total_return_pct: ret, realized_return_pct: ret, n_closed: 10, n_open: 2,
   trade_win_rate: 0.5, best_trade: 500, worst_trade: -300, hit_rate: 0.5, brier: 0.2,
-  n_directional: 8,
+  n_directional: 8, option_win_rate: 0.45, avg_option_pnl: -0.1,
 })
 
 describe('Arena', () => {
@@ -20,7 +20,6 @@ describe('Arena', () => {
       entry(1, 'momentum', 'Momentum (動能派)', 0.14),
       entry(2, 'analyst', 'Analyst (消息派)', -0.05),
     ])
-    vi.mocked(api.positions).mockResolvedValue([])
     vi.mocked(api.divergence).mockResolvedValue([])
 
     render(<MemoryRouter><Arena /></MemoryRouter>)

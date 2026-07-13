@@ -46,7 +46,7 @@ def test_watchlist_route(client):
     resp = client.get("/api/watchlist")
     assert resp.status_code == 200
     body = resp.json()
-    assert len(body["core"]) == 11
+    assert len(body["core"]) == 31
     assert body["candidates"] == []
 
 

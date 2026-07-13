@@ -51,7 +51,7 @@ def _seed_snapshot(conn, symbol="NVDA", sector="semiconductor", as_of=date(2026,
 def test_watchlist_core_returns_active_members():
     conn = _conn()
     core = queries.watchlist_core(conn)
-    assert len(core) == 11
+    assert len(core) == 31
     assert {"symbol": "NVDA", "sector": "semiconductor", "tier": "core"} in core
 
 
@@ -370,14 +370,14 @@ def test_regime_label_map_from_empirical_centroids():
     _seed_prediction_regime(conn, "AMD", 0, (0.16, 15.0, 0.4), date(2026, 7, 8))
     _seed_prediction_regime(conn, "TSM", 2, (0.45, 35.0, 1.1), date(2026, 7, 9))
     label_map = queries.regime_label_map(conn)
-    assert label_map[0] == "低波動盤整"
-    assert label_map[2] == "高波動趨勢"
+    assert label_map[0] == "低波動震盪盤"
+    assert label_map[2] == "高波動趨勢盤"
 
 
 def test_regime_label_falls_back_for_unknown_id():
     assert queries.regime_label(None) == "未分類"
-    assert queries.regime_label(7, {0: "低波動盤整"}) == "regime 7"
-    assert queries.regime_label(0, {0: "低波動盤整"}) == "低波動盤整"
+    assert queries.regime_label(7, {0: "低波動震盪盤"}) == "regime 7"
+    assert queries.regime_label(0, {0: "低波動震盪盤"}) == "低波動震盪盤"
 
 
 def test_regime_label_map_empty_when_no_predictions():

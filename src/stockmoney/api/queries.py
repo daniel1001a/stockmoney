@@ -275,6 +275,47 @@ def _latest_catalyst_headlines(conn: duckdb.DuckDBPyConnection) -> dict[str, str
     return {r[0]: r[1] for r in rows}
 
 
+# Only surface news this fresh on the opportunity board. Older items are stale
+# for a same-day trading decision (news decays fast) and made the board feel
+# dead when a symbol's only catalyst_signal was weeks old -- see news_feed's
+# same freshness bound.
+OPPORTUNITY_NEWS_MAX_AGE_DAYS = 10
+
+
+def _latest_symbol_news(
+    conn: duckdb.DuckDBPyConnection, *, max_age_days: int = OPPORTUNITY_NEWS_MAX_AGE_DAYS
+) -> dict[str, dict]:
+    """The single most relevant RECENT headline per symbol, so every opportunity
+    card can show a live news line -- not just the few symbols that happen to
+    have an LLM catalyst_signal. Ranked by importance then recency; bounded to
+    the last `max_age_days` so a stale headline never masquerades as today's
+    reason to trade."""
+    rows = conn.execute(
+        """
+        WITH ranked AS (
+            SELECT symbol, item_id, headline, sentiment_score, importance, published_at,
+                   row_number() OVER (
+                       PARTITION BY symbol
+                       ORDER BY coalesce(importance, 0) DESC, published_at DESC
+                   ) AS rn
+            FROM news_items
+            WHERE symbol IS NOT NULL
+              AND published_at >= now() - (? * INTERVAL 1 DAY)
+        )
+        SELECT symbol, item_id, headline, sentiment_score, importance, published_at
+        FROM ranked WHERE rn = 1
+        """,
+        [max_age_days],
+    ).fetchall()
+    return {
+        r[0]: {
+            "item_id": r[1], "headline": r[2], "sentiment_score": r[3],
+            "importance": r[4], "published_at": r[5],
+        }
+        for r in rows
+    }
+
+
 def opportunities(conn: duckdb.DuckDBPyConnection) -> list[dict]:
     """Today's (or most-recently-cached) call for every watchlist symbol that
     has one, ranked so the money-making calls come first.
@@ -301,12 +342,17 @@ def opportunities(conn: duckdb.DuckDBPyConnection) -> list[dict]:
     """
     snapshots = _latest_snapshot_rows(conn)
     headlines = _latest_catalyst_headlines(conn)
+    symbol_news = _latest_symbol_news(conn)
     rows = _latest_prediction_rows(conn)
     label_map = regime_label_map(conn)
     items = []
     for r in rows:
         item = _prediction_row_to_dict(r, snapshots.get(r[0]), label_map)
         item["catalyst_headline"] = headlines.get(r[0])
+        # Every symbol with recent news gets a live headline (with a link +
+        # sentiment), so the board reflects the news radar instead of only the
+        # handful of symbols that have an LLM catalyst_signal.
+        item["top_news"] = symbol_news.get(r[0])
         items.append(item)
     return sorted(
         items,
@@ -590,12 +636,24 @@ _NEWS_COLS = (
 )
 
 
-def news_feed(conn: duckdb.DuckDBPyConnection, *, limit: int = 60) -> list[dict]:
+# News decays fast: a week-old "breaking" headline is noise on a trading feed.
+# Both the radar and the per-symbol list bound to this window so stale items age
+# out on their own instead of needing manual cleanup.
+NEWS_FEED_MAX_AGE_DAYS = 14
+
+
+def news_feed(
+    conn: duckdb.DuckDBPyConnection, *, limit: int = 60, max_age_days: int = NEWS_FEED_MAX_AGE_DAYS
+) -> list[dict]:
     """The 消息雷達 feed: every kind of market-relevant news in one normalised
-    stream, newest first. The frontend filters by type/symbol/search on top of
-    this -- kept server-side simple so the list stays one honest query."""
+    stream, newest first, bounded to the last `max_age_days` so the radar stays
+    current (stale news is worse than no news on a same-day trading surface).
+    The frontend filters by type/symbol/search on top of this."""
     rows = conn.execute(
-        f"SELECT {_NEWS_COLS} FROM news_items ORDER BY published_at DESC LIMIT ?", [limit]
+        f"SELECT {_NEWS_COLS} FROM news_items "
+        "WHERE published_at >= now() - (? * INTERVAL 1 DAY) "
+        "ORDER BY published_at DESC LIMIT ?",
+        [max_age_days, limit],
     ).fetchall()
     return [_news_row_to_dict(r) for r in rows]
 
@@ -607,14 +665,19 @@ def news_item(conn: duckdb.DuckDBPyConnection, item_id: str) -> dict | None:
     return _news_row_to_dict(rows[0]) if rows else None
 
 
-def news_for_symbol(conn: duckdb.DuckDBPyConnection, symbol: str, *, limit: int = 8) -> list[dict]:
+def news_for_symbol(
+    conn: duckdb.DuckDBPyConnection, symbol: str, *, limit: int = 8,
+    max_age_days: int = NEWS_FEED_MAX_AGE_DAYS,
+) -> list[dict]:
     """Per-ticker news list for the detail page (Robinhood-style): the symbol's
-    own items plus market-wide macro items that move everything."""
+    own items plus market-wide macro items that move everything, bounded to the
+    last `max_age_days` (same freshness rule as the radar)."""
     rows = conn.execute(
         f"SELECT {_NEWS_COLS} FROM news_items "
-        "WHERE symbol = ? OR (symbol IS NULL AND item_type = 'macro') "
+        "WHERE (symbol = ? OR (symbol IS NULL AND item_type = 'macro')) "
+        "  AND published_at >= now() - (? * INTERVAL 1 DAY) "
         "ORDER BY published_at DESC LIMIT ?",
-        [symbol.upper(), limit],
+        [symbol.upper(), max_age_days, limit],
     ).fetchall()
     return [_news_row_to_dict(r) for r in rows]
 

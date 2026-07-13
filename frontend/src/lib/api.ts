@@ -43,6 +43,13 @@ export interface Opportunity {
   model_version: string
   backtest: Backtest | null
   catalyst_headline: string | null
+  top_news: {
+    item_id: string
+    headline: string
+    sentiment_score: number | null
+    importance: number | null
+    published_at: string
+  } | null
 }
 
 export interface CatalystDetail {
@@ -142,6 +149,8 @@ export interface LeaderboardEntry {
   hit_rate: number | null
   brier: number | null
   n_directional: number
+  option_win_rate: number | null
+  avg_option_pnl: number | null
 }
 
 export interface TraderTrade {
