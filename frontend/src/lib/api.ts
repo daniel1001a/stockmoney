@@ -98,12 +98,30 @@ export interface TickerDetail extends Omit<Opportunity, 'catalyst_headline'> {
   price_history: PricePoint[]
   catalyst: CatalystDetail | null
   news: NewsItem[]
+  analyst_sentiment: AnalystSentiment
 }
 
 export interface MarketMover {
   symbol: string
   close: number
   change_pct: number
+}
+
+export interface MarketAnalystSentiment {
+  n_symbols_covered: number
+  bullish: number
+  neutral: number
+  bearish: number
+}
+
+export interface AnalystSentiment {
+  n_ratings: number
+  n_scored: number
+  avg_sentiment: number | null
+  sufficient_data: boolean
+  latest_headline: string | null
+  latest_url: string | null
+  latest_published_at: string | null
 }
 
 export interface MarketSummary {
@@ -115,6 +133,7 @@ export interface MarketSummary {
   avg_conviction: number | null
   vix: number | null
   vix_term_slope: number | null
+  analyst_sentiment: MarketAnalystSentiment
   top_gainers: MarketMover[]
   top_losers: MarketMover[]
 }

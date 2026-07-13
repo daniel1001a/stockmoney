@@ -316,6 +316,79 @@ def _latest_symbol_news(
     }
 
 
+# "機構情緒" = sell-side analyst ratings/price-target actions we already ingest
+# as news_items(item_type='analyst_rating') — real data, never fabricated. No
+# free source for actual institutional order flow or insider positioning
+# exists (that's the CLAUDE.md-honest answer, not a gap to paper over), so this
+# is explicitly scoped to "what sell-side analysts are saying", not a broader
+# "institutional sentiment" claim.
+ANALYST_SENTIMENT_WINDOW_DAYS = 30
+# Below this many sentiment-scored ratings in the window, don't report a
+# direction at all -- 1 headline swinging from -1 to +1 is noise, not a signal.
+ANALYST_SENTIMENT_MIN_RATINGS = 2
+
+
+def analyst_sentiment_for_symbol(
+    conn: duckdb.DuckDBPyConnection, symbol: str, *, window_days: int = ANALYST_SENTIMENT_WINDOW_DAYS
+) -> dict:
+    """Aggregate recent analyst-rating news into one honest read: average
+    sentiment (None, not 0, when there isn't enough data -- 0 would silently
+    claim "neutral"), the raw count backing it, and the single latest rating
+    headline/link for a human to read themselves."""
+    rows = conn.execute(
+        """
+        SELECT sentiment_score, headline, url, published_at
+        FROM news_items
+        WHERE symbol = ? AND item_type = 'analyst_rating'
+          AND published_at >= now() - (? * INTERVAL 1 DAY)
+        ORDER BY published_at DESC
+        """,
+        [symbol.upper(), window_days],
+    ).fetchall()
+    scored = [r[0] for r in rows if r[0] is not None]
+    n_scored = len(scored)
+    sufficient = n_scored >= ANALYST_SENTIMENT_MIN_RATINGS
+    latest = rows[0] if rows else None
+    return {
+        "n_ratings": len(rows),
+        "n_scored": n_scored,
+        "avg_sentiment": (sum(scored) / n_scored) if sufficient else None,
+        "sufficient_data": sufficient,
+        "latest_headline": latest[1] if latest else None,
+        "latest_url": latest[2] if latest else None,
+        "latest_published_at": latest[3] if latest else None,
+    }
+
+
+def market_analyst_sentiment(
+    conn: duckdb.DuckDBPyConnection, *, window_days: int = ANALYST_SENTIMENT_WINDOW_DAYS
+) -> dict:
+    """Watchlist-wide read for the morning-briefing strip: how many symbols
+    currently have enough analyst-rating coverage to call bullish/bearish/
+    neutral, and the tally. Symbols below ANALYST_SENTIMENT_MIN_RATINGS are
+    excluded entirely rather than counted as neutral -- "no data" and "neutral
+    rating" are different facts."""
+    rows = conn.execute(
+        """
+        SELECT symbol, avg(sentiment_score) AS avg_s, count(*) AS n
+        FROM news_items
+        WHERE item_type = 'analyst_rating' AND sentiment_score IS NOT NULL
+          AND symbol IS NOT NULL
+          AND published_at >= now() - (? * INTERVAL 1 DAY)
+        GROUP BY symbol
+        HAVING count(*) >= ?
+        """,
+        [window_days, ANALYST_SENTIMENT_MIN_RATINGS],
+    ).fetchall()
+    bullish = sum(1 for _, avg_s, _ in rows if avg_s > 0.15)
+    bearish = sum(1 for _, avg_s, _ in rows if avg_s < -0.15)
+    neutral = len(rows) - bullish - bearish
+    return {
+        "n_symbols_covered": len(rows),
+        "bullish": bullish, "neutral": neutral, "bearish": bearish,
+    }
+
+
 def opportunities(conn: duckdb.DuckDBPyConnection) -> list[dict]:
     """Today's (or most-recently-cached) call for every watchlist symbol that
     has one, ranked so the money-making calls come first.
@@ -414,6 +487,7 @@ def ticker_detail(conn: duckdb.DuckDBPyConnection, symbol: str) -> dict | None:
     )
 
     prediction["news"] = news_for_symbol(conn, symbol, limit=8)
+    prediction["analyst_sentiment"] = analyst_sentiment_for_symbol(conn, symbol)
 
     return prediction
 
@@ -772,6 +846,7 @@ def market_summary(conn: duckdb.DuckDBPyConnection) -> dict:
         "avg_conviction": sum(convictions) / len(convictions) if convictions else None,
         "vix": vix_spot,
         "vix_term_slope": vix_slope,
+        "analyst_sentiment": market_analyst_sentiment(conn),
         "top_gainers": moves[:3],
         "top_losers": list(reversed(moves[-3:])) if len(moves) >= 3 else [],
     }

@@ -45,9 +45,10 @@ function MarketStrip({ m }: { m: MarketSummary }) {
     m.vix_term_slope !== null && m.vix_term_slope < 0
       ? { t: 'backwardation(恐慌)', c: 'text-rose-300' }
       : { t: 'contango(平靜)', c: 'text-emerald-300' }
+  const sent = m.analyst_sentiment
   return (
     <Card className="mb-6 p-4">
-      <div className="grid grid-cols-2 gap-4 sm:grid-cols-4 lg:grid-cols-5">
+      <div className="grid grid-cols-2 gap-4 sm:grid-cols-4 lg:grid-cols-6">
         <div>
           <div className="text-xs text-neutral-500">大盤狀態(多數標的)</div>
           <div className="mt-1"><RegimeChip label={m.dominant_regime ?? '—'} /></div>
@@ -75,6 +76,19 @@ function MarketStrip({ m }: { m: MarketSummary }) {
             {m.vix?.toFixed(1) ?? '--'}
           </div>
           <div className={`text-xs ${vixMood.c}`}>{vixMood.t}</div>
+        </div>
+        <div>
+          <div className="text-xs text-neutral-500">機構評級氛圍</div>
+          {sent.n_symbols_covered === 0 ? (
+            <div className="mt-1 text-sm text-neutral-500">資料不足</div>
+          ) : (
+            <div className="mt-1 text-xs">
+              <span className="text-emerald-400">{sent.bullish} 偏多</span> ·{' '}
+              <span className="text-neutral-400">{sent.neutral} 中性</span> ·{' '}
+              <span className="text-rose-400">{sent.bearish} 偏空</span>
+              <div className="mt-0.5 text-neutral-600">{sent.n_symbols_covered} 檔有足夠評級</div>
+            </div>
+          )}
         </div>
         <div className="col-span-2 sm:col-span-4 lg:col-span-1">
           <div className="text-xs text-neutral-500">今日領漲 / 領跌</div>

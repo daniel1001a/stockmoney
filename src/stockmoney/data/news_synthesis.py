@@ -22,18 +22,42 @@ from datetime import datetime, timezone
 import duckdb
 
 # Watchlist tickers -> the names/aliases that actually appear in headlines.
+# Must stay in sync with watchlist_members (migrations 001 + 038) -- a symbol
+# missing here silently gets ZERO news tagged (tag_symbol only matches on these
+# aliases), which is exactly the gap that made the 20-symbol watchlist expansion
+# only show news for the original 11 until this was caught and fixed.
 COMPANY_ALIASES: dict[str, list[str]] = {
     "NVDA": ["nvidia", "nvda"],
     "AVGO": ["broadcom", "avgo"],
     "AMD": ["amd", "advanced micro"],
     "TSM": ["tsmc", "taiwan semiconductor", "tsm"],
+    "MU": ["micron", " mu "],
+    "QCOM": ["qualcomm", "qcom"],
+    "MRVL": ["marvell", "mrvl"],
+    "INTC": ["intel", "intc"],
     "AAPL": ["apple", "aapl", "iphone"],
     "MSFT": ["microsoft", "msft", "azure"],
     "GOOGL": ["alphabet", "google", "googl", "gemini"],
     "META": ["meta platforms", "facebook", "instagram", " meta ", "meta's"],
     "AMZN": ["amazon", "amzn", " aws "],
+    "TSLA": ["tesla", "tsla", "elon musk"],
+    "NFLX": ["netflix", "nflx"],
+    "ORCL": ["oracle", "orcl"],
+    "CRM": ["salesforce", " crm "],
+    "PLTR": ["palantir", "pltr"],
+    "JPM": ["jpmorgan", "jp morgan", " jpm "],
+    "BAC": ["bank of america", " bac "],
+    "GS": ["goldman sachs", " gs "],
+    "MS": ["morgan stanley"],
+    "WFC": ["wells fargo", " wfc "],
+    "XOM": ["exxon", "exxonmobil", " xom "],
+    "CVX": ["chevron", " cvx "],
+    "COP": ["conocophillips", " cop "],
+    "SLB": ["schlumberger", " slb "],
     "SOXL": ["soxl", "semiconductor etf"],
     "SOXS": ["soxs"],
+    "SOXX": ["soxx"],
+    "QQQ": ["qqq", "nasdaq-100 etf", "nasdaq 100 etf"],
 }
 
 EARNINGS_KW = ["earnings", "revenue", "guidance", "quarterly", "q1", "q2", "q3", "q4",
@@ -80,12 +104,31 @@ def _clean(text: str | None) -> str:
     return re.sub(r"<[^>]+>", "", text).strip()
 
 
+# Sell-side banks whose name appears in financial headlines FAR more often as
+# the SOURCE of a rating on some other company ("Goldman Sachs says [other
+# stock] is a buy") than as the article's own subject. A plain alias match
+# mis-tags every such headline to the bank's own ticker -- confirmed on real
+# ingested headlines (e.g. "American Express is a buy..., JPMorgan says" got
+# tagged JPM, "...has made a big comeback, Goldman Sachs says" got tagged GS).
+# Scoped to just these banks: for a product company, "$SYMBOL says X" (e.g.
+# "Nvidia says it will ship Blackwell") genuinely IS news about that company,
+# so the same exclusion would wrongly suppress real self-announcements there.
+_RATING_SOURCE_SYMBOLS = {"JPM", "GS", "MS", "BAC", "WFC"}
+_SOURCE_ATTRIBUTION_RE = re.compile(r"^'?s?\W*(says?|said)\b")
+
+
 def tag_symbol(text: str) -> str | None:
     low = f" {text.lower()} "
     for symbol, aliases in COMPANY_ALIASES.items():
         for alias in aliases:
-            if alias in low:
-                return symbol
+            idx = low.find(alias)
+            if idx == -1:
+                continue
+            if symbol in _RATING_SOURCE_SYMBOLS:
+                after = low[idx + len(alias): idx + len(alias) + 16]
+                if _SOURCE_ATTRIBUTION_RE.match(after):
+                    continue  # "<bank> says ..." -> source citation, not the subject
+            return symbol
     return None
 
 

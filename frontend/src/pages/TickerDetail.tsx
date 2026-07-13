@@ -1,7 +1,7 @@
 import { Link, useParams } from 'react-router-dom'
 import { api } from '../lib/api'
 import { useApi } from '../lib/useApi'
-import { DIRECTION_CLASSES, DIRECTION_LABEL, regimeClass, num, pct } from '../lib/format'
+import { DIRECTION_CLASSES, DIRECTION_LABEL, regimeClass, num, pct, sentimentLabel, relTime } from '../lib/format'
 import ProbaBar from '../components/ProbaBar'
 import Sparkline from '../components/Sparkline'
 import GlossaryTerm from '../components/GlossaryTerm'
@@ -125,6 +125,45 @@ export default function TickerDetail() {
                       <NewsRow key={n.item_id} item={n} showSymbol={false} />
                     ))}
                   </div>
+                )}
+              </Card>
+
+              <Card className="p-4">
+                <SectionTitle title="機構評級氛圍" hint="彙總近 30 天的分析師評級/目標價新聞(真實資料);未達最低則數不強行給方向。" />
+                {data.analyst_sentiment.sufficient_data ? (
+                  <div>
+                    {(() => {
+                      const s = sentimentLabel(data.analyst_sentiment.avg_sentiment)
+                      return (
+                        <p className="text-sm">
+                          <span className={`font-medium ${s.cls}`}>{s.label}</span>
+                          <span className="ml-2 text-xs text-neutral-500">
+                            近 30 天 {data.analyst_sentiment.n_scored} 則有情緒標記(共 {data.analyst_sentiment.n_ratings} 則評級新聞)
+                          </span>
+                        </p>
+                      )
+                    })()}
+                    {data.analyst_sentiment.latest_headline && (
+                      <p className="mt-2 text-xs text-neutral-400">
+                        最新:
+                        {data.analyst_sentiment.latest_url ? (
+                          <a href={data.analyst_sentiment.latest_url} target="_blank" rel="noreferrer"
+                             className="ml-1 text-neutral-300 hover:text-neutral-100 hover:underline">
+                            {data.analyst_sentiment.latest_headline}
+                          </a>
+                        ) : (
+                          <span className="ml-1">{data.analyst_sentiment.latest_headline}</span>
+                        )}
+                        {data.analyst_sentiment.latest_published_at && (
+                          <span className="ml-1 text-neutral-600">· {relTime(data.analyst_sentiment.latest_published_at)}</span>
+                        )}
+                      </p>
+                    )}
+                  </div>
+                ) : (
+                  <Empty>
+                    近 30 天分析師評級新聞不足(僅 {data.analyst_sentiment.n_ratings} 則),暫不判斷氛圍。
+                  </Empty>
                 )}
               </Card>
 

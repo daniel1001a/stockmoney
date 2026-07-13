@@ -28,7 +28,9 @@ const opp = (symbol: string, conviction: number, direction: Opportunity['predict
 const market: MarketSummary = {
   as_of_date: '2026-07-10', n_symbols: 2, direction_counts: { up: 1, down: 1, range: 0 },
   regime_counts: { 高波動趨勢盤: 2 }, dominant_regime: '高波動趨勢盤', avg_conviction: 0.65,
-  vix: 12.5, vix_term_slope: 1.2, top_gainers: [{ symbol: 'NVDA', close: 178, change_pct: 0.06 }],
+  vix: 12.5, vix_term_slope: 1.2,
+  analyst_sentiment: { n_symbols_covered: 2, bullish: 1, neutral: 1, bearish: 0 },
+  top_gainers: [{ symbol: 'NVDA', close: 178, change_pct: 0.06 }],
   top_losers: [{ symbol: 'AMD', close: 170, change_pct: -0.03 }],
 }
 

@@ -383,3 +383,69 @@ def test_regime_label_falls_back_for_unknown_id():
 def test_regime_label_map_empty_when_no_predictions():
     conn = _conn()
     assert queries.regime_label_map(conn) == {}
+
+
+# --- analyst sentiment aggregation -----------------------------------------
+
+def _seed_analyst_rating(
+    conn, *, item_id, symbol, sentiment_score, published_at=datetime(2026, 7, 10, tzinfo=timezone.utc),
+):
+    conn.execute(
+        """
+        INSERT INTO news_items
+            (item_id, symbol, item_type, headline, published_at, sentiment_score, available_at, created_at)
+        VALUES (?, ?, 'analyst_rating', ?, ?, ?, ?, ?)
+        """,
+        [item_id, symbol, f"rating for {symbol}", published_at, sentiment_score, published_at, published_at],
+    )
+
+
+def test_analyst_sentiment_insufficient_data_reports_none_not_zero():
+    conn = _conn()
+    _seed_analyst_rating(conn, item_id="a1", symbol="NVDA", sentiment_score=0.6)
+    # Only 1 scored rating -- below ANALYST_SENTIMENT_MIN_RATINGS (2).
+    result = queries.analyst_sentiment_for_symbol(conn, "NVDA")
+    assert result["sufficient_data"] is False
+    assert result["avg_sentiment"] is None  # never fabricate "neutral" (0.0) from thin data
+    assert result["n_ratings"] == 1
+    assert result["latest_headline"] == "rating for NVDA"
+
+
+def test_analyst_sentiment_averages_once_enough_ratings():
+    conn = _conn()
+    _seed_analyst_rating(conn, item_id="a1", symbol="NVDA", sentiment_score=0.6,
+                          published_at=datetime(2026, 7, 8, tzinfo=timezone.utc))
+    _seed_analyst_rating(conn, item_id="a2", symbol="NVDA", sentiment_score=0.2,
+                          published_at=datetime(2026, 7, 10, tzinfo=timezone.utc))
+    result = queries.analyst_sentiment_for_symbol(conn, "NVDA")
+    assert result["sufficient_data"] is True
+    assert result["avg_sentiment"] == pytest.approx(0.4)
+    assert result["n_scored"] == 2
+    assert result["latest_headline"] == "rating for NVDA"  # most recent by published_at
+
+
+def test_analyst_sentiment_ignores_unrelated_symbol_and_old_ratings():
+    conn = _conn()
+    _seed_analyst_rating(conn, item_id="a1", symbol="AMD", sentiment_score=0.6)
+    _seed_analyst_rating(conn, item_id="a2", symbol="NVDA", sentiment_score=0.6,
+                          published_at=datetime(2020, 1, 1, tzinfo=timezone.utc))  # outside window
+    result = queries.analyst_sentiment_for_symbol(conn, "NVDA", window_days=30)
+    assert result["n_ratings"] == 0
+    assert result["sufficient_data"] is False
+
+
+def test_market_analyst_sentiment_excludes_thin_coverage_symbols():
+    conn = _conn()
+    # NVDA: 2 ratings, net bullish -> counted.
+    _seed_analyst_rating(conn, item_id="a1", symbol="NVDA", sentiment_score=0.5,
+                          published_at=datetime(2026, 7, 8, tzinfo=timezone.utc))
+    _seed_analyst_rating(conn, item_id="a2", symbol="NVDA", sentiment_score=0.3,
+                          published_at=datetime(2026, 7, 10, tzinfo=timezone.utc))
+    # AMD: only 1 rating -> excluded entirely, not counted as neutral.
+    _seed_analyst_rating(conn, item_id="a3", symbol="AMD", sentiment_score=-0.8)
+
+    result = queries.market_analyst_sentiment(conn)
+    assert result["n_symbols_covered"] == 1
+    assert result["bullish"] == 1
+    assert result["bearish"] == 0
+    assert result["neutral"] == 0
