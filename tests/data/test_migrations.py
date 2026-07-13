@@ -44,6 +44,8 @@ EXPECTED_TABLES = {
     "trader_method_proposals",
     "trader_review_log",
     "trader_divergence_log",
+    # Wave C: market-level VRP (models/vrp.py)
+    "market_index_ohlcv_daily",
 }
 
 # 15 base migrations + 3 Tier1 tables + 1 ALTER + 3 round-6 tables + 1 options-risk table
@@ -53,7 +55,8 @@ EXPECTED_TABLES = {
 # + 4 Trader League migrations (030 traders, 031 trader_predictions,
 #   032 trader_methods [2 tables], 033 trader_review [2 tables]) = 33
 # + 2 redesign migrations (034 news_items, 035 trader_portfolios [2 tables]) = 35
-EXPECTED_MIGRATION_COUNT = 35
+# + 1 Wave C migration (036 market_index_ohlcv_daily) = 36
+EXPECTED_MIGRATION_COUNT = 36
 
 
 def _table_names(conn: duckdb.DuckDBPyConnection) -> set[str]:
