@@ -3,7 +3,7 @@ import { Link } from 'react-router-dom'
 import { api, type Opportunity, type MarketSummary } from '../lib/api'
 import { useApi } from '../lib/useApi'
 import {
-  DIRECTION_CLASSES, DIRECTION_LABEL, REGIME_CLASSES, pct, signedPct,
+  DIRECTION_CLASSES, DIRECTION_LABEL, regimeClass, pct, signedPct,
 } from '../lib/format'
 import { Card, Chip, SectionTitle, Loading, ErrorMsg, Empty } from '../components/ui'
 import GlossaryTerm from '../components/GlossaryTerm'
@@ -13,7 +13,7 @@ function DirectionChip({ d }: { d: string }) {
 }
 
 function RegimeChip({ label }: { label: string }) {
-  return <Chip className={REGIME_CLASSES[label] ?? 'text-neutral-300 bg-neutral-500/10 border-neutral-500/30'}>{label}</Chip>
+  return <Chip className={regimeClass(label)}>{label}</Chip>
 }
 
 // --- Market briefing strip --------------------------------------------------

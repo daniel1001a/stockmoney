@@ -1,7 +1,7 @@
 import { Link, useParams } from 'react-router-dom'
 import { api } from '../lib/api'
 import { useApi } from '../lib/useApi'
-import { DIRECTION_CLASSES, DIRECTION_LABEL, REGIME_CLASSES, num, pct } from '../lib/format'
+import { DIRECTION_CLASSES, DIRECTION_LABEL, regimeClass, num, pct } from '../lib/format'
 import ProbaBar from '../components/ProbaBar'
 import Sparkline from '../components/Sparkline'
 import GlossaryTerm from '../components/GlossaryTerm'
@@ -47,7 +47,7 @@ export default function TickerDetail() {
               <p className="mt-1 text-sm text-neutral-500">{data.sector} · 資料日期 {data.trade_date}</p>
             </div>
             <div className="flex items-center gap-2">
-              <Chip className={REGIME_CLASSES[data.regime_label] ?? 'text-neutral-300 bg-neutral-500/10 border-neutral-500/30'}>
+              <Chip className={regimeClass(data.regime_label)}>
                 {data.regime_label}
               </Chip>
               <Chip className={DIRECTION_CLASSES[data.predicted_direction] ?? DIRECTION_CLASSES.range}>

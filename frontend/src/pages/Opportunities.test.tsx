@@ -8,8 +8,8 @@ vi.mock('../lib/api')
 
 const opp = (symbol: string, conviction: number, direction: Opportunity['predicted_direction']): Opportunity => ({
   symbol, sector: 'semiconductor', trade_date: '2026-07-10', horizon: 5,
-  label_end_date: '2026-07-17', regime: 1, regime_label: '趨勢多頭',
-  thesis: `趨勢多頭格局下,模型偏向看漲,信心 ${Math.round(conviction * 100)}%。`,
+  label_end_date: '2026-07-17', regime: 2, regime_label: '高波動趨勢',
+  thesis: `高波動趨勢格局下,模型偏向看漲,信心 ${Math.round(conviction * 100)}%。`,
   proba: { down: 0.2, range: 0.2, up: 0.6 }, predicted_direction: direction, conviction,
   entry_price: 178, target_price_up: 190, target_price_down: 166,
   feature_values: { realized_vol_20d: 0.5 }, model_version: 'gmm-logistic-v2',
@@ -23,7 +23,7 @@ const opp = (symbol: string, conviction: number, direction: Opportunity['predict
 
 const market: MarketSummary = {
   as_of_date: '2026-07-10', n_symbols: 2, direction_counts: { up: 1, down: 1, range: 0 },
-  regime_counts: { 趨勢多頭: 2 }, dominant_regime: '趨勢多頭', avg_conviction: 0.65,
+  regime_counts: { 高波動趨勢: 2 }, dominant_regime: '高波動趨勢', avg_conviction: 0.65,
   vix: 12.5, vix_term_slope: 1.2, top_gainers: [{ symbol: 'NVDA', close: 178, change_pct: 0.06 }],
   top_losers: [{ symbol: 'AMD', close: 170, change_pct: -0.03 }],
 }
@@ -36,8 +36,8 @@ describe('Opportunities', () => {
     render(<MemoryRouter><Opportunities /></MemoryRouter>)
 
     await waitFor(() => expect(screen.getByRole('table')).toBeInTheDocument())
-    // human regime label appears (no bare "regime 0")
-    expect(screen.getAllByText('趨勢多頭').length).toBeGreaterThan(0)
+    // human strength label appears (no bare "regime 0", no up/down direction word)
+    expect(screen.getAllByText('高波動趨勢').length).toBeGreaterThan(0)
     // both the picks section and the watchlist show the symbols
     expect(screen.getAllByText('NVDA').length).toBeGreaterThan(0)
     expect(screen.getByText('本日精選 · 最有信心的 5 檔')).toBeInTheDocument()

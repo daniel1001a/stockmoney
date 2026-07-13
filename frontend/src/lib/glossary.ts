@@ -3,7 +3,7 @@
 // src/stockmoney/models/*.py, src/stockmoney/api/queries.py) -- not guesses.
 export const GLOSSARY: Record<string, string> = {
   conviction: '模型對這個方向判斷的信心，等於機率分佈中最高的那一項（漲/跌/盤整三選一取最大值）。',
-  regime: '目前市場狀態分類（趨勢多頭／趨勢空頭／震盪盤整），依已實現波動率、趨勢強度、跨股離散度判斷。',
+  regime: '目前市場狀態分類，衡量「波動／趨勢強度」而非漲跌方向（例：低波動盤整／中波動／高波動趨勢）。依已實現波動率、趨勢強度(ADX)、跨股離散度分群，每個分群的名稱由其中心點特徵決定。',
   overall_accuracy: '樣本外回測的方向判斷準確率，跟瞎猜基準（約1/3）比較才有意義。',
   overall_brier: 'Brier分數：機率預測的校準程度，越接近0代表機率估計越準，不是單純的對錯率。',
   overall_sharpe: '樣本外回測的風險調整後報酬（Sharpe ratio），越高代表相同風險下報酬越好。',

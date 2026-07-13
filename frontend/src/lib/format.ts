@@ -50,11 +50,16 @@ export const DIRECTION_CLASSES: Record<string, string> = {
   range: 'text-amber-200 bg-amber-500/10 border-amber-500/40',
 }
 
-// Regime chip colouring keyed on the plain-language label the API now returns.
-export const REGIME_CLASSES: Record<string, string> = {
-  趨勢多頭: 'text-emerald-300 bg-emerald-500/10 border-emerald-500/30',
-  趨勢空頭: 'text-rose-300 bg-rose-500/10 border-rose-500/30',
-  震盪盤整: 'text-amber-200 bg-amber-500/10 border-amber-500/30',
+// Regime chip colouring. The API's regime label describes volatility / trend
+// STRENGTH (低波動盤整 / 中波動 / 高波動趨勢), not up/down direction, and is
+// derived per-fit from each cluster's centroid -- so we colour by the vol tier
+// keyword rather than an exact-string map: high vol = caution (rose), low vol =
+// calm (emerald), otherwise neutral amber.
+export function regimeClass(label: string | null | undefined): string {
+  if (label && label.includes('高波動')) return 'text-rose-300 bg-rose-500/10 border-rose-500/30'
+  if (label && label.includes('低波動')) return 'text-emerald-300 bg-emerald-500/10 border-emerald-500/30'
+  if (label && label.includes('波動')) return 'text-amber-200 bg-amber-500/10 border-amber-500/30'
+  return 'text-neutral-300 bg-neutral-500/10 border-neutral-500/30'
 }
 
 export const RISK_LIGHT_CLASSES: Record<string, string> = {

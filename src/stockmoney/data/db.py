@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import os
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -8,7 +9,14 @@ import duckdb
 import polars as pl
 
 MIGRATIONS_DIR = Path(__file__).parent / "migrations"
-DEFAULT_DB_PATH = "data/stockmoney.duckdb"
+
+# The default DB every script/CLI/API handler falls back to. Resolved from the
+# STOCKMONEY_DB env var so the whole app (API + all --db-defaulting scripts) can
+# be pointed at the live DB (data/stockmoney_live.duckdb) without touching code:
+#   STOCKMONEY_DB=data/stockmoney_live.duckdb .venv/bin/python -m uvicorn ...
+# An explicit --db / db_path argument still wins over this. Read at import time,
+# which is correct for the intended use (env is set before the process starts).
+DEFAULT_DB_PATH = os.environ.get("STOCKMONEY_DB") or "data/stockmoney.duckdb"
 
 # Sentinel for market-wide rows in key columns that cannot be NULL
 # (e.g. feature_store.symbol for a market regime label).

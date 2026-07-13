@@ -29,28 +29,84 @@ from stockmoney.data.trader_review import recent_divergence_rows
 from stockmoney.data.traders import list_all_traders
 from stockmoney.league.league_table import league_table as _compute_league_table
 from stockmoney.models.options_risk import MarketSnapshot, assess_position
+from stockmoney.models.regime import REGIME_OBS_COLUMNS, describe_regimes
 
 ROLLING_WIN_RATE_WINDOW = 20
 RECENT_PREDICTIONS_LIMIT = 15
 PRICE_HISTORY_DAYS = 90
 
-# Plain-language names for the GMM regime cluster ids so the UI never shows a
-# bare "regime 0" (the user's feedback: an integer is meaningless to a human).
-# The mapping is a demo/serving convention -- in production it would come from
-# characterising each cluster's feature centroid; the seed writes ids that match
-# this convention (up-biased days -> 1, down -> 2, choppy -> 0).
-REGIME_LABELS = {0: "震盪盤整", 1: "趨勢多頭", 2: "趨勢空頭"}
 DIRECTION_CN = {"up": "看漲", "down": "看跌", "range": "區間"}
 
 
-def regime_label(regime: int | None) -> str:
+def regime_label(regime: int | None, label_map: dict[int, str] | None = None) -> str:
+    """Human name for a regime cluster id.
+
+    Cluster ids are arbitrary and unstable across fits, so the label must be
+    derived from the cluster's centroid (vol / trend strength), not a fixed
+    id->name table -- see models.regime.describe_regimes. ``label_map`` is that
+    per-fit mapping, built by ``regime_label_map`` from the latest predictions'
+    stored feature values. Falls back to a bare "regime N" only when the map has
+    no entry (e.g. a historical id from an older fit).
+    """
     if regime is None:
         return "未分類"
-    return REGIME_LABELS.get(regime, f"regime {regime}")
+    if label_map and regime in label_map:
+        return label_map[regime]
+    return f"regime {regime}"
 
 
-def _plain_thesis(direction: str, regime: int | None, conviction: float) -> str:
-    return f"{regime_label(regime)}格局下,模型偏向{DIRECTION_CN.get(direction, direction)},信心 {round(conviction * 100)}%。"
+def regime_label_map(conn: duckdb.DuckDBPyConnection) -> dict[int, str]:
+    """Build {regime_id: label} from the empirical centroid of each cluster.
+
+    Reads the most recent fit's predictions (latest ``model_version``) and
+    averages the three regime-observation features
+    (realized_vol_20d / adx_14 / xsec_dispersion, stored in each row's
+    ``feature_values`` JSON) per regime id -- the empirical centroid of that
+    cluster -- then hands them to models.regime.describe_regimes. Scoping to one
+    model_version avoids pooling clusters from fits with different feature
+    semantics; ids are stable within a version.
+    """
+    row = conn.execute(
+        "SELECT model_version FROM daily_predictions ORDER BY trade_date DESC LIMIT 1"
+    ).fetchone()
+    if row is None:
+        return {}
+    latest_version = row[0]
+    rows = conn.execute(
+        "SELECT regime, feature_values FROM daily_predictions WHERE model_version = ?",
+        [latest_version],
+    ).fetchall()
+
+    sums: dict[int, list[float]] = {}
+    counts: dict[int, int] = {}
+    for regime, fv_json in rows:
+        try:
+            fv = json.loads(fv_json)
+            obs = [float(fv[c]) for c in REGIME_OBS_COLUMNS]
+        except (KeyError, TypeError, ValueError):
+            continue
+        if regime not in sums:
+            sums[regime] = [0.0, 0.0, 0.0]
+            counts[regime] = 0
+        for i in range(3):
+            sums[regime][i] += obs[i]
+        counts[regime] += 1
+
+    centroids = {
+        r: tuple(sums[r][i] / counts[r] for i in range(3))
+        for r in sums
+        if counts[r] > 0
+    }
+    return describe_regimes(centroids)
+
+
+def _plain_thesis(
+    direction: str, regime: int | None, conviction: float, label_map: dict[int, str] | None = None
+) -> str:
+    return (
+        f"{regime_label(regime, label_map)}格局下,模型偏向"
+        f"{DIRECTION_CN.get(direction, direction)},信心 {round(conviction * 100)}%。"
+    )
 
 # Per-table max acceptable lag before pipeline_health flags it stale, in
 # calendar days. Grounded in what actually runs on a recurring schedule
@@ -162,7 +218,9 @@ def _latest_snapshot_rows(conn: duckdb.DuckDBPyConnection) -> dict[str, dict]:
     return out
 
 
-def _prediction_row_to_dict(row: tuple, snapshot: dict | None) -> dict:
+def _prediction_row_to_dict(
+    row: tuple, snapshot: dict | None, label_map: dict[int, str] | None = None
+) -> dict:
     (
         symbol, sector, trade_date, horizon, label_end_date, regime, proba_down, proba_range,
         proba_up, predicted_direction, entry_price, target_price_up, target_price_down,
@@ -172,8 +230,8 @@ def _prediction_row_to_dict(row: tuple, snapshot: dict | None) -> dict:
     return {
         "symbol": symbol, "sector": sector, "trade_date": trade_date, "horizon": horizon,
         "label_end_date": label_end_date, "regime": regime,
-        "regime_label": regime_label(regime),
-        "thesis": _plain_thesis(predicted_direction, regime, conviction),
+        "regime_label": regime_label(regime, label_map),
+        "thesis": _plain_thesis(predicted_direction, regime, conviction, label_map),
         "proba": {"down": proba_down, "range": proba_range, "up": proba_up},
         "predicted_direction": predicted_direction, "conviction": conviction,
         "entry_price": entry_price, "target_price_up": target_price_up,
@@ -213,9 +271,10 @@ def opportunities(conn: duckdb.DuckDBPyConnection) -> list[dict]:
     snapshots = _latest_snapshot_rows(conn)
     headlines = _latest_catalyst_headlines(conn)
     rows = _latest_prediction_rows(conn)
+    label_map = regime_label_map(conn)
     items = []
     for r in rows:
-        item = _prediction_row_to_dict(r, snapshots.get(r[0]))
+        item = _prediction_row_to_dict(r, snapshots.get(r[0]), label_map)
         item["catalyst_headline"] = headlines.get(r[0])
         items.append(item)
     return sorted(items, key=lambda it: it["conviction"], reverse=True)
@@ -227,7 +286,7 @@ def ticker_detail(conn: duckdb.DuckDBPyConnection, symbol: str) -> dict | None:
     if not rows:
         return None
     snapshot = _latest_snapshot_rows(conn).get(symbol)
-    prediction = _prediction_row_to_dict(rows[0], snapshot)
+    prediction = _prediction_row_to_dict(rows[0], snapshot, regime_label_map(conn))
 
     history = conn.execute(
         """
@@ -554,6 +613,7 @@ def market_summary(conn: duckdb.DuckDBPyConnection) -> dict:
     Regime mix + directional breadth + VIX + biggest movers across the
     watchlist, all from the latest cached rows."""
     preds = _latest_prediction_rows(conn)
+    label_map = regime_label_map(conn)
     as_of = max((r[2] for r in preds), default=None)
     dir_counts = {"up": 0, "down": 0, "range": 0}
     regime_counts: dict[str, int] = {}
@@ -561,7 +621,8 @@ def market_summary(conn: duckdb.DuckDBPyConnection) -> dict:
     for r in preds:
         direction = r[9]
         dir_counts[direction] = dir_counts.get(direction, 0) + 1
-        regime_counts[regime_label(r[5])] = regime_counts.get(regime_label(r[5]), 0) + 1
+        label = regime_label(r[5], label_map)
+        regime_counts[label] = regime_counts.get(label, 0) + 1
         convictions.append(max(r[6], r[7], r[8]))
 
     # dominant regime = the one the most symbols are in right now
@@ -785,6 +846,7 @@ def trader_profile(conn: duckdb.DuckDBPyConnection, trader_id: str) -> dict | No
         """,
         [trader_id],
     ).fetchall()
+    label_map = regime_label_map(conn)
 
     return {
         "trader_id": trader.trader_id, "name": trader.name, "philosophy": trader.philosophy,
@@ -798,7 +860,7 @@ def trader_profile(conn: duckdb.DuckDBPyConnection, trader_id: str) -> dict | No
         "recent_predictions": [
             {
                 "trade_date": r[0], "symbol": r[1], "direction": r[2], "conviction": r[3],
-                "rationale": r[4], "regime": r[5], "regime_label": regime_label(r[5]),
+                "rationale": r[4], "regime": r[5], "regime_label": regime_label(r[5], label_map),
                 "status": r[6], "outcome": r[7], "label_end_date": r[8],
             }
             for r in recent_preds

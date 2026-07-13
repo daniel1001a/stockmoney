@@ -28,6 +28,7 @@ import uuid
 from datetime import date, datetime, timedelta, timezone
 
 from stockmoney.data.db import DEFAULT_DB_PATH, get_connection, run_migrations
+from stockmoney.models.feature_matrix import FEATURE_COLUMNS
 
 RNG = random.Random(20260712)
 NOW = datetime(2026, 7, 12, 13, 0, tzinfo=timezone.utc)
@@ -49,8 +50,27 @@ UNIVERSE = {
     "AMZN": ("big_tech", 224.0, 0.16, 0.023),
 }
 
-REGIME_LABELS = {0: "震盪盤整", 1: "趨勢多頭", 2: "趨勢空頭"}
 DIRECTIONS = ("down", "range", "up")
+
+# Real GMM/KMeans cluster ids are arbitrary, and a regime measures volatility /
+# trend STRENGTH, not up/down direction (CLAUDE.md section 4). So the demo seeds
+# three well-separated (realized_vol, adx, dispersion) archetypes and lets the
+# same centroid-based labeller the live path uses
+# (models.regime.describe_regimes via api.queries.regime_label_map) recover the
+# names -- instead of the old, semantically-wrong fixed {up->多頭, down->空頭}
+# map. Regime is chosen INDEPENDENTLY of direction here, so the demo honestly
+# shows the two axes are orthogonal. id 0 = calm, 1 = neutral, 2 = stormy.
+REGIME_ARCHETYPES = {
+    0: {"realized_vol_20d": (0.10, 0.18), "adx_14": (10.0, 17.0), "xsec_dispersion": (0.2, 0.5)},
+    1: {"realized_vol_20d": (0.20, 0.30), "adx_14": (18.0, 25.0), "xsec_dispersion": (0.5, 0.9)},
+    2: {"realized_vol_20d": (0.35, 0.60), "adx_14": (28.0, 45.0), "xsec_dispersion": (0.9, 1.6)},
+}
+
+
+def _regime_obs(regime: int) -> dict[str, float]:
+    """Coherent regime-observation features for a seeded archetype id, so the
+    centroid labeller reproduces 低波動盤整 / 中波動 / 高波動趨勢."""
+    return {k: round(RNG.uniform(lo, hi), 4) for k, (lo, hi) in REGIME_ARCHETYPES[regime].items()}
 
 
 def business_days(end: date, n: int) -> list[date]:
@@ -159,14 +179,11 @@ def _proba_for(direction: str, conviction: float) -> tuple[float, float, float]:
     return (rest, conviction, rest)
 
 
-FEATURE_TEMPLATES = [
-    "trend_strength_adx",
-    "realized_vol_20d",
-    "rsi_14",
-    "put_call_ratio_z",
-    "iv_rank_252",
-    "sector_dispersion_z",
-]
+# Match the production feature vector (models.feature_matrix.FEATURE_COLUMNS)
+# so the demo's "why" panel keys line up with the frontend glossary
+# (adx_14 / xsec_dispersion, not the old ad-hoc names) and with the regime
+# centroid labeller.
+FEATURE_TEMPLATES = list(FEATURE_COLUMNS)
 
 
 def seed_daily_predictions(conn, closes) -> None:
@@ -189,12 +206,11 @@ def seed_daily_predictions(conn, closes) -> None:
             )[0]
             conviction = round(RNG.uniform(0.42, 0.78), 3)
             pd_, pr_, pu_ = _proba_for(direction, conviction)
-            regime = {"up": 1, "down": 2, "range": 0}[direction]
-            if RNG.random() < 0.2:  # some noise in regime labelling
-                regime = RNG.choice([0, 1, 2])
+            # Regime is orthogonal to direction (vol/trend strength, not up/down).
+            regime = RNG.choice([0, 1, 2])
             band = close_on * vol * 1.6
             fv = {k: round(RNG.uniform(-2, 2), 4) for k in FEATURE_TEMPLATES}
-            fv["realized_vol_20d"] = round(vol * math.sqrt(252), 4)
+            fv.update(_regime_obs(regime))  # coherent obs so the label matches the id
             pid = f"dp-{symbol}-{d.isoformat()}"
             if is_today:
                 status, actual_price, actual_return, actual_label, outcome, graded_at = (
@@ -346,7 +362,7 @@ def seed_trader_predictions(conn, closes) -> None:
                 if is_today:
                     direction = RNG.choices(DIRECTIONS, weights=(1, 0.8, 1.2))[0]
                     conviction = round(RNG.uniform(0.45, 0.82), 3)
-                    regime = {"up": 1, "down": 2, "range": 0}[direction]
+                    regime = RNG.choice([0, 1, 2])  # orthogonal to direction
                     payload = {"conviction": conviction, "engine": method}
                     status, ap, ar, al, outcome, graded_at = "pending", None, None, None, None, None
                 else:
@@ -364,7 +380,7 @@ def seed_trader_predictions(conn, closes) -> None:
                     else:
                         direction = RNG.choice([x for x in DIRECTIONS if x != al])
                     conviction = round(RNG.uniform(0.62, 0.85) if direction == al else RNG.uniform(0.45, 0.66), 3)
-                    regime = {"up": 1, "down": 2, "range": 0}[direction]
+                    regime = RNG.choice([0, 1, 2])  # orthogonal to direction
                     payload = {"conviction": conviction, "engine": method}
                     outcome = "win" if direction == al else "loss"
                     graded_at, status = NOW, "graded"

@@ -321,3 +321,40 @@ def test_ticker_detail_catalyst_none_when_absent():
     _seed_prediction(conn)
     detail = queries.ticker_detail(conn, "NVDA")
     assert detail["catalyst"] is None
+
+
+def _seed_prediction_regime(conn, symbol, regime, obs, trade_date=date(2026, 7, 9)):
+    """Seed a prediction whose stored feature_values carry the regime-observation
+    features, so regime_label_map can recover the cluster's empirical centroid."""
+    fv = {
+        "realized_vol_20d": obs[0], "adx_14": obs[1], "xsec_dispersion": obs[2],
+        "yield_curve_10y2y": 0.5, "dxy_chg_1d": 0.0, "oil_chg_1d": 0.0,
+    }
+    return record_prediction(
+        conn, trade_date=trade_date, symbol=symbol, sector="semiconductor", horizon=5,
+        label_end_date=date(2026, 7, 16), regime=regime, proba=(0.2, 0.3, 0.5),
+        entry_price=180.0, feature_values=fv, model_version="test-v1",
+    )
+
+
+def test_regime_label_map_from_empirical_centroids():
+    conn = _conn()
+    # calm cluster (id 0), stormy cluster (id 2) -- ids arbitrary, labels follow
+    # the centroid.
+    _seed_prediction_regime(conn, "NVDA", 0, (0.12, 12.0, 0.3), date(2026, 7, 7))
+    _seed_prediction_regime(conn, "AMD", 0, (0.16, 15.0, 0.4), date(2026, 7, 8))
+    _seed_prediction_regime(conn, "TSM", 2, (0.45, 35.0, 1.1), date(2026, 7, 9))
+    label_map = queries.regime_label_map(conn)
+    assert label_map[0] == "低波動盤整"
+    assert label_map[2] == "高波動趨勢"
+
+
+def test_regime_label_falls_back_for_unknown_id():
+    assert queries.regime_label(None) == "未分類"
+    assert queries.regime_label(7, {0: "低波動盤整"}) == "regime 7"
+    assert queries.regime_label(0, {0: "低波動盤整"}) == "低波動盤整"
+
+
+def test_regime_label_map_empty_when_no_predictions():
+    conn = _conn()
+    assert queries.regime_label_map(conn) == {}
