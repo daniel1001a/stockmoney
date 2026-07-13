@@ -46,7 +46,9 @@ from stockmoney.data.attribution import run_attribution
 from stockmoney.data.db import DEFAULT_DB_PATH, get_connection, run_migrations
 from stockmoney.data.ingestion.fred_macro import ingest_macro_series
 from stockmoney.data.ingestion.options_chain import ingest_watchlist_options
+from stockmoney.data.ingestion.vix_term import ingest_vix_term
 from stockmoney.data.ingestion.yfinance_ohlcv import ingest_watchlist_ohlcv
+from stockmoney.data.news_synthesis import refresh_news_items
 from stockmoney.league.orchestration import run_predictions
 from stockmoney.league.review import run_review
 
@@ -74,10 +76,29 @@ def main(db_path: str = DEFAULT_DB_PATH) -> None:
         print(f"  macro_series_daily FAILED: {exc}")
 
     try:
-        written = ingest_watchlist_options(conn, trade_date=today)
+        n = ingest_vix_term(conn, today - timedelta(days=OHLCV_LOOKBACK_DAYS), today)
+        print(f"  vix_term_structure_daily: +{n} rows")
+    except Exception as exc:
+        print(f"  vix_term_structure_daily FAILED: {exc}")
+
+    try:
+        # No explicit trade_date: ingest_watchlist_options resolves the latest
+        # REAL trading day from ohlcv_daily itself, so a run on a weekend/
+        # holiday (wall-clock `today`) never orphans this irreplaceable,
+        # non-backfillable snapshot under a date nothing else ever has.
+        written = ingest_watchlist_options(conn)
         print(f"  options snapshot: {written}")
     except Exception as exc:
         print(f"  options snapshot FAILED: {exc}")
+
+    # Live news feed (消息雷達): general finance RSS + per-symbol Google News,
+    # classified into news_items. Display-only discretion layer (no model
+    # feature), so a network hiccup here never blocks the rest of the refresh.
+    try:
+        summary = refresh_news_items(conn)
+        print(f"  news_items: {summary}")
+    except Exception as exc:
+        print(f"  news_items FAILED: {exc}")
 
     run_feature_recompute(conn)
 

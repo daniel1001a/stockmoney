@@ -1,6 +1,29 @@
 import numpy as np
 
-from stockmoney.models.regime import HMMTrack, KMeansGMMTrack, N_REGIMES
+from stockmoney.models.regime import HMMTrack, KMeansGMMTrack, N_REGIMES, describe_regimes
+
+
+def test_describe_regimes_labels_from_centroid_not_id():
+    # (realized_vol, adx, dispersion): calm / neutral / stormy. The id ordering
+    # is deliberately scrambled to prove the label follows the centroid, not id.
+    labels = describe_regimes({2: (0.14, 13.0, 0.35), 0: (0.48, 36.0, 1.2), 1: (0.25, 21.0, 0.7)})
+    assert labels[0] == "高波動趨勢"   # highest vol + highest adx
+    assert labels[2] == "低波動盤整"   # lowest vol + lowest adx
+    assert labels[1] == "中波動"       # middle vol, non-extreme adx
+    # Never up/down direction words -- regimes measure strength, not direction.
+    assert not any("多頭" in v or "空頭" in v for v in labels.values())
+
+
+def test_describe_regimes_two_clusters_and_empty():
+    two = describe_regimes({5: (0.2, 20.0, 0.5), 9: (0.4, 30.0, 0.9)})
+    assert two == {5: "低波動盤整", 9: "高波動趨勢"}
+    assert describe_regimes({}) == {}
+
+
+def test_describe_regimes_equal_adx_drops_trend_suffix():
+    # When ADX centroids tie, no cluster is "trending"/"ranging" -- vol tier only.
+    labels = describe_regimes({0: (0.1, 20.0, 0.5), 1: (0.3, 20.0, 0.5), 2: (0.5, 20.0, 0.5)})
+    assert labels == {0: "低波動", 1: "中波動", 2: "高波動"}
 
 
 def _two_cluster_data(seed=0, n_per=100):

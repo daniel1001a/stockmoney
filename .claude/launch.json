@@ -3,8 +3,8 @@
   "configurations": [
     {
       "name": "fastapi-backend",
-      "runtimeExecutable": "uv",
-      "runtimeArgs": ["run", "uvicorn", "stockmoney.api.main:app", "--reload", "--port", "8000"],
+      "runtimeExecutable": ".venv/bin/python",
+      "runtimeArgs": ["-m", "uvicorn", "stockmoney.api.main:app", "--reload", "--port", "8000"],
       "port": 8000
     },
     {

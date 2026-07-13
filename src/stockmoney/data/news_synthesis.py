@@ -1,0 +1,230 @@
+"""Turn raw RSS articles (news_articles_raw) into the unified, human-facing
+`news_items` feed the 消息雷達 reads.
+
+This is the "constantly updating, more sources" half of the news redesign: the
+RSS ingester (data/ingestion/rss_news.py) pulls fresh free-feed headlines every
+run; this module classifies each one (type / symbol / sentiment / importance),
+keeps only the market-relevant ones for the watchlist, and upserts them into
+news_items with an honest `available_at` look-ahead stamp (the moment we saw
+it, not the article's own timestamp -- CLAUDE.md section 2).
+
+Everything here is lexicon/heuristic, deliberately: it is a discretion-layer
+display aid (CLAUDE.md section 1), never a model feature, so it needs no API
+key and no significance test. Swap the heuristics for the Haiku/Sonnet
+classify+synthesis passes later without changing the news_items contract.
+"""
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass
+from datetime import datetime, timezone
+
+import duckdb
+
+# Watchlist tickers -> the names/aliases that actually appear in headlines.
+COMPANY_ALIASES: dict[str, list[str]] = {
+    "NVDA": ["nvidia", "nvda"],
+    "AVGO": ["broadcom", "avgo"],
+    "AMD": ["amd", "advanced micro"],
+    "TSM": ["tsmc", "taiwan semiconductor", "tsm"],
+    "AAPL": ["apple", "aapl", "iphone"],
+    "MSFT": ["microsoft", "msft", "azure"],
+    "GOOGL": ["alphabet", "google", "googl", "gemini"],
+    "META": ["meta platforms", "facebook", "instagram", " meta ", "meta's"],
+    "AMZN": ["amazon", "amzn", " aws "],
+    "SOXL": ["soxl", "semiconductor etf"],
+    "SOXS": ["soxs"],
+}
+
+EARNINGS_KW = ["earnings", "revenue", "guidance", "quarterly", "q1", "q2", "q3", "q4",
+               "eps", "results", "profit", "forecast", "outlook", "beats", "misses"]
+ANALYST_KW = ["upgrade", "downgrade", "price target", "initiates", "initiated", "overweight",
+              "underweight", "buy rating", "sell rating", "neutral rating", "analyst",
+              "raises target", "cuts target", "reiterates", "outperform"]
+MACRO_KW = ["fed", "fomc", "federal reserve", "inflation", "cpi", "ppi", "jobs report",
+            "nonfarm", "payroll", "interest rate", "rate cut", "rate hike", "treasury",
+            "yield", "gdp", "dollar index", "dxy", "tariff", "powell", "recession"]
+
+POS_KW = ["surge", "soar", "jump", "rally", "beat", "beats", "record", "upgrade", "gains",
+          "climbs", "boost", "strong", "raises", "outperform", "bullish", "tops", "wins"]
+NEG_KW = ["plunge", "plummet", "slump", "drop", "falls", "miss", "misses", "downgrade",
+          "cuts", "weak", "warns", "warning", "lawsuit", "probe", "recall", "bearish",
+          "tumbles", "slides", "sinks", "selloff", "layoffs"]
+BIG_MOVE_KW = ["surge", "plunge", "soar", "crash", "record", "historic", "biggest", "sinks"]
+
+MODEL_VERSION = "news-heuristic-v1"
+
+
+@dataclass
+class NewsItemRow:
+    item_id: str
+    symbol: str | None
+    item_type: str
+    headline: str
+    summary: str | None
+    url: str | None
+    source_name: str | None
+    published_at: datetime
+    sentiment_score: float | None
+    importance: float | None
+    novelty_score: float | None
+    priced_in_estimate: float | None
+    transmission_chain: str | None
+    source_refs: str  # JSON array
+
+
+def _clean(text: str | None) -> str:
+    if not text:
+        return ""
+    # RSS summaries are frequently HTML; strip tags for the short synopsis.
+    return re.sub(r"<[^>]+>", "", text).strip()
+
+
+def tag_symbol(text: str) -> str | None:
+    low = f" {text.lower()} "
+    for symbol, aliases in COMPANY_ALIASES.items():
+        for alias in aliases:
+            if alias in low:
+                return symbol
+    return None
+
+
+def classify_type(text: str, symbol: str | None) -> str:
+    low = text.lower()
+    if any(k in low for k in ANALYST_KW):
+        return "analyst_rating"
+    if any(k in low for k in EARNINGS_KW):
+        return "earnings"
+    if symbol is None and any(k in low for k in MACRO_KW):
+        return "macro"
+    return "headline"
+
+
+def score_sentiment(text: str) -> float | None:
+    low = text.lower()
+    pos = sum(1 for k in POS_KW if k in low)
+    neg = sum(1 for k in NEG_KW if k in low)
+    if pos == 0 and neg == 0:
+        return None
+    return max(-1.0, min(1.0, (pos - neg) / 2.0))
+
+
+def score_importance(text: str, item_type: str) -> float:
+    low = text.lower()
+    base = 0.45
+    if item_type in ("earnings", "analyst_rating", "macro"):
+        base += 0.2
+    if any(k in low for k in BIG_MOVE_KW):
+        base += 0.25
+    return round(min(1.0, base), 2)
+
+
+def _recency_novelty(published_at: datetime, now: datetime) -> float:
+    hours = max(0.0, (now - published_at).total_seconds() / 3600)
+    if hours <= 6:
+        return 0.8
+    if hours <= 24:
+        return 0.6
+    if hours <= 72:
+        return 0.4
+    return 0.2
+
+
+def build_news_items(
+    articles: list[dict], *, now: datetime | None = None, macro_generic: bool = True
+) -> list[NewsItemRow]:
+    """Classify raw articles into news_items rows, keeping only the ones that
+    mention a watchlist name or are clearly macro (everything else is noise for
+    this watchlist-scoped product)."""
+    now = now or datetime.now(timezone.utc)
+    out: list[NewsItemRow] = []
+    for a in articles:
+        title = _clean(a.get("title"))
+        if not title:
+            continue
+        summary = _clean(a.get("summary"))
+        blob = f"{title} {summary}"
+        # A symbol-scoped source (Google News per-ticker query) already knows
+        # the symbol; general feeds are matched from the text.
+        symbol = a.get("symbol_hint") or tag_symbol(blob)
+        item_type = classify_type(blob, symbol)
+        is_macro = item_type == "macro"
+        if symbol is None and not (is_macro and macro_generic):
+            continue  # not about our universe and not a macro story -> drop
+        published = a.get("published_at") or now
+        item = NewsItemRow(
+            item_id=f"rss:{a['article_id']}",
+            symbol=symbol,
+            item_type=item_type,
+            headline=title[:280],
+            summary=(summary[:400] or None),
+            url=a.get("url"),
+            source_name=(a.get("source_name") or "rss").upper(),
+            published_at=published,
+            sentiment_score=score_sentiment(blob),
+            importance=score_importance(blob, item_type),
+            novelty_score=_recency_novelty(published, now),
+            priced_in_estimate=0.5,
+            transmission_chain=None,
+            source_refs=f'["{a["article_id"]}"]',
+        )
+        out.append(item)
+    return out
+
+
+def refresh_news_items(conn: duckdb.DuckDBPyConnection) -> dict:
+    """One-call live refresh used by both scripts/ingest_news.py and the nightly
+    job: pull general + per-symbol RSS, classify, upsert. Kept here so the
+    orchestration is a single import and both callers stay in sync."""
+    from stockmoney.data.ingestion.rss_news import ingest_news
+    from stockmoney.data.ingestion.symbol_news import fetch_symbol_news
+
+    raw_written = ingest_news(conn)
+    rows = conn.execute(
+        """
+        WITH latest AS (
+            SELECT article_id, source_name, title, summary, url, published_at,
+                   row_number() OVER (PARTITION BY article_id ORDER BY ingested_at DESC) AS rn
+            FROM news_articles_raw
+        )
+        SELECT article_id, source_name, title, summary, url, published_at
+        FROM latest WHERE rn = 1 AND title IS NOT NULL
+        ORDER BY published_at DESC NULLS LAST LIMIT 400
+        """
+    ).fetchall()
+    cols = ["article_id", "source_name", "title", "summary", "url", "published_at"]
+    articles = [dict(zip(cols, r)) for r in rows] + fetch_symbol_news()
+    items = build_news_items(articles)
+    upserted = upsert_news_items(conn, items)
+    return {"rss_raw": raw_written, "news_items_upserted": upserted,
+            "symbol_tagged": sum(1 for it in items if it.symbol is not None)}
+
+
+def upsert_news_items(conn: duckdb.DuckDBPyConnection, items: list[NewsItemRow]) -> int:
+    """Idempotent upsert keyed on item_id. Re-running the ingester refreshes a
+    story's scores rather than duplicating it."""
+    now = datetime.now(timezone.utc)
+    n = 0
+    for it in items:
+        conn.execute(
+            """
+            INSERT INTO news_items
+            (item_id, symbol, item_type, headline, summary, url, source_name, published_at,
+             sentiment_score, importance, novelty_score, priced_in_estimate, transmission_chain,
+             source_refs, available_at, created_at)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            ON CONFLICT (item_id) DO UPDATE SET
+                sentiment_score = excluded.sentiment_score,
+                importance = excluded.importance,
+                novelty_score = excluded.novelty_score,
+                summary = excluded.summary
+            """,
+            [
+                it.item_id, it.symbol, it.item_type, it.headline, it.summary, it.url,
+                it.source_name, it.published_at, it.sentiment_score, it.importance,
+                it.novelty_score, it.priced_in_estimate, it.transmission_chain,
+                it.source_refs, now, now,
+            ],
+        )
+        n += 1
+    return n

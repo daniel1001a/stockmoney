@@ -34,6 +34,7 @@ from stockmoney.data.features.options_derived import (
 )
 from stockmoney.data.features.realized_vol import compute_realized_vol_20d
 from stockmoney.data.features.rsi import compute_rsi_14
+from stockmoney.data.features.vix_term import compute_vix_term_features
 from stockmoney.data.features.volume import compute_volume_zscore_20d
 
 
@@ -48,6 +49,7 @@ def run_feature_recompute(conn: duckdb.DuckDBPyConnection) -> None:
         ("gex_estimate", compute_gex_feature),
         ("skew_25delta (+chg_1d)", compute_skew_feature),
         ("put_call_ratio", compute_put_call_ratio_feature),
+        ("vix_term_slope (+back)", compute_vix_term_features),
     ]:
         try:
             n = fn(conn)

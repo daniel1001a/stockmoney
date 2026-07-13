@@ -23,6 +23,61 @@ from sklearn.preprocessing import StandardScaler
 
 N_REGIMES = 3
 
+# Order of the observation vector every track sees, mirroring
+# feature_matrix.REGIME_COLUMNS. Kept here too so describe_regimes() can read a
+# centroid positionally without importing the models.feature_matrix layer.
+REGIME_OBS_COLUMNS = ("realized_vol_20d", "adx_14", "xsec_dispersion")
+
+
+def describe_regimes(centroids: dict[int, tuple[float, float, float]]) -> dict[int, str]:
+    """Map each regime cluster id to a human label derived from its CENTROID.
+
+    Cluster ids from KMeans/GMM/HMM are arbitrary and unstable across fits, so a
+    fixed ``{0: ..., 1: ...}`` map is meaningless on real data. And per CLAUDE.md
+    section 4 a regime measures volatility / trend *strength*, never up/down
+    price direction -- so the label is built from where the cluster sits on the
+    realized-vol and ADX (trend-strength) axes:
+
+        centroids: {regime_id: (realized_vol_20d, adx_14, xsec_dispersion)}
+        -> {regime_id: e.g. "高波動趨勢" / "低波動盤整" / "中波動"}
+
+    Volatility tier comes from the cluster's rank in realized vol (低/中/高波動);
+    the "趨勢" (trending) / "盤整" (ranging) suffix marks the clusters holding the
+    highest / lowest ADX centroid. Pure + deterministic so it is unit-testable
+    without a DB or a fitted model.
+    """
+    ids = list(centroids)
+    if not ids:
+        return {}
+
+    vols = {r: centroids[r][0] for r in ids}
+    adxs = {r: centroids[r][1] for r in ids}
+
+    by_vol = sorted(ids, key=lambda r: vols[r])
+    n = len(ids)
+    vol_tier: dict[int, str] = {}
+    for i, r in enumerate(by_vol):
+        if n >= 3 and i == 0:
+            vol_tier[r] = "低波動"
+        elif n >= 3 and i == n - 1:
+            vol_tier[r] = "高波動"
+        elif n == 2:
+            vol_tier[r] = "高波動" if i == 1 else "低波動"
+        else:
+            vol_tier[r] = "中波動"
+
+    hi_adx, lo_adx = max(adxs.values()), min(adxs.values())
+    labels: dict[int, str] = {}
+    for r in ids:
+        if hi_adx > lo_adx and adxs[r] == hi_adx:
+            suffix = "趨勢"
+        elif hi_adx > lo_adx and adxs[r] == lo_adx:
+            suffix = "盤整"
+        else:
+            suffix = ""
+        labels[r] = vol_tier[r] + suffix
+    return labels
+
 
 class KMeansGMMTrack:
     def __init__(self, method: str = "gmm", n_regimes: int = N_REGIMES, seed: int = 0):

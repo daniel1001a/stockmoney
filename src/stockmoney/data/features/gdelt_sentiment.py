@@ -42,7 +42,15 @@ from stockmoney.data.features.base import FeatureValue, write_features
 # permanently block the real backfilled values from ever being written.
 # Safe to bump: this candidate feature was never added to
 # feature_matrix.FEATURE_COLUMNS, so nothing has trained on v1's values.
-FEATURE_VERSION = "v2"
+# v2 -> v3 (2026-07-12): SAME failure recurred -- v2 was also written all-neutral
+# (build_live.py / an earlier compute_features run happened while
+# event_news_gdelt was still empty on the LIVE DB), so all 551 v2 rows were the
+# 0.0 fallback and the immutability contract blocked the real values captured by
+# the 2026-07-12 GDELT backfill. Bumped so the ablation tests real sentiment, not
+# zeros. (Ordering fix for the future: run scripts/backfill_gdelt.py BEFORE
+# compute_features on a fresh DB, so v3 gets real values on first write and no
+# further bump is needed.) Still a candidate; nothing has trained on it.
+FEATURE_VERSION = "v3"
 AVGTONE_FEATURE = "gdelt_avgtone_1d"
 GOLDSTEIN_FEATURE = "gdelt_goldstein_1d"
 FORWARD_FILL_CAP_DAYS = 3

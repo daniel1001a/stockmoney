@@ -19,6 +19,8 @@ from stockmoney.data.traders import list_active_traders
 from stockmoney.data.watchlist import sector_for_symbol
 from stockmoney.league.context import build_context
 from stockmoney.league.engines import ENGINE_REGISTRY
+from stockmoney.league.grading_options import grade_option_pnl
+from stockmoney.league.option_bridge import build_option_structure
 from stockmoney.models import production
 
 GRADE_LOOKUP_GRACE_DAYS = 5  # mirror daily_prediction_cli: search forward if label_end lands on a holiday
@@ -69,6 +71,11 @@ def run_predictions(
                 skips.append(f"{symbol}/{trader.trader_id}: {skip_reason}")
                 continue
 
+            # Instrument selection is mechanical, applied identically to every
+            # trader's call -- see league/option_bridge.py's module docstring
+            # for why this lives here rather than inside each engine.
+            call.option_structure = build_option_structure(conn, ctx, call)
+
             tp.record_trader_prediction(
                 conn,
                 trader_id=trader.trader_id,
@@ -88,6 +95,7 @@ def run_predictions(
                 regime=ctx.regime,          # shared regime -> per-regime comparability
                 band_k=ctx.band_k,
                 available_at=ctx.available_at,
+                option_structure=call.option_structure,
             )
             summary[trader.trader_id]["recorded"] += 1
 
@@ -113,5 +121,11 @@ def grade_matured(conn: duckdb.DuckDBPyConnection, *, as_of: date | None = None)
             still_pending += 1
             continue
         tp.grade_trader_prediction(conn, p.prediction_id, actual_price=actual_price)
+        # Real option P&L, on the same actual_price the directional grade
+        # just used -- days_held uses the nominal (trade_date, label_end_date)
+        # span, matching backtest_options_pnl.py's convention even when the
+        # grace-window search above found the price a few days later.
+        days_held = (p.label_end_date - p.trade_date).days
+        grade_option_pnl(conn, p.prediction_id, exit_spot=actual_price, days_held=days_held)
         graded += 1
     return {"graded": graded, "still_pending": still_pending}

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, timedelta
 
 import duckdb
 import polars as pl
@@ -22,13 +22,24 @@ _EMPTY_SCHEMA = {
 
 def fetch_ohlcv(symbols: list[str], start: date, end: date) -> pl.DataFrame:
     """Fetch daily OHLCV for ``symbols`` from yfinance and reshape into the
-    long/tidy ``ohlcv_daily`` schema (one row per symbol per trade_date)."""
+    long/tidy ``ohlcv_daily`` schema (one row per symbol per trade_date).
+
+    Both ``start`` and ``end`` are INCLUSIVE from this function's callers'
+    point of view -- but yfinance's own ``end`` parameter is exclusive
+    (confirmed empirically: end=2026-07-10 returns rows only through
+    2026-07-09), so a caller passing today's date as ``end`` would otherwise
+    silently never receive today's own close. Every caller here
+    (nightly_refresh's rolling window, build_live's historical backfill)
+    reasons about ``end`` as "through this date", so the +1 day is applied
+    once, internally, rather than asking every caller to remember yfinance's
+    exclusive convention.
+    """
     import yfinance as yf
 
     data = yf.download(
         symbols,
         start=start,
-        end=end,
+        end=end + timedelta(days=1),
         auto_adjust=False,
         group_by="ticker",
         progress=False,

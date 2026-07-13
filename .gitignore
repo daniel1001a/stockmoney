@@ -21,3 +21,4 @@ data/*.duckdb.wal
 
 # Secrets
 .env
+secrets/

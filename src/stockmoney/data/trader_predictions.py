@@ -57,6 +57,12 @@ class TraderPrediction:
     actual_return: float | None = None
     actual_label: str | None = None
     outcome: str | None = None
+    # Wave D (IMPROVEMENT_PLAN.md §S3): the concrete option instrument chosen
+    # at prediction time (league/option_bridge.py), and its realized P&L once
+    # graded (league/grading_options.py). Both None for 'range' calls or when
+    # no usable entry IV existed that day -- see option_bridge.py.
+    option_structure: dict | None = None
+    option_pnl: float | None = None
 
     # Attributes the review layer (reused attribution helpers) reads. The
     # attribution decompose/verdict functions only touch these + the fields
@@ -98,6 +104,7 @@ def record_trader_prediction(
     regime: int | None = None,
     band_k: float = 0.5,
     available_at: datetime | None = None,
+    option_structure: dict | None = None,
 ) -> str:
     """Idempotent per (trader_id, symbol, trade_date): re-running `predict`
     for a day already recorded returns the existing prediction_id rather than
@@ -118,14 +125,16 @@ def record_trader_prediction(
             prediction_id, trader_id, method_version, trade_date, symbol, sector,
             horizon, label_end_date, direction, conviction, rationale, invalidation,
             regime, entry_price, band_k, grade_vol, engine_payload, available_at,
-            status, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)
+            option_structure, status, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)
         """,
         [
             prediction_id, trader_id, method_version, trade_date, symbol.upper(), sector,
             horizon, label_end_date, direction, conviction, rationale, invalidation,
             regime, entry_price, band_k, grade_vol, json.dumps(engine_payload),
-            available_at or datetime.now(timezone.utc), datetime.now(timezone.utc),
+            available_at or datetime.now(timezone.utc),
+            json.dumps(option_structure) if option_structure is not None else None,
+            datetime.now(timezone.utc),
         ],
     )
     return prediction_id
@@ -135,7 +144,7 @@ _SELECT_COLUMNS = """
     prediction_id, trader_id, method_version, trade_date, symbol, sector, horizon,
     label_end_date, direction, conviction, rationale, invalidation, regime,
     entry_price, band_k, grade_vol, engine_payload, available_at, status,
-    actual_price, actual_return, actual_label, outcome
+    actual_price, actual_return, actual_label, outcome, option_structure, option_pnl
 """
 
 
@@ -145,6 +154,7 @@ def _row_to_prediction(row: tuple) -> TraderPrediction:
         label_end_date, direction, conviction, rationale, invalidation, regime,
         entry_price, band_k, grade_vol, engine_payload_json, available_at, status,
         actual_price, actual_return, actual_label, outcome,
+        option_structure_json, option_pnl,
     ) = row
     return TraderPrediction(
         prediction_id=prediction_id, trader_id=trader_id, method_version=method_version,
@@ -155,6 +165,8 @@ def _row_to_prediction(row: tuple) -> TraderPrediction:
         engine_payload=json.loads(engine_payload_json) if engine_payload_json else {},
         available_at=available_at, status=status, actual_price=actual_price,
         actual_return=actual_return, actual_label=actual_label, outcome=outcome,
+        option_structure=json.loads(option_structure_json) if option_structure_json else None,
+        option_pnl=option_pnl,
     )
 
 
@@ -216,6 +228,19 @@ def grade_trader_prediction(
         WHERE prediction_id = ?
         """,
         [actual_price, actual_return, actual_label, outcome, datetime.now(timezone.utc), prediction_id],
+    )
+
+
+def set_option_pnl(conn: duckdb.DuckDBPyConnection, prediction_id: str, *, option_pnl: float) -> None:
+    """Write the option_pnl computed by league/grading_options.py. Separate
+    from grade_trader_prediction (which sets the directional outcome) because
+    the two are graded from different inputs (a volatility-band label vs an
+    actual repriced option) and grading_options.py needs to run AFTER the
+    directional grade has stamped label_end_date's actual_price, not instead
+    of it."""
+    conn.execute(
+        "UPDATE trader_predictions SET option_pnl = ? WHERE prediction_id = ?",
+        [option_pnl, prediction_id],
     )
 
 

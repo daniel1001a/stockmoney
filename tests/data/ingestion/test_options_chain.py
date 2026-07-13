@@ -120,3 +120,25 @@ def test_ingest_watchlist_options_end_to_end(monkeypatch):
         ("options_derived_daily", "success"),
         ("put_call_ratio_daily", "success"),
     ]
+
+
+def test_ingest_watchlist_options_defaults_to_latest_ohlcv_trading_day(monkeypatch):
+    """Without an explicit trade_date, the snapshot must be stamped with the
+    latest REAL trading day already in ohlcv_daily -- never wall-clock
+    date.today() -- so a run on a weekend/holiday can't orphan this
+    non-backfillable data under a date no other table ever has a row for."""
+    monkeypatch.setattr("yfinance.Ticker", _FakeTicker)
+
+    conn = duckdb.connect(":memory:")
+    run_migrations(conn)
+    real_trading_day = date(2026, 7, 10)  # e.g. the Friday before a "today" that's a Sunday
+    conn.execute(
+        "INSERT INTO ohlcv_daily (symbol, trade_date, close, source, ingested_at) "
+        "VALUES ('NVDA', ?, 100.0, 'test', now())",
+        [real_trading_day],
+    )
+
+    options_chain.ingest_watchlist_options(conn)  # no trade_date passed
+
+    stamped = conn.execute("SELECT DISTINCT trade_date FROM iv_surface_daily").fetchall()
+    assert stamped == [(real_trading_day,)]
