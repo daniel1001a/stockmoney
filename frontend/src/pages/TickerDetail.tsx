@@ -1,7 +1,8 @@
 import { Link, useParams } from 'react-router-dom'
 import { api } from '../lib/api'
 import { useApi } from '../lib/useApi'
-import { DIRECTION_CLASSES, DIRECTION_LABEL, regimeClass, num, pct } from '../lib/format'
+import { refreshIntervalMs } from '../lib/refreshCadence'
+import { DIRECTION_CLASSES, DIRECTION_LABEL, regimeClass, num, pct, signedPct, sentimentLabel, relTime } from '../lib/format'
 import ProbaBar from '../components/ProbaBar'
 import Sparkline from '../components/Sparkline'
 import GlossaryTerm from '../components/GlossaryTerm'
@@ -14,6 +15,8 @@ export default function TickerDetail() {
   const { symbol = '' } = useParams()
   const { data, loading, error } = useApi(() => api.ticker(symbol), [symbol])
   const { data: tradersData } = useApi(() => api.tickerTraders(symbol), [symbol])
+  const { data: quotes } = useApi(api.quotes, [], { refreshMs: () => refreshIntervalMs() })
+  const quote = quotes?.[symbol.toUpperCase()]
 
   const last = data?.price_history?.at(-1)?.close
   const prev = data?.price_history?.at(-2)?.close
@@ -45,6 +48,17 @@ export default function TickerDetail() {
                 )}
               </div>
               <p className="mt-1 text-sm text-neutral-500">{data.sector} · 資料日期 {data.trade_date}</p>
+              {quote?.price != null && (
+                <p className="mt-0.5 text-xs text-neutral-500">
+                  即時 <span className="tabular-nums text-neutral-300">{`$${num(quote.price)}`}</span>
+                  {quote.change_pct !== null && (
+                    <span className={`ml-1 tabular-nums ${quote.change_pct >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
+                      {signedPct(quote.change_pct, 1)}
+                    </span>
+                  )}
+                  {quote.as_of && <span className="ml-1 text-neutral-600">· {relTime(quote.as_of)}(約15分鐘延遲)</span>}
+                </p>
+              )}
             </div>
             <div className="flex items-center gap-2">
               <Chip className={regimeClass(data.regime_label)}>
@@ -125,6 +139,45 @@ export default function TickerDetail() {
                       <NewsRow key={n.item_id} item={n} showSymbol={false} />
                     ))}
                   </div>
+                )}
+              </Card>
+
+              <Card className="p-4">
+                <SectionTitle title="機構評級氛圍" hint="彙總近 30 天的分析師評級/目標價新聞(真實資料);未達最低則數不強行給方向。" />
+                {data.analyst_sentiment.sufficient_data ? (
+                  <div>
+                    {(() => {
+                      const s = sentimentLabel(data.analyst_sentiment.avg_sentiment)
+                      return (
+                        <p className="text-sm">
+                          <span className={`font-medium ${s.cls}`}>{s.label}</span>
+                          <span className="ml-2 text-xs text-neutral-500">
+                            近 30 天 {data.analyst_sentiment.n_scored} 則有情緒標記(共 {data.analyst_sentiment.n_ratings} 則評級新聞)
+                          </span>
+                        </p>
+                      )
+                    })()}
+                    {data.analyst_sentiment.latest_headline && (
+                      <p className="mt-2 text-xs text-neutral-400">
+                        最新:
+                        {data.analyst_sentiment.latest_url ? (
+                          <a href={data.analyst_sentiment.latest_url} target="_blank" rel="noreferrer"
+                             className="ml-1 text-neutral-300 hover:text-neutral-100 hover:underline">
+                            {data.analyst_sentiment.latest_headline}
+                          </a>
+                        ) : (
+                          <span className="ml-1">{data.analyst_sentiment.latest_headline}</span>
+                        )}
+                        {data.analyst_sentiment.latest_published_at && (
+                          <span className="ml-1 text-neutral-600">· {relTime(data.analyst_sentiment.latest_published_at)}</span>
+                        )}
+                      </p>
+                    )}
+                  </div>
+                ) : (
+                  <Empty>
+                    近 30 天分析師評級新聞不足(僅 {data.analyst_sentiment.n_ratings} 則),暫不判斷氛圍。
+                  </Empty>
                 )}
               </Card>
 

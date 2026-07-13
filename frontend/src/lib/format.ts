@@ -51,7 +51,7 @@ export const DIRECTION_CLASSES: Record<string, string> = {
 }
 
 // Regime chip colouring. The API's regime label describes volatility / trend
-// STRENGTH (低波動盤整 / 中波動 / 高波動趨勢), not up/down direction, and is
+// STRENGTH (低波動震盪盤 / 中波動 / 高波動趨勢盤; the market's mode, NOT a stock's up/down call), not up/down direction, and is
 // derived per-fit from each cluster's centroid -- so we colour by the vol tier
 // keyword rather than an exact-string map: high vol = caution (rose), low vol =
 // calm (emerald), otherwise neutral amber.

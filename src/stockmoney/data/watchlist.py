@@ -13,7 +13,8 @@ import duckdb
 # a sector with no computed xsec_dispersion feature, and production.predict_latest
 # would silently return None for a symbol that's actually fully supported.
 _FEATURE_SECTOR_ALIASES = {
-    "semiconductor_etf": "semiconductor",
+    "semiconductor_etf": "semiconductor",  # SOXL / SOXS / SOXX
+    "big_tech_etf": "big_tech",            # QQQ -> the big-tech dispersion group
 }
 
 

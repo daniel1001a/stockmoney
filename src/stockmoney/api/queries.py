@@ -275,6 +275,120 @@ def _latest_catalyst_headlines(conn: duckdb.DuckDBPyConnection) -> dict[str, str
     return {r[0]: r[1] for r in rows}
 
 
+# Only surface news this fresh on the opportunity board. Older items are stale
+# for a same-day trading decision (news decays fast) and made the board feel
+# dead when a symbol's only catalyst_signal was weeks old -- see news_feed's
+# same freshness bound.
+OPPORTUNITY_NEWS_MAX_AGE_DAYS = 10
+
+
+def _latest_symbol_news(
+    conn: duckdb.DuckDBPyConnection, *, max_age_days: int = OPPORTUNITY_NEWS_MAX_AGE_DAYS
+) -> dict[str, dict]:
+    """The single most relevant RECENT headline per symbol, so every opportunity
+    card can show a live news line -- not just the few symbols that happen to
+    have an LLM catalyst_signal. Ranked by importance then recency; bounded to
+    the last `max_age_days` so a stale headline never masquerades as today's
+    reason to trade."""
+    rows = conn.execute(
+        """
+        WITH ranked AS (
+            SELECT symbol, item_id, headline, sentiment_score, importance, published_at,
+                   row_number() OVER (
+                       PARTITION BY symbol
+                       ORDER BY coalesce(importance, 0) DESC, published_at DESC
+                   ) AS rn
+            FROM news_items
+            WHERE symbol IS NOT NULL
+              AND published_at >= now() - (? * INTERVAL 1 DAY)
+        )
+        SELECT symbol, item_id, headline, sentiment_score, importance, published_at
+        FROM ranked WHERE rn = 1
+        """,
+        [max_age_days],
+    ).fetchall()
+    return {
+        r[0]: {
+            "item_id": r[1], "headline": r[2], "sentiment_score": r[3],
+            "importance": r[4], "published_at": r[5],
+        }
+        for r in rows
+    }
+
+
+# "機構情緒" = sell-side analyst ratings/price-target actions we already ingest
+# as news_items(item_type='analyst_rating') — real data, never fabricated. No
+# free source for actual institutional order flow or insider positioning
+# exists (that's the CLAUDE.md-honest answer, not a gap to paper over), so this
+# is explicitly scoped to "what sell-side analysts are saying", not a broader
+# "institutional sentiment" claim.
+ANALYST_SENTIMENT_WINDOW_DAYS = 30
+# Below this many sentiment-scored ratings in the window, don't report a
+# direction at all -- 1 headline swinging from -1 to +1 is noise, not a signal.
+ANALYST_SENTIMENT_MIN_RATINGS = 2
+
+
+def analyst_sentiment_for_symbol(
+    conn: duckdb.DuckDBPyConnection, symbol: str, *, window_days: int = ANALYST_SENTIMENT_WINDOW_DAYS
+) -> dict:
+    """Aggregate recent analyst-rating news into one honest read: average
+    sentiment (None, not 0, when there isn't enough data -- 0 would silently
+    claim "neutral"), the raw count backing it, and the single latest rating
+    headline/link for a human to read themselves."""
+    rows = conn.execute(
+        """
+        SELECT sentiment_score, headline, url, published_at
+        FROM news_items
+        WHERE symbol = ? AND item_type = 'analyst_rating'
+          AND published_at >= now() - (? * INTERVAL 1 DAY)
+        ORDER BY published_at DESC
+        """,
+        [symbol.upper(), window_days],
+    ).fetchall()
+    scored = [r[0] for r in rows if r[0] is not None]
+    n_scored = len(scored)
+    sufficient = n_scored >= ANALYST_SENTIMENT_MIN_RATINGS
+    latest = rows[0] if rows else None
+    return {
+        "n_ratings": len(rows),
+        "n_scored": n_scored,
+        "avg_sentiment": (sum(scored) / n_scored) if sufficient else None,
+        "sufficient_data": sufficient,
+        "latest_headline": latest[1] if latest else None,
+        "latest_url": latest[2] if latest else None,
+        "latest_published_at": latest[3] if latest else None,
+    }
+
+
+def market_analyst_sentiment(
+    conn: duckdb.DuckDBPyConnection, *, window_days: int = ANALYST_SENTIMENT_WINDOW_DAYS
+) -> dict:
+    """Watchlist-wide read for the morning-briefing strip: how many symbols
+    currently have enough analyst-rating coverage to call bullish/bearish/
+    neutral, and the tally. Symbols below ANALYST_SENTIMENT_MIN_RATINGS are
+    excluded entirely rather than counted as neutral -- "no data" and "neutral
+    rating" are different facts."""
+    rows = conn.execute(
+        """
+        SELECT symbol, avg(sentiment_score) AS avg_s, count(*) AS n
+        FROM news_items
+        WHERE item_type = 'analyst_rating' AND sentiment_score IS NOT NULL
+          AND symbol IS NOT NULL
+          AND published_at >= now() - (? * INTERVAL 1 DAY)
+        GROUP BY symbol
+        HAVING count(*) >= ?
+        """,
+        [window_days, ANALYST_SENTIMENT_MIN_RATINGS],
+    ).fetchall()
+    bullish = sum(1 for _, avg_s, _ in rows if avg_s > 0.15)
+    bearish = sum(1 for _, avg_s, _ in rows if avg_s < -0.15)
+    neutral = len(rows) - bullish - bearish
+    return {
+        "n_symbols_covered": len(rows),
+        "bullish": bullish, "neutral": neutral, "bearish": bearish,
+    }
+
+
 def opportunities(conn: duckdb.DuckDBPyConnection) -> list[dict]:
     """Today's (or most-recently-cached) call for every watchlist symbol that
     has one, ranked so the money-making calls come first.
@@ -301,12 +415,17 @@ def opportunities(conn: duckdb.DuckDBPyConnection) -> list[dict]:
     """
     snapshots = _latest_snapshot_rows(conn)
     headlines = _latest_catalyst_headlines(conn)
+    symbol_news = _latest_symbol_news(conn)
     rows = _latest_prediction_rows(conn)
     label_map = regime_label_map(conn)
     items = []
     for r in rows:
         item = _prediction_row_to_dict(r, snapshots.get(r[0]), label_map)
         item["catalyst_headline"] = headlines.get(r[0])
+        # Every symbol with recent news gets a live headline (with a link +
+        # sentiment), so the board reflects the news radar instead of only the
+        # handful of symbols that have an LLM catalyst_signal.
+        item["top_news"] = symbol_news.get(r[0])
         items.append(item)
     return sorted(
         items,
@@ -368,6 +487,7 @@ def ticker_detail(conn: duckdb.DuckDBPyConnection, symbol: str) -> dict | None:
     )
 
     prediction["news"] = news_for_symbol(conn, symbol, limit=8)
+    prediction["analyst_sentiment"] = analyst_sentiment_for_symbol(conn, symbol)
 
     return prediction
 
@@ -590,12 +710,24 @@ _NEWS_COLS = (
 )
 
 
-def news_feed(conn: duckdb.DuckDBPyConnection, *, limit: int = 60) -> list[dict]:
+# News decays fast: a week-old "breaking" headline is noise on a trading feed.
+# Both the radar and the per-symbol list bound to this window so stale items age
+# out on their own instead of needing manual cleanup.
+NEWS_FEED_MAX_AGE_DAYS = 14
+
+
+def news_feed(
+    conn: duckdb.DuckDBPyConnection, *, limit: int = 60, max_age_days: int = NEWS_FEED_MAX_AGE_DAYS
+) -> list[dict]:
     """The 消息雷達 feed: every kind of market-relevant news in one normalised
-    stream, newest first. The frontend filters by type/symbol/search on top of
-    this -- kept server-side simple so the list stays one honest query."""
+    stream, newest first, bounded to the last `max_age_days` so the radar stays
+    current (stale news is worse than no news on a same-day trading surface).
+    The frontend filters by type/symbol/search on top of this."""
     rows = conn.execute(
-        f"SELECT {_NEWS_COLS} FROM news_items ORDER BY published_at DESC LIMIT ?", [limit]
+        f"SELECT {_NEWS_COLS} FROM news_items "
+        "WHERE published_at >= now() - (? * INTERVAL 1 DAY) "
+        "ORDER BY published_at DESC LIMIT ?",
+        [max_age_days, limit],
     ).fetchall()
     return [_news_row_to_dict(r) for r in rows]
 
@@ -607,14 +739,19 @@ def news_item(conn: duckdb.DuckDBPyConnection, item_id: str) -> dict | None:
     return _news_row_to_dict(rows[0]) if rows else None
 
 
-def news_for_symbol(conn: duckdb.DuckDBPyConnection, symbol: str, *, limit: int = 8) -> list[dict]:
+def news_for_symbol(
+    conn: duckdb.DuckDBPyConnection, symbol: str, *, limit: int = 8,
+    max_age_days: int = NEWS_FEED_MAX_AGE_DAYS,
+) -> list[dict]:
     """Per-ticker news list for the detail page (Robinhood-style): the symbol's
-    own items plus market-wide macro items that move everything."""
+    own items plus market-wide macro items that move everything, bounded to the
+    last `max_age_days` (same freshness rule as the radar)."""
     rows = conn.execute(
         f"SELECT {_NEWS_COLS} FROM news_items "
-        "WHERE symbol = ? OR (symbol IS NULL AND item_type = 'macro') "
+        "WHERE (symbol = ? OR (symbol IS NULL AND item_type = 'macro')) "
+        "  AND published_at >= now() - (? * INTERVAL 1 DAY) "
         "ORDER BY published_at DESC LIMIT ?",
-        [symbol.upper(), limit],
+        [symbol.upper(), max_age_days, limit],
     ).fetchall()
     return [_news_row_to_dict(r) for r in rows]
 
@@ -709,6 +846,7 @@ def market_summary(conn: duckdb.DuckDBPyConnection) -> dict:
         "avg_conviction": sum(convictions) / len(convictions) if convictions else None,
         "vix": vix_spot,
         "vix_term_slope": vix_slope,
+        "analyst_sentiment": market_analyst_sentiment(conn),
         "top_gainers": moves[:3],
         "top_losers": list(reversed(moves[-3:])) if len(moves) >= 3 else [],
     }

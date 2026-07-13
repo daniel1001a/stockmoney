@@ -19,6 +19,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from stockmoney.api import queries
 from stockmoney.api.db import ro_connection
+from stockmoney.api.live_quotes import get_quotes
 
 app = FastAPI(title="stockmoney API", description="Read-only decision-support data. Never places orders.")
 
@@ -57,6 +58,17 @@ def watchlist() -> dict:
 def opportunities() -> list[dict]:
     with ro_connection() as conn:
         return queries.opportunities(conn)
+
+
+@app.get("/api/quotes")
+def quotes() -> dict[str, dict]:
+    """Live (yfinance free-tier, ~15min-delayed) price overlay for the whole
+    watchlist -- a pure price read, never fed into any model/prediction (see
+    live_quotes.py module docstrings). Server-side cached so N open tabs
+    polling this on refreshCadence.py's cadence share one upstream fetch."""
+    with ro_connection() as conn:
+        symbols = [row["symbol"] for row in queries.watchlist_core(conn)]
+    return get_quotes(symbols)
 
 
 @app.get("/api/ticker/{symbol}")

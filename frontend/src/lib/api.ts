@@ -43,6 +43,13 @@ export interface Opportunity {
   model_version: string
   backtest: Backtest | null
   catalyst_headline: string | null
+  top_news: {
+    item_id: string
+    headline: string
+    sentiment_score: number | null
+    importance: number | null
+    published_at: string
+  } | null
 }
 
 export interface CatalystDetail {
@@ -91,12 +98,30 @@ export interface TickerDetail extends Omit<Opportunity, 'catalyst_headline'> {
   price_history: PricePoint[]
   catalyst: CatalystDetail | null
   news: NewsItem[]
+  analyst_sentiment: AnalystSentiment
 }
 
 export interface MarketMover {
   symbol: string
   close: number
   change_pct: number
+}
+
+export interface MarketAnalystSentiment {
+  n_symbols_covered: number
+  bullish: number
+  neutral: number
+  bearish: number
+}
+
+export interface AnalystSentiment {
+  n_ratings: number
+  n_scored: number
+  avg_sentiment: number | null
+  sufficient_data: boolean
+  latest_headline: string | null
+  latest_url: string | null
+  latest_published_at: string | null
 }
 
 export interface MarketSummary {
@@ -108,6 +133,7 @@ export interface MarketSummary {
   avg_conviction: number | null
   vix: number | null
   vix_term_slope: number | null
+  analyst_sentiment: MarketAnalystSentiment
   top_gainers: MarketMover[]
   top_losers: MarketMover[]
 }
@@ -142,6 +168,8 @@ export interface LeaderboardEntry {
   hit_rate: number | null
   brier: number | null
   n_directional: number
+  option_win_rate: number | null
+  avg_option_pnl: number | null
 }
 
 export interface TraderTrade {
@@ -389,8 +417,16 @@ async function getJsonOrNull<T>(path: string): Promise<T | null> {
   return res.json() as Promise<T>
 }
 
+export interface Quote {
+  price: number | null
+  prev_close: number | null
+  change_pct: number | null
+  as_of: string | null
+}
+
 export const api = {
   opportunities: () => getJson<Opportunity[]>('/opportunities'),
+  quotes: () => getJson<Record<string, Quote>>('/quotes'),
   ticker: (symbol: string) => getJson<TickerDetail>(`/ticker/${encodeURIComponent(symbol)}`),
   predictions: () => getJson<PredictionsOverview>('/predictions'),
   positions: () => getJson<PositionRisk[]>('/positions'),

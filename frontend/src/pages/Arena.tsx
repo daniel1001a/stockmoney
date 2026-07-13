@@ -1,9 +1,7 @@
 import { Link } from 'react-router-dom'
-import { api, type LeaderboardEntry, type PositionRisk, type DivergenceRow } from '../lib/api'
+import { api, type LeaderboardEntry, type DivergenceRow } from '../lib/api'
 import { useApi } from '../lib/useApi'
-import {
-  DIRECTION_LABEL, RISK_LIGHT_CLASSES, RISK_LIGHT_LABEL, money, pct, num,
-} from '../lib/format'
+import { DIRECTION_LABEL, money, pct } from '../lib/format'
 import { Card, SectionTitle, Return, Loading, ErrorMsg, Empty } from '../components/ui'
 
 function RulesBanner() {
@@ -32,6 +30,7 @@ function Leaderboard({ rows }: { rows: LeaderboardEntry[] }) {
             <th className="px-3 py-2.5 text-right font-normal">已實現報酬</th>
             <th className="px-3 py-2.5 text-right font-normal">帳戶淨值</th>
             <th className="px-3 py-2.5 text-right font-normal">交易勝率</th>
+            <th className="px-3 py-2.5 text-right font-normal">選擇權勝率</th>
             <th className="px-3 py-2.5 text-right font-normal">方向命中率</th>
             <th className="px-3 py-2.5 text-right font-normal">持倉</th>
           </tr>
@@ -52,6 +51,9 @@ function Leaderboard({ rows }: { rows: LeaderboardEntry[] }) {
                 {r.trade_win_rate !== null ? `${pct(r.trade_win_rate)}` : '—'}
                 <span className="ml-1 text-xs text-neutral-600">{r.n_closed}筆</span>
               </td>
+              <td className="px-3 py-3 text-right tabular-nums text-neutral-300" title="到期用真實選擇權定價算的勝率(含 theta/IV 影響)">
+                {r.option_win_rate !== null ? pct(r.option_win_rate) : '—'}
+              </td>
               <td className="px-3 py-3 text-right tabular-nums text-neutral-400">
                 {r.hit_rate !== null ? pct(r.hit_rate) : '—'}
               </td>
@@ -60,31 +62,6 @@ function Leaderboard({ rows }: { rows: LeaderboardEntry[] }) {
           ))}
         </tbody>
       </table>
-    </div>
-  )
-}
-
-function PositionsPanel({ rows }: { rows: PositionRisk[] }) {
-  if (rows.length === 0) return <Empty>目前沒有你自己的未平倉選擇權部位。</Empty>
-  return (
-    <div className="space-y-2">
-      {rows.map((p) => (
-        <div key={p.position_id} className="flex flex-wrap items-center gap-x-4 gap-y-1 rounded-lg border border-neutral-800 bg-neutral-900/60 px-3 py-2.5">
-          <span className={`h-2.5 w-2.5 rounded-full ${RISK_LIGHT_CLASSES[p.light]}`} title={RISK_LIGHT_LABEL[p.light]} />
-          <Link to={`/ticker/${p.symbol}`} className="font-semibold text-neutral-100 hover:text-neutral-300">{p.symbol}</Link>
-          <span className="text-xs text-neutral-400">
-            {p.side === 'long' ? '買' : '賣'}{p.option_right === 'call' ? ' Call' : ' Put'}
-          </span>
-          <span className="text-xs text-neutral-500">進場 ${num(p.entry_underlying_price)} · 現價 ${num(p.current_underlying_price)}</span>
-          <span className="ml-auto text-xs">
-            {p.triggers.length > 0 ? (
-              <span className="text-amber-300">{p.triggers.map((t) => t.detail).join(' · ')}</span>
-            ) : (
-              <span className="text-neutral-600">燈號:{RISK_LIGHT_LABEL[p.light]}</span>
-            )}
-          </span>
-        </div>
-      ))}
     </div>
   )
 }
@@ -129,7 +106,6 @@ function DivergencePanel({ rows }: { rows: DivergenceRow[] }) {
 
 export default function Arena() {
   const { data: board, loading, error } = useApi(api.leaderboard)
-  const { data: positions } = useApi(api.positions)
   const { data: divergence } = useApi(() => api.divergence(), [])
 
   return (
@@ -137,29 +113,25 @@ export default function Arena() {
       <div className="mb-5">
         <h1 className="text-2xl font-bold text-neutral-50">交易員競技場</h1>
         <p className="mt-1 text-sm text-neutral-500">
-          每個流派操一個模擬選擇權帳戶競賽,持續出手、對帳、進步。點交易員看他的完整帳戶、持倉與交易紀錄。
+          六個流派各操一個 $25,000 模擬選擇權帳戶,持續出手、到期用真實選擇權損益對帳。看似比賽,實則是模型策略強弱的即時視覺化——現在哪套邏輯在賺錢一眼看穿。點交易員看他的完整帳戶、持倉與每筆交易紀錄。
         </p>
       </div>
 
       <RulesBanner />
 
       <section className="mb-8">
-        <SectionTitle title="排行榜" hint="以已實現報酬率排名;命中率、勝率、持倉為輔助欄位。" />
+        <SectionTitle title="排行榜" hint="以已實現報酬率排名。「交易勝率」是模擬帳戶的實際輸贏;「選擇權勝率」用真實選擇權定價算(方向對但 theta/IV 崩仍可能賠);「方向命中率」只看漲跌判斷對不對。" />
         {loading && <Loading />}
         {error && <ErrorMsg error={error} />}
         {board && <Leaderboard rows={board} />}
       </section>
 
-      <div className="grid grid-cols-1 gap-6 lg:grid-cols-2">
+      <section>
+        <SectionTitle title="跨交易員分歧雷達" hint="有人看多、有人看空 = 有價值的訊息(CLAUDE.md §8):市場正在用消息篩選贏家輸家。" />
         <Card className="p-4">
-          <SectionTitle title="你的持倉風控" hint="你自己的未平倉選擇權(非模擬),🟢正常 🟡接近 🔴已觸發。" />
-          {positions && <PositionsPanel rows={positions} />}
-        </Card>
-        <Card className="p-4">
-          <SectionTitle title="跨交易員分歧雷達" hint="有人看多、有人看空 = 有價值的訊息(CLAUDE.md §8)。" />
           {divergence && <DivergencePanel rows={divergence} />}
         </Card>
-      </div>
+      </section>
     </div>
   )
 }

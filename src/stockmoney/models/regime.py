@@ -39,12 +39,17 @@ def describe_regimes(centroids: dict[int, tuple[float, float, float]]) -> dict[i
     realized-vol and ADX (trend-strength) axes:
 
         centroids: {regime_id: (realized_vol_20d, adx_14, xsec_dispersion)}
-        -> {regime_id: e.g. "高波動趨勢" / "低波動盤整" / "中波動"}
+        -> {regime_id: e.g. "高波動趨勢盤" / "低波動震盪盤" / "中波動"}
 
-    Volatility tier comes from the cluster's rank in realized vol (低/中/高波動);
-    the "趨勢" (trending) / "盤整" (ranging) suffix marks the clusters holding the
-    highest / lowest ADX centroid. Pure + deterministic so it is unit-testable
-    without a DB or a fitted model.
+    Volatility tier comes from the cluster's rank in realized vol (低/中/高波動).
+    The market-mode suffix marks the clusters holding the highest / lowest ADX
+    centroid: "趨勢盤" (a trending/directional MARKET session -- not up vs down,
+    just "moving with conviction") vs "震盪盤" (a choppy, back-and-forth market).
+    Deliberately NOT "盤整": that word is the per-stock DIRECTION label
+    (up/down/range), and a regime describes the whole market's mode, not any one
+    stock's call -- reusing it made "why is a 趨勢 regime showing a 盤整
+    direction?" read as a contradiction when it is not (a stock can range inside
+    a trending market). Pure + deterministic so it is unit-testable without a DB.
     """
     ids = list(centroids)
     if not ids:
@@ -70,9 +75,9 @@ def describe_regimes(centroids: dict[int, tuple[float, float, float]]) -> dict[i
     labels: dict[int, str] = {}
     for r in ids:
         if hi_adx > lo_adx and adxs[r] == hi_adx:
-            suffix = "趨勢"
+            suffix = "趨勢盤"
         elif hi_adx > lo_adx and adxs[r] == lo_adx:
-            suffix = "盤整"
+            suffix = "震盪盤"
         else:
             suffix = ""
         labels[r] = vol_tier[r] + suffix
