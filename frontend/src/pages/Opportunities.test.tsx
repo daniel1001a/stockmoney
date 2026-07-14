@@ -1,18 +1,23 @@
 import { describe, expect, it, vi } from 'vitest'
-import { render, screen, waitFor } from '@testing-library/react'
+import { render, screen, waitFor, fireEvent } from '@testing-library/react'
 import { MemoryRouter } from 'react-router-dom'
 import Opportunities from './Opportunities'
 import { api, type CockpitCard, type Briefing, type Quote } from '../lib/api'
 
 vi.mock('../lib/api')
 
-const card = (symbol: string, sector: string, gate: 'green' | 'red' | 'unknown' = 'green'): CockpitCard => ({
+const card = (
+  symbol: string,
+  sector: string,
+  gate: 'green' | 'red' | 'unknown' = 'green',
+  breakoutState = '區間內盤整',
+): CockpitCard => ({
   symbol,
   sector,
   as_of_date: '2026-07-10',
   price: 178.0,
   levels: { nday_high: 190, nday_low: 160, prev_high: 180, prev_low: 175, sma20: 172, sma50: 168 },
-  breakout_state: '區間內盤整',
+  breakout_state: breakoutState,
   regime: '高波動趨勢盤',
   top_news: {
     item_id: 'n1', headline: 'Some fresh headline about ' + symbol, sentiment_score: 0.4,
@@ -35,6 +40,9 @@ const briefing: Briefing = {
   sector_rotation: [
     { sector: 'semiconductor', sector_label: '半導體', n_symbols: 2, ret_1d_avg: 0.012, ret_5d_avg: 0.03, rank: 1 },
   ],
+  vix: 18.2,
+  vix_term_slope: 0.3,
+  breadth: { up: 1, down: 1, flat: 0 },
   guardrail: '無方向 edge;賣方收租是唯一微弱正 edge;做多贏過一切 —— 本工具輔助你的判斷,不預測方向。',
   market_lines: ['核心觀察清單 2 檔中,主導 regime 為「高波動趨勢盤」。'],
   symbol_lines: ['NVDA 現價 178.00;今日觀察 20 日區間 160~190。', 'AMD 現價 178.00;今日觀察 20 日區間 160~190。'],
@@ -65,8 +73,8 @@ describe('Opportunities', () => {
     expect(screen.getAllByText('區間內盤整').length).toBeGreaterThan(0)
     // The daily briefing narrative paragraph renders.
     expect(screen.getByText(/主導市場狀態為「高波動趨勢盤」/)).toBeInTheDocument()
-    // Sector rotation panel renders.
-    expect(screen.getByText('半導體')).toBeInTheDocument()
+    // Sector rotation panel renders (also appears per-card as the sector label).
+    expect(screen.getAllByText('半導體').length).toBeGreaterThan(0)
     // Per-card volume + sector-linkage badges render.
     expect(screen.getAllByText(/放量/).length).toBeGreaterThan(0)
     expect(screen.getAllByText('跟隨板塊同步').length).toBeGreaterThan(0)
@@ -93,5 +101,52 @@ describe('Opportunities', () => {
 
     await waitFor(() => expect(screen.getByText('$185.50')).toBeInTheDocument())
     expect(screen.getByText('+4.2%')).toBeInTheDocument()
+  })
+
+  it('defaults to posture grouping and buckets cards by breakout_state, never predicting direction', async () => {
+    vi.mocked(api.cockpit).mockResolvedValue([
+      card('NVDA', 'semiconductor', 'green', '站上前日高點'),
+      card('AMD', 'semiconductor', 'green', '區間內盤整'),
+      card('SOXS', 'semiconductor_etf', 'green', '跌破前日低點'),
+    ])
+    vi.mocked(api.briefing).mockResolvedValue(briefing)
+    vi.mocked(api.quotes).mockResolvedValue({})
+
+    render(<MemoryRouter><Opportunities /></MemoryRouter>)
+
+    await waitFor(() => expect(screen.getAllByText('NVDA').length).toBeGreaterThan(0))
+    // Honest posture-section framing, never a forecast.
+    expect(screen.getByText(/當前姿態.*非漲跌預測/)).toBeInTheDocument()
+    expect(screen.getByText(/偏強姿態/)).toBeInTheDocument()
+    expect(screen.getAllByText(/中性/).length).toBeGreaterThan(0)
+    expect(screen.getByText(/偏弱姿態/)).toBeInTheDocument()
+  })
+
+  it('collapses the sell-put box to a one-line summary by default and expands the reason on click', async () => {
+    vi.mocked(api.cockpit).mockResolvedValue([card('NVDA', 'semiconductor', 'red')])
+    vi.mocked(api.briefing).mockResolvedValue(briefing)
+    vi.mocked(api.quotes).mockResolvedValue({})
+
+    render(<MemoryRouter><Opportunities /></MemoryRouter>)
+
+    await waitFor(() => expect(screen.getByText(/🔴 賣方閘門關/)).toBeInTheDocument())
+    // Reason detail is not shown until expanded.
+    expect(screen.queryByText('閘門建議空手')).not.toBeInTheDocument()
+
+    fireEvent.click(screen.getByText('詳情 ▼'))
+
+    expect(screen.getByText('閘門建議空手')).toBeInTheDocument()
+  })
+
+  it('shows a compact VIX / term-structure / breadth stats strip', async () => {
+    vi.mocked(api.cockpit).mockResolvedValue([card('NVDA', 'semiconductor')])
+    vi.mocked(api.briefing).mockResolvedValue(briefing)
+    vi.mocked(api.quotes).mockResolvedValue({})
+
+    render(<MemoryRouter><Opportunities /></MemoryRouter>)
+
+    await waitFor(() => expect(screen.getByText('18.2')).toBeInTheDocument())
+    expect(screen.getByText(/1漲/)).toBeInTheDocument()
+    expect(screen.getByText(/1跌/)).toBeInTheDocument()
   })
 })

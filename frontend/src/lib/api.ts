@@ -457,6 +457,14 @@ export interface Briefing {
   narrative: string
   narrative_basis: 'macro_news' | 'fallback_regime_sector'
   sector_rotation: SectorRotationEntry[]
+  // Compact market-stats strip inputs (v2 homepage iteration): VIX level +
+  // term-structure mood plus a plain up/down/flat breadth count across the
+  // watchlist -- both already backing `narrative` above, just also exposed
+  // as structured fields so the frontend can render a small stats strip
+  // instead of re-parsing the narrative sentence.
+  vix: number | null
+  vix_term_slope: number | null
+  breadth: { up: number; down: number; flat: number }
   guardrail: string
   market_lines: string[]
   symbol_lines: string[]

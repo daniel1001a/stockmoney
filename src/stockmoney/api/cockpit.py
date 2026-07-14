@@ -691,6 +691,26 @@ def build_briefing(conn: duckdb.DuckDBPyConnection) -> dict:
 
     lines = [_level_line(c) for c in cards]
 
+    # v2 item (homepage stats strip): plain counts of watchlist names that
+    # closed up/down/flat today, reusing the exact same `returns` used for
+    # sector_rotation above -- so this is a descriptive breadth READ ("how
+    # many names moved which way today"), not a re-derivation of the old
+    # per-symbol "direction" prediction column build_narrative deliberately
+    # avoids. Together with VIX + term-structure mood (already computed in
+    # `market`) this backs the compact market-stats strip on the homepage,
+    # freeing up the space the old, taller sector-rotation panel used.
+    breadth = {"up": 0, "down": 0, "flat": 0}
+    for r in returns.values():
+        ret = r.get("ret_1d")
+        if ret is None:
+            continue
+        if ret > 0:
+            breadth["up"] += 1
+        elif ret < 0:
+            breadth["down"] += 1
+        else:
+            breadth["flat"] += 1
+
     return {
         "as_of_date": market["as_of_date"],
         "headline": breadth_line,
@@ -703,6 +723,12 @@ def build_briefing(conn: duckdb.DuckDBPyConnection) -> dict:
         # v2 item 5: sector-rotation ranking (today's + trailing-5-day avg
         # return per sector), strongest first.
         "sector_rotation": rotation,
+        # Compact market-stats strip inputs: VIX level + term-structure mood
+        # (same fields build_narrative already reads off `market`) plus the
+        # breadth count above.
+        "vix": market["vix"],
+        "vix_term_slope": market["vix_term_slope"],
+        "breadth": breadth,
         "guardrail": (
             "無方向 edge;賣方收租是唯一微弱正 edge;做多贏過一切 —— "
             "本工具輔助你的判斷,不預測方向。"

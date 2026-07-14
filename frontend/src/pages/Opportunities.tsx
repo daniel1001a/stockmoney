@@ -77,6 +77,7 @@ function DailyBriefing({ b }: { b: Briefing }) {
       </details>
 
       {b.sector_rotation.length > 0 && <SectorRotationPanel rotation={b.sector_rotation} />}
+      <MarketStatsStrip b={b} />
 
       <button
         type="button"
@@ -101,38 +102,65 @@ function DailyBriefing({ b }: { b: Briefing }) {
 }
 
 // --- Sector rotation panel (v2 item 5) ---------------------------------------
+// Shrunk from a stacked-bar panel to a single row of compact pills: each
+// sector's 1-day return (and 5-day on hover-width tooltip via title attr)
+// as one small chip instead of a full-width bar row. Frees vertical space
+// on the homepage for MarketStatsStrip below without losing the "where is
+// money moving today" read.
 
 function SectorRotationPanel({ rotation }: { rotation: SectorRotationEntry[] }) {
-  const maxAbs = Math.max(0.001, ...rotation.map((r) => Math.abs(r.ret_1d_avg)))
   return (
-    <div className="mt-3 rounded-lg border border-neutral-800/70 bg-neutral-950/40 p-3">
-      <div className="mb-2 flex items-center gap-1.5">
+    <div className="mt-3 rounded-lg border border-neutral-800/70 bg-neutral-950/40 p-2.5">
+      <div className="mb-1.5 flex items-center gap-1.5">
         <GlossaryTerm term="sector_rotation" className="text-xs font-medium text-neutral-300">
           板塊輪動(資金今天在哪)
         </GlossaryTerm>
       </div>
-      <div className="space-y-1.5">
-        {rotation.map((r) => {
-          const positive = r.ret_1d_avg >= 0
-          const widthPct = Math.min(100, (Math.abs(r.ret_1d_avg) / maxAbs) * 100)
-          return (
-            <div key={r.sector} className="flex items-center gap-2 text-xs">
-              <span className="w-20 shrink-0 text-neutral-400">{r.sector_label}</span>
-              <div className="relative h-3 flex-1 rounded bg-neutral-900">
-                <div
-                  className={`absolute top-0 h-3 rounded ${positive ? 'left-1/2 bg-emerald-500/60' : 'right-1/2 bg-rose-500/60'}`}
-                  style={{ width: `${widthPct / 2}%` }}
-                />
-                <div className="absolute left-1/2 top-0 h-3 w-px bg-neutral-700" />
-              </div>
-              <Return value={r.ret_1d_avg} digits={1} className="w-14 shrink-0 text-right" />
-              <span className="w-20 shrink-0 text-right text-neutral-500">
-                5日{r.ret_5d_avg !== null ? <Return value={r.ret_5d_avg} digits={1} /> : '—'}
-              </span>
-            </div>
-          )
-        })}
+      <div className="flex flex-wrap gap-1.5">
+        {rotation.map((r) => (
+          <div
+            key={r.sector}
+            title={`5日均${r.ret_5d_avg !== null ? signedPct(r.ret_5d_avg, 1) : '—'}`}
+            className="flex items-center gap-1.5 rounded-md border border-neutral-800 bg-neutral-900/60 px-2 py-1 text-xs"
+          >
+            <span className="text-neutral-400">{r.sector_label}</span>
+            <Return value={r.ret_1d_avg} digits={1} />
+          </div>
+        ))}
       </div>
+    </div>
+  )
+}
+
+// --- Market stats strip (v2 homepage iteration) -------------------------
+// Compact replacement for the vertical space the old, taller sector-rotation
+// panel used to dominate: VIX level + term-structure mood + today's
+// up/down breadth across the watchlist. All three numbers are already
+// computed server-side for the narrative paragraph -- this just also
+// surfaces them as small stat tiles for a glance-able read.
+
+function MarketStatsStrip({ b }: { b: Briefing }) {
+  const moodLabel = b.vix === null ? '資料不足' : (b.vix_term_slope ?? 0) < 0 ? '偏恐慌後仰' : '平靜正常'
+  return (
+    <div className="mt-3 grid grid-cols-3 gap-1.5 text-center">
+      <div className="rounded-lg border border-neutral-800/70 bg-neutral-950/40 px-2 py-1.5">
+        <div className="text-[11px] text-neutral-500">VIX</div>
+        <div className="mt-0.5 text-sm font-semibold tabular-nums text-neutral-100">
+          {b.vix !== null ? b.vix.toFixed(1) : '—'}
+        </div>
+      </div>
+      <GlossaryTerm term="vix_term_mood" className="rounded-lg border border-neutral-800/70 bg-neutral-950/40 px-2 py-1.5">
+        <div className="text-[11px] text-neutral-500">期限結構</div>
+        <div className="mt-0.5 text-sm font-semibold text-neutral-100">{moodLabel}</div>
+      </GlossaryTerm>
+      <GlossaryTerm term="market_breadth" className="rounded-lg border border-neutral-800/70 bg-neutral-950/40 px-2 py-1.5">
+        <div className="text-[11px] text-neutral-500">今日漲跌家數</div>
+        <div className="mt-0.5 text-sm font-semibold tabular-nums text-neutral-100">
+          <span className="text-emerald-300">{b.breadth.up}漲</span>
+          {' / '}
+          <span className="text-rose-300">{b.breadth.down}跌</span>
+        </div>
+      </GlossaryTerm>
     </div>
   )
 }
@@ -195,6 +223,43 @@ function SignalRow({ card }: { card: CockpitCard }) {
   )
 }
 
+// Collapsed by default (v2: cards were getting cluttered) -- shows just the
+// gate light + suggested strike on one line; click reveals the full
+// reason/detail text. Click handling stops propagation + prevents default so
+// it doesn't also trigger the card's outer <Link> navigation.
+function SellPutBox({ sellput }: { sellput: CockpitCard['sellput'] }) {
+  const [open, setOpen] = useState(false)
+  if (!sellput) return null
+  return (
+    <div className="mt-3 rounded-lg border border-neutral-800/70 p-2.5">
+      <button
+        type="button"
+        onClick={(e) => {
+          e.preventDefault()
+          e.stopPropagation()
+          setOpen((o) => !o)
+        }}
+        className="flex w-full items-center justify-between gap-2 text-left"
+      >
+        <span className="flex min-w-0 items-center gap-1.5 text-xs">
+          <Chip className={GATE_CLASS[sellput.gate_light]}>{GATE_LABEL[sellput.gate_light]}</Chip>
+          <span className="truncate text-neutral-300">履約價 ~{num(sellput.strike)}</span>
+        </span>
+        <span className="shrink-0 text-xs text-neutral-600">{open ? '收起 ▲' : '詳情 ▼'}</span>
+      </button>
+      {open && (
+        <div className="mt-2 border-t border-neutral-800/70 pt-2">
+          <div className="text-xs text-neutral-500">賣 put 收租構想(示意)</div>
+          <div className="mt-1 text-sm text-neutral-200">
+            履約價 ~{num(sellput.strike)}(現價 -{(sellput.otm_pct * 100).toFixed(0)}% OTM)
+          </div>
+          <p className="mt-1 text-xs text-neutral-500">{sellput.reason}</p>
+        </div>
+      )}
+    </div>
+  )
+}
+
 function DecisionCard({ card, quote }: { card: CockpitCard; quote: Quote | undefined }) {
   return (
     <Link
@@ -232,25 +297,59 @@ function DecisionCard({ card, quote }: { card: CockpitCard; quote: Quote | undef
 
       <div className="mt-3"><WhyLine card={card} /></div>
 
-      {card.sellput && (
-        <div className="mt-3 rounded-lg border border-neutral-800/70 p-2.5">
-          <div className="flex items-center justify-between">
-            <span className="text-xs text-neutral-500">賣 put 收租構想(示意)</span>
-            <Chip className={GATE_CLASS[card.sellput.gate_light]}>{GATE_LABEL[card.sellput.gate_light]}</Chip>
-          </div>
-          <div className="mt-1 text-sm text-neutral-200">
-            履約價 ~{num(card.sellput.strike)}(現價 -{(card.sellput.otm_pct * 100).toFixed(0)}% OTM)
-          </div>
-          <p className="mt-1 text-xs text-neutral-500">{card.sellput.reason}</p>
-        </div>
-      )}
+      <SellPutBox sellput={card.sellput} />
     </Link>
   )
 }
 
 // --- Page ---------------------------------------------------------------
 
-type SortKey = 'symbol' | 'sector'
+type SortKey = 'posture' | 'sector' | 'symbol'
+
+// v2 homepage default: group by "current posture" -- purely descriptive of
+// where price sits relative to its own recent range/prior day (the same
+// breakout_state string already shown as a chip on each card), NEVER a
+// forecast of which way it goes next. breakout_state strings come straight
+// from cockpit.py's breakout_state(); unrecognized/missing values fall back
+// to the neutral bucket per the task's fallback rule.
+type PostureKey = 'strong' | 'neutral' | 'weak'
+
+const POSTURE_OF_STATE: Record<string, PostureKey> = {
+  創新高: 'strong',
+  接近區間高點: 'strong',
+  站上前日高點: 'strong',
+  區間內盤整: 'neutral',
+  創新低: 'weak',
+  接近區間低點: 'weak',
+  跌破前日低點: 'weak',
+}
+
+const POSTURE_SECTION: Record<PostureKey, { title: string; hint: string }> = {
+  strong: { title: '偏強姿態(站上關鍵價/突破)', hint: '現價站上前日高點、20日高點附近,或創新高——描述現在位置,非漲跌預測。' },
+  neutral: { title: '中性(區間內)', hint: '現價落在近期區間或關鍵均線附近,尚未站上或跌破關鍵價。' },
+  weak: { title: '偏弱姿態(跌破關鍵價)', hint: '現價跌破前日低點、20日低點附近,或創新低——描述現在位置,非漲跌預測。' },
+}
+
+function postureOf(state: string): PostureKey {
+  return POSTURE_OF_STATE[state] ?? 'neutral'
+}
+
+// "Strength" within a posture group = how far price has already travelled
+// past the level that defines that posture, combined with today's volume
+// ratio (both already on the card) -- e.g. a name 3% above its prior-day
+// high on 2x volume reads as more "extended" than one just barely above it
+// on thin volume. Purely a display-ordering heuristic, not a new signal.
+function strengthScore(card: CockpitCard): number {
+  const { price, levels } = card
+  if (price === null) return 0
+  const posture = postureOf(card.breakout_state)
+  const refLevel = posture === 'strong' ? levels.prev_high ?? levels.nday_high
+    : posture === 'weak' ? levels.prev_low ?? levels.nday_low
+    : null
+  const extension = refLevel !== null && refLevel !== 0 ? Math.abs((price - refLevel) / refLevel) : 0
+  const volRatio = card.volume_signal.ratio ?? 1
+  return extension * volRatio
+}
 
 export default function Opportunities() {
   // Market-hours-aware silent refresh (see refreshCadence.ts): fastest in the
@@ -260,13 +359,23 @@ export default function Opportunities() {
   const { data: briefing } = useApi(api.briefing, [], cadence)
   const { data: quotes } = useApi(api.quotes, [], cadence)
 
-  const [sort, setSort] = useState<SortKey>('sector')
+  const [sort, setSort] = useState<SortKey>('posture')
   const sorted = useMemo(() => {
     if (!data) return []
     const s = [...data]
     if (sort === 'symbol') s.sort((a, b) => a.symbol.localeCompare(b.symbol))
-    else s.sort((a, b) => a.sector.localeCompare(b.sector) || a.symbol.localeCompare(b.symbol))
+    else if (sort === 'sector') s.sort((a, b) => a.sector.localeCompare(b.sector) || a.symbol.localeCompare(b.symbol))
     return s
+  }, [data, sort])
+
+  const postureGroups = useMemo(() => {
+    if (sort !== 'posture' || !data) return null
+    const buckets: Record<PostureKey, CockpitCard[]> = { strong: [], neutral: [], weak: [] }
+    for (const card of data) buckets[postureOf(card.breakout_state)].push(card)
+    for (const key of Object.keys(buckets) as PostureKey[]) {
+      buckets[key].sort((a, b) => strengthScore(b) - strengthScore(a) || a.symbol.localeCompare(b.symbol))
+    }
+    return buckets
   }, [data, sort])
 
   return (
@@ -292,9 +401,20 @@ export default function Opportunities() {
           <div className="mb-3 flex items-center justify-between">
             <SectionTitle
               title="核心觀察清單"
-              hint="固定深度追蹤的全部核心標的,依板塊分組。點卡片看完整分析與新聞。"
+              hint={
+                sort === 'posture'
+                  ? '當前姿態(描述現在價格在哪,非漲跌預測)——依站上/區間內/跌破關鍵價分組。點卡片看完整分析與新聞。'
+                  : '固定深度追蹤的全部核心標的。點卡片看完整分析與新聞。'
+              }
             />
             <div className="flex gap-1 text-xs">
+              <button
+                type="button"
+                onClick={() => setSort('posture')}
+                className={`rounded-md border px-2 py-1 ${sort === 'posture' ? 'border-neutral-600 text-neutral-200' : 'border-neutral-800 text-neutral-500'}`}
+              >
+                依姿態
+              </button>
               <button
                 type="button"
                 onClick={() => setSort('sector')}
@@ -311,11 +431,35 @@ export default function Opportunities() {
               </button>
             </div>
           </div>
-          <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
-            {sorted.map((card) => (
-              <DecisionCard key={card.symbol} card={card} quote={quotes?.[card.symbol]} />
-            ))}
-          </div>
+
+          {postureGroups ? (
+            <div className="space-y-6">
+              {(['strong', 'neutral', 'weak'] as PostureKey[]).map((key) => {
+                const cards = postureGroups[key]
+                if (cards.length === 0) return null
+                const section = POSTURE_SECTION[key]
+                return (
+                  <div key={key}>
+                    <GlossaryTerm term="posture_grouping" className="text-xs font-medium text-neutral-400">
+                      {section.title} · {cards.length} 檔
+                    </GlossaryTerm>
+                    <p className="mt-0.5 mb-2 text-xs text-neutral-600">{section.hint}</p>
+                    <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
+                      {cards.map((card) => (
+                        <DecisionCard key={card.symbol} card={card} quote={quotes?.[card.symbol]} />
+                      ))}
+                    </div>
+                  </div>
+                )
+              })}
+            </div>
+          ) : (
+            <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
+              {sorted.map((card) => (
+                <DecisionCard key={card.symbol} card={card} quote={quotes?.[card.symbol]} />
+              ))}
+            </div>
+          )}
         </section>
       )}
     </div>
