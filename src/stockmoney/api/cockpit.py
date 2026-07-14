@@ -544,6 +544,43 @@ def _level_line(card: dict) -> str:
     return "；".join(parts) + "。"
 
 
+# Genuine market-moving macro themes vs. the noise that gets mis-tagged
+# item_type='macro' upstream (coffee-tariff spats, UAW disputes, student-loan
+# explainers, "cheapest states 2026" lifestyle filler -- all seen in the live
+# data with importance up to 0.9, so an importance threshold can't separate
+# them; a topical allow/deny pass can). Documented-as-heuristic, same spirit as
+# the other v2 descriptive thresholds -- precision over recall for the morning
+# narrative (better to cite 2 clearly-relevant items than 4 with filler).
+_MACRO_RELEVANT = (
+    "fed", "fomc", "interest rate", "rate hike", "rate cut", "monetary", "powell",
+    "inflation", "cpi", "pce", "yield", "treasury", "bond market", "dollar", "dxy",
+    "greenback", "oil", "crude", "opec", "recession", "gdp", "payroll", "jobs report",
+    "unemployment", "selloff", "sell-off", "geopolit", "iran", "hormuz", "ukraine",
+    "russia", "trade war", "tariffs on", "export control", "nasdaq", "s&p", "vix",
+    "equities", "stock market", "semiconductor export",
+)
+_MACRO_NOISE = (
+    "cheapest states", "expensive states", "student loan", "where to put cash",
+    "air taxi", "coffee", "rap plan", "beta wraps",
+)
+
+
+import re as _re
+
+# Whole-word match so short tokens don't false-positive on substrings (e.g.
+# "fed" must NOT match "Federal monitor ... UAW", which is not a macro item).
+_MACRO_RE = _re.compile(r"\b(" + "|".join(_re.escape(k) for k in _MACRO_RELEVANT) + r")\b", _re.I)
+
+
+def _is_market_relevant_macro(headline: str) -> bool:
+    """True iff `headline` reads as a genuine US-equity-moving macro item, not
+    upstream mis-classified filler. Heuristic allow/deny topical pass."""
+    h = (headline or "").lower()
+    if any(bad in h for bad in _MACRO_NOISE):
+        return False
+    return bool(_MACRO_RE.search(h))
+
+
 def _recent_macro_headlines(conn: duckdb.DuckDBPyConnection) -> list[dict]:
     """Real-world macro/event news for the narrative (v2 item 1): Fed, oil,
     geopolitics, rates -- item_type='macro' rows have symbol IS NULL (market-
@@ -569,7 +606,7 @@ def _recent_macro_headlines(conn: duckdb.DuckDBPyConnection) -> list[dict]:
             "importance": r[3], "sentiment_score": r[4],
         }
         for r in rows
-        if not queries.is_generic_headline(r[0])
+        if not queries.is_generic_headline(r[0]) and _is_market_relevant_macro(r[0])
     ]
     return items[:NARRATIVE_MACRO_LIMIT]
 

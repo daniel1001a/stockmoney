@@ -3,7 +3,7 @@ import { Link } from 'react-router-dom'
 import { api, type CockpitCard, type Briefing, type Quote, type SectorRotationEntry } from '../lib/api'
 import { useApi } from '../lib/useApi'
 import { refreshIntervalMs } from '../lib/refreshCadence'
-import { regimeClass, sentimentLabel, num, signedPct, relTime } from '../lib/format'
+import { regimeClass, sentimentLabel, num, signedPct, sectorLabel } from '../lib/format'
 import { Card, Chip, SectionTitle, Loading, ErrorMsg, Empty, Return } from '../components/ui'
 import GlossaryTerm from '../components/GlossaryTerm'
 
@@ -33,7 +33,7 @@ function LivePrice({ quote }: { quote: Quote | undefined }) {
           {signedPct(quote.change_pct, 1)}
         </span>
       )}
-      <span className="text-neutral-600">即時{quote.as_of ? ` · ${relTime(quote.as_of)}` : ''}</span>
+      <span className="text-neutral-600">即時</span>
     </div>
   )
 }
@@ -204,7 +204,7 @@ function DecisionCard({ card, quote }: { card: CockpitCard; quote: Quote | undef
       <div className="flex items-start justify-between">
         <div>
           <div className="text-lg font-bold text-neutral-50">{card.symbol}</div>
-          <div className="text-xs text-neutral-500">{card.sector}</div>
+          <div className="text-xs text-neutral-500">{sectorLabel(card.sector)}</div>
         </div>
         <div className="text-right">
           <div className="text-lg font-semibold tabular-nums text-neutral-50">

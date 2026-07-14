@@ -50,6 +50,18 @@ export const DIRECTION_CLASSES: Record<string, string> = {
   range: 'text-amber-200 bg-amber-500/10 border-amber-500/40',
 }
 
+// Human-readable sector labels (the raw slugs like "big_tech" look like a bug).
+export const SECTOR_LABEL: Record<string, string> = {
+  big_tech: '大型科技',
+  semiconductor: '半導體',
+  energy: '能源',
+  financials: '金融',
+  semiconductor_etf: '半導體 ETF',
+  big_tech_etf: '大型科技 ETF',
+}
+export const sectorLabel = (s: string | null | undefined): string =>
+  (s && SECTOR_LABEL[s]) || s || '—'
+
 // Regime chip colouring. The API's regime label describes volatility / trend
 // STRENGTH (低波動震盪盤 / 中波動 / 高波動趨勢盤; the market's mode, NOT a stock's up/down call), not up/down direction, and is
 // derived per-fit from each cluster's centroid -- so we colour by the vol tier
