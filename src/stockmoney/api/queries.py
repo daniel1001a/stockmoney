@@ -17,6 +17,7 @@ directly, so a request is always just a DuckDB read.
 from __future__ import annotations
 
 import json
+import re
 from datetime import date, datetime, timedelta, timezone
 
 import duckdb
@@ -281,6 +282,29 @@ def _latest_catalyst_headlines(conn: duckdb.DuckDBPyConnection) -> dict[str, str
 # same freshness bound.
 OPPORTUNITY_NEWS_MAX_AGE_DAYS = 10
 
+# Auto-generated ticker-quote boilerplate a data vendor emits for every symbol
+# every day (e.g. "AAPL Stock Quote Price and Forecast - CNN") -- it carries no
+# actual news, just a templated page title. Dashboard v2 item 2
+# (WORKER6_AUTONOMOUS_SPEC.md): filter these out wherever a headline is meant
+# to explain "why" something is happening, so a real story isn't crowded out
+# by a template. Kept as a short, explicit pattern list rather than a broad
+# "forecast" ban -- a real analyst-forecast headline (e.g. "TSMC Posts
+# Stronger-Than-Expected Sales") should still get through.
+_GENERIC_HEADLINE_PATTERNS = (
+    re.compile(r"stock quote", re.IGNORECASE),
+    re.compile(r"price and forecast", re.IGNORECASE),
+)
+
+
+def is_generic_headline(headline: str | None) -> bool:
+    """True for template/no-information headlines (see _GENERIC_HEADLINE_PATTERNS
+    above). Used by both the SQL filter in _latest_symbol_news below and
+    cockpit.py's macro-narrative headline picker, so "what counts as generic"
+    is defined in exactly one place."""
+    if not headline:
+        return False
+    return any(p.search(headline) for p in _GENERIC_HEADLINE_PATTERNS)
+
 
 def _latest_symbol_news(
     conn: duckdb.DuckDBPyConnection, *, max_age_days: int = OPPORTUNITY_NEWS_MAX_AGE_DAYS
@@ -289,7 +313,10 @@ def _latest_symbol_news(
     card can show a live news line -- not just the few symbols that happen to
     have an LLM catalyst_signal. Ranked by importance then recency; bounded to
     the last `max_age_days` so a stale headline never masquerades as today's
-    reason to trade."""
+    reason to trade. Generic template headlines (is_generic_headline) are
+    excluded from the ranking itself -- not just hidden after the fact -- so a
+    symbol whose only recent item is a "Stock Quote" boilerplate falls back to
+    no headline rather than showing a useless one."""
     rows = conn.execute(
         """
         WITH ranked AS (
@@ -301,6 +328,8 @@ def _latest_symbol_news(
             FROM news_items
             WHERE symbol IS NOT NULL
               AND published_at >= now() - (? * INTERVAL 1 DAY)
+              AND headline NOT ILIKE '%stock quote%'
+              AND headline NOT ILIKE '%price and forecast%'
         )
         SELECT symbol, item_id, headline, sentiment_score, importance, published_at
         FROM ranked WHERE rn = 1
