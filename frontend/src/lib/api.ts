@@ -560,6 +560,15 @@ export interface CockpitCard {
   sellput: SellPutSuggestion | null
   volume_signal: VolumeSignal
   sector_linkage: SectorLinkage
+  // v2 (2026-07-14, Task D part 2): descriptive facts, never a direction
+  // call. iv: ATM (50-delta) implied vol as a fraction (0.286 = 28.6%),
+  // null if no iv_surface_daily row. dollar_volume: today's close x volume.
+  // earnings_date: best-effort next earnings date (event_calendar DB-first,
+  // Nasdaq network fallback -- see stockmoney.data.earnings_calendar), null
+  // when genuinely unknown -- never fabricated.
+  iv: number | null
+  dollar_volume: number | null
+  earnings_date: string | null
 }
 
 export const api = {

@@ -19,10 +19,12 @@ request time (a handful of symbols, so no caching layer is needed the way
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import date
 
 import duckdb
 
 from stockmoney.api import queries
+from stockmoney.data.news_synthesis import _is_genuine_macro
 
 # Same OTM% used by the sell-put strategies in scripts/premium_selling_backtest.py
 # and stockmoney.backtest.highvol_strategies.SELLPUT_OTM -- kept identical here
@@ -437,6 +439,100 @@ def sector_rotation(members: list[dict], returns: dict[str, dict]) -> list[dict]
     return out
 
 
+import statistics as _stats
+
+# The free self-estimated IV surface (yfinance) is NOISY -- especially very
+# short-dated buckets, which throw absurd values (CVX's front expiry reads 162%
+# while its next reads 3%; SOXL has a 2043% row). Surfacing the nearest-expiry
+# number as-is showed "IV 162.5%" on a large-cap card, which reads as a bug.
+# So take a ROBUST estimate: the median of 50-delta IVs across near-dated
+# (<=120d) future expiries, keeping only values in a plausible [5%, 120%] band.
+# A symbol with no plausible value is absent -> None ("IV 資料不足"). This is
+# still only a rough free estimate (a real IV feed is needed to trust it -- see
+# the options-microstructure memory), never a forecast.
+IV_PLAUSIBLE_LO = 0.05
+IV_PLAUSIBLE_HI = 1.20
+
+
+def _iv_by_symbol(conn: duckdb.DuckDBPyConnection) -> dict[str, float | None]:
+    """Robust ATM (50-delta) implied vol per symbol (see module note above):
+    median of plausible near-dated 50-delta IVs at each symbol's latest
+    iv_surface_daily trade_date; None if none are plausible. A descriptive
+    fraction (e.g. 0.286 = 28.6%), never fabricated, never a forecast."""
+    rows = conn.execute(
+        """
+        WITH latest_trade AS (
+            SELECT symbol, max(trade_date) AS trade_date
+            FROM iv_surface_daily
+            GROUP BY symbol
+        )
+        SELECT i.symbol, i.implied_vol
+        FROM iv_surface_daily i
+        JOIN latest_trade lt
+          ON i.symbol = lt.symbol AND i.trade_date = lt.trade_date
+        WHERE i.delta_bucket = '50'
+          AND i.expiry_date >= i.trade_date
+          AND i.expiry_date <= i.trade_date + INTERVAL 120 DAY
+        """
+    ).fetchall()
+    by_sym: dict[str, list[float]] = {}
+    for sym, iv in rows:
+        if iv is not None and IV_PLAUSIBLE_LO <= iv <= IV_PLAUSIBLE_HI:
+            by_sym.setdefault(sym, []).append(iv)
+    return {s: _stats.median(v) for s, v in by_sym.items() if v}
+
+
+def _earnings_dates_from_calendar(
+    conn: duckdb.DuckDBPyConnection, symbols: list[str]
+) -> dict[str, date]:
+    """DB-first source for next earnings date: `event_calendar` (migration
+    013). Empty in the live DB as of this writing, so this returns {} today
+    -- kept as the first-choice source so a future ingester (or a manual
+    entry) is picked up automatically with no code change here.
+    `earnings_calendar.py`'s Nasdaq network scan is only the fallback for
+    whatever this query doesn't cover."""
+    if not symbols:
+        return {}
+    placeholders = ",".join(["?"] * len(symbols))
+    rows = conn.execute(
+        f"""
+        WITH latest AS (
+            SELECT symbol, scheduled_at,
+                   row_number() OVER (PARTITION BY event_id ORDER BY ingested_at DESC) AS rn
+            FROM event_calendar
+            WHERE event_type = 'earnings' AND symbol IN ({placeholders})
+              AND scheduled_at >= current_date
+        )
+        SELECT symbol, min(scheduled_at) FROM latest WHERE rn = 1 GROUP BY symbol
+        """,
+        symbols,
+    ).fetchall()
+    return {r[0]: (r[1].date() if hasattr(r[1], "date") else r[1]) for r in rows}
+
+
+def _earnings_date_map(
+    conn: duckdb.DuckDBPyConnection, symbols: list[str]
+) -> dict[str, date | None]:
+    """Best-effort next-earnings-date per symbol (CLAUDE.md Task D part 2):
+    `event_calendar` first (DB, currently empty), Nasdaq's free earnings-
+    calendar API (earnings_calendar.py) as the fallback for whatever
+    event_calendar doesn't have. Never fabricates a date -- a symbol neither
+    source finds maps to None, which the frontend renders as "財報日未知"."""
+    from stockmoney.data.earnings_calendar import get_next_earnings_dates
+
+    out: dict[str, date | None] = dict(_earnings_dates_from_calendar(conn, symbols))
+    missing = [s for s in symbols if s not in out]
+    if missing:
+        try:
+            out.update(get_next_earnings_dates(missing))
+        except Exception:
+            # Network fallback must never break the cockpit endpoint --
+            # degrade to "unknown" for whatever it couldn't resolve.
+            for s in missing:
+                out[s] = None
+    return out
+
+
 def cockpit_symbol(
     conn: duckdb.DuckDBPyConnection,
     symbol: str,
@@ -444,6 +540,8 @@ def cockpit_symbol(
     regime_label: str,
     top_news: dict | None,
     sector_link: dict | None = None,
+    iv: float | None = None,
+    earnings_date: date | None = None,
 ) -> dict:
     rows = _price_series(conn, symbol)
     levels = compute_levels(rows)
@@ -452,6 +550,13 @@ def cockpit_symbol(
     sellput = sellput_suggestion(levels, gate)
     volume = volume_signal(rows)
     as_of = rows[-1][0] if rows else None
+    # v2 item (2026-07-14): dollar volume = today's close x today's volume,
+    # both already loaded by _price_series -- a plain liquidity/size fact
+    # ("how much dollar value traded today"), not a signal.
+    today_volume = rows[-1][5] if rows else None
+    dollar_volume = (
+        levels.close * today_volume if levels.close is not None and today_volume is not None else None
+    )
     return {
         "symbol": symbol,
         "as_of_date": as_of,
@@ -472,6 +577,11 @@ def cockpit_symbol(
         "sector_linkage": sector_link or {
             "state": "資料不足", "symbol_return": None, "peer_avg_return": None, "z": None, "note": None,
         },
+        # v2 items (2026-07-14, Task D part 2): descriptive facts, never a
+        # direction call -- see _iv_by_symbol / _earnings_date_map docstrings.
+        "iv": iv,
+        "dollar_volume": dollar_volume,
+        "earnings_date": earnings_date,
     }
 
 
@@ -502,6 +612,8 @@ def build_cockpit(conn: duckdb.DuckDBPyConnection) -> list[dict]:
     symbol_news = queries._latest_symbol_news(conn)
     returns = _watchlist_returns(conn)
     linkage_map = sector_linkage_map(members, returns)
+    iv_map = _iv_by_symbol(conn)
+    earnings_map = _earnings_date_map(conn, [m["symbol"] for m in members])
     out = []
     for m in members:
         symbol = m["symbol"]
@@ -510,6 +622,7 @@ def build_cockpit(conn: duckdb.DuckDBPyConnection) -> list[dict]:
         card = cockpit_symbol(
             conn, symbol, regime_label=label, top_news=symbol_news.get(symbol),
             sector_link=linkage_map.get(symbol),
+            iv=iv_map.get(symbol), earnings_date=earnings_map.get(symbol),
         )
         card["sector"] = m["sector"]
         out.append(card)
@@ -544,41 +657,17 @@ def _level_line(card: dict) -> str:
     return "；".join(parts) + "。"
 
 
-# Genuine market-moving macro themes vs. the noise that gets mis-tagged
-# item_type='macro' upstream (coffee-tariff spats, UAW disputes, student-loan
-# explainers, "cheapest states 2026" lifestyle filler -- all seen in the live
-# data with importance up to 0.9, so an importance threshold can't separate
-# them; a topical allow/deny pass can). Documented-as-heuristic, same spirit as
-# the other v2 descriptive thresholds -- precision over recall for the morning
-# narrative (better to cite 2 clearly-relevant items than 4 with filler).
-_MACRO_RELEVANT = (
-    "fed", "fomc", "interest rate", "rate hike", "rate cut", "monetary", "powell",
-    "inflation", "cpi", "pce", "yield", "treasury", "bond market", "dollar", "dxy",
-    "greenback", "oil", "crude", "opec", "recession", "gdp", "payroll", "jobs report",
-    "unemployment", "selloff", "sell-off", "geopolit", "iran", "hormuz", "ukraine",
-    "russia", "trade war", "tariffs on", "export control", "nasdaq", "s&p", "vix",
-    "equities", "stock market", "semiconductor export",
-)
-_MACRO_NOISE = (
-    "cheapest states", "expensive states", "student loan", "where to put cash",
-    "air taxi", "coffee", "rap plan", "beta wraps",
-)
-
-
-import re as _re
-
-# Whole-word match so short tokens don't false-positive on substrings (e.g.
-# "fed" must NOT match "Federal monitor ... UAW", which is not a macro item).
-_MACRO_RE = _re.compile(r"\b(" + "|".join(_re.escape(k) for k in _MACRO_RELEVANT) + r")\b", _re.I)
-
-
+# Root-cause fix (2026-07-14): the coffee-tariff/UAW/student-loan/"cheapest
+# states" lifestyle noise that used to slip through as item_type='macro' is
+# now filtered upstream, at classification time, by
+# stockmoney.data.news_synthesis.classify_type -> _is_genuine_macro (whole-
+# word macro-theme match + denylist -- the same allow/deny pass that used to
+# live only here). So news_items.item_type='macro' rows reaching this query
+# should already be clean by construction. This call is kept as a *cheap,
+# redundant-by-design* backstop -- defence in depth against any future
+# upstream regression -- not because it's still doing the real work.
 def _is_market_relevant_macro(headline: str) -> bool:
-    """True iff `headline` reads as a genuine US-equity-moving macro item, not
-    upstream mis-classified filler. Heuristic allow/deny topical pass."""
-    h = (headline or "").lower()
-    if any(bad in h for bad in _MACRO_NOISE):
-        return False
-    return bool(_MACRO_RE.search(h))
+    return _is_genuine_macro(headline or "")
 
 
 def _recent_macro_headlines(conn: duckdb.DuckDBPyConnection) -> list[dict]:

@@ -65,9 +65,43 @@ EARNINGS_KW = ["earnings", "revenue", "guidance", "quarterly", "q1", "q2", "q3",
 ANALYST_KW = ["upgrade", "downgrade", "price target", "initiates", "initiated", "overweight",
               "underweight", "buy rating", "sell rating", "neutral rating", "analyst",
               "raises target", "cuts target", "reiterates", "outperform"]
-MACRO_KW = ["fed", "fomc", "federal reserve", "inflation", "cpi", "ppi", "jobs report",
-            "nonfarm", "payroll", "interest rate", "rate cut", "rate hike", "treasury",
-            "yield", "gdp", "dollar index", "dxy", "tariff", "powell", "recession"]
+
+# Genuine US-equity-moving macro themes. Root-cause fix (superseding the old
+# cockpit-layer `_MACRO_RELEVANT`/`_MACRO_NOISE` backstop in api/cockpit.py):
+# short tokens like "fed" must be WHOLE-WORD matched (see MACRO_RE below) so
+# they don't false-positive on substrings like "Federal monitor" or "confeder-
+# ate" -- and a denylist catches lifestyle/off-topic filler that otherwise
+# slips through on a stray macro-sounding word (confirmed on real ingested
+# headlines: coffee-tariff spats, UAW disputes, student-loan explainers,
+# "cheapest states 2026" listicles, air-taxi puff pieces).
+MACRO_KW = [
+    "fed", "fomc", "federal reserve", "interest rate", "rate hike", "rate cut",
+    "monetary", "powell",
+    "inflation", "cpi", "ppi", "pce", "jobs report", "nonfarm", "payroll",
+    "unemployment", "treasury", "yield", "bond market", "gdp",
+    "dollar index", "dxy", "greenback", "oil", "crude", "opec",
+    "recession", "tariff", "geopolit", "iran", "hormuz", "ukraine",
+    "russia", "trade war", "export control", "selloff", "sell-off",
+    "stock market", "market selloff",
+]
+MACRO_NOISE_KW = [
+    "cheapest states", "expensive states", "student loan", "where to put cash",
+    "air taxi", "coffee", "rap plan", "beta wraps", "uaw",
+]
+
+_MACRO_RE = re.compile(r"\b(" + "|".join(re.escape(k) for k in MACRO_KW) + r")\b", re.I)
+
+
+def _is_genuine_macro(text: str) -> bool:
+    """Whole-word macro-theme match, minus the denylisted lifestyle/off-topic
+    filler -- the source-of-truth check for item_type='macro' (see
+    classify_type below). Whole-word matching matters for short tokens like
+    "fed" or "rate", which would otherwise substring-match unrelated words
+    ("Federal monitor", "accelerate")."""
+    low = text.lower()
+    if any(bad in low for bad in MACRO_NOISE_KW):
+        return False
+    return bool(_MACRO_RE.search(low))
 
 POS_KW = ["surge", "soar", "jump", "rally", "beat", "beats", "record", "upgrade", "gains",
           "climbs", "boost", "strong", "raises", "outperform", "bullish", "tops", "wins"]
@@ -138,7 +172,7 @@ def classify_type(text: str, symbol: str | None) -> str:
         return "analyst_rating"
     if any(k in low for k in EARNINGS_KW):
         return "earnings"
-    if symbol is None and any(k in low for k in MACRO_KW):
+    if symbol is None and _is_genuine_macro(text):
         return "macro"
     return "headline"
 

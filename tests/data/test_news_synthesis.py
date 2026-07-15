@@ -81,6 +81,57 @@ def test_classify_type_priority_and_macro():
     assert classify_type("Apple unveils new store design", "AAPL") == "headline"
 
 
+def test_classify_type_macro_whole_word_not_substring():
+    """Root-cause fix: a short macro token like "fed" must NOT substring-match
+    unrelated words. This exact headline was seen live, mis-tagged 'macro'
+    under the old substring-only MACRO_KW check ("fed" matched inside
+    "Federal monitor")."""
+    assert classify_type(
+        "Federal monitor says UAW head Shawn Fain abused authority; Fain denies findings", None
+    ) == "headline"
+
+
+def test_classify_type_macro_denylist_filters_lifestyle_noise():
+    """Real live-data examples that used to slip through as item_type='macro'
+    because they happened to contain a macro-ish word ("inflation", "tariff",
+    "coffee") while actually being lifestyle/off-topic filler."""
+    assert classify_type(
+        "These are America's 10 cheapest states for 2026, where you can still beat inflation", None
+    ) == "headline"
+    assert classify_type(
+        "Student loan borrowers on new RAP plan can lose key benefits if they pay even one day late", None
+    ) == "headline"
+    assert classify_type(
+        "Air taxi company Beta wraps first test flights in U.S. government's pilot program", None
+    ) == "headline"
+    assert classify_type(
+        "Arabica Coffee Prices Hit Record on U.S., Colombia Tariff Spat", None
+    ) == "headline"
+    assert classify_type(
+        "Where to put cash right now: Should you lock in at 4% — or wait for the next Fed rate decision?", None
+    ) == "headline"
+
+
+def test_classify_type_macro_still_catches_genuine_themes():
+    """Genuine macro/geopolitical themes must still classify as 'macro' after
+    the whole-word + denylist tightening -- this is a precision fix, not a
+    recall cut."""
+    assert classify_type(
+        "A Fed interest-rate hike could trigger a short-term stock selloff, but history points to a big silver lining",
+        None,
+    ) == "macro"
+    assert classify_type(
+        "Strong dollar, weak bond market: Investors favor greenback as Fed tightening bets grow", None
+    ) == "macro"
+    assert classify_type(
+        "Trump threatens to 'decimate' Iran if it tries to kill him, as Treasury sanctions alleged Iranian financier",
+        None,
+    ) == "macro"
+    assert classify_type(
+        "India's retail inflation accelerates to 4.38%, raising rate hike expectations", None
+    ) == "macro"
+
+
 def test_score_sentiment_direction():
     assert score_sentiment("stock surges to record high") > 0
     assert score_sentiment("shares plunge as company warns on guidance") < 0

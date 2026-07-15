@@ -25,6 +25,31 @@ export function signedMoney(x: number | null | undefined): string {
   return `${x >= 0 ? '+' : '-'}$${Math.abs(x).toLocaleString('en-US', { maximumFractionDigits: 0 })}`
 }
 
+// Compact large-dollar-amount formatting for things like today's dollar
+// volume (close x volume): "$1.3B" / "$542.1M" / "$88.4K". USD with a $
+// prefix, matching money()/LivePrice's convention elsewhere in the app
+// rather than mixing in a Chinese 億/萬 unit alongside a $ sign.
+export function compactMoney(x: number | null | undefined): string {
+  if (x === null || x === undefined || Number.isNaN(x)) return '--'
+  const sign = x < 0 ? '-' : ''
+  const abs = Math.abs(x)
+  if (abs >= 1e9) return `${sign}$${(abs / 1e9).toFixed(1)}B`
+  if (abs >= 1e6) return `${sign}$${(abs / 1e6).toFixed(1)}M`
+  if (abs >= 1e3) return `${sign}$${(abs / 1e3).toFixed(1)}K`
+  return `${sign}$${abs.toFixed(0)}`
+}
+
+// "2026-07-30" -> "7/30". Falls back to "未知" for null/unparseable -- used
+// for the cockpit card's best-effort next-earnings-date field, which is
+// genuinely unknown for some symbols (never fabricated, see
+// stockmoney.data.earnings_calendar).
+export function shortDate(iso: string | null | undefined): string {
+  if (!iso) return '未知'
+  const d = new Date(`${iso.slice(0, 10)}T00:00:00`)
+  if (Number.isNaN(d.getTime())) return '未知'
+  return `${d.getMonth() + 1}/${d.getDate()}`
+}
+
 // Rough "x小時前 / x天前" from an ISO timestamp. Purely cosmetic.
 export function relTime(iso: string | null | undefined): string {
   if (!iso) return ''

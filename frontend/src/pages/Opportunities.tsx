@@ -3,7 +3,7 @@ import { Link } from 'react-router-dom'
 import { api, type CockpitCard, type Briefing, type Quote, type SectorRotationEntry } from '../lib/api'
 import { useApi } from '../lib/useApi'
 import { refreshIntervalMs } from '../lib/refreshCadence'
-import { regimeClass, sentimentLabel, num, signedPct, sectorLabel } from '../lib/format'
+import { regimeClass, sentimentLabel, num, signedPct, sectorLabel, pct, compactMoney, shortDate } from '../lib/format'
 import { Card, Chip, SectionTitle, Loading, ErrorMsg, Empty, Return } from '../components/ui'
 import GlossaryTerm from '../components/GlossaryTerm'
 
@@ -206,6 +206,27 @@ const LINKAGE_STATE_CLASS: Record<string, string> = {
   資料不足: 'text-neutral-500 bg-neutral-500/10 border-neutral-500/30',
 }
 
+// v2 (Task D part 2): three descriptive per-card facts -- IV, today's dollar
+// volume, and best-effort next earnings date. None of these is a direction
+// call (see glossary.ts card_iv/card_dollar_volume/card_earnings_date);
+// each pairs a plain-language GlossaryTerm label with the number/date so a
+// non-expert user isn't left staring at unexplained jargon.
+function FactsRow({ card }: { card: CockpitCard }) {
+  return (
+    <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-neutral-400">
+      <GlossaryTerm term="card_iv">
+        IV {card.iv !== null ? pct(card.iv, 1) : '資料不足'}
+      </GlossaryTerm>
+      <GlossaryTerm term="card_dollar_volume">
+        成交額 {compactMoney(card.dollar_volume)}
+      </GlossaryTerm>
+      <GlossaryTerm term="card_earnings_date">
+        財報日 {shortDate(card.earnings_date)}
+      </GlossaryTerm>
+    </div>
+  )
+}
+
 function SignalRow({ card }: { card: CockpitCard }) {
   const v = card.volume_signal
   const l = card.sector_linkage
@@ -285,6 +306,7 @@ function DecisionCard({ card, quote }: { card: CockpitCard; quote: Quote | undef
       </div>
 
       <SignalRow card={card} />
+      <FactsRow card={card} />
 
       <div className="mt-3 grid grid-cols-2 gap-x-4 gap-y-1 rounded-lg border border-neutral-800/70 bg-neutral-950/40 p-2.5">
         <LevelRow label="20日高" value={card.levels.nday_high} />

@@ -30,6 +30,9 @@ const card = (
   },
   volume_signal: { ratio: 1.8, state: '放量', today_volume: 90_000_000, avg_volume_20d: 50_000_000 },
   sector_linkage: { state: '跟隨板塊同步', symbol_return: 0.01, peer_avg_return: 0.009, z: 0.2, note: null },
+  iv: 0.286,
+  dollar_volume: 1_300_000_000,
+  earnings_date: '2026-07-30',
 })
 
 const briefing: Briefing = {
@@ -136,6 +139,23 @@ describe('Opportunities', () => {
     fireEvent.click(screen.getByText('詳情 ▼'))
 
     expect(screen.getByText('閘門建議空手')).toBeInTheDocument()
+  })
+
+  it('shows IV, dollar volume, and next earnings date per card, and "未知" when earnings date is unavailable', async () => {
+    vi.mocked(api.cockpit).mockResolvedValue([
+      card('NVDA', 'semiconductor'),
+      { ...card('AVGO', 'semiconductor'), earnings_date: null },
+    ])
+    vi.mocked(api.briefing).mockResolvedValue(briefing)
+    vi.mocked(api.quotes).mockResolvedValue({})
+
+    render(<MemoryRouter><Opportunities /></MemoryRouter>)
+
+    await waitFor(() => expect(screen.getAllByText('NVDA').length).toBeGreaterThan(0))
+    expect(screen.getAllByText(/IV 28\.6%/).length).toBeGreaterThan(0)
+    expect(screen.getAllByText(/成交額 \$1\.3B/).length).toBeGreaterThan(0)
+    expect(screen.getAllByText(/財報日 7\/30/).length).toBeGreaterThan(0)
+    expect(screen.getAllByText(/財報日 未知/).length).toBeGreaterThan(0)
   })
 
   it('shows a compact VIX / term-structure / breadth stats strip', async () => {
