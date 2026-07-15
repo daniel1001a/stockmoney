@@ -25,6 +25,7 @@ import duckdb
 
 from stockmoney.api import queries
 from stockmoney.data.news_synthesis import _is_genuine_macro
+from stockmoney.models.strike_ladder import snap_strike
 
 # Same OTM% used by the sell-put strategies in scripts/premium_selling_backtest.py
 # and stockmoney.backtest.highvol_strategies.SELLPUT_OTM -- kept identical here
@@ -302,7 +303,9 @@ def sellput_gate(levels: SymbolLevels, rv_series: list[float]) -> dict:
 def sellput_suggestion(levels: SymbolLevels, gate: dict) -> dict | None:
     if levels.close is None:
         return None
-    strike = round(levels.close * (1 - SELLPUT_OTM), 2)
+    # Snap to a real listed strike so the suggested contract is one a broker
+    # would actually show (data-integrity audit 2026-07-15).
+    strike = snap_strike(levels.close * (1 - SELLPUT_OTM))
     return {
         "strike": strike,
         "otm_pct": SELLPUT_OTM,

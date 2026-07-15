@@ -9,6 +9,7 @@ from stockmoney.models.option_selection import (
     select_option,
     strike_for_delta,
 )
+from stockmoney.models.strike_ladder import is_on_ladder
 
 
 def test_strike_reproduces_target_delta_call():
@@ -60,3 +61,24 @@ def test_invalid_direction_raises():
 def test_dte_flows_into_entry():
     entry = select_option(UP, 100.0, 0.3, params=SelectionParams(dte_days=45))
     assert entry.t_years == pytest.approx(45 / 365)
+
+
+# --- snap param: off by default (research/backtest path stays continuous) --
+
+def test_snap_defaults_off_strike_stays_continuous():
+    entry = select_option(UP, 967.65, 0.4)  # NFLX-like spot
+    assert not is_on_ladder(entry.strike)  # the raw BS-inverted strike, uncorrected
+
+
+def test_snap_true_produces_a_listed_strike():
+    entry = select_option(UP, 967.65, 0.4, snap=True)  # NFLX-like spot
+    assert is_on_ladder(entry.strike)
+
+
+def test_snap_true_preserves_call_put_direction():
+    up = select_option(UP, 100.0, 0.3, snap=True)
+    down = select_option(DOWN, 100.0, 0.3, snap=True)
+    assert up.strike > 100.0  # still OTM after snapping
+    assert down.strike < 100.0
+    assert is_on_ladder(up.strike)
+    assert is_on_ladder(down.strike)

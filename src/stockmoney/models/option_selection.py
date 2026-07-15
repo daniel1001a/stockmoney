@@ -29,6 +29,7 @@ from statistics import NormalDist
 
 from stockmoney.models.feature_matrix import DOWN, RANGE, UP
 from stockmoney.models.options_pnl import DEFAULT_RATE, DAYS_PER_YEAR, OptionEntry
+from stockmoney.models.strike_ladder import snap_strike
 
 _NORM = NormalDist()
 
@@ -61,10 +62,21 @@ def select_option(
     *,
     params: SelectionParams = SelectionParams(),
     r: float = DEFAULT_RATE,
+    snap: bool = False,
 ) -> OptionEntry | None:
     """Turn a module-A direction label into the option to trade, or None for a
     RANGE call (no directional edge -> no trade). `direction` uses the same
-    {DOWN,RANGE,UP} integer labels as feature_matrix / the walk-forward result."""
+    {DOWN,RANGE,UP} integer labels as feature_matrix / the walk-forward result.
+
+    `snap` (default False): whether to round the continuous Black-Scholes
+    strike to the nearest realistic listed increment (strike_ladder.snap_strike).
+    Defaults OFF here because this is also the entry point research backtests
+    (backtest_options_pnl.py) use to evaluate the target-delta methodology
+    itself on a smooth continuum -- snapping there would inject ladder-tier
+    rounding noise into a methodology test that doesn't care about it. The
+    live/display path (league/option_bridge.build_option_structure) is the one
+    that must never show an unrealizable strike, so it passes snap=True.
+    """
     if direction == RANGE:
         return None
     if direction not in (DOWN, UP):
@@ -75,6 +87,8 @@ def select_option(
     is_call = direction == UP
     t_years = params.dte_days / DAYS_PER_YEAR
     strike = strike_for_delta(spot, iv, t_years, params.target_delta, is_call=is_call, r=r)
+    if snap:
+        strike = snap_strike(strike)
     return OptionEntry(
         spot=spot, strike=strike, is_call=is_call, iv=iv, t_years=t_years, side=params.side
     )

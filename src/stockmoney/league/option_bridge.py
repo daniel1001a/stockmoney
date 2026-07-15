@@ -50,7 +50,15 @@ def build_option_structure(
     entry_iv, iv_source = entry_iv_for_symbol(
         conn, ctx.symbol, ctx.trade_date, realized_vol_20d=ctx.grade_vol,
     )
-    entry = select_option(direction_class, ctx.entry_price, entry_iv, params=params)
+    # snap=True: this is the arena/display path (IMPROVEMENT_PLAN.md §S3's
+    # "impossible strike" bug -- a raw Black-Scholes-inverted strike like
+    # "NFLX 996.7 Call" that no real chain lists). grading_options.py always
+    # reprices from THIS stored strike (never a separately-cached premium), so
+    # snapping here is the only place needed for premium/strike/P&L to stay
+    # internally consistent -- there is no separate entry_premium field to
+    # reconcile. Research backtests go through option_selection.select_option
+    # directly with the snap=False default, so they stay undisturbed.
+    entry = select_option(direction_class, ctx.entry_price, entry_iv, params=params, snap=True)
     if entry is None:
         return None
 

@@ -12,6 +12,7 @@ from stockmoney.league.context import MarketContext
 from stockmoney.league.engines import EngineCall
 from stockmoney.league.option_bridge import build_option_structure
 from stockmoney.models.production import ProductionPrediction
+from stockmoney.models.strike_ladder import is_on_ladder
 
 TRADE_DATE = date(2026, 6, 1)
 END = date(2026, 6, 8)
@@ -102,3 +103,18 @@ def test_dte_days_matches_selection_params_default():
     structure = build_option_structure(conn, _ctx(), _call("up"))
     assert structure["dte_days"] == 30
     assert structure["t_years"] == pytest.approx(30 / 365)
+
+
+def test_strike_is_snapped_to_a_listed_increment_not_a_raw_bs_strike():
+    """The flagship "impossible strike" bug: option_selection's raw
+    Black-Scholes-inverted strike (e.g. 996.7139... for a ~$967 underlying)
+    must never reach the arena's stored option_structure verbatim."""
+    conn = _conn()
+    structure = build_option_structure(conn, _ctx(symbol="NFLX", entry_price=967.65), _call("up"))
+    assert is_on_ladder(structure["strike"])
+
+
+def test_strike_is_snapped_for_a_put_too():
+    conn = _conn()
+    structure = build_option_structure(conn, _ctx(symbol="TSLA", entry_price=234.6), _call("down"))
+    assert is_on_ladder(structure["strike"])

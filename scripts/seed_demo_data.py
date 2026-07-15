@@ -29,6 +29,7 @@ from datetime import date, datetime, timedelta, timezone
 
 from stockmoney.data.db import DEFAULT_DB_PATH, get_connection, run_migrations
 from stockmoney.models.feature_matrix import FEATURE_COLUMNS
+from stockmoney.models.strike_ladder import snap_strike
 
 RNG = random.Random(20260712)
 NOW = datetime(2026, 7, 12, 13, 0, tzinfo=timezone.utc)
@@ -446,7 +447,7 @@ def seed_portfolios(conn, closes) -> None:
             exit_d, exit_px = px[exit_i]
             right = "call" if tid != "contrarian" else rng.choice(["call", "put"])
             side = "short" if tid == "vol_seller" else "long"
-            strike = round(entry_px * (1.03 if right == "call" else 0.97), 1)
+            strike = snap_strike(entry_px * (1.03 if right == "call" else 0.97))
             contracts = rng.randint(1, 2)
             entry_prem = round(entry_px * rng.uniform(0.02, 0.04), 2)
             basis = entry_prem * 100 * contracts  # premium paid (long) or collected (short)
@@ -480,7 +481,7 @@ def seed_portfolios(conn, closes) -> None:
             entry_d, entry_px = px[entry_i]
             right = "call" if rng.random() < 0.7 else "put"
             side = "short" if tid == "vol_seller" and rng.random() < 0.6 else "long"
-            strike = round(entry_px * (1.03 if right == "call" else 0.97), 1)
+            strike = snap_strike(entry_px * (1.03 if right == "call" else 0.97))
             contracts = 1
             entry_prem = round(entry_px * rng.uniform(0.02, 0.05), 2)
             cost = entry_prem * 100 * contracts
@@ -609,7 +610,7 @@ def seed_human_positions(conn, closes) -> None:
     for i, (symbol, right, side) in enumerate(picks):
         px = closes[symbol]
         entry_d, entry_px = px[-9]
-        strike = round(entry_px * (1.03 if right == "call" else 0.97), 1)
+        strike = snap_strike(entry_px * (1.03 if right == "call" else 0.97))
         rows.append((
             f"pos-{i}", symbol, right, side, strike, TODAY + timedelta(days=21),
             entry_d, entry_px, round(entry_px * 0.035, 2), round(0.30 * math.sqrt(252) / math.sqrt(252) + 0.30, 3),
