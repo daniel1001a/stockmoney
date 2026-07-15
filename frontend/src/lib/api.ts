@@ -209,6 +209,31 @@ export interface TraderTrade {
   unrealized_pnl?: number | null
 }
 
+// A trade row joined to the trader's display name/philosophy -- powers the
+// Arena "交易動態 (Live Board)" feed across ALL traders (GET /api/trader-trades).
+export interface TraderTradeFeedEntry {
+  trade_id: string
+  trader_id: string
+  trader_name: string
+  philosophy: string
+  symbol: string
+  option_right: 'call' | 'put'
+  side: 'long' | 'short'
+  strike: number
+  expiry_date: string
+  contracts: number
+  entry_at: string
+  entry_underlying: number
+  entry_premium: number
+  exit_at: string | null
+  exit_underlying: number | null
+  exit_premium: number | null
+  realized_pnl: number | null
+  status: 'open' | 'closed'
+  thesis: string | null
+  exit_reason: string | null
+}
+
 export interface ContestRules {
   starting_capital: number
   instrument: string
@@ -560,6 +585,8 @@ export const api = {
     getJsonOrNull<TickerTradersResponse>(`/ticker/${encodeURIComponent(symbol)}/traders`),
   divergence: (hours?: number) =>
     getJson<DivergenceRow[]>(`/divergence${hours !== undefined ? `?hours=${hours}` : ''}`),
+  traderTrades: (limit?: number) =>
+    getJson<TraderTradeFeedEntry[]>(`/trader-trades${limit !== undefined ? `?limit=${limit}` : ''}`),
   briefing: () => getJson<Briefing>('/briefing'),
   cockpit: () => getJson<CockpitCard[]>('/cockpit'),
   scoreboardSummary: () => getJson<ScoreboardSummary>('/scoreboard-summary'),

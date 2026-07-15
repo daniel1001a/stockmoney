@@ -1,7 +1,7 @@
 import { Link, useParams } from 'react-router-dom'
 import { api, type TraderTrade } from '../lib/api'
 import { useApi } from '../lib/useApi'
-import { DIRECTION_LABEL, money, signedMoney, num, pct } from '../lib/format'
+import { DIRECTION_LABEL, formatOptionContract, money, signedMoney, num, pct } from '../lib/format'
 import { Card, Chip, SectionTitle, Stat, Return, Loading, ErrorMsg, Empty } from '../components/ui'
 
 function fmtDate(iso: string | null): string {
@@ -13,6 +13,10 @@ function TradeSide({ t }: { t: TraderTrade }) {
   const label = `${t.side === 'long' ? '買' : '賣'} ${t.option_right === 'call' ? 'Call' : 'Put'}`
   const cls = t.option_right === 'call' ? 'text-emerald-300' : 'text-rose-300'
   return <span className={cls}>{label}</span>
+}
+
+function ContractLabel({ t }: { t: TraderTrade }) {
+  return <span className="font-mono text-xs text-neutral-400">{formatOptionContract({ symbol: t.symbol, strike: t.strike, right: t.option_right, expiry: t.expiry_date })}</span>
 }
 
 function OpenPositions({ rows }: { rows: TraderTrade[] }) {
@@ -38,7 +42,10 @@ function OpenPositions({ rows }: { rows: TraderTrade[] }) {
                 <Link to={`/ticker/${t.symbol}`} className="font-medium text-neutral-100 hover:text-neutral-300">{t.symbol}</Link>
                 <div className="text-xs text-neutral-600">{t.contracts} 口 · 進場 {fmtDate(t.entry_at)}</div>
               </td>
-              <td className="py-2 pr-4"><TradeSide t={t} /></td>
+              <td className="py-2 pr-4">
+                <TradeSide t={t} />
+                <div><ContractLabel t={t} /></div>
+              </td>
               <td className="py-2 pr-4 tabular-nums text-neutral-300">${num(t.strike, 1)}</td>
               <td className="py-2 pr-4 text-neutral-400">{fmtDate(t.expiry_date)}</td>
               <td className="py-2 pr-4 text-right tabular-nums text-neutral-300">${num(t.entry_premium)}</td>
@@ -78,7 +85,10 @@ function ClosedTrades({ rows }: { rows: TraderTrade[] }) {
                 <Link to={`/ticker/${t.symbol}`} className="font-medium text-neutral-100 hover:text-neutral-300">{t.symbol}</Link>
                 <div className="text-xs text-neutral-600">{t.contracts} 口</div>
               </td>
-              <td className="py-2 pr-4"><TradeSide t={t} /></td>
+              <td className="py-2 pr-4">
+                <TradeSide t={t} />
+                <div><ContractLabel t={t} /></div>
+              </td>
               <td className="py-2 pr-4 text-xs text-neutral-400">
                 {fmtDate(t.entry_at)} → {fmtDate(t.exit_at)}
               </td>

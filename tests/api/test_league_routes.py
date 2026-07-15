@@ -72,3 +72,45 @@ def test_divergence_route(client):
     resp = client.get("/api/divergence")
     assert resp.status_code == 200
     assert isinstance(resp.json(), list)
+
+
+def test_trader_trades_route_empty(client):
+    # trader_trades hasn't been populated in this throwaway DB -- must degrade
+    # to an empty list, not error.
+    resp = client.get("/api/trader-trades")
+    assert resp.status_code == 200
+    assert resp.json() == []
+
+
+def test_trader_trades_route(client):
+    from datetime import datetime, timezone
+
+    import stockmoney.api.db as api_db
+
+    # Re-open the same on-disk DB the fixture wrote to via the monkeypatched path.
+    conn = duckdb.connect(api_db.DEFAULT_DB_PATH)
+    now = datetime.now(timezone.utc)
+    conn.execute(
+        """INSERT INTO trader_trades
+        (trade_id, trader_id, symbol, option_right, side, strike, expiry_date, contracts,
+         entry_at, entry_underlying, entry_premium, exit_at, exit_underlying, exit_premium,
+         realized_pnl, status, thesis, exit_reason, linked_prediction_id, created_at)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        [
+            "trade-1", "chartist", "SOXL", "call", "long", 45.0, "2026-07-10", 1,
+            now, 44.0, 2.1, None, None, None, None, "open", "趨勢延續", None, None, now,
+        ],
+    )
+    conn.close()
+
+    resp = client.get("/api/trader-trades?limit=10")
+    assert resp.status_code == 200
+    rows = resp.json()
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["trade_id"] == "trade-1"
+    assert row["trader_id"] == "chartist"
+    assert row["trader_name"]  # joined from traders table
+    assert row["symbol"] == "SOXL"
+    assert row["status"] == "open"
+    assert row["thesis"] == "趨勢延續"

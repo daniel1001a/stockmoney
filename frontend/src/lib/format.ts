@@ -130,6 +130,28 @@ export function pricedInLabel(p: number | null | undefined): string {
   return '市場可能還沒反映'
 }
 
+// Professional option contract notation, e.g. "MSFT 373.3 Call 7/7".
+// symbol + strike (trailing ".0" stripped) + Call/Put + M/D from expiry_date.
+export function formatOptionContract({
+  symbol, strike, right, expiry,
+}: {
+  symbol: string
+  strike: number
+  right: 'call' | 'put'
+  expiry: string | null | undefined
+}): string {
+  const strikeStr = Number.isInteger(strike) ? String(strike) : String(Math.round(strike * 100) / 100)
+  const rightLabel = right === 'put' ? 'Put' : 'Call'
+  let expiryStr = ''
+  if (expiry) {
+    const d = new Date(`${expiry.slice(0, 10)}T00:00:00`)
+    if (!Number.isNaN(d.getTime())) {
+      expiryStr = ` ${d.getMonth() + 1}/${d.getDate()}`
+    }
+  }
+  return `${symbol} ${strikeStr} ${rightLabel}${expiryStr}`
+}
+
 export function importanceLabel(i: number | null | undefined): string {
   if (i === null || i === undefined) return '一般'
   if (i >= 0.75) return '重大'

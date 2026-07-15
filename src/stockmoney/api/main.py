@@ -175,6 +175,14 @@ def divergence(hours: int = 168) -> list[dict]:
         return queries.recent_divergence(conn, hours=hours)
 
 
+@app.get("/api/trader-trades")
+def trader_trades(limit: int = 40) -> list[dict]:
+    """Read-only trade tape across all Arena traders, most-recent-first --
+    powers the Arena "交易動態 (Live Board)" feed. Never places orders."""
+    with ro_connection() as conn:
+        return queries.recent_trader_trades(conn, limit=limit)
+
+
 # --- Honest Lin cockpit (Worker 5) -------------------------------------------
 # No direction prediction anywhere below this line -- see cockpit.py's module
 # docstring for the 8y walk-forward verdict that motivated this shape
