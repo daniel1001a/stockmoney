@@ -60,7 +60,8 @@ describe('Arena', () => {
     expect(screen.getByText('MSFT 373.3 Call 7/7')).toBeInTheDocument()
     expect(screen.getByText('AAPL 200 Put 7/10')).toBeInTheDocument()
     expect(screen.getByText('持倉中')).toBeInTheDocument()
-    expect(screen.getByText('已平倉')).toBeInTheDocument()
+    // Closed trade with realized_pnl > 0 renders the win outcome-state badge.
+    expect(screen.getByText('獲利平倉')).toBeInTheDocument()
     expect(screen.getByText('+$250')).toBeInTheDocument()
     expect(screen.getByText('達停利目標', { exact: false })).toBeInTheDocument()
   })

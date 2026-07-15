@@ -1,6 +1,6 @@
 import { useMemo, useState } from 'react'
 import { Link } from 'react-router-dom'
-import { api, type CockpitCard, type Briefing, type Quote, type SectorRotationEntry } from '../lib/api'
+import { api, type CockpitCard, type Briefing, type Quote, type SectorRotationEntry, type PredictionsOverview, type PostmarketWrap } from '../lib/api'
 import { useApi } from '../lib/useApi'
 import { refreshIntervalMs } from '../lib/refreshCadence'
 import { regimeClass, sentimentLabel, num, signedPct, sectorLabel, pct, compactMoney, shortDate } from '../lib/format'
@@ -48,6 +48,89 @@ function GuardrailBanner({ text }: { text: string }) {
   )
 }
 
+// --- Model direction-prediction track record (F3) -----------------------
+// The homepage is deliberately honest ("本工具不預測漲跌"), but the app DOES
+// run a direction model whose calls get graded — the user asked to see that
+// model's accuracy held to the same standard as the arena traders. This
+// surfaces its historical hit-rate transparently (with the sample size, and
+// framed as disclosure, not a call to act). Honest "資料不足" until predictions
+// have actually settled.
+
+function ModelTrackRecord({ p }: { p: PredictionsOverview }) {
+  const wins = p.outcome_counts?.win ?? 0
+  const losses = p.outcome_counts?.loss ?? 0
+  const graded = wins + losses
+  const acc = graded > 0 ? wins / graded : null
+  const roll = p.rolling_win_rate?.length ? p.rolling_win_rate[p.rolling_win_rate.length - 1] : null
+  const accTone = acc === null ? 'text-neutral-400' : acc >= 0.55 ? 'text-emerald-300' : acc >= 0.45 ? 'text-amber-200' : 'text-rose-300'
+  return (
+    <div className="mb-5 flex flex-wrap items-center gap-x-4 gap-y-1 rounded-lg border border-neutral-800 bg-neutral-950/40 px-4 py-2.5 text-sm">
+      <span className="text-xs font-medium text-neutral-400">🎯 模型方向預測戰績</span>
+      {graded > 0 ? (
+        <>
+          <span className="text-neutral-300">
+            歷史命中率 <span className={`font-semibold tabular-nums ${accTone}`}>{pct(acc)}</span>{' '}
+            <span className="text-xs text-neutral-500">({wins}勝 {losses}敗)</span>
+          </span>
+          {roll && (
+            <span className="text-neutral-300">
+              近窗滾動 <span className="font-semibold tabular-nums text-neutral-100">{pct(roll.rolling_win_rate)}</span>
+            </span>
+          )}
+        </>
+      ) : (
+        <span className="text-neutral-400">資料不足(尚無已結算預測)</span>
+      )}
+      <span className="ml-auto text-xs text-neutral-600">透明揭露 · 非操作建議</span>
+    </div>
+  )
+}
+
+// --- Post-market wrap-up (F1) -------------------------------------------
+// Companion to the pre-market briefing: an honest end-of-day desk note —
+// what the watchlist did today and, where a real headline exists, why.
+// Never fabricates a driver (shows "查無明確相關消息" instead).
+
+function PostMarketWrap({ w }: { w: PostmarketWrap }) {
+  return (
+    <Card className="mb-6 p-4">
+      <SectionTitle
+        title="📉 今日盤後總結"
+        hint={w.as_of_date ? `收盤資料截至 ${w.as_of_date}` : undefined}
+      />
+      {!w.data_sufficient ? (
+        <p className="text-sm text-neutral-400">{w.insufficient_reason ?? '資料不足'}</p>
+      ) : (
+        <>
+          <p className="text-sm font-medium text-neutral-100">{w.headline}</p>
+          <p className="mt-1.5 text-sm leading-relaxed text-neutral-300">{w.narrative}</p>
+
+          {w.top_movers.length > 0 && (
+            <div className="mt-3 space-y-1.5">
+              <div className="text-xs font-medium text-neutral-500">今日主要變動(漲跌幅最大)</div>
+              {w.top_movers.slice(0, 6).map((m) => (
+                <div key={m.symbol} className="flex flex-wrap items-baseline gap-x-2 text-sm">
+                  <Link to={`/ticker/${m.symbol}`} className="font-mono text-neutral-200 hover:text-neutral-50">{m.symbol}</Link>
+                  <span className={`tabular-nums ${m.change_pct >= 0 ? 'text-emerald-300' : 'text-rose-300'}`}>{signedPct(m.change_pct, 1)}</span>
+                  <span className="min-w-0 flex-1 truncate text-xs text-neutral-500">
+                    {m.driver_headline ?? '查無明確相關消息'}
+                  </span>
+                </div>
+              ))}
+            </div>
+          )}
+
+          {w.notable.length > 0 && (
+            <ul className="mt-3 list-disc space-y-0.5 pl-4 text-xs text-neutral-400">
+              {w.notable.map((n, i) => <li key={i}>{n}</li>)}
+            </ul>
+          )}
+        </>
+      )}
+    </Card>
+  )
+}
+
 // --- Daily briefing (Lin morning-note style narrative) ----------------------
 
 const NARRATIVE_BASIS_LABEL: Record<Briefing['narrative_basis'], string> = {
@@ -55,7 +138,7 @@ const NARRATIVE_BASIS_LABEL: Record<Briefing['narrative_basis'], string> = {
   fallback_regime_sector: '無足夠總經新聞,退回 regime + 板塊強弱簡版摘要',
 }
 
-function DailyBriefing({ b }: { b: Briefing }) {
+function DailyBriefing({ b, cards, quotes }: { b: Briefing; cards: CockpitCard[]; quotes: Record<string, Quote> | null | undefined }) {
   const [expanded, setExpanded] = useState(false)
   return (
     <Card className="mb-6 p-4">
@@ -77,7 +160,7 @@ function DailyBriefing({ b }: { b: Briefing }) {
       </details>
 
       {b.sector_rotation.length > 0 && <SectorRotationPanel rotation={b.sector_rotation} />}
-      <MarketStatsStrip b={b} />
+      <MarketStatsStrip b={b} cards={cards} quotes={quotes} />
 
       <button
         type="button"
@@ -132,35 +215,87 @@ function SectorRotationPanel({ rotation }: { rotation: SectorRotationEntry[] }) 
   )
 }
 
-// --- Market stats strip (v2 homepage iteration) -------------------------
-// Compact replacement for the vertical space the old, taller sector-rotation
-// panel used to dominate: VIX level + term-structure mood + today's
-// up/down breadth across the watchlist. All three numbers are already
-// computed server-side for the narrative paragraph -- this just also
-// surfaces them as small stat tiles for a glance-able read.
+// --- Market prep strip (homepage) ---------------------------------------
+// Rebuilt after user feedback that the old strip (raw VIX + "期限結構" jargon +
+// meaningless watchlist 漲跌家數) was hollow — none of it helped prepare a
+// trade. Every tile now answers a concrete pre-trade question a short-dated
+// options trader actually asks, from data already on the page:
+//   1. 選擇權環境  — is premium cheap or rich to trade today? (VIX, reframed)
+//   2. 今日焦點    — which watchlist name is moving most? (where to look first)
+//   3. 最近財報    — what event risk is coming up? (nearest earnings)
+// Honest fallbacks ("資料不足") whenever the underlying number is missing.
 
-function MarketStatsStrip({ b }: { b: Briefing }) {
-  const moodLabel = b.vix === null ? '資料不足' : (b.vix_term_slope ?? 0) < 0 ? '偏恐慌後仰' : '平靜正常'
+// Rough, honest VIX bands — a *context* read for whether options premium is
+// cheap or rich to trade, NOT a direction signal.
+function vixEnv(vix: number | null): { label: string; tone: string; hint: string } {
+  if (vix === null) return { label: '資料不足', tone: 'text-neutral-400', hint: '' }
+  if (vix >= 25) return { label: '偏貴 · 利於賣方', tone: 'text-amber-200', hint: '恐慌高、權利金貴,買方要付溢價' }
+  if (vix <= 15) return { label: '偏便宜 · 利於買方', tone: 'text-emerald-300', hint: '波動低、權利金便宜,買方成本低' }
+  return { label: '中性', tone: 'text-neutral-200', hint: '權利金定價大致合理' }
+}
+
+function topMover(cards: CockpitCard[], quotes: Record<string, Quote> | null | undefined): { symbol: string; change_pct: number } | null {
+  if (!quotes) return null
+  let best: { symbol: string; change_pct: number } | null = null
+  for (const c of cards) {
+    const q = quotes[c.symbol]
+    if (!q || q.change_pct === null) continue
+    if (!best || Math.abs(q.change_pct) > Math.abs(best.change_pct)) best = { symbol: c.symbol, change_pct: q.change_pct }
+  }
+  return best
+}
+
+function nearestEarnings(cards: CockpitCard[]): { symbol: string; days: number } | null {
+  const today = new Date()
+  today.setHours(0, 0, 0, 0)
+  let best: { symbol: string; days: number } | null = null
+  for (const c of cards) {
+    if (!c.earnings_date) continue
+    const d = new Date(`${c.earnings_date.slice(0, 10)}T00:00:00`)
+    if (Number.isNaN(d.getTime())) continue
+    const days = Math.round((d.getTime() - today.getTime()) / 86_400_000)
+    if (days < 0) continue
+    if (!best || days < best.days) best = { symbol: c.symbol, days }
+  }
+  return best
+}
+
+function MarketStatsStrip({ b, cards, quotes }: { b: Briefing; cards: CockpitCard[]; quotes: Record<string, Quote> | null | undefined }) {
+  const env = vixEnv(b.vix)
+  const mover = topMover(cards, quotes)
+  const earnings = nearestEarnings(cards)
   return (
-    <div className="mt-3 grid grid-cols-3 gap-1.5 text-center">
-      <div className="rounded-lg border border-neutral-800/70 bg-neutral-950/40 px-2 py-1.5">
-        <div className="text-[11px] text-neutral-500">VIX</div>
-        <div className="mt-0.5 text-sm font-semibold tabular-nums text-neutral-100">
-          {b.vix !== null ? b.vix.toFixed(1) : '—'}
+    <div className="mt-3 grid grid-cols-3 gap-1.5">
+      <div className="rounded-lg border border-neutral-800/70 bg-neutral-950/40 px-2.5 py-2" title={env.hint}>
+        <div className="text-[11px] text-neutral-500">選擇權環境{b.vix !== null ? ` · VIX ${b.vix.toFixed(1)}` : ''}</div>
+        <div className={`mt-0.5 text-sm font-semibold ${env.tone}`}>{env.label}</div>
+      </div>
+      <div className="rounded-lg border border-neutral-800/70 bg-neutral-950/40 px-2.5 py-2" title="清單中今日漲跌幅最大的標的——先看這裡">
+        <div className="text-[11px] text-neutral-500">今日焦點</div>
+        <div className="mt-0.5 text-sm font-semibold text-neutral-100">
+          {mover ? (
+            <>
+              <span className="text-neutral-100">{mover.symbol}</span>{' '}
+              <span className={mover.change_pct >= 0 ? 'text-emerald-300' : 'text-rose-300'}>{signedPct(mover.change_pct, 1)}</span>
+            </>
+          ) : (
+            <span className="text-neutral-400">資料不足</span>
+          )}
         </div>
       </div>
-      <GlossaryTerm term="vix_term_mood" className="rounded-lg border border-neutral-800/70 bg-neutral-950/40 px-2 py-1.5">
-        <div className="text-[11px] text-neutral-500">期限結構</div>
-        <div className="mt-0.5 text-sm font-semibold text-neutral-100">{moodLabel}</div>
-      </GlossaryTerm>
-      <GlossaryTerm term="market_breadth" className="rounded-lg border border-neutral-800/70 bg-neutral-950/40 px-2 py-1.5">
-        <div className="text-[11px] text-neutral-500">今日漲跌家數</div>
-        <div className="mt-0.5 text-sm font-semibold tabular-nums text-neutral-100">
-          <span className="text-emerald-300">{b.breadth.up}漲</span>
-          {' / '}
-          <span className="text-rose-300">{b.breadth.down}跌</span>
+      <div className="rounded-lg border border-neutral-800/70 bg-neutral-950/40 px-2.5 py-2" title="清單中最近的財報日——財報前後波動放大,是主要事件風險">
+        <div className="text-[11px] text-neutral-500">最近財報</div>
+        <div className="mt-0.5 text-sm font-semibold text-neutral-100">
+          {earnings ? (
+            <>
+              <span>{earnings.symbol}</span>{' '}
+              <span className="text-amber-200">{earnings.days === 0 ? '今天' : `${earnings.days}天後`}</span>
+            </>
+          ) : (
+            <span className="text-neutral-400">資料不足</span>
+          )}
         </div>
-      </GlossaryTerm>
+      </div>
     </div>
   )
 }
@@ -380,6 +515,8 @@ export default function Opportunities() {
   const { data, loading, error } = useApi(api.cockpit, [], cadence)
   const { data: briefing } = useApi(api.briefing, [], cadence)
   const { data: quotes } = useApi(api.quotes, [], cadence)
+  const { data: predictions } = useApi(api.predictions, [], cadence)
+  const { data: postmarket } = useApi(api.postmarket, [], cadence)
 
   const [sort, setSort] = useState<SortKey>('posture')
   const sorted = useMemo(() => {
@@ -410,7 +547,9 @@ export default function Opportunities() {
       </div>
 
       {briefing && <GuardrailBanner text={briefing.guardrail} />}
-      {briefing && <DailyBriefing b={briefing} />}
+      {predictions && <ModelTrackRecord p={predictions} />}
+      {briefing && <DailyBriefing b={briefing} cards={data ?? []} quotes={quotes} />}
+      {postmarket && <PostMarketWrap w={postmarket} />}
 
       {loading && <Loading />}
       {error && <ErrorMsg error={error} />}

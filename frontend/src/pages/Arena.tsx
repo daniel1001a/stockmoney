@@ -104,15 +104,46 @@ function DivergencePanel({ rows }: { rows: DivergenceRow[] }) {
   )
 }
 
+// The three states a Live Board row can be in, encoded with colour so it is
+// scannable at a glance (user feedback: a lone red/green dollar figure was
+// "incomplete" — hard to tell holding vs sold-for-profit vs sold-for-loss):
+//   holding — position still open (opened N days ago, still held)
+//   win     — closed for a realised profit
+//   loss    — closed for a realised loss
+//   flat    — closed at break-even / P&L not recorded
+type TradeState = 'holding' | 'win' | 'loss' | 'flat'
+
+function tradeState(t: TraderTradeFeedEntry): TradeState {
+  if (t.status !== 'closed') return 'holding'
+  if (t.realized_pnl === null) return 'flat'
+  if (t.realized_pnl > 0) return 'win'
+  if (t.realized_pnl < 0) return 'loss'
+  return 'flat'
+}
+
+// label = the outcome badge; border = left-edge accent colour for whole-row
+// scanning; text = colour for the P&L figure.
+const STATE_META: Record<TradeState, { label: string; chip: string; border: string; text: string }> = {
+  holding: { label: '持倉中', chip: 'border-sky-500/40 bg-sky-500/10 text-sky-300', border: 'border-l-sky-500/70', text: 'text-sky-300' },
+  win: { label: '獲利平倉', chip: 'border-emerald-500/40 bg-emerald-500/10 text-emerald-300', border: 'border-l-emerald-500/80', text: 'text-emerald-300' },
+  loss: { label: '虧損平倉', chip: 'border-rose-500/40 bg-rose-500/10 text-rose-300', border: 'border-l-rose-500/80', text: 'text-rose-300' },
+  flat: { label: '平倉持平', chip: 'border-neutral-700 bg-neutral-500/10 text-neutral-400', border: 'border-l-neutral-700', text: 'text-neutral-400' },
+}
+
 function LiveBoardRow({ t }: { t: TraderTradeFeedEntry }) {
   const isClosed = t.status === 'closed'
+  const state = tradeState(t)
+  const meta = STATE_META[state]
   // 買入 = opening a long, 賣出 = opening a short; once it's closed we call it
   // by what actually happened to the position (平倉), not the original side.
   const actionLabel = isClosed ? '平倉' : t.side === 'long' ? '買入開倉' : '賣出開倉'
   const contract = formatOptionContract({ symbol: t.symbol, strike: t.strike, right: t.option_right, expiry: t.expiry_date })
+  // Qualify the timestamp so an old open position reads as "opened N days ago,
+  // still holding" rather than looking like a stale/mistaken "today's trade".
+  const timeLabel = isClosed ? `${relTime(t.exit_at ?? t.entry_at)}平倉` : `${relTime(t.entry_at)}進場`
 
   return (
-    <div className="border-b border-neutral-900 px-4 py-3 last:border-0">
+    <div className={`border-l-2 ${meta.border} px-4 py-3`}>
       <div className="flex flex-wrap items-center justify-between gap-2">
         <div className="flex flex-wrap items-center gap-2">
           <Link to={`/trader/${t.trader_id}`} className="text-sm font-semibold text-neutral-100 hover:text-neutral-300">
@@ -124,17 +155,17 @@ function LiveBoardRow({ t }: { t: TraderTradeFeedEntry }) {
           <Link to={`/ticker/${t.symbol}`} className="font-mono text-sm text-neutral-200 hover:text-neutral-50">
             {contract}
           </Link>
-          <Chip className={isClosed ? 'border-neutral-700 text-neutral-400' : 'border-sky-500/40 text-sky-300'}>
-            {isClosed ? '已平倉' : '持倉中'}
+          <Chip className={meta.chip}>
+            {meta.label}
           </Chip>
         </div>
         <div className="flex items-center gap-3 text-xs text-neutral-500">
           {isClosed && t.realized_pnl !== null && (
-            <span className={`text-sm font-semibold tabular-nums ${t.realized_pnl >= 0 ? 'text-emerald-300' : 'text-rose-300'}`}>
+            <span className={`text-sm font-semibold tabular-nums ${meta.text}`}>
               {signedMoney(t.realized_pnl)}
             </span>
           )}
-          <span>{relTime(t.exit_at ?? t.entry_at)}</span>
+          <span>{timeLabel}</span>
         </div>
       </div>
 

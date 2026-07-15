@@ -510,6 +510,35 @@ export interface Briefing {
   scoreboard: ScoreboardSummary
 }
 
+// --- Post-market (end-of-day) wrap-up (F1) ------------------------------
+
+export interface PostmarketMover {
+  symbol: string
+  sector: string | null
+  change_pct: number
+  close: number
+  driver_headline: string | null
+  driver_source: string | null
+  driver_published_at: string | null
+  driver_sentiment: number | null
+}
+
+export interface PostmarketWrap {
+  as_of_date: string | null
+  headline: string
+  narrative: string
+  dominant_regime: string | null
+  vix: number | null
+  vix_term_slope: number | null
+  breadth: { up: number; down: number; flat: number }
+  top_movers: PostmarketMover[]
+  // reuses the same shape as SectorRotationEntry
+  sector_strength: SectorRotationEntry[] | null
+  notable: string[]
+  data_sufficient: boolean
+  insufficient_reason: string | null
+}
+
 export interface CockpitLevels {
   nday_high: number | null
   nday_low: number | null
@@ -598,5 +627,6 @@ export const api = {
     getJson<TraderTradeFeedEntry[]>(`/trader-trades${limit !== undefined ? `?limit=${limit}` : ''}`),
   briefing: () => getJson<Briefing>('/briefing'),
   cockpit: () => getJson<CockpitCard[]>('/cockpit'),
+  postmarket: () => getJson<PostmarketWrap>('/postmarket'),
   scoreboardSummary: () => getJson<ScoreboardSummary>('/scoreboard-summary'),
 }

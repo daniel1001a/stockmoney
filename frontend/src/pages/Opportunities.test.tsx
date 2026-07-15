@@ -1,10 +1,39 @@
-import { describe, expect, it, vi } from 'vitest'
+import { describe, expect, it, vi, beforeEach } from 'vitest'
 import { render, screen, waitFor, fireEvent } from '@testing-library/react'
 import { MemoryRouter } from 'react-router-dom'
 import Opportunities from './Opportunities'
-import { api, type CockpitCard, type Briefing, type Quote } from '../lib/api'
+import { api, type CockpitCard, type Briefing, type Quote, type PredictionsOverview, type PostmarketWrap } from '../lib/api'
 
 vi.mock('../lib/api')
+
+// The page also fetches the model-track-record and post-market-wrap endpoints.
+// Stub them to their honest empty states so every mount resolves; these tests
+// assert the briefing/watchlist behaviour, not those two panels.
+const predictionsOverview: PredictionsOverview = {
+  rolling_win_rate: [],
+  outcome_counts: {},
+  recent: [],
+}
+
+const postmarketWrap: PostmarketWrap = {
+  as_of_date: null,
+  headline: '',
+  narrative: '',
+  dominant_regime: null,
+  vix: null,
+  vix_term_slope: null,
+  breadth: { up: 0, down: 0, flat: 0 },
+  top_movers: [],
+  sector_strength: null,
+  notable: [],
+  data_sufficient: false,
+  insufficient_reason: '資料不足',
+}
+
+beforeEach(() => {
+  vi.mocked(api.predictions).mockResolvedValue(predictionsOverview)
+  vi.mocked(api.postmarket).mockResolvedValue(postmarketWrap)
+})
 
 const card = (
   symbol: string,
@@ -103,7 +132,9 @@ describe('Opportunities', () => {
     render(<MemoryRouter><Opportunities /></MemoryRouter>)
 
     await waitFor(() => expect(screen.getByText('$185.50')).toBeInTheDocument())
-    expect(screen.getByText('+4.2%')).toBeInTheDocument()
+    // The change% appears on the card badge and again in the 今日焦點 top-mover
+    // tile (NVDA is the sole/top mover), so match all occurrences.
+    expect(screen.getAllByText('+4.2%').length).toBeGreaterThan(0)
   })
 
   it('defaults to posture grouping and buckets cards by breakout_state, never predicting direction', async () => {
@@ -158,15 +189,19 @@ describe('Opportunities', () => {
     expect(screen.getAllByText(/財報日 未知/).length).toBeGreaterThan(0)
   })
 
-  it('shows a compact VIX / term-structure / breadth stats strip', async () => {
+  it('shows a compact market-prep strip (選擇權環境 / 今日焦點 / 最近財報)', async () => {
     vi.mocked(api.cockpit).mockResolvedValue([card('NVDA', 'semiconductor')])
     vi.mocked(api.briefing).mockResolvedValue(briefing)
     vi.mocked(api.quotes).mockResolvedValue({})
 
     render(<MemoryRouter><Opportunities /></MemoryRouter>)
 
-    await waitFor(() => expect(screen.getByText('18.2')).toBeInTheDocument())
-    expect(screen.getByText(/1漲/)).toBeInTheDocument()
-    expect(screen.getByText(/1跌/)).toBeInTheDocument()
+    // The rebuilt strip surfaces the options-premium environment (VIX reframed),
+    // today's focus mover, and the nearest earnings — not the old raw
+    // VIX/term-structure/breadth tiles.
+    await waitFor(() => expect(screen.getByText(/選擇權環境/)).toBeInTheDocument())
+    expect(screen.getByText(/VIX 18\.2/)).toBeInTheDocument()
+    expect(screen.getByText('今日焦點')).toBeInTheDocument()
+    expect(screen.getByText('最近財報')).toBeInTheDocument()
   })
 })
