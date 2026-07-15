@@ -138,3 +138,53 @@ def test_price_on_date_dedupes_by_ingested_at():
 def test_price_on_date_returns_none_when_missing():
     conn = _migrated_conn()
     assert price_on_date(conn, "SOXL", date(2026, 7, 8)) is None
+
+
+def test_latest_underlying_price_skips_nan_close():
+    """Regression (2026-07-15 incident): a yfinance partial bar can leave an
+    IEEE NaN close as the most recent ingested row (`close IS NOT NULL` does
+    NOT exclude NaN in DuckDB SQL). Picking that row as "the" latest price
+    used to hand a NaN entry_price to league/context.py, which flowed into
+    option_selection.select_option -> strike_ladder.snap_strike and crashed
+    the whole league predict pass with ValueError('strike must be a positive
+    finite number, got nan'). The latest *usable* (non-NaN) close must be
+    returned instead."""
+    conn = _migrated_conn()
+    df = pl.DataFrame({
+        "symbol": ["AVGO", "AVGO"],
+        "trade_date": [date(2026, 7, 14), date(2026, 7, 15)],
+        "open": [385.0, 300.0],
+        "high": [392.0, 305.0],
+        "low": [380.0, 298.0],
+        "close": [389.11, float("nan")],  # 2026-07-15's partial bar
+        "adj_close": [389.11, float("nan")],
+        "volume": [1000, 1000],
+        "source": ["yfinance", "yfinance"],
+        "ingested_at": [
+            datetime(2026, 7, 14, 21, 0, tzinfo=timezone.utc),
+            datetime(2026, 7, 15, 15, 0, tzinfo=timezone.utc),
+        ],
+    })
+    append_rows(conn, "ohlcv_daily", df)
+
+    result = latest_underlying_price(conn, "AVGO")
+    assert result == (date(2026, 7, 14), 389.11)
+
+
+def test_price_on_date_skips_nan_close():
+    conn = _migrated_conn()
+    df = pl.DataFrame({
+        "symbol": ["AVGO"],
+        "trade_date": [date(2026, 7, 15)],
+        "open": [300.0],
+        "high": [305.0],
+        "low": [298.0],
+        "close": [float("nan")],
+        "adj_close": [float("nan")],
+        "volume": [1000],
+        "source": ["yfinance"],
+        "ingested_at": [datetime(2026, 7, 15, 15, 0, tzinfo=timezone.utc)],
+    })
+    append_rows(conn, "ohlcv_daily", df)
+
+    assert price_on_date(conn, "AVGO", date(2026, 7, 15)) is None

@@ -8,6 +8,7 @@ so it lives in feature_store alongside per-symbol features without colliding.
 """
 from __future__ import annotations
 
+import math
 import statistics
 from datetime import date, datetime
 
@@ -44,7 +45,14 @@ def compute_xsec_dispersion(
                        PARTITION BY symbol, trade_date ORDER BY ingested_at DESC
                    ) AS rn
             FROM ohlcv_daily
-            WHERE close IS NOT NULL AND symbol IN ({placeholders})
+            -- `close IS NOT NULL` alone does NOT exclude IEEE NaN (DuckDB NaN
+            -- gotcha: NaN passes an IS NOT NULL check); a NaN close (e.g. a
+            -- yfinance partial-bar row for today, see integrity_fixes.py's
+            -- delete_nan_ohlcv_rows) would otherwise propagate into the
+            -- return computation below and crash statistics.stdev with
+            -- "'float' object has no attribute 'numerator'" -- its exact-
+            -- fraction internals can't represent NaN.
+            WHERE close IS NOT NULL AND NOT isnan(close) AND symbol IN ({placeholders})
         )
         SELECT symbol, trade_date, close, ingested_at
         FROM latest WHERE rn = 1
@@ -66,6 +74,8 @@ def compute_xsec_dispersion(
             prev_close = series[i - 1][1]
             if prev_close and prev_close > 0:
                 ret = close / prev_close - 1.0
+                if not math.isfinite(ret):  # belt-and-suspenders vs. the SQL isnan() filter above
+                    continue
                 returns_by_date.setdefault(d, {})[symbol] = (ret, ingested_at)
 
     values: list[FeatureValue] = []

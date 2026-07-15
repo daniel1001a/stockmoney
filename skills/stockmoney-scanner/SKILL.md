@@ -112,9 +112,12 @@ Working directory for all commands: `/Users/danielisgod/Projects/stockmoney`
 ## Classification pass
 
 Run when the message says to run the classification pass (scheduled
-nightly, Sonnet-tier via claude-cli subscription — this is a high-volume,
-low-complexity task, so work through every item; token cost per item should
-stay small).
+nightly, Haiku-tier via claude-cli subscription — this is a high-volume,
+low-complexity task (often 100+ items in one turn), so work through every
+item quickly; token cost per item should stay small. Running this on a
+heavier tier is what previously stalled the pass past the no-output watchdog
+and burned the shared subscription budget, so keep it on the utility model —
+CLAUDE.md section 13).
 
 1. Run command 3 to see the current watchlist. Do not run anything else to
    "double check" this — command 3's output is complete and authoritative.

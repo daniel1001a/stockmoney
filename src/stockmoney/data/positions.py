@@ -113,7 +113,18 @@ def list_open_positions(conn: duckdb.DuckDBPyConnection) -> list[OptionPosition]
 
 def latest_underlying_price(conn: duckdb.DuckDBPyConnection, symbol: str) -> tuple[date, float] | None:
     """Most recent close for `symbol`, deduped the same way feature engineering
-    is (highest `ingested_at` wins for a given `trade_date`)."""
+    is (highest `ingested_at` wins for a given `trade_date`).
+
+    `close IS NOT NULL` alone does NOT exclude IEEE NaN (DuckDB NaN gotcha:
+    NaN passes an IS NOT NULL check) -- a NaN close (e.g. a yfinance
+    partial-bar row ingested for today, see integrity_fixes.py's
+    delete_nan_ohlcv_rows for the 2026-07-15 incident) would otherwise be
+    picked as "the" latest price and flow into league/context.py's
+    entry_price, poisoning the option strike computation downstream
+    (option_selection.select_option -> strike_ladder.snap_strike, which
+    correctly rejects a NaN strike but too late to give a clean price here).
+    `NOT isnan(close)` skips such a row and falls back to the last genuinely
+    usable close instead."""
     row = conn.execute(
         """
         WITH latest AS (
@@ -122,7 +133,7 @@ def latest_underlying_price(conn: duckdb.DuckDBPyConnection, symbol: str) -> tup
                        PARTITION BY trade_date ORDER BY ingested_at DESC
                    ) AS rn
             FROM ohlcv_daily
-            WHERE symbol = ? AND close IS NOT NULL
+            WHERE symbol = ? AND close IS NOT NULL AND NOT isnan(close)
         )
         SELECT trade_date, close FROM latest WHERE rn = 1
         ORDER BY trade_date DESC LIMIT 1
@@ -134,9 +145,9 @@ def latest_underlying_price(conn: duckdb.DuckDBPyConnection, symbol: str) -> tup
 
 def price_on_date(conn: duckdb.DuckDBPyConnection, symbol: str, trade_date: date) -> float | None:
     """Close on an exact `trade_date`, deduped the same way as
-    `latest_underlying_price` (highest `ingested_at` wins). Used by the
-    daily-prediction grading job to look up the price on a prediction's
-    label_end_date."""
+    `latest_underlying_price` (highest `ingested_at` wins, NaN closes
+    excluded -- see that function's docstring). Used by the daily-prediction
+    grading job to look up the price on a prediction's label_end_date."""
     row = conn.execute(
         """
         WITH latest AS (
@@ -145,7 +156,7 @@ def price_on_date(conn: duckdb.DuckDBPyConnection, symbol: str, trade_date: date
                        PARTITION BY trade_date ORDER BY ingested_at DESC
                    ) AS rn
             FROM ohlcv_daily
-            WHERE symbol = ? AND trade_date = ? AND close IS NOT NULL
+            WHERE symbol = ? AND trade_date = ? AND close IS NOT NULL AND NOT isnan(close)
         )
         SELECT close FROM latest WHERE rn = 1
         """,

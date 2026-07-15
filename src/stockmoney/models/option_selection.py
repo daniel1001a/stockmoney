@@ -81,7 +81,15 @@ def select_option(
         return None
     if direction not in (DOWN, UP):
         raise ValueError(f"direction must be one of DOWN/RANGE/UP, got {direction!r}")
-    if iv is None or iv <= 0 or spot <= 0:
+    # `iv <= 0` / `spot <= 0` do NOT catch IEEE NaN (any comparison against
+    # NaN is False, the same DuckDB/Python NaN gotcha behind the 2026-07-15
+    # incident) -- a NaN entry price or IV would otherwise sail through here
+    # and strike_for_delta would silently produce a NaN strike, later raised
+    # as an uncaught ValueError by strike_ladder.strike_increment far away
+    # from this, the actual point of bad input. math.isfinite rejects NaN
+    # and +/-inf explicitly so this returns the normal "no usable entry IV"
+    # None instead of blowing up downstream.
+    if iv is None or not math.isfinite(iv) or iv <= 0 or not math.isfinite(spot) or spot <= 0:
         return None  # can't size a strike without a usable entry IV
 
     is_call = direction == UP

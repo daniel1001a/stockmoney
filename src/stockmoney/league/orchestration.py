@@ -74,7 +74,23 @@ def run_predictions(
             # Instrument selection is mechanical, applied identically to every
             # trader's call -- see league/option_bridge.py's module docstring
             # for why this lives here rather than inside each engine.
-            call.option_structure = build_option_structure(conn, ctx, call)
+            #
+            # build_option_structure/select_option already return None
+            # gracefully for the routine "no usable entry IV" cases (see
+            # their own guards); this try/except is the last line of defense
+            # for anything those guards don't anticipate (e.g. strike_ladder's
+            # NaN/positivity guard firing on a strike that slipped through --
+            # that guard is intentionally strict and must stay). One bad
+            # symbol must never abort predictions for every other symbol in
+            # the league (2026-07-15 incident: an uncaught ValueError here
+            # took down the whole nightly run_predictions call) -- the
+            # directional call itself is still perfectly valid and gets
+            # recorded, just without an instrument attached.
+            try:
+                call.option_structure = build_option_structure(conn, ctx, call)
+            except Exception as exc:
+                call.option_structure = None
+                skips.append(f"{symbol}/{trader.trader_id}: option structure build failed ({exc}), recording call without an instrument")
 
             tp.record_trader_prediction(
                 conn,

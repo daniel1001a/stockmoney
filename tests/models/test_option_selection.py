@@ -53,6 +53,22 @@ def test_bad_iv_yields_no_trade():
     assert select_option(UP, 100.0, None) is None
 
 
+def test_nan_spot_or_iv_yields_no_trade_not_a_crash():
+    """Regression (2026-07-15 incident): `iv <= 0` / `spot <= 0` do not catch
+    IEEE NaN (any comparison against NaN is False), so a NaN entry_price or
+    IV used to sail past this guard, strike_for_delta would silently produce
+    a NaN strike, and strike_ladder.snap_strike would then raise an uncaught
+    ValueError far from the actual bad input -- aborting the whole league
+    predict pass for every symbol, not just the one with bad data. NaN must
+    be treated the same as "no usable entry IV", same as 0/None."""
+    assert select_option(UP, float("nan"), 0.3) is None
+    assert select_option(DOWN, 100.0, float("nan")) is None
+    assert select_option(UP, float("nan"), float("nan")) is None
+    # snap=True is the live/league path (option_bridge.build_option_structure)
+    # -- must not raise even with snapping engaged.
+    assert select_option(UP, float("nan"), 0.3, snap=True) is None
+
+
 def test_invalid_direction_raises():
     with pytest.raises(ValueError):
         select_option(7, 100.0, 0.3)

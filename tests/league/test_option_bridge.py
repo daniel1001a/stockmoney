@@ -118,3 +118,24 @@ def test_strike_is_snapped_for_a_put_too():
     conn = _conn()
     structure = build_option_structure(conn, _ctx(symbol="TSLA", entry_price=234.6), _call("down"))
     assert is_on_ladder(structure["strike"])
+
+
+def test_nan_entry_price_produces_no_structure_not_a_crash():
+    """Regression (2026-07-15 incident): a NaN entry_price (from a yfinance
+    partial-bar close, see stockmoney.data.positions.latest_underlying_price)
+    used to reach option_selection.select_option -> strike_ladder.snap_strike
+    and raise ValueError('strike must be a positive finite number, got nan'),
+    aborting orchestration.run_predictions for the whole league. It must be
+    treated as "no usable entry price" -- same as the existing missing-
+    grade_vol case -- and return None instead of raising."""
+    conn = _conn()
+    assert build_option_structure(conn, _ctx(entry_price=float("nan")), _call("up")) is None
+
+
+def test_nan_grade_vol_produces_no_structure_not_a_crash():
+    """Same NaN-vs-guard gap as above, via the proxy-IV path (grade_vol ->
+    entry_iv_proxy): `ctx.grade_vol <= 0` does not catch NaN either, so this
+    exercises option_selection.select_option's NaN guard on `iv` rather than
+    a guard inside build_option_structure itself."""
+    conn = _conn()
+    assert build_option_structure(conn, _ctx(grade_vol=float("nan")), _call("up")) is None
