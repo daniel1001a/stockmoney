@@ -6,16 +6,25 @@ import { Chip } from './ui'
 // One row in a news list. Clicking opens the in-app detail page (/news/:id) --
 // the Robinhood pattern the user asked for: a list of headlines you tap into,
 // staying inside the app, with the outbound source link on the detail page.
-export default function NewsRow({ item, showSymbol = true }: { item: NewsItem; showSymbol?: boolean }) {
+export default function NewsRow({
+  item, showSymbol = true, isNew = false,
+}: { item: NewsItem; showSymbol?: boolean; isNew?: boolean }) {
   const meta = newsTypeMeta(item.item_type)
   const sent = sentimentLabel(item.sentiment_score)
   const important = (item.importance ?? 0) >= 0.75
   return (
     <Link
       to={`/news/${item.item_id}`}
-      className="block border-b border-neutral-900 px-3 py-3 transition-colors last:border-0 hover:bg-neutral-900/60"
+      className={`block border-b border-neutral-900 px-3 py-3 transition-colors last:border-0 hover:bg-neutral-900/60 ${isNew ? 'bg-sky-500/[0.04]' : ''}`}
     >
       <div className="flex items-center gap-2">
+        {isNew && (
+          <span
+            aria-label="自你上次到訪後新增"
+            title="自你上次到訪後新增"
+            className="h-1.5 w-1.5 shrink-0 rounded-full bg-sky-400"
+          />
+        )}
         <Chip className={meta.cls}>{meta.label}</Chip>
         {showSymbol && item.symbol && (
           <span className="text-xs font-semibold text-neutral-300">{item.symbol}</span>

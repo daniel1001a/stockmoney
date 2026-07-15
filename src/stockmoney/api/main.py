@@ -119,6 +119,12 @@ def news_detail(item_id: str) -> dict:
     return result
 
 
+@app.get("/api/news-freshness")
+def news_freshness() -> dict:
+    with ro_connection() as conn:
+        return queries.news_freshness(conn)
+
+
 @app.get("/api/events")
 def events() -> list[dict]:
     with ro_connection() as conn:

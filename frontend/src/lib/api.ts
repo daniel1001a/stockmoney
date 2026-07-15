@@ -138,6 +138,20 @@ export interface MarketSummary {
   top_losers: MarketMover[]
 }
 
+export interface NewsFreshnessRun {
+  source: string | null
+  rows_written: number | null
+  finished_at: string | null
+  status: string | null
+}
+
+export interface NewsFreshness {
+  last_updated: string | null
+  last_run: NewsFreshnessRun | null
+  news_last_24h: number
+  median_ingest_gap_minutes: number | null
+}
+
 export interface MarketEvent {
   event_id: string
   symbol: string | null
@@ -534,6 +548,7 @@ export const api = {
   news: (limit?: number) => getJson<NewsItem[]>(`/news${limit !== undefined ? `?limit=${limit}` : ''}`),
   newsItem: (id: string) => getJsonOrNull<NewsItem>(`/news/${encodeURIComponent(id)}`),
   events: () => getJson<MarketEvent[]>('/events'),
+  newsFreshness: () => getJson<NewsFreshness>('/news-freshness'),
   leaderboard: () => getJson<LeaderboardEntry[]>('/leaderboard'),
   traderProfile: (id: string) => getJsonOrNull<TraderProfile>(`/traders/${encodeURIComponent(id)}`),
   watchlist: () => getJson<WatchlistResponse>('/watchlist'),

@@ -785,6 +785,67 @@ def news_for_symbol(
     return [_news_row_to_dict(r) for r in rows]
 
 
+def news_freshness(conn: duckdb.DuckDBPyConnection, *, now: datetime | None = None) -> dict:
+    """Backs the 消息雷達 freshness strip: "how stale is this feed right now,
+    and how often does it actually update" -- the user's complaint was they
+    have to re-skim the whole list every time they come back, with no signal
+    for whether anything even changed. Read-only, degrades to nulls if
+    ingestion_runs has no news rows yet (fresh DB / migration not run)."""
+    now = now or datetime.now(timezone.utc)
+    last_updated = conn.execute("SELECT max(created_at) FROM news_items").fetchone()[0]
+
+    cutoff = now - timedelta(hours=24)
+    news_last_24h = conn.execute(
+        "SELECT count(*) FROM news_items WHERE created_at >= ?", [cutoff]
+    ).fetchone()[0]
+
+    run_row = conn.execute(
+        """
+        SELECT source, rows_written, finished_at, status
+        FROM ingestion_runs
+        WHERE target_table = 'news_articles_raw'
+        ORDER BY finished_at DESC NULLS LAST
+        LIMIT 1
+        """
+    ).fetchone()
+    last_run = None
+    if run_row is not None:
+        last_run = {
+            "source": run_row[0], "rows_written": run_row[1],
+            "finished_at": run_row[2], "status": run_row[3],
+        }
+
+    # Cadence signal: median gap between the last ~20 successful news
+    # ingestion runs. Needs >=2 finished runs to mean anything.
+    finish_times = [
+        r[0] for r in conn.execute(
+            """
+            SELECT finished_at FROM ingestion_runs
+            WHERE target_table = 'news_articles_raw' AND status = 'success'
+              AND finished_at IS NOT NULL
+            ORDER BY finished_at DESC LIMIT 20
+            """
+        ).fetchall()
+    ]
+    median_gap_minutes = None
+    if len(finish_times) >= 2:
+        gaps = sorted(
+            (finish_times[i] - finish_times[i + 1]).total_seconds() / 60
+            for i in range(len(finish_times) - 1)
+        )
+        mid = len(gaps) // 2
+        median_gap_minutes = (
+            gaps[mid] if len(gaps) % 2 == 1 else (gaps[mid - 1] + gaps[mid]) / 2
+        )
+
+    return {
+        "last_updated": last_updated,
+        "last_run": last_run,
+        "news_last_24h": news_last_24h,
+        "median_ingest_gap_minutes": median_gap_minutes,
+    }
+
+
 def events(conn: duckdb.DuckDBPyConnection, *, now: datetime | None = None) -> list[dict]:
     """Upcoming scheduled market events (earnings / FOMC / CPI / NFP), soonest
     first. Real, public, everyone-knows-it news -- the calm counterpart to the
