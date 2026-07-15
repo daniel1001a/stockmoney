@@ -47,7 +47,12 @@ def fetch_ohlcv(symbols: list[str], start: date, end: date) -> pl.DataFrame:
 
     frames = []
     for symbol in symbols:
-        sub = data[symbol].dropna(how="all")
+        # yfinance sometimes returns a partial bar (valid Open/High/Low/Volume
+        # but NaN Close) rather than omitting the row entirely -- a Close-less
+        # bar is unusable downstream, so drop on NaN Close specifically rather
+        # than relying on dropna(how="all") (which only catches fully-empty
+        # rows) (incident 2026-07-15: 29 NaN-close rows for 2026-07-14).
+        sub = data[symbol].dropna(how="all").dropna(subset=["Close"])
         if sub.empty:
             continue
         frames.append(

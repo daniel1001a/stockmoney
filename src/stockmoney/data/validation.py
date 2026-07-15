@@ -222,6 +222,39 @@ def validate_option_positions(conn: duckdb.DuckDBPyConnection, *, as_of: date | 
     return violations
 
 
+def validate_ohlcv(conn: duckdb.DuckDBPyConnection) -> list[Violation]:
+    """Catch IEEE NaN close/open/high/low in ohlcv_daily (2026-07-15 incident:
+    yfinance returned a partial bar -- valid Open/High/Low/Volume but NaN
+    Close -- for 2026-07-14; the downstream dedup-by-latest-ingested_at picked
+    that NaN row, poisoning dispersion stats and league predict strikes).
+
+    NB DuckDB NaN-comparison gotcha: `close != close` and `close <= 0` do NOT
+    detect NaN (NaN = NaN is TRUE, NaN <= 0 is FALSE in DuckDB SQL) -- must
+    use isnan() explicitly, one row per (symbol, trade_date) that has any NaN
+    OHLC value."""
+    rows = conn.execute(
+        """
+        SELECT symbol, trade_date, open, high, low, close
+        FROM ohlcv_daily
+        WHERE isnan(close) OR isnan(open) OR isnan(high) OR isnan(low)
+        """
+    ).fetchall()
+    violations: list[Violation] = []
+    for symbol, trade_date, o, h, l, c in rows:
+        row_id = f"{symbol}:{trade_date}"
+        bad_fields = [
+            name for name, val in (("open", o), ("high", h), ("low", l), ("close", c))
+            if val is not None and val != val  # NaN check that works in plain Python
+        ]
+        violations.append(
+            Violation(
+                "ohlcv_daily", "/".join(bad_fields) or "close", row_id,
+                f"NaN value(s) in {bad_fields}: open={o}, high={h}, low={l}, close={c}",
+            )
+        )
+    return violations
+
+
 def validate_all(conn: duckdb.DuckDBPyConnection, *, as_of: date | None = None) -> list[Violation]:
     """Run every table-level check available. Extend as more tables are
     covered; keep each table's checks in its own validate_* function above so
@@ -229,4 +262,5 @@ def validate_all(conn: duckdb.DuckDBPyConnection, *, as_of: date | None = None) 
     return [
         *validate_trader_trades(conn, as_of=as_of),
         *validate_option_positions(conn, as_of=as_of),
+        *validate_ohlcv(conn),
     ]

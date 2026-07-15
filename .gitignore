@@ -26,3 +26,6 @@ data/highvol_ohlcv/
 # Secrets
 .env
 secrets/
+
+# DB safety backups (never commit)
+*.duckdb.bak*

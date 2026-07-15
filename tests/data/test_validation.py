@@ -19,6 +19,7 @@ from stockmoney.data.validation import (
     realized_pnl_violation,
     strike_violation,
     validate_all,
+    validate_ohlcv,
     validate_option_positions,
     validate_trader_trades,
 )
@@ -232,6 +233,56 @@ def test_validate_trader_trades_clean_row_is_clean():
     )
     violations = validate_trader_trades(conn, as_of=date(2026, 6, 1))
     assert violations == []
+
+
+def _insert_ohlcv(conn, symbol, trade_date, **overrides):
+    defaults = dict(
+        open=100.0, high=101.0, low=99.0, close=100.5, adj_close=100.5,
+        volume=1_000_000, source="yfinance", ingested_at=datetime.now(timezone.utc),
+    )
+    defaults.update(overrides)
+    conn.execute(
+        """INSERT INTO ohlcv_daily
+        (symbol, trade_date, open, high, low, close, adj_close, volume, source, ingested_at)
+        VALUES (?,?,?,?,?,?,?,?,?,?)""",
+        [
+            symbol, trade_date, defaults["open"], defaults["high"], defaults["low"],
+            defaults["close"], defaults["adj_close"], defaults["volume"],
+            defaults["source"], defaults["ingested_at"],
+        ],
+    )
+
+
+def test_validate_ohlcv_catches_nan_close():
+    """2026-07-15 incident regression: yfinance partial bar with valid
+    Open/High/Low/Volume but NaN Close must be flagged."""
+    conn = _conn()
+    _insert_ohlcv(conn, "XOM", date(2026, 7, 14), close=float("nan"))
+    violations = validate_ohlcv(conn)
+    assert len(violations) == 1
+    assert violations[0].table == "ohlcv_daily"
+    assert "close" in violations[0].field
+
+
+def test_validate_ohlcv_catches_nan_in_other_ohlc_fields():
+    conn = _conn()
+    _insert_ohlcv(conn, "CVX", date(2026, 7, 14), open=float("nan"))
+    violations = validate_ohlcv(conn)
+    assert len(violations) == 1
+    assert "open" in violations[0].field
+
+
+def test_validate_ohlcv_clean_row_is_clean():
+    conn = _conn()
+    _insert_ohlcv(conn, "XOM", date(2026, 7, 14))
+    assert validate_ohlcv(conn) == []
+
+
+def test_validate_all_includes_ohlcv_violations():
+    conn = _conn()
+    _insert_ohlcv(conn, "XOM", date(2026, 7, 14), close=float("nan"))
+    violations = validate_all(conn, as_of=date(2026, 7, 15))
+    assert any(v.table == "ohlcv_daily" for v in violations)
 
 
 # ============================================================================

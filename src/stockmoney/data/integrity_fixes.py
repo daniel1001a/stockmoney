@@ -110,6 +110,23 @@ def snap_trader_predictions_option_structures(
     return updated, skipped
 
 
+def delete_nan_ohlcv_rows(conn: duckdb.DuckDBPyConnection) -> int:
+    """DELETE rows from ohlcv_daily where open/high/low/close is IEEE NaN
+    (2026-07-15 incident: yfinance returned partial bars -- valid OHLV but NaN
+    Close -- for 2026-07-14; the dedup-by-latest-ingested_at logic then picked
+    the NaN row over the earlier valid one, poisoning dispersion/features/
+    league predict downstream). The source-side fix is in
+    ingestion/yfinance_ohlcv.py (drops NaN-Close rows before they're written);
+    this is the one-off repair for rows already on disk. Idempotent -- returns
+    0 on a second run. NB: DuckDB's `col != col` / `col <= 0` do NOT detect
+    NaN (NaN = NaN is TRUE, NaN <= 0 is FALSE in DuckDB SQL) -- must use
+    isnan()."""
+    cur = conn.execute(
+        "DELETE FROM ohlcv_daily WHERE isnan(close) OR isnan(open) OR isnan(high) OR isnan(low)"
+    )
+    return cur.fetchone()[0]  # DuckDB's DELETE returns a 1-row/1-col result: rows deleted
+
+
 def nearest_friday(d: date, *, on_or_after: date | None = None) -> date:
     """The nearest Friday to `d` (real US equity options only expire on
     Fridays). Ties round forward. If `on_or_after` is given, the result is
