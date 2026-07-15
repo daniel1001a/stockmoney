@@ -27,9 +27,15 @@ describe('marketPhaseET', () => {
 })
 
 describe('refreshIntervalMs', () => {
-  it('ticks fastest in the power hour, slower midday, and stops when closed', () => {
+  it('ticks fastest in the power hour, slower midday, and hourly when closed', () => {
     expect(refreshIntervalMs(etJuly('14:00'))).toBe(60_000) // 10:00 ET
     expect(refreshIntervalMs(etJuly('18:00'))).toBe(180_000) // 14:00 ET
-    expect(refreshIntervalMs(etJuly('23:00'))).toBeNull() // 19:00 ET, closed
+    expect(refreshIntervalMs(etJuly('23:00'))).toBe(3_600_000) // 19:00 ET, after close
+  })
+
+  it('never stops timed polling -- always returns a number, even overnight/weekend', () => {
+    expect(refreshIntervalMs(etJuly('10:00'))).toBe(3_600_000) // 06:00 ET, pre-open
+    expect(refreshIntervalMs(etJuly('16:00', 18))).toBe(3_600_000) // Sat 2026-07-18, midday ET
+    expect(refreshIntervalMs(etJuly('16:00', 19))).toBe(3_600_000) // Sun 2026-07-19
   })
 })
