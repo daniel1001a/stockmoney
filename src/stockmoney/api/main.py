@@ -17,9 +17,12 @@ from __future__ import annotations
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
+from datetime import date
+
 from stockmoney.api import cockpit, queries
 from stockmoney.api.db import ro_connection
 from stockmoney.api.live_quotes import get_quotes
+from stockmoney.models import postmarket_wrap
 
 app = FastAPI(title="stockmoney API", description="Read-only decision-support data. Never places orders.")
 
@@ -198,6 +201,15 @@ def briefing() -> dict:
 def cockpit_route() -> list[dict]:
     with ro_connection() as conn:
         return cockpit.build_cockpit(conn)
+
+
+@app.get("/api/postmarket")
+def postmarket(as_of_date: str | None = None) -> dict:
+    """End-of-day wrap-up: what the watchlist did today and (honestly) why.
+    Optional ?as_of_date=YYYY-MM-DD for historical replay/debugging."""
+    parsed = date.fromisoformat(as_of_date) if as_of_date else None
+    with ro_connection() as conn:
+        return postmarket_wrap.build_postmarket_wrap(conn, parsed)
 
 
 @app.get("/api/scoreboard-summary")
