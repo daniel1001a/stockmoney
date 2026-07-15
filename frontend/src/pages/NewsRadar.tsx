@@ -1,12 +1,49 @@
-import { useMemo, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { Link } from 'react-router-dom'
-import { api, type MarketEvent } from '../lib/api'
+import { api, type MarketEvent, type NewsFreshness } from '../lib/api'
 import { useApi } from '../lib/useApi'
-import { NEWS_TYPE_META, newsTypeMeta } from '../lib/format'
+import { NEWS_TYPE_META, newsTypeMeta, relTime } from '../lib/format'
 import { Card, Chip, SectionTitle, Loading, ErrorMsg, Empty } from '../components/ui'
 import NewsRow from '../components/NewsRow'
 
 const TYPE_ORDER = ['catalyst', 'analyst_rating', 'earnings', 'macro', 'headline'] as const
+
+// "要是我動不動就回來看,我得要好好翻閱" -- the user's complaint. localStorage
+// remembers the last time they left this page so we can mark what's new.
+const LAST_SEEN_KEY = 'newsradar_last_seen'
+
+function FreshnessStrip({ freshness, newCount, onMarkRead }: {
+  freshness: NewsFreshness | null
+  newCount: number
+  onMarkRead: () => void
+}) {
+  if (!freshness) return null
+  const { last_updated, last_run, news_last_24h } = freshness
+  return (
+    <div className="mb-4 flex flex-wrap items-center justify-between gap-2 rounded-lg border border-neutral-800 bg-neutral-900/40 px-3 py-2 text-xs text-neutral-400">
+      <span>
+        消息最後更新 {last_updated ? relTime(last_updated) : '尚無資料'}
+        {last_run && (
+          <> · 上次抓取 {last_run.rows_written ?? '—'} 則({last_run.source ?? '—'})</>
+        )}
+        {' '}· 近24h {news_last_24h} 則
+      </span>
+      {newCount > 0 && (
+        <div className="flex items-center gap-2">
+          <Chip className="border-sky-500/40 bg-sky-500/10 text-sky-200">
+            自你上次到訪 · 新增 {newCount} 則
+          </Chip>
+          <button
+            onClick={onMarkRead}
+            className="rounded-md border border-neutral-700 px-2 py-1 text-neutral-300 hover:bg-neutral-800"
+          >
+            標記為已讀
+          </button>
+        </div>
+      )}
+    </div>
+  )
+}
 
 function EventStrip({ events }: { events: MarketEvent[] }) {
   if (events.length === 0) return null
@@ -33,10 +70,45 @@ function EventStrip({ events }: { events: MarketEvent[] }) {
 export default function NewsRadar() {
   const { data, loading, error } = useApi(() => api.news(80), [])
   const { data: events } = useApi(api.events)
+  const { data: freshness } = useApi(api.newsFreshness)
 
   const [type, setType] = useState<string>('all')
   const [symbol, setSymbol] = useState<string>('all')
   const [q, setQ] = useState('')
+
+  // Capture the stored "last seen" timestamp once, before this render writes
+  // a new one -- this is the baseline for "what's new". On a genuinely first
+  // visit there's nothing stored, so we don't claim every item is "new" (that
+  // would just be noise); we only start showing deltas from the second visit
+  // onward.
+  const [baseline] = useState<string | null>(() => localStorage.getItem(LAST_SEEN_KEY))
+  const [cleared, setCleared] = useState(false)
+
+  useEffect(() => {
+    // Leave a fresh timestamp for next time regardless of whether the user
+    // explicitly marked things read -- otherwise every visit after the first
+    // would keep comparing against the same stale baseline forever.
+    return () => {
+      localStorage.setItem(LAST_SEEN_KEY, new Date().toISOString())
+    }
+  }, [])
+
+  const newIds = useMemo(() => {
+    if (!baseline || cleared || !data) return new Set<string>()
+    const cutoff = new Date(baseline).getTime()
+    if (Number.isNaN(cutoff)) return new Set<string>()
+    const ids = new Set<string>()
+    data.forEach((n) => {
+      const t = new Date(n.published_at).getTime()
+      if (!Number.isNaN(t) && t > cutoff) ids.add(n.item_id)
+    })
+    return ids
+  }, [data, baseline, cleared])
+
+  const markRead = () => {
+    localStorage.setItem(LAST_SEEN_KEY, new Date().toISOString())
+    setCleared(true)
+  }
 
   const symbols = useMemo(() => {
     const s = new Set<string>()
@@ -70,6 +142,8 @@ export default function NewsRadar() {
           所有可能影響股價的消息匯流:我們推理出、市場可能還沒反映的催化劑,以及財報、分析師評級、總經事件。用類型/標的/關鍵字快速篩選。
         </p>
       </div>
+
+      <FreshnessStrip freshness={freshness ?? null} newCount={newIds.size} onMarkRead={markRead} />
 
       {events && <EventStrip events={events} />}
 
@@ -119,14 +193,14 @@ export default function NewsRadar() {
           ) : (
             <div>
               {filtered.map((n) => (
-                <NewsRow key={n.item_id} item={n} />
+                <NewsRow key={n.item_id} item={n} isNew={newIds.has(n.item_id)} />
               ))}
             </div>
           )}
         </Card>
       )}
       <p className="mt-3 text-xs text-neutral-600">
-        共 {filtered.length} 則。點任一則看詳情與原文連結。示範資料來自 seed;接上 GDELT/RSS/FRED 後即為即時來源。
+        共 {filtered.length} 則。點任一則看詳情與原文連結。新聞標題與財報/總經事件來自 RSS/GDELT 等即時來源;「催化劑推理」欄位是模型對這些消息的推論,非原始報導。
         <Link to="/" className="ml-2 text-neutral-500 hover:text-neutral-300">← 回今日機會</Link>
       </p>
     </div>

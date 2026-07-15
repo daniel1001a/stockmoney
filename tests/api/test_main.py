@@ -111,3 +111,13 @@ def test_pipeline_health_route(client):
     resp = client.get("/api/pipeline-health")
     assert resp.status_code == 200
     assert resp.json() == []
+
+
+def test_news_freshness_route(client):
+    resp = client.get("/api/news-freshness")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["last_updated"] is None
+    assert body["last_run"] is None
+    assert body["news_last_24h"] == 0
+    assert body["median_ingest_gap_minutes"] is None

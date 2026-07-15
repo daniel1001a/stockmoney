@@ -138,6 +138,20 @@ export interface MarketSummary {
   top_losers: MarketMover[]
 }
 
+export interface NewsFreshnessRun {
+  source: string | null
+  rows_written: number | null
+  finished_at: string | null
+  status: string | null
+}
+
+export interface NewsFreshness {
+  last_updated: string | null
+  last_run: NewsFreshnessRun | null
+  news_last_24h: number
+  median_ingest_gap_minutes: number | null
+}
+
 export interface MarketEvent {
   event_id: string
   symbol: string | null
@@ -193,6 +207,31 @@ export interface TraderTrade {
   current_underlying?: number | null
   current_premium_est?: number | null
   unrealized_pnl?: number | null
+}
+
+// A trade row joined to the trader's display name/philosophy -- powers the
+// Arena "交易動態 (Live Board)" feed across ALL traders (GET /api/trader-trades).
+export interface TraderTradeFeedEntry {
+  trade_id: string
+  trader_id: string
+  trader_name: string
+  philosophy: string
+  symbol: string
+  option_right: 'call' | 'put'
+  side: 'long' | 'short'
+  strike: number
+  expiry_date: string
+  contracts: number
+  entry_at: string
+  entry_underlying: number
+  entry_premium: number
+  exit_at: string | null
+  exit_underlying: number | null
+  exit_premium: number | null
+  realized_pnl: number | null
+  status: 'open' | 'closed'
+  thesis: string | null
+  exit_reason: string | null
 }
 
 export interface ContestRules {
@@ -424,6 +463,114 @@ export interface Quote {
   as_of: string | null
 }
 
+// --- Honest Lin cockpit (no direction prediction, see cockpit.py) ----------
+
+export interface ScoreboardFinding {
+  id: string
+  text: string
+}
+
+export interface ScoreboardSummary {
+  as_of: string
+  headline: string
+  conclusions: ScoreboardFinding[]
+  so_what: string
+}
+
+export interface SectorRotationEntry {
+  sector: string
+  sector_label: string
+  n_symbols: number
+  ret_1d_avg: number
+  ret_5d_avg: number | null
+  rank: number
+}
+
+export interface Briefing {
+  as_of_date: string | null
+  headline: string
+  // v2: the fuller morning-note paragraph (macro news + regime + sector
+  // strength), plus which of the two shapes it took -- 'macro_news' when a
+  // real event headline was found, 'fallback_regime_sector' when the
+  // narrative had to degrade to regime+sector-only text.
+  narrative: string
+  narrative_basis: 'macro_news' | 'fallback_regime_sector'
+  sector_rotation: SectorRotationEntry[]
+  // Compact market-stats strip inputs (v2 homepage iteration): VIX level +
+  // term-structure mood plus a plain up/down/flat breadth count across the
+  // watchlist -- both already backing `narrative` above, just also exposed
+  // as structured fields so the frontend can render a small stats strip
+  // instead of re-parsing the narrative sentence.
+  vix: number | null
+  vix_term_slope: number | null
+  breadth: { up: number; down: number; flat: number }
+  guardrail: string
+  market_lines: string[]
+  symbol_lines: string[]
+  scoreboard: ScoreboardSummary
+}
+
+export interface CockpitLevels {
+  nday_high: number | null
+  nday_low: number | null
+  prev_high: number | null
+  prev_low: number | null
+  sma20: number | null
+  sma50: number | null
+}
+
+export interface SellPutSuggestion {
+  strike: number
+  otm_pct: number
+  gate_light: 'green' | 'red' | 'unknown'
+  reason: string
+  note: string
+}
+
+export interface VolumeSignal {
+  ratio: number | null
+  state: '放量' | '縮量' | '量能正常' | '資料不足'
+  today_volume: number | null
+  avg_volume_20d: number | null
+}
+
+export interface SectorLinkage {
+  state: '脫離板塊獨走' | '跟隨板塊同步' | '不適用' | '資料不足'
+  symbol_return: number | null
+  peer_avg_return: number | null
+  z: number | null
+  note: string | null
+}
+
+export interface CockpitCard {
+  symbol: string
+  sector: string
+  as_of_date: string | null
+  price: number | null
+  levels: CockpitLevels
+  breakout_state: string
+  regime: string
+  top_news: {
+    item_id: string
+    headline: string
+    sentiment_score: number | null
+    importance: number | null
+    published_at: string
+  } | null
+  sellput: SellPutSuggestion | null
+  volume_signal: VolumeSignal
+  sector_linkage: SectorLinkage
+  // v2 (2026-07-14, Task D part 2): descriptive facts, never a direction
+  // call. iv: ATM (50-delta) implied vol as a fraction (0.286 = 28.6%),
+  // null if no iv_surface_daily row. dollar_volume: today's close x volume.
+  // earnings_date: best-effort next earnings date (event_calendar DB-first,
+  // Nasdaq network fallback -- see stockmoney.data.earnings_calendar), null
+  // when genuinely unknown -- never fabricated.
+  iv: number | null
+  dollar_volume: number | null
+  earnings_date: string | null
+}
+
 export const api = {
   opportunities: () => getJson<Opportunity[]>('/opportunities'),
   quotes: () => getJson<Record<string, Quote>>('/quotes'),
@@ -435,6 +582,7 @@ export const api = {
   news: (limit?: number) => getJson<NewsItem[]>(`/news${limit !== undefined ? `?limit=${limit}` : ''}`),
   newsItem: (id: string) => getJsonOrNull<NewsItem>(`/news/${encodeURIComponent(id)}`),
   events: () => getJson<MarketEvent[]>('/events'),
+  newsFreshness: () => getJson<NewsFreshness>('/news-freshness'),
   leaderboard: () => getJson<LeaderboardEntry[]>('/leaderboard'),
   traderProfile: (id: string) => getJsonOrNull<TraderProfile>(`/traders/${encodeURIComponent(id)}`),
   watchlist: () => getJson<WatchlistResponse>('/watchlist'),
@@ -446,4 +594,9 @@ export const api = {
     getJsonOrNull<TickerTradersResponse>(`/ticker/${encodeURIComponent(symbol)}/traders`),
   divergence: (hours?: number) =>
     getJson<DivergenceRow[]>(`/divergence${hours !== undefined ? `?hours=${hours}` : ''}`),
+  traderTrades: (limit?: number) =>
+    getJson<TraderTradeFeedEntry[]>(`/trader-trades${limit !== undefined ? `?limit=${limit}` : ''}`),
+  briefing: () => getJson<Briefing>('/briefing'),
+  cockpit: () => getJson<CockpitCard[]>('/cockpit'),
+  scoreboardSummary: () => getJson<ScoreboardSummary>('/scoreboard-summary'),
 }

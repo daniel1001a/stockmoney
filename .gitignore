@@ -13,6 +13,10 @@ wheels/
 data/*.duckdb
 data/*.duckdb.wal
 
+# Backfilled market/news data (large, regenerable via scripts/backfill_*.py)
+data/news_backfill/
+data/highvol_ohlcv/
+
 # pytest
 .pytest_cache/
 

@@ -5,6 +5,7 @@
       "name": "fastapi-backend",
       "runtimeExecutable": ".venv/bin/python",
       "runtimeArgs": ["-m", "uvicorn", "stockmoney.api.main:app", "--reload", "--port", "8000"],
+      "env": { "STOCKMONEY_DB": "data/stockmoney_live.duckdb" },
       "port": 8000
     },
     {

@@ -17,7 +17,7 @@ from __future__ import annotations
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
-from stockmoney.api import queries
+from stockmoney.api import cockpit, queries
 from stockmoney.api.db import ro_connection
 from stockmoney.api.live_quotes import get_quotes
 
@@ -119,6 +119,12 @@ def news_detail(item_id: str) -> dict:
     return result
 
 
+@app.get("/api/news-freshness")
+def news_freshness() -> dict:
+    with ro_connection() as conn:
+        return queries.news_freshness(conn)
+
+
 @app.get("/api/events")
 def events() -> list[dict]:
     with ro_connection() as conn:
@@ -167,3 +173,33 @@ def ticker_traders(symbol: str) -> dict:
 def divergence(hours: int = 168) -> list[dict]:
     with ro_connection() as conn:
         return queries.recent_divergence(conn, hours=hours)
+
+
+@app.get("/api/trader-trades")
+def trader_trades(limit: int = 40) -> list[dict]:
+    """Read-only trade tape across all Arena traders, most-recent-first --
+    powers the Arena "交易動態 (Live Board)" feed. Never places orders."""
+    with ro_connection() as conn:
+        return queries.recent_trader_trades(conn, limit=limit)
+
+
+# --- Honest Lin cockpit (Worker 5) -------------------------------------------
+# No direction prediction anywhere below this line -- see cockpit.py's module
+# docstring for the 8y walk-forward verdict that motivated this shape
+# (CLAUDE.md section 0 / REBUILD_PLAN.md Phase 0-1c).
+
+@app.get("/api/briefing")
+def briefing() -> dict:
+    with ro_connection() as conn:
+        return cockpit.build_briefing(conn)
+
+
+@app.get("/api/cockpit")
+def cockpit_route() -> list[dict]:
+    with ro_connection() as conn:
+        return cockpit.build_cockpit(conn)
+
+
+@app.get("/api/scoreboard-summary")
+def scoreboard_summary() -> dict:
+    return cockpit.scoreboard_summary()

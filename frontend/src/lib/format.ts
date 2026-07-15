@@ -25,6 +25,31 @@ export function signedMoney(x: number | null | undefined): string {
   return `${x >= 0 ? '+' : '-'}$${Math.abs(x).toLocaleString('en-US', { maximumFractionDigits: 0 })}`
 }
 
+// Compact large-dollar-amount formatting for things like today's dollar
+// volume (close x volume): "$1.3B" / "$542.1M" / "$88.4K". USD with a $
+// prefix, matching money()/LivePrice's convention elsewhere in the app
+// rather than mixing in a Chinese 億/萬 unit alongside a $ sign.
+export function compactMoney(x: number | null | undefined): string {
+  if (x === null || x === undefined || Number.isNaN(x)) return '--'
+  const sign = x < 0 ? '-' : ''
+  const abs = Math.abs(x)
+  if (abs >= 1e9) return `${sign}$${(abs / 1e9).toFixed(1)}B`
+  if (abs >= 1e6) return `${sign}$${(abs / 1e6).toFixed(1)}M`
+  if (abs >= 1e3) return `${sign}$${(abs / 1e3).toFixed(1)}K`
+  return `${sign}$${abs.toFixed(0)}`
+}
+
+// "2026-07-30" -> "7/30". Falls back to "未知" for null/unparseable -- used
+// for the cockpit card's best-effort next-earnings-date field, which is
+// genuinely unknown for some symbols (never fabricated, see
+// stockmoney.data.earnings_calendar).
+export function shortDate(iso: string | null | undefined): string {
+  if (!iso) return '未知'
+  const d = new Date(`${iso.slice(0, 10)}T00:00:00`)
+  if (Number.isNaN(d.getTime())) return '未知'
+  return `${d.getMonth() + 1}/${d.getDate()}`
+}
+
 // Rough "x小時前 / x天前" from an ISO timestamp. Purely cosmetic.
 export function relTime(iso: string | null | undefined): string {
   if (!iso) return ''
@@ -49,6 +74,18 @@ export const DIRECTION_CLASSES: Record<string, string> = {
   down: 'text-rose-300 bg-rose-500/10 border-rose-500/40',
   range: 'text-amber-200 bg-amber-500/10 border-amber-500/40',
 }
+
+// Human-readable sector labels (the raw slugs like "big_tech" look like a bug).
+export const SECTOR_LABEL: Record<string, string> = {
+  big_tech: '大型科技',
+  semiconductor: '半導體',
+  energy: '能源',
+  financials: '金融',
+  semiconductor_etf: '半導體 ETF',
+  big_tech_etf: '大型科技 ETF',
+}
+export const sectorLabel = (s: string | null | undefined): string =>
+  (s && SECTOR_LABEL[s]) || s || '—'
 
 // Regime chip colouring. The API's regime label describes volatility / trend
 // STRENGTH (低波動震盪盤 / 中波動 / 高波動趨勢盤; the market's mode, NOT a stock's up/down call), not up/down direction, and is
@@ -116,6 +153,28 @@ export function pricedInLabel(p: number | null | undefined): string {
   if (p >= 0.7) return '市場多已反映'
   if (p >= 0.4) return '部分反映'
   return '市場可能還沒反映'
+}
+
+// Professional option contract notation, e.g. "MSFT 373.3 Call 7/7".
+// symbol + strike (trailing ".0" stripped) + Call/Put + M/D from expiry_date.
+export function formatOptionContract({
+  symbol, strike, right, expiry,
+}: {
+  symbol: string
+  strike: number
+  right: 'call' | 'put'
+  expiry: string | null | undefined
+}): string {
+  const strikeStr = Number.isInteger(strike) ? String(strike) : String(Math.round(strike * 100) / 100)
+  const rightLabel = right === 'put' ? 'Put' : 'Call'
+  let expiryStr = ''
+  if (expiry) {
+    const d = new Date(`${expiry.slice(0, 10)}T00:00:00`)
+    if (!Number.isNaN(d.getTime())) {
+      expiryStr = ` ${d.getMonth() + 1}/${d.getDate()}`
+    }
+  }
+  return `${symbol} ${strikeStr} ${rightLabel}${expiryStr}`
 }
 
 export function importanceLabel(i: number | null | undefined): string {

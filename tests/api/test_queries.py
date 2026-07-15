@@ -60,13 +60,13 @@ def test_watchlist_candidates_empty_by_default():
     assert queries.watchlist_candidates(conn) == []
 
 
-def _seed_ingestion_run(conn, *, target_table, status="success", started_at, source="test"):
+def _seed_ingestion_run(conn, *, target_table, status="success", started_at, source="test", finished_at=None):
     conn.execute(
         """
-        INSERT INTO ingestion_runs (run_id, source, target_table, status, started_at)
-        VALUES (?, ?, ?, ?, ?)
+        INSERT INTO ingestion_runs (run_id, source, target_table, status, started_at, finished_at)
+        VALUES (?, ?, ?, ?, ?, ?)
         """,
-        [f"{target_table}-{started_at.isoformat()}", source, target_table, status, started_at],
+        [f"{target_table}-{started_at.isoformat()}", source, target_table, status, started_at, finished_at],
     )
 
 
@@ -118,6 +118,75 @@ def test_pipeline_health_unknown_table_uses_default_lag_threshold():
     _seed_ingestion_run(conn, target_table="some_new_table", started_at=now - timedelta(days=10))
     [entry] = queries.pipeline_health(conn, now=now)
     assert entry["is_stale"] is True
+
+
+# --- news_freshness --------------------------------------------------------
+
+def test_news_freshness_empty_db_degrades_to_nulls():
+    conn = _conn()
+    result = queries.news_freshness(conn)
+    assert result["last_updated"] is None
+    assert result["last_run"] is None
+    assert result["news_last_24h"] == 0
+    assert result["median_ingest_gap_minutes"] is None
+
+
+def _seed_news_item(conn, *, item_id, symbol="NVDA", created_at, published_at=None):
+    conn.execute(
+        """
+        INSERT INTO news_items (
+            item_id, symbol, item_type, headline, published_at, available_at, created_at
+        ) VALUES (?, ?, 'headline', 'test headline', ?, ?, ?)
+        """,
+        [item_id, symbol, published_at or created_at, created_at, created_at],
+    )
+
+
+def test_news_freshness_reports_last_updated_and_24h_count():
+    conn = _conn()
+    now = datetime(2026, 7, 13, 12, 0, tzinfo=timezone.utc)
+    _seed_news_item(conn, item_id="n1", created_at=now - timedelta(hours=2))
+    _seed_news_item(conn, item_id="n2", created_at=now - timedelta(hours=40))
+    result = queries.news_freshness(conn, now=now)
+    assert result["last_updated"] == now - timedelta(hours=2)
+    assert result["news_last_24h"] == 1
+
+
+def test_news_freshness_reports_last_ingestion_run():
+    conn = _conn()
+    now = datetime(2026, 7, 13, 12, 0, tzinfo=timezone.utc)
+    _seed_ingestion_run(
+        conn, target_table="news_articles_raw", source="rss",
+        started_at=now - timedelta(hours=1), finished_at=now - timedelta(hours=1),
+    )
+    result = queries.news_freshness(conn, now=now)
+    assert result["last_run"]["source"] == "rss"
+    assert result["last_run"]["status"] == "success"
+
+
+def test_news_freshness_median_gap_needs_at_least_two_runs():
+    conn = _conn()
+    now = datetime(2026, 7, 13, 12, 0, tzinfo=timezone.utc)
+    _seed_ingestion_run(
+        conn, target_table="news_articles_raw", source="rss",
+        started_at=now - timedelta(hours=1), finished_at=now - timedelta(hours=1),
+    )
+    result = queries.news_freshness(conn, now=now)
+    assert result["median_ingest_gap_minutes"] is None
+
+
+def test_news_freshness_computes_median_gap_across_runs():
+    conn = _conn()
+    now = datetime(2026, 7, 13, 12, 0, tzinfo=timezone.utc)
+    # Three successful runs 30 minutes apart -> median gap is 30 minutes.
+    for i, hours_ago in enumerate([2.0, 1.5, 1.0]):
+        started = now - timedelta(hours=hours_ago)
+        _seed_ingestion_run(
+            conn, target_table="news_articles_raw", source="rss",
+            started_at=started, finished_at=started,
+        )
+    result = queries.news_freshness(conn, now=now)
+    assert result["median_ingest_gap_minutes"] == pytest.approx(30.0)
 
 
 # --- opportunities ---------------------------------------------------------

@@ -1,8 +1,8 @@
-import { describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { render, screen, waitFor, fireEvent } from '@testing-library/react'
 import { MemoryRouter } from 'react-router-dom'
 import NewsRadar from './NewsRadar'
-import { api, type NewsItem, type MarketEvent } from '../lib/api'
+import { api, type NewsItem, type MarketEvent, type NewsFreshness } from '../lib/api'
 
 vi.mock('../lib/api')
 
@@ -26,11 +26,26 @@ const events: MarketEvent[] = [
     scheduled_at: new Date().toISOString(), status: 'scheduled', days_until: 6 },
 ]
 
+const freshness: NewsFreshness = {
+  last_updated: new Date().toISOString(),
+  last_run: { source: 'rss', rows_written: 57, finished_at: new Date().toISOString(), status: 'success' },
+  news_last_24h: 12,
+  median_ingest_gap_minutes: 90,
+}
+
+beforeEach(() => {
+  localStorage.clear()
+  vi.mocked(api.news).mockResolvedValue(news)
+  vi.mocked(api.events).mockResolvedValue(events)
+  vi.mocked(api.newsFreshness).mockResolvedValue(freshness)
+})
+
+afterEach(() => {
+  localStorage.clear()
+})
+
 describe('NewsRadar', () => {
   it('renders the feed and filters by type', async () => {
-    vi.mocked(api.news).mockResolvedValue(news)
-    vi.mocked(api.events).mockResolvedValue(events)
-
     render(<MemoryRouter><NewsRadar /></MemoryRouter>)
 
     await waitFor(() => expect(screen.getByText('NVDA 財報前瞻')).toBeInTheDocument())
@@ -43,5 +58,31 @@ describe('NewsRadar', () => {
     fireEvent.click(screen.getByText(/財報 \(1\)/))
     expect(screen.getByText('NVDA 財報前瞻')).toBeInTheDocument()
     expect(screen.queryByText('Fed 官員談話偏鷹')).not.toBeInTheDocument()
+  })
+
+  it('shows the freshness strip from /api/news-freshness', async () => {
+    render(<MemoryRouter><NewsRadar /></MemoryRouter>)
+
+    await waitFor(() => expect(screen.getByText(/上次抓取 57 則\(rss\)/)).toBeInTheDocument())
+    expect(screen.getByText(/近24h 12 則/)).toBeInTheDocument()
+  })
+
+  it('has no "since last visit" badge on a first-ever visit', async () => {
+    render(<MemoryRouter><NewsRadar /></MemoryRouter>)
+
+    await waitFor(() => expect(screen.getByText('NVDA 財報前瞻')).toBeInTheDocument())
+    expect(screen.queryByText(/自你上次到訪/)).not.toBeInTheDocument()
+  })
+
+  it('marks items newer than the stored last-seen timestamp as new, and clears on 標記為已讀', async () => {
+    // Seed a last-seen timestamp older than both news items so both count as new.
+    localStorage.setItem('newsradar_last_seen', new Date(Date.now() - 60 * 60 * 1000).toISOString())
+
+    render(<MemoryRouter><NewsRadar /></MemoryRouter>)
+
+    await waitFor(() => expect(screen.getByText(/自你上次到訪 · 新增 2 則/)).toBeInTheDocument())
+
+    fireEvent.click(screen.getByText('標記為已讀'))
+    expect(screen.queryByText(/自你上次到訪/)).not.toBeInTheDocument()
   })
 })

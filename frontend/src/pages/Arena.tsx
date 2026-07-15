@@ -1,8 +1,8 @@
 import { Link } from 'react-router-dom'
-import { api, type LeaderboardEntry, type DivergenceRow } from '../lib/api'
+import { api, type LeaderboardEntry, type DivergenceRow, type TraderTradeFeedEntry } from '../lib/api'
 import { useApi } from '../lib/useApi'
-import { DIRECTION_LABEL, money, pct } from '../lib/format'
-import { Card, SectionTitle, Return, Loading, ErrorMsg, Empty } from '../components/ui'
+import { DIRECTION_LABEL, formatOptionContract, money, num, pct, relTime, signedMoney } from '../lib/format'
+import { Card, Chip, SectionTitle, Return, Loading, ErrorMsg, Empty } from '../components/ui'
 
 function RulesBanner() {
   return (
@@ -104,9 +104,69 @@ function DivergencePanel({ rows }: { rows: DivergenceRow[] }) {
   )
 }
 
+function LiveBoardRow({ t }: { t: TraderTradeFeedEntry }) {
+  const isClosed = t.status === 'closed'
+  // 買入 = opening a long, 賣出 = opening a short; once it's closed we call it
+  // by what actually happened to the position (平倉), not the original side.
+  const actionLabel = isClosed ? '平倉' : t.side === 'long' ? '買入開倉' : '賣出開倉'
+  const contract = formatOptionContract({ symbol: t.symbol, strike: t.strike, right: t.option_right, expiry: t.expiry_date })
+
+  return (
+    <div className="border-b border-neutral-900 px-4 py-3 last:border-0">
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <div className="flex flex-wrap items-center gap-2">
+          <Link to={`/trader/${t.trader_id}`} className="text-sm font-semibold text-neutral-100 hover:text-neutral-300">
+            {t.trader_name}
+          </Link>
+          <Chip className={t.option_right === 'call' ? 'border-emerald-500/40 text-emerald-300' : 'border-rose-500/40 text-rose-300'}>
+            {actionLabel}
+          </Chip>
+          <Link to={`/ticker/${t.symbol}`} className="font-mono text-sm text-neutral-200 hover:text-neutral-50">
+            {contract}
+          </Link>
+          <Chip className={isClosed ? 'border-neutral-700 text-neutral-400' : 'border-sky-500/40 text-sky-300'}>
+            {isClosed ? '已平倉' : '持倉中'}
+          </Chip>
+        </div>
+        <div className="flex items-center gap-3 text-xs text-neutral-500">
+          {isClosed && t.realized_pnl !== null && (
+            <span className={`text-sm font-semibold tabular-nums ${t.realized_pnl >= 0 ? 'text-emerald-300' : 'text-rose-300'}`}>
+              {signedMoney(t.realized_pnl)}
+            </span>
+          )}
+          <span>{relTime(t.exit_at ?? t.entry_at)}</span>
+        </div>
+      </div>
+
+      <div className="mt-1.5 flex flex-wrap items-center gap-x-4 gap-y-0.5 text-xs text-neutral-500">
+        <span>{t.contracts} 口</span>
+        <span>進場 標的 ${num(t.entry_underlying)} · 權利金 ${num(t.entry_premium)}</span>
+        {isClosed && (
+          <span>
+            出場 標的 {t.exit_underlying !== null ? `$${num(t.exit_underlying)}` : '—'} · 權利金 {t.exit_premium !== null ? `$${num(t.exit_premium)}` : '—'}
+          </span>
+        )}
+      </div>
+
+      {t.thesis && <p className="mt-1.5 text-xs text-neutral-400">論點:{t.thesis}</p>}
+      {isClosed && t.exit_reason && <p className="mt-1 text-xs text-neutral-600">出場原因:{t.exit_reason}</p>}
+    </div>
+  )
+}
+
+function LiveBoard({ rows }: { rows: TraderTradeFeedEntry[] }) {
+  if (rows.length === 0) return <Empty>尚無交易紀錄。</Empty>
+  return (
+    <div className="divide-y divide-neutral-900">
+      {rows.map((t) => <LiveBoardRow key={t.trade_id} t={t} />)}
+    </div>
+  )
+}
+
 export default function Arena() {
   const { data: board, loading, error } = useApi(api.leaderboard)
   const { data: divergence } = useApi(() => api.divergence(), [])
+  const { data: liveBoard, loading: liveBoardLoading, error: liveBoardError } = useApi(() => api.traderTrades(40), [])
 
   return (
     <div>
@@ -124,6 +184,15 @@ export default function Arena() {
         {loading && <Loading />}
         {error && <ErrorMsg error={error} />}
         {board && <Leaderboard rows={board} />}
+      </section>
+
+      <section className="mb-8">
+        <SectionTitle title="交易動態 (Live Board)" hint="全部交易員的即時交易紀錄,最新在最上面。這是流派競技的過程紀錄,不是操作建議——六次回測已證實,沒有一個流派長期打贏單純持有(見 CLAUDE.md)。" />
+        <Card className="p-0">
+          {liveBoardLoading && <div className="p-4"><Loading /></div>}
+          {liveBoardError && <div className="p-4"><ErrorMsg error={liveBoardError} /></div>}
+          {liveBoard && <LiveBoard rows={liveBoard} />}
+        </Card>
       </section>
 
       <section>

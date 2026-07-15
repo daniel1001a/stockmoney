@@ -17,6 +17,7 @@ directly, so a request is always just a DuckDB read.
 from __future__ import annotations
 
 import json
+import re
 from datetime import date, datetime, timedelta, timezone
 
 import duckdb
@@ -281,6 +282,29 @@ def _latest_catalyst_headlines(conn: duckdb.DuckDBPyConnection) -> dict[str, str
 # same freshness bound.
 OPPORTUNITY_NEWS_MAX_AGE_DAYS = 10
 
+# Auto-generated ticker-quote boilerplate a data vendor emits for every symbol
+# every day (e.g. "AAPL Stock Quote Price and Forecast - CNN") -- it carries no
+# actual news, just a templated page title. Dashboard v2 item 2
+# (WORKER6_AUTONOMOUS_SPEC.md): filter these out wherever a headline is meant
+# to explain "why" something is happening, so a real story isn't crowded out
+# by a template. Kept as a short, explicit pattern list rather than a broad
+# "forecast" ban -- a real analyst-forecast headline (e.g. "TSMC Posts
+# Stronger-Than-Expected Sales") should still get through.
+_GENERIC_HEADLINE_PATTERNS = (
+    re.compile(r"stock quote", re.IGNORECASE),
+    re.compile(r"price and forecast", re.IGNORECASE),
+)
+
+
+def is_generic_headline(headline: str | None) -> bool:
+    """True for template/no-information headlines (see _GENERIC_HEADLINE_PATTERNS
+    above). Used by both the SQL filter in _latest_symbol_news below and
+    cockpit.py's macro-narrative headline picker, so "what counts as generic"
+    is defined in exactly one place."""
+    if not headline:
+        return False
+    return any(p.search(headline) for p in _GENERIC_HEADLINE_PATTERNS)
+
 
 def _latest_symbol_news(
     conn: duckdb.DuckDBPyConnection, *, max_age_days: int = OPPORTUNITY_NEWS_MAX_AGE_DAYS
@@ -289,7 +313,10 @@ def _latest_symbol_news(
     card can show a live news line -- not just the few symbols that happen to
     have an LLM catalyst_signal. Ranked by importance then recency; bounded to
     the last `max_age_days` so a stale headline never masquerades as today's
-    reason to trade."""
+    reason to trade. Generic template headlines (is_generic_headline) are
+    excluded from the ranking itself -- not just hidden after the fact -- so a
+    symbol whose only recent item is a "Stock Quote" boilerplate falls back to
+    no headline rather than showing a useless one."""
     rows = conn.execute(
         """
         WITH ranked AS (
@@ -301,6 +328,8 @@ def _latest_symbol_news(
             FROM news_items
             WHERE symbol IS NOT NULL
               AND published_at >= now() - (? * INTERVAL 1 DAY)
+              AND headline NOT ILIKE '%stock quote%'
+              AND headline NOT ILIKE '%price and forecast%'
         )
         SELECT symbol, item_id, headline, sentiment_score, importance, published_at
         FROM ranked WHERE rn = 1
@@ -634,6 +663,38 @@ def league_table(conn: duckdb.DuckDBPyConnection, *, window: int = 20, cost_bps:
     return _compute_league_table(conn, window=window, cost_bps=cost_bps)
 
 
+def recent_trader_trades(conn: duckdb.DuckDBPyConnection, *, limit: int = 40) -> list[dict]:
+    """Read-only trade tape across ALL traders for the Arena "交易動態 (Live
+    Board)" feed -- most-recent-first, open + closed, joined to the trader's
+    display name/philosophy. Degrades to an empty list if trader_trades hasn't
+    been populated yet (honest empty state, not an error)."""
+    try:
+        rows = conn.execute(
+            """
+            SELECT tt.trade_id, tt.trader_id, tr.name, tr.philosophy,
+                   tt.symbol, tt.option_right, tt.side, tt.strike, tt.expiry_date,
+                   tt.contracts, tt.entry_at, tt.entry_underlying, tt.entry_premium,
+                   tt.exit_at, tt.exit_underlying, tt.exit_premium, tt.realized_pnl,
+                   tt.status, tt.thesis, tt.exit_reason
+            FROM trader_trades tt
+            JOIN traders tr ON tr.trader_id = tt.trader_id
+            ORDER BY coalesce(tt.entry_at, tt.created_at) DESC
+            LIMIT ?
+            """,
+            [limit],
+        ).fetchall()
+    except duckdb.Error:
+        return []
+    cols = [
+        "trade_id", "trader_id", "trader_name", "philosophy",
+        "symbol", "option_right", "side", "strike", "expiry_date",
+        "contracts", "entry_at", "entry_underlying", "entry_premium",
+        "exit_at", "exit_underlying", "exit_premium", "realized_pnl",
+        "status", "thesis", "exit_reason",
+    ]
+    return [dict(zip(cols, r)) for r in rows]
+
+
 def traders(conn: duckdb.DuckDBPyConnection) -> list[dict]:
     """The trader roster (active + retired) for the league view's legend."""
     return [
@@ -754,6 +815,67 @@ def news_for_symbol(
         [symbol.upper(), max_age_days, limit],
     ).fetchall()
     return [_news_row_to_dict(r) for r in rows]
+
+
+def news_freshness(conn: duckdb.DuckDBPyConnection, *, now: datetime | None = None) -> dict:
+    """Backs the 消息雷達 freshness strip: "how stale is this feed right now,
+    and how often does it actually update" -- the user's complaint was they
+    have to re-skim the whole list every time they come back, with no signal
+    for whether anything even changed. Read-only, degrades to nulls if
+    ingestion_runs has no news rows yet (fresh DB / migration not run)."""
+    now = now or datetime.now(timezone.utc)
+    last_updated = conn.execute("SELECT max(created_at) FROM news_items").fetchone()[0]
+
+    cutoff = now - timedelta(hours=24)
+    news_last_24h = conn.execute(
+        "SELECT count(*) FROM news_items WHERE created_at >= ?", [cutoff]
+    ).fetchone()[0]
+
+    run_row = conn.execute(
+        """
+        SELECT source, rows_written, finished_at, status
+        FROM ingestion_runs
+        WHERE target_table = 'news_articles_raw'
+        ORDER BY finished_at DESC NULLS LAST
+        LIMIT 1
+        """
+    ).fetchone()
+    last_run = None
+    if run_row is not None:
+        last_run = {
+            "source": run_row[0], "rows_written": run_row[1],
+            "finished_at": run_row[2], "status": run_row[3],
+        }
+
+    # Cadence signal: median gap between the last ~20 successful news
+    # ingestion runs. Needs >=2 finished runs to mean anything.
+    finish_times = [
+        r[0] for r in conn.execute(
+            """
+            SELECT finished_at FROM ingestion_runs
+            WHERE target_table = 'news_articles_raw' AND status = 'success'
+              AND finished_at IS NOT NULL
+            ORDER BY finished_at DESC LIMIT 20
+            """
+        ).fetchall()
+    ]
+    median_gap_minutes = None
+    if len(finish_times) >= 2:
+        gaps = sorted(
+            (finish_times[i] - finish_times[i + 1]).total_seconds() / 60
+            for i in range(len(finish_times) - 1)
+        )
+        mid = len(gaps) // 2
+        median_gap_minutes = (
+            gaps[mid] if len(gaps) % 2 == 1 else (gaps[mid - 1] + gaps[mid]) / 2
+        )
+
+    return {
+        "last_updated": last_updated,
+        "last_run": last_run,
+        "news_last_24h": news_last_24h,
+        "median_ingest_gap_minutes": median_gap_minutes,
+    }
 
 
 def events(conn: duckdb.DuckDBPyConnection, *, now: datetime | None = None) -> list[dict]:
