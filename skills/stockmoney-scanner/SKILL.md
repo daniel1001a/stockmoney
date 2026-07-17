@@ -148,22 +148,42 @@ CLAUDE.md section 13).
 Run when the message says to run the digest pass (scheduled after the
 classification pass, Sonnet-tier — this is the "spend a little more
 thought" step, deliberately small in scope). The same HARD RULE applies:
-only the one query below, nothing else.
+only the two read-only queries below, nothing else.
 
-1. Query today's new rows in `watchlist_candidates` and any `alt_social_hourly`
-   rows showing a clear sentiment shift for tracked tickers:
+**Write the ENTIRE reply in Traditional Chinese (繁體中文).** This is the
+message the user reads over morning coffee on WhatsApp; they read Chinese, not
+English. Ticker symbols, numbers, and code stay as-is; all prose is 繁中.
+
+1. Trader-league state (who's winning, today's calls, any new self-improvement
+   proposal) — read-only:
+   ```
+   /opt/homebrew/bin/uv run python scripts/league_digest.py
+   ```
+   Prints one JSON object: `{"standings": [...], "latest_calls": [...],
+   "new_proposal": {...}|null}`. `standings` is ranked by cumulative option
+   P&L (best first); each has `n_graded`, `hit_rate`, `cum_option_pnl`.
+   `latest_calls` is each trader's highest-conviction call on its latest day.
+   `new_proposal` is the newest un-reviewed method-update the league proposed
+   for itself (null if none).
+2. Today's new candidates + notable sentiment shifts on tracked tickers —
+   read-only:
    ```
    /opt/homebrew/bin/uv run python scripts/scanner_todays_candidates.py
    ```
    Prints one JSON object: `{"new_candidates": [...], "sentiment_last_24h": [...]}`.
-2. Write a short, plain-language morning summary as your final reply text
-   (not a database write): what new candidates showed up and why they're
-   interesting, any notable sentiment shifts on tracked tickers, and
-   anything you'd flag as worth a closer human look. Keep it concise — a few
-   paragraphs, not an essay. This reply is what the user reads over morning
-   coffee. Do not run any further commands to "enrich" this summary — if the
-   query above returned little or nothing, say so plainly rather than
-   digging for more.
+3. Write a short **繁體中文** morning summary as your final reply text (not a
+   database write), in this order:
+   - **聯賽戰況**: who is ahead and by how much (from `standings`); if
+     `n_graded` is small, say the sample is still thin — don't oversell it.
+   - **今日最高信心的一手**: each trader's top call from `latest_calls`
+     (標的、方向、信心、一句話理由). Frame as the model's view, NOT advice to act.
+   - **模型自我改進**: if `new_proposal` isn't null, one line on what the league
+     proposed to change about itself; skip this line if null.
+   - **今日觀察**: notable new candidates / sentiment shifts worth a human look.
+   Keep it concise — a few short paragraphs, not an essay. Do not run any
+   further commands to "enrich" it — if a query returned little, say so plainly
+   in 繁中 rather than digging for more. End with a one-line honest reminder
+   that this is 觀察參考、非下單建議.
 
 ## Catalyst synthesis pass
 
