@@ -94,6 +94,65 @@ def compute_stats(
     }
 
 
+def equity_curve(preds: list[TraderPrediction], *, cost_bps: float = 0.0) -> list[dict]:
+    """Time-ordered cumulative P&L series for the Arena's 資金曲線
+    (equity-curve) chart -- "who is winning, and by how much, over time".
+
+    Ordered by `trade_date` (the day the call was made, not `label_end_date`
+    when it matured/graded), so the curve reads left-to-right the way a
+    trader would read their own daily blotter. Only settled rows
+    (`status == 'graded'`) are included -- no look-ahead, matching
+    `compute_stats`.
+
+    Each point carries both P&L notions `compute_stats` already distinguishes:
+    - directional pnl: `_signed_return` (same signed-return definition as
+      `cum_pnl` there), 0-contribution for non-directional 'range' calls.
+    - option pnl: the stored `option_pnl` (league/grading_options.py),
+      0-contribution when None (range call, or no usable entry IV that day).
+    The two running totals are accumulated over different denominators than
+    `compute_stats` reports (every graded row here vs n_directional /
+    n_option_graded there) -- that's intentional, an equity curve needs one
+    continuous line, not a per-bucket average.
+    """
+    graded = [p for p in preds if p.status == "graded" and p.outcome is not None]
+    graded.sort(key=lambda p: (p.trade_date, p.symbol))
+    out: list[dict] = []
+    cum_pnl = 0.0
+    cum_option_pnl = 0.0
+    for p in graded:
+        pnl = _signed_return(p, cost_bps=cost_bps) if _is_directional(p) else 0.0
+        option_pnl = p.option_pnl if p.option_pnl is not None else 0.0
+        cum_pnl += pnl
+        cum_option_pnl += option_pnl
+        out.append({
+            "trade_date": p.trade_date,
+            "symbol": p.symbol,
+            "direction": p.direction,
+            "pnl": pnl,
+            "cum_pnl": cum_pnl,
+            "option_pnl": option_pnl,
+            "cum_option_pnl": cum_option_pnl,
+        })
+    return out
+
+
+def league_equity_curves(conn: duckdb.DuckDBPyConnection, *, cost_bps: float = 0.0) -> list[dict]:
+    """Per-trader equity curves for every trader that has ever traded (active
+    or retired), same roster as `league_table`. Honest empty `points: []`
+    when a trader has no graded predictions yet rather than omitting them."""
+    rows: list[dict] = []
+    for trader in list_all_traders(conn):
+        graded = tp.graded_predictions(conn, trader_id=trader.trader_id)
+        rows.append({
+            "trader_id": trader.trader_id,
+            "name": trader.name,
+            "philosophy": trader.philosophy,
+            "active": trader.active,
+            "points": equity_curve(graded, cost_bps=cost_bps),
+        })
+    return rows
+
+
 def _by_regime(
     preds: list[TraderPrediction], *, high_conviction: float, cost_bps: float
 ) -> dict[str, dict]:

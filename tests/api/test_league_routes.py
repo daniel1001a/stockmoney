@@ -46,6 +46,17 @@ def test_league_route(client):
     assert rows["analyst"]["overall"]["n_graded"] == 0  # honest empty
 
 
+def test_league_equity_route(client):
+    resp = client.get("/api/league/equity")
+    assert resp.status_code == 200
+    rows = {r["trader_id"]: r for r in resp.json()}
+    chart_points = rows["chartist"]["points"]
+    assert len(chart_points) == 1
+    assert chart_points[0]["symbol"] == "SOXL"
+    assert chart_points[0]["cum_pnl"] == pytest.approx(0.30)
+    assert rows["analyst"]["points"] == []  # ungraded -> honest empty, not omitted
+
+
 def test_traders_route(client):
     resp = client.get("/api/traders")
     assert resp.status_code == 200

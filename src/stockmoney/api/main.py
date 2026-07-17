@@ -157,6 +157,15 @@ def league(window: int = 20, cost_bps: float = 0.0) -> list[dict]:
         return queries.league_table(conn, window=window, cost_bps=cost_bps)
 
 
+@app.get("/api/league/equity")
+def league_equity(cost_bps: float = 0.0) -> list[dict]:
+    """Per-trader equity curves (資金曲線) -- cumulative P&L over settled
+    predictions, ordered by trade_date. Powers the Arena's 'who is winning
+    over time' chart alongside /api/leaderboard's point-in-time standings."""
+    with ro_connection() as conn:
+        return queries.league_equity(conn, cost_bps=cost_bps)
+
+
 @app.get("/api/traders")
 def traders() -> list[dict]:
     with ro_connection() as conn:

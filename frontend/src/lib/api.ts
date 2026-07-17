@@ -184,6 +184,26 @@ export interface LeaderboardEntry {
   n_directional: number
   option_win_rate: number | null
   avg_option_pnl: number | null
+  cum_option_pnl: number
+  n_graded: number
+}
+
+export interface EquityPoint {
+  trade_date: string
+  symbol: string
+  direction: string
+  pnl: number
+  cum_pnl: number
+  option_pnl: number
+  cum_option_pnl: number
+}
+
+export interface LeagueEquityEntry {
+  trader_id: string
+  name: string
+  philosophy: string
+  active: boolean
+  points: EquityPoint[]
 }
 
 export interface TraderTrade {
@@ -618,6 +638,7 @@ export const api = {
   pipelineHealth: () => getJson<PipelineHealthEntry[]>('/pipeline-health'),
   league: (window?: number) =>
     getJson<LeagueEntry[]>(`/league${window !== undefined ? `?window=${window}` : ''}`),
+  leagueEquity: () => getJson<LeagueEquityEntry[]>('/league/equity'),
   traders: () => getJson<Trader[]>('/traders'),
   tickerTraders: (symbol: string) =>
     getJsonOrNull<TickerTradersResponse>(`/ticker/${encodeURIComponent(symbol)}/traders`),

@@ -8,13 +8,16 @@ import pytest
 from stockmoney.data.db import run_migrations
 from stockmoney.data import trader_predictions as tp
 from stockmoney.data.trader_predictions import TraderPrediction
-from stockmoney.league.league_table import compute_stats, league_table
+from stockmoney.league.league_table import compute_stats, equity_curve, league_equity_curves, league_table
 
 
-def _p(direction, conviction, outcome, actual_return, regime, *, status="graded", option_pnl=None) -> TraderPrediction:
+def _p(
+    direction, conviction, outcome, actual_return, regime, *,
+    status="graded", option_pnl=None, trade_date=date(2026, 6, 1), symbol="S",
+) -> TraderPrediction:
     return TraderPrediction(
-        prediction_id="x", trader_id="t", method_version="m", trade_date=date(2026, 6, 1),
-        symbol="S", sector="semiconductor", horizon=5, label_end_date=date(2026, 6, 8),
+        prediction_id="x", trader_id="t", method_version="m", trade_date=trade_date,
+        symbol=symbol, sector="semiconductor", horizon=5, label_end_date=date(2026, 6, 8),
         direction=direction, conviction=conviction, rationale="r", invalidation="i",
         entry_price=100.0, band_k=0.5, grade_vol=0.4, regime=regime, status=status,
         actual_return=actual_return, outcome=outcome, option_pnl=option_pnl,
@@ -103,3 +106,55 @@ def test_league_table_integration_and_per_regime():
     # analyst has no graded rows -> honest empty scorecard, still listed
     assert rows["analyst"]["overall"]["n_graded"] == 0
     assert rows["analyst"]["overall"]["hit_rate"] is None
+
+
+def test_equity_curve_accumulates_in_trade_date_order():
+    # deliberately out of order + one ungraded/pending row that must be excluded
+    preds = [
+        _p("up", 0.8, "win", 0.10, 0, trade_date=date(2026, 6, 3), symbol="B", option_pnl=0.4),
+        _p("down", 0.7, "loss", 0.05, 0, trade_date=date(2026, 6, 1), symbol="A", option_pnl=-0.2),
+        _p("range", 0.5, "win", 0.00, 0, trade_date=date(2026, 6, 2), symbol="C"),
+        _p("up", 0.6, "win", 0.20, 0, trade_date=date(2026, 6, 5), symbol="D", status="pending"),
+    ]
+    points = equity_curve(preds)
+    assert len(points) == 3  # pending row excluded
+    assert [p["trade_date"] for p in points] == [date(2026, 6, 1), date(2026, 6, 2), date(2026, 6, 3)]
+
+    # day 1: down loss -> signed pnl = -0.05
+    assert points[0]["pnl"] == pytest.approx(-0.05)
+    assert points[0]["cum_pnl"] == pytest.approx(-0.05)
+    assert points[0]["option_pnl"] == pytest.approx(-0.2)
+    assert points[0]["cum_option_pnl"] == pytest.approx(-0.2)
+
+    # day 2: range call -> no directional exposure, no option pnl
+    assert points[1]["pnl"] == 0.0
+    assert points[1]["cum_pnl"] == pytest.approx(-0.05)
+    assert points[1]["cum_option_pnl"] == pytest.approx(-0.2)
+
+    # day 3: up win -> +0.10, option +0.4, cumulative carries forward
+    assert points[2]["pnl"] == pytest.approx(0.10)
+    assert points[2]["cum_pnl"] == pytest.approx(0.05)
+    assert points[2]["option_pnl"] == pytest.approx(0.4)
+    assert points[2]["cum_option_pnl"] == pytest.approx(0.2)
+
+
+def test_equity_curve_empty_is_honest_not_crash():
+    assert equity_curve([]) == []
+
+
+def test_league_equity_curves_integration():
+    conn = duckdb.connect(":memory:")
+    run_migrations(conn)
+    pid = tp.record_trader_prediction(
+        conn, trader_id="chartist", method_version="m", trade_date=date(2026, 6, 1),
+        symbol="SOXL", sector="semiconductor", horizon=5, label_end_date=date(2026, 6, 8),
+        direction="up", conviction=0.7, rationale="r", invalidation="i", entry_price=100.0,
+        grade_vol=0.4, engine_payload={}, regime=0,
+    )
+    tp.grade_trader_prediction(conn, pid, actual_price=130.0)  # +30% -> up -> win
+
+    curves = {r["trader_id"]: r for r in league_equity_curves(conn)}
+    assert len(curves["chartist"]["points"]) == 1
+    assert curves["chartist"]["points"][0]["cum_pnl"] == pytest.approx(0.30)
+    # analyst has no graded rows -> honest empty points list, still listed
+    assert curves["analyst"]["points"] == []

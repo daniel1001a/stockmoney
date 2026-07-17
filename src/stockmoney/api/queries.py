@@ -28,6 +28,7 @@ from stockmoney.data.positions import list_open_positions
 from stockmoney.data.trader_predictions import predictions_on_date
 from stockmoney.data.trader_review import recent_divergence_rows
 from stockmoney.data.traders import list_all_traders
+from stockmoney.league.league_table import league_equity_curves as _compute_equity_curves
 from stockmoney.league.league_table import league_table as _compute_league_table
 from stockmoney.models.options_risk import MarketSnapshot, assess_position
 from stockmoney.models.regime import REGIME_OBS_COLUMNS, describe_regimes
@@ -663,6 +664,14 @@ def league_table(conn: duckdb.DuckDBPyConnection, *, window: int = 20, cost_bps:
     return _compute_league_table(conn, window=window, cost_bps=cost_bps)
 
 
+def league_equity(conn: duckdb.DuckDBPyConnection, *, cost_bps: float = 0.0) -> list[dict]:
+    """Per-trader cumulative P&L series (資金曲線) over settled predictions,
+    ordered by trade_date -- powers the Arena equity-curve chart. See
+    league_table.league_equity_curves for the no-look-ahead / directional-vs-
+    option P&L accounting this wraps."""
+    return _compute_equity_curves(conn, cost_bps=cost_bps)
+
+
 def recent_trader_trades(conn: duckdb.DuckDBPyConnection, *, limit: int = 40) -> list[dict]:
     """Read-only trade tape across ALL traders for the Arena "交易動態 (Live
     Board)" feed -- most-recent-first, open + closed, joined to the trader's
@@ -1086,13 +1095,23 @@ def leaderboard(conn: duckdb.DuckDBPyConnection, *, window: int = 20) -> list[di
     league_by_id = {r["trader_id"]: r for r in _compute_league_table(conn, window=window)}
     out = []
     for trader in list_all_traders(conn):
-        portfolio = _portfolio_row(conn, trader.trader_id)
-        if portfolio is None:
-            continue
-        trades = _trader_trades(conn, trader.trader_id)
-        stats = _portfolio_stats(portfolio, trades, spot)
         league = league_by_id.get(trader.trader_id, {})
         rolling = league.get("rolling", {})
+        portfolio = _portfolio_row(conn, trader.trader_id)
+        # A trader with no virtual-account portfolio row yet (trader_portfolios
+        # is populated lazily) should still appear on the board as long as it
+        # has graded calls -- the standings the user cares about (hit rate,
+        # option P&L) come from graded predictions, not from booked trades. Only
+        # omit a trader that has neither a portfolio nor any graded call.
+        if portfolio is None and not (rolling.get("n_graded") or 0):
+            continue
+        if portfolio is None:
+            portfolio = {
+                "starting_capital": 25000.0, "cash": 25000.0,
+                "max_position_pct": None, "instrument_scope": None, "inception_date": None,
+            }
+        trades = _trader_trades(conn, trader.trader_id)
+        stats = _portfolio_stats(portfolio, trades, spot)
         out.append({
             "trader_id": trader.trader_id, "name": trader.name, "philosophy": trader.philosophy,
             "active": trader.active,
@@ -1107,11 +1126,19 @@ def leaderboard(conn: duckdb.DuckDBPyConnection, *, window: int = 20) -> list[di
             # hit_rate alone can't show.
             "option_win_rate": rolling.get("option_win_rate"),
             "avg_option_pnl": rolling.get("avg_option_pnl"),
+            "cum_option_pnl": rolling.get("cum_option_pnl", 0.0),
+            "n_graded": rolling.get("n_graded", 0),
         })
     # Ranked on REALIZED (booked) return -- a contest is scored on closed
     # results; open positions are marked-to-market for display but their rough
     # mark shouldn't decide the standings.
-    out.sort(key=lambda r: r["realized_return_pct"] if r["realized_return_pct"] is not None else -1e9, reverse=True)
+    out.sort(
+        key=lambda r: (
+            r["realized_return_pct"] if r["realized_return_pct"] is not None else -1e9,
+            r["cum_option_pnl"] if r["cum_option_pnl"] is not None else -1e9,
+        ),
+        reverse=True,
+    )
     for i, r in enumerate(out):
         r["rank"] = i + 1
     return out

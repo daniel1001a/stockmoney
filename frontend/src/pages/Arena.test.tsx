@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from 'vitest'
 import { render, screen, waitFor } from '@testing-library/react'
 import { MemoryRouter } from 'react-router-dom'
 import Arena from './Arena'
-import { api, type LeaderboardEntry, type TraderTradeFeedEntry } from '../lib/api'
+import { api, type LeaderboardEntry, type LeagueEquityEntry, type TraderTradeFeedEntry } from '../lib/api'
 
 vi.mock('../lib/api')
 
@@ -12,6 +12,7 @@ const entry = (rank: number, id: string, name: string, ret: number): Leaderboard
   total_return_pct: ret, realized_return_pct: ret, n_closed: 10, n_open: 2,
   trade_win_rate: 0.5, best_trade: 500, worst_trade: -300, hit_rate: 0.5, brier: 0.2,
   n_directional: 8, option_win_rate: 0.45, avg_option_pnl: -0.1,
+  cum_option_pnl: ret * 25000, n_graded: 8,
 })
 
 const tradeRow = (overrides: Partial<TraderTradeFeedEntry> = {}): TraderTradeFeedEntry => ({
@@ -23,11 +24,22 @@ const tradeRow = (overrides: Partial<TraderTradeFeedEntry> = {}): TraderTradeFee
   ...overrides,
 })
 
+const equityEntry = (id: string, name: string, points: LeagueEquityEntry['points']): LeagueEquityEntry => ({
+  trader_id: id, name, philosophy: 'p', active: true, points,
+})
+
 describe('Arena', () => {
   it('renders the contest rules and a return-ranked leaderboard', async () => {
     vi.mocked(api.leaderboard).mockResolvedValue([
       entry(1, 'momentum', 'Momentum (動能派)', 0.14),
       entry(2, 'analyst', 'Analyst (消息派)', -0.05),
+    ])
+    vi.mocked(api.leagueEquity).mockResolvedValue([
+      equityEntry('momentum', 'Momentum (動能派)', [
+        { trade_date: '2026-07-01', symbol: 'MSFT', direction: 'up', pnl: 0.1, cum_pnl: 0.1, option_pnl: 200, cum_option_pnl: 200 },
+        { trade_date: '2026-07-03', symbol: 'AAPL', direction: 'up', pnl: 0.05, cum_pnl: 0.15, option_pnl: 100, cum_option_pnl: 300 },
+      ]),
+      equityEntry('analyst', 'Analyst (消息派)', []),
     ])
     vi.mocked(api.divergence).mockResolvedValue([])
     vi.mocked(api.traderTrades).mockResolvedValue([])
@@ -36,14 +48,33 @@ describe('Arena', () => {
 
     await waitFor(() => expect(screen.getByText('排行榜')).toBeInTheDocument())
     expect(screen.getByText('比賽規則')).toBeInTheDocument()
-    expect(screen.getByText('Momentum (動能派)')).toBeInTheDocument()
+    expect(screen.getAllByText('Momentum (動能派)').length).toBeGreaterThan(0)
     // realized return rendered as a signed percentage
     expect(screen.getByText('+14.0%')).toBeInTheDocument()
     expect(screen.getByText('-5.0%')).toBeInTheDocument()
+    // equity curve + compact standings section
+    expect(screen.getByText('資金曲線與戰績')).toBeInTheDocument()
+    expect(screen.getByText('+$3,500')).toBeInTheDocument() // cum_option_pnl for momentum in StandingsCompact
+  })
+
+  it('shows an honest empty state when no trader has graded predictions yet', async () => {
+    vi.mocked(api.leaderboard).mockResolvedValue([entry(1, 'momentum', 'Momentum (動能派)', 0.14)])
+    vi.mocked(api.leagueEquity).mockResolvedValue([
+      equityEntry('momentum', 'Momentum (動能派)', []),
+      equityEntry('analyst', 'Analyst (消息派)', []),
+    ])
+    vi.mocked(api.divergence).mockResolvedValue([])
+    vi.mocked(api.traderTrades).mockResolvedValue([])
+
+    render(<MemoryRouter><Arena /></MemoryRouter>)
+
+    await waitFor(() => expect(screen.getByText('資金曲線與戰績')).toBeInTheDocument())
+    expect(screen.getByText('資料不足,尚無足夠已結算紀錄')).toBeInTheDocument()
   })
 
   it('renders the live board with professional option notation and P&L', async () => {
     vi.mocked(api.leaderboard).mockResolvedValue([entry(1, 'momentum', 'Momentum (動能派)', 0.14)])
+    vi.mocked(api.leagueEquity).mockResolvedValue([])
     vi.mocked(api.divergence).mockResolvedValue([])
     vi.mocked(api.traderTrades).mockResolvedValue([
       tradeRow(),

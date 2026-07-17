@@ -1,8 +1,62 @@
 import { Link } from 'react-router-dom'
-import { api, type LeaderboardEntry, type DivergenceRow, type TraderTradeFeedEntry } from '../lib/api'
+import { api, type LeaderboardEntry, type DivergenceRow, type TraderTradeFeedEntry, type LeagueEquityEntry } from '../lib/api'
 import { useApi } from '../lib/useApi'
 import { DIRECTION_LABEL, formatOptionContract, money, num, pct, relTime, signedMoney } from '../lib/format'
 import { Card, Chip, SectionTitle, Return, Loading, ErrorMsg, Empty } from '../components/ui'
+import EquityCurveChart from '../components/EquityCurveChart'
+
+// Cycled by trader index so the roster can grow past two without picking
+// colors per trader_id by hand.
+const TRADER_COLORS = ['#60a5fa', '#f472b6', '#34d399', '#fbbf24', '#a78bfa', '#fb7185']
+
+function StandingsCompact({ rows }: { rows: LeaderboardEntry[] }) {
+  if (rows.length === 0) return <Empty>尚無交易員參賽紀錄。</Empty>
+  return (
+    <div className="overflow-x-auto rounded-xl border border-neutral-800">
+      <table className="w-full text-sm">
+        <thead>
+          <tr className="border-b border-neutral-800 bg-neutral-900/50 text-left text-neutral-500">
+            <th className="px-3 py-2 font-normal">#</th>
+            <th className="px-3 py-2 font-normal">交易員</th>
+            <th className="px-3 py-2 text-right font-normal">方向命中率</th>
+            <th className="px-3 py-2 text-right font-normal">累積選擇權損益</th>
+            <th className="px-3 py-2 text-right font-normal">已結算筆數</th>
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map((r) => (
+            <tr key={r.trader_id} className="border-b border-neutral-900 last:border-0">
+              <td className="px-3 py-2 tabular-nums text-neutral-500">{r.rank}</td>
+              <td className="px-3 py-2">
+                <Link to={`/trader/${r.trader_id}`} className="font-medium text-neutral-100 hover:text-neutral-300">
+                  {r.name}
+                </Link>
+              </td>
+              <td className="px-3 py-2 text-right tabular-nums text-neutral-300">
+                {r.hit_rate !== null ? pct(r.hit_rate) : '—'}
+              </td>
+              <td className="px-3 py-2 text-right tabular-nums font-semibold">
+                <span className={r.cum_option_pnl > 0 ? 'text-emerald-400' : r.cum_option_pnl < 0 ? 'text-rose-400' : 'text-neutral-400'}>
+                  {signedMoney(r.cum_option_pnl)}
+                </span>
+              </td>
+              <td className="px-3 py-2 text-right tabular-nums text-neutral-500">{r.n_graded}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  )
+}
+
+function EquityCurveSection({ entries }: { entries: LeagueEquityEntry[] }) {
+  const series = entries.map((e, i) => ({
+    label: e.name,
+    color: TRADER_COLORS[i % TRADER_COLORS.length],
+    points: e.points.map((p) => ({ date: p.trade_date, value: p.cum_option_pnl })),
+  }))
+  return <EquityCurveChart series={series} />
+}
 
 function RulesBanner() {
   return (
@@ -196,6 +250,7 @@ function LiveBoard({ rows }: { rows: TraderTradeFeedEntry[] }) {
 
 export default function Arena() {
   const { data: board, loading, error } = useApi(api.leaderboard)
+  const { data: equity, loading: equityLoading, error: equityError } = useApi(api.leagueEquity)
   const { data: divergence } = useApi(() => api.divergence(), [])
   const { data: liveBoard, loading: liveBoardLoading, error: liveBoardError } = useApi(() => api.traderTrades(40), [])
 
@@ -215,6 +270,22 @@ export default function Arena() {
         {loading && <Loading />}
         {error && <ErrorMsg error={error} />}
         {board && <Leaderboard rows={board} />}
+      </section>
+
+      <section className="mb-8">
+        <SectionTitle title="資金曲線與戰績" hint="累積選擇權損益(已結算)隨時間變化,一眼看出誰在贏;右側精簡榜單以方向命中率與已結算筆數輔助判讀。" />
+        <div className="grid grid-cols-1 gap-4 lg:grid-cols-3">
+          <Card className="p-4 lg:col-span-2">
+            {equityLoading && <Loading />}
+            {equityError && <ErrorMsg error={equityError} />}
+            {equity && <EquityCurveSection entries={equity} />}
+          </Card>
+          <div className="lg:col-span-1">
+            {loading && <Loading />}
+            {error && <ErrorMsg error={error} />}
+            {board && <StandingsCompact rows={board} />}
+          </div>
+        </div>
       </section>
 
       <section className="mb-8">
