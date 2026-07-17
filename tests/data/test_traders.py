@@ -22,7 +22,7 @@ def _conn():
 def test_seeded_traders_present_and_active():
     conn = _conn()
     active = {t.trader_id for t in list_active_traders(conn)}
-    assert active == {"chartist", "analyst"}
+    assert active == {"chartist", "analyst", "reversion", "flow", "sentiment"}
     assert get_trader(conn, "chartist").engine_key == "chartist"
 
 
@@ -41,7 +41,7 @@ def test_deactivate_retires_without_deleting():
     conn = _conn()
     deactivate_trader(conn, "analyst")
     active = {t.trader_id for t in list_active_traders(conn)}
-    assert active == {"chartist"}
+    assert active == {"chartist", "reversion", "flow", "sentiment"}
     # still present in the full roster (history stays attributable)
     all_ids = {t.trader_id for t in list_all_traders(conn)}
     assert "analyst" in all_ids

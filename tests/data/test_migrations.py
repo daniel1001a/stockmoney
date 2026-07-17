@@ -57,7 +57,7 @@ EXPECTED_TABLES = {
 # + 2 redesign migrations (034 news_items, 035 trader_portfolios [2 tables]) = 35
 # + 1 Wave C migration (036 market_index_ohlcv_daily) = 36
 # + 1 Wave D migration (037 trader_predictions option_structure/option_pnl ALTER) = 37
-EXPECTED_MIGRATION_COUNT = 38
+EXPECTED_MIGRATION_COUNT = 39
 
 
 def _table_names(conn: duckdb.DuckDBPyConnection) -> set[str]:

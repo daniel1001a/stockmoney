@@ -60,7 +60,9 @@ def test_league_equity_route(client):
 def test_traders_route(client):
     resp = client.get("/api/traders")
     assert resp.status_code == 200
-    assert {t["trader_id"] for t in resp.json()} == {"chartist", "analyst"}
+    assert {t["trader_id"] for t in resp.json()} == {
+        "chartist", "analyst", "reversion", "flow", "sentiment",
+    }
 
 
 def test_ticker_traders_route(client):
