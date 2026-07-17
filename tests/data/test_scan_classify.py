@@ -254,3 +254,79 @@ def test_run_classification_pass_leaves_unmatched_items_unprocessed_for_retry():
     # A subsequent run should see the same item again (not silently dropped).
     items = fetch_unprocessed_items(conn)
     assert len(items) == 1
+
+
+# --- claude_cli_classify_fn (bounded subprocess, no paid API) ------------------
+
+import json as _json
+from unittest.mock import patch
+
+from stockmoney.data.scan_classify import claude_cli_classify_fn
+
+
+def _envelope(result_text, *, is_error=False):
+    """Shape of `claude -p ... --output-format json` stdout."""
+    class _P:
+        returncode = 0
+        stdout = _json.dumps({"is_error": is_error, "result": result_text})
+        stderr = ""
+    return _P()
+
+
+def _items():
+    now = datetime.now(timezone.utc)
+    return [ScanItem(item_id="a1", item_type="news", title="NVDA up", body="demand", timestamp=now)]
+
+
+def test_cli_classify_parses_bare_json():
+    payload = '{"results": [{"item_id": "a1", "verdict": "irrelevant"}]}'
+    with patch("stockmoney.data.scan_classify.subprocess.run", return_value=_envelope(payload)):
+        out = claude_cli_classify_fn(_items(), ["NVDA"])
+    assert out == [{"item_id": "a1", "verdict": "irrelevant"}]
+
+
+def test_cli_classify_parses_fenced_json():
+    payload = 'Here you go:\n```json\n{"results": [{"item_id": "a1", "verdict": "irrelevant"}]}\n```'
+    with patch("stockmoney.data.scan_classify.subprocess.run", return_value=_envelope(payload)):
+        out = claude_cli_classify_fn(_items(), ["NVDA"])
+    assert out[0]["item_id"] == "a1"
+
+
+def test_cli_classify_timeout_raises_valueerror():
+    import subprocess as _sp
+    with patch("stockmoney.data.scan_classify.subprocess.run",
+               side_effect=_sp.TimeoutExpired(cmd="claude", timeout=120)):
+        with pytest.raises(ValueError, match="timed out"):
+            claude_cli_classify_fn(_items(), ["NVDA"])
+
+
+def test_cli_classify_nonzero_exit_raises():
+    class _P:
+        returncode = 1
+        stdout = ""
+        stderr = "boom"
+    with patch("stockmoney.data.scan_classify.subprocess.run", return_value=_P()):
+        with pytest.raises(ValueError, match="exited 1"):
+            claude_cli_classify_fn(_items(), ["NVDA"])
+
+
+def test_cli_classify_error_envelope_raises():
+    with patch("stockmoney.data.scan_classify.subprocess.run",
+               return_value=_envelope("rate limited", is_error=True)):
+        with pytest.raises(ValueError, match="reported an error"):
+            claude_cli_classify_fn(_items(), ["NVDA"])
+
+
+def test_run_pass_batch_failure_does_not_crash_and_retries():
+    conn = _conn()
+    _seed_article(conn, article_id="a1")
+    _seed_post(conn, post_id="p1")
+
+    def _boom(batch, symbols):
+        raise ValueError("claude CLI timed out after 120s")
+
+    counts = run_classification_pass(conn, classify_fn=_boom)
+    assert counts["batch_failed"] == 2
+    # nothing recorded, items left unprocessed so a later run retries them
+    assert conn.execute("SELECT count(*) FROM scan_classifications").fetchone()[0] == 0
+    assert len(fetch_unprocessed_items(conn)) == 2

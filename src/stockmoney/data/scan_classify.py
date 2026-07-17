@@ -29,6 +29,8 @@ re-bills) the same item twice.
 from __future__ import annotations
 
 import json
+import re
+import subprocess
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
@@ -36,8 +38,11 @@ import duckdb
 
 from stockmoney.data.classification import record_candidate, record_sentiment
 
-DEFAULT_MODEL = "claude-haiku-4-5-20251001"
+DEFAULT_MODEL = "claude-haiku-4-5-20251001"  # paid-API id for the (unused-by-default) SDK path
 MODEL_VERSION = "scan-classify-haiku-v1"
+DEFAULT_CLI_MODEL = "haiku"  # `claude` CLI alias -- keep on the utility tier (CLAUDE.md §13)
+CLI_MODEL_VERSION = "scan-classify-claude-cli-batch-v1"  # tag for claude_cli_classify_fn
+CLI_TIMEOUT_SECONDS = 120  # hard per-batch subprocess bound so one hung batch can't stall the pass
 DEFAULT_BATCH_SIZE = 20
 DEFAULT_HOURS = 6
 DEFAULT_LIMIT = 200
@@ -230,6 +235,10 @@ def _build_prompt(items: list[ScanItem], symbols: list[str]) -> str:
 
 
 def _default_classify_fn(items: list[ScanItem], symbols: list[str], *, model: str) -> list[dict]:
+    # Inert reference implementation: the original paid-API (ANTHROPIC_API_KEY)
+    # path. No longer wired in by default -- see claude_cli_classify_fn, which
+    # runs on the Claude Code subscription instead (the user's standing "no paid
+    # API keys" rule). Kept only to document the equivalent SDK call.
     import anthropic
 
     client = anthropic.Anthropic()
@@ -245,6 +254,65 @@ def _default_classify_fn(items: list[ScanItem], symbols: list[str], *, model: st
         if block.type == "tool_use" and block.name == "classify_items":
             return block.input.get("results", [])
     return []
+
+
+_JSON_OBJECT_RE = re.compile(r"\{.*\}", re.DOTALL)
+
+
+def _extract_json_object(text: str) -> dict:
+    """`claude --output-format json` returns the model's answer as a plain
+    string in `result` -- possibly bare, fenced in ```json ... ```, or with a
+    stray line of preamble. Take the outermost {...} span and parse it."""
+    match = _JSON_OBJECT_RE.search(text)
+    if not match:
+        raise ValueError(f"no JSON object found in claude CLI output: {text!r}")
+    return json.loads(match.group(0))
+
+
+def claude_cli_classify_fn(
+    items: list[ScanItem], symbols: list[str], *, model: str = DEFAULT_CLI_MODEL, timeout: int = CLI_TIMEOUT_SECONDS
+) -> list[dict]:
+    """Default `classify_fn`: shells out to the `claude` CLI in headless print
+    mode so this runs on the Claude Code subscription, never a paid Anthropic
+    API key (CLAUDE.md §13 / the user's standing "no paid API keys" rule --
+    ANTHROPIC_API_KEY is intentionally unset). Bounded by a hard subprocess
+    timeout so one slow/hung batch can't stall the whole pass -- callers should
+    treat any exception here (including subprocess.TimeoutExpired, re-raised as
+    ValueError) as a failed batch and move on, exactly like a malformed
+    response. `--tools ""` / `--no-session-persistence` keep each call a cheap,
+    stateless, non-agentic structured completion -- no tool use, no skill/
+    CLAUDE.md auto-discovery, nothing written to disk (this is what previously
+    made the agent-turn cron stall past the no-output watchdog)."""
+    schema = CLASSIFY_TOOL["input_schema"]["properties"]["results"]["items"]
+    task = (
+        _build_prompt(items, symbols)
+        + "\n\nRespond with ONLY a single JSON object (no markdown fences, no "
+        'commentary) of the form {"results": [...]} with exactly one entry per '
+        "item_id above, each entry matching this schema: "
+        + json.dumps(schema)
+    )
+    argv = [
+        "claude", "-p", task,
+        "--output-format", "json",
+        "--model", model,
+        "--append-system-prompt", SYSTEM_PROMPT,
+        "--tools", "",
+        "--no-session-persistence",
+    ]
+    try:
+        proc = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        raise ValueError(f"claude CLI timed out after {timeout}s") from exc
+    if proc.returncode != 0:
+        raise ValueError(f"claude CLI exited {proc.returncode}: {proc.stderr[:500]!r}")
+
+    envelope = json.loads(proc.stdout)
+    if envelope.get("is_error"):
+        raise ValueError(f"claude CLI reported an error: {envelope.get('result')!r}")
+    results = _extract_json_object(envelope["result"]).get("results", [])
+    if not isinstance(results, list):
+        raise ValueError(f"claude CLI 'results' is not a list: {results!r}")
+    return results
 
 
 def apply_result(
@@ -330,20 +398,28 @@ def run_classification_pass(
     limit: int = DEFAULT_LIMIT,
     batch_size: int = DEFAULT_BATCH_SIZE,
     classify_fn=None,
-    model: str = DEFAULT_MODEL,
+    model: str = DEFAULT_CLI_MODEL,
 ) -> dict:
     """Fetch unprocessed items, classify in batches, write through
     apply_result. `classify_fn(items, symbols) -> list[dict]` is injectable
-    for testing (default calls the real Anthropic API). Returns outcome
-    counts."""
-    classify_fn = classify_fn or (lambda batch, symbols: _default_classify_fn(batch, symbols, model=model))
+    for testing (default: claude_cli_classify_fn, the claude-cli/subscription
+    call). Returns outcome counts."""
+    classify_fn = classify_fn or (lambda batch, symbols: claude_cli_classify_fn(batch, symbols, model=model))
     symbols = _active_watchlist_symbols(conn)
     items = fetch_unprocessed_items(conn, hours=hours, limit=limit)
 
-    counts = {"sentiment": 0, "candidate": 0, "irrelevant": 0, "error": 0, "unmatched": 0}
+    counts = {"sentiment": 0, "candidate": 0, "irrelevant": 0, "error": 0, "unmatched": 0, "batch_failed": 0}
     for i in range(0, len(items), batch_size):
         batch = items[i : i + batch_size]
-        results = classify_fn(batch, symbols)
+        try:
+            results = classify_fn(batch, symbols)
+        except (ValueError, TypeError, json.JSONDecodeError):
+            # A hung/slow/malformed batch (e.g. claude_cli_classify_fn's bounded
+            # timeout fired) must not kill the whole pass. Leave this batch's
+            # items unprocessed so the next scheduled run retries them, and move
+            # on to the remaining batches.
+            counts["batch_failed"] += len(batch)
+            continue
         results_by_id = {r["item_id"]: r for r in results if isinstance(r, dict) and "item_id" in r}
         for item in batch:
             result = results_by_id.get(item.item_id)
