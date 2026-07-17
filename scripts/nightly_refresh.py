@@ -49,7 +49,7 @@ from stockmoney.data.ingestion.options_chain import ingest_watchlist_options
 from stockmoney.data.ingestion.vix_term import ingest_vix_term
 from stockmoney.data.ingestion.yfinance_ohlcv import ingest_watchlist_ohlcv
 from stockmoney.data.news_synthesis import refresh_news_items
-from stockmoney.league.orchestration import run_predictions
+from stockmoney.league.orchestration import grade_matured, run_predictions
 from stockmoney.league.review import run_review
 
 OHLCV_LOOKBACK_DAYS = 10
@@ -114,15 +114,25 @@ def main(db_path: str = DEFAULT_DB_PATH) -> None:
     except Exception as exc:
         print(f"  attribution FAILED: {exc}")
 
-    # Trader League: every active trader makes today's calls, then the review
-    # side-branch attributes any newly-graded ones + refreshes divergence.
-    # Grading stays a manual step (scripts/league_cli.py grade), so review
-    # is idempotent and safely no-ops when nothing new has been graded.
+    # Trader League: every active trader makes today's calls, then we grade any
+    # prediction whose horizon has now matured, then the review side-branch
+    # attributes the newly-graded ones + refreshes divergence + proposes method
+    # updates. grade_matured only resolves predictions whose label_end_date is
+    # already in the past (using that day's close, a settled historical fact), so
+    # it introduces no look-ahead -- it is the missing link that lets the league
+    # actually score itself and improve unattended (previously grading was a
+    # manual step nobody ran, so review perpetually no-oped on 0 graded rows).
     try:
         summary = run_predictions(conn)
         print(f"  league predict: { {k: v for k, v in summary.items() if k != 'skips'} }")
     except Exception as exc:
         print(f"  league predict FAILED: {exc}")
+
+    try:
+        summary = grade_matured(conn)
+        print(f"  league grade: {summary}")
+    except Exception as exc:
+        print(f"  league grade FAILED: {exc}")
 
     try:
         summary = run_review(conn)

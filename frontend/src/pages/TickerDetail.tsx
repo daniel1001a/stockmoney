@@ -34,31 +34,39 @@ export default function TickerDetail() {
           {/* Header */}
           <div className="flex flex-wrap items-start justify-between gap-3">
             <div>
-              <div className="flex items-center gap-3">
+              <div className="flex items-baseline gap-3">
                 <h1 className="text-3xl font-bold text-neutral-50">{data.symbol}</h1>
-                {last !== undefined && (
+                {quote?.price != null ? (
                   <div className="flex items-baseline gap-2">
-                    <span className="text-2xl font-semibold tabular-nums text-neutral-100">${num(last)}</span>
-                    {dayChange !== null && (
-                      <span className={`text-sm tabular-nums ${dayChange >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
-                        {dayChange >= 0 ? '+' : ''}{pct(dayChange, 1)}
+                    <span className="text-3xl font-semibold tabular-nums text-neutral-50">{`$${num(quote.price)}`}</span>
+                    {quote.change_pct !== null && (
+                      <span className={`text-sm tabular-nums ${quote.change_pct >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
+                        {signedPct(quote.change_pct, 1)}
                       </span>
                     )}
+                    <span className="text-[10px] uppercase tracking-wide text-neutral-500">即時 · 約15分延遲</span>
                   </div>
+                ) : (
+                  last !== undefined && (
+                    <div className="flex items-baseline gap-2">
+                      <span className="text-2xl font-semibold tabular-nums text-neutral-100">${num(last)}</span>
+                      {dayChange !== null && (
+                        <span className={`text-sm tabular-nums ${dayChange >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
+                          {dayChange >= 0 ? '+' : ''}{pct(dayChange, 1)}
+                        </span>
+                      )}
+                      <span className="text-[10px] uppercase tracking-wide text-neutral-500">收盤</span>
+                    </div>
+                  )
                 )}
               </div>
-              <p className="mt-1 text-sm text-neutral-500">{data.sector} · 資料日期 {data.trade_date}</p>
-              {quote?.price != null && (
-                <p className="mt-0.5 text-xs text-neutral-500">
-                  即時 <span className="tabular-nums text-neutral-300">{`$${num(quote.price)}`}</span>
-                  {quote.change_pct !== null && (
-                    <span className={`ml-1 tabular-nums ${quote.change_pct >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
-                      {signedPct(quote.change_pct, 1)}
-                    </span>
-                  )}
-                  {quote.as_of && <span className="ml-1 text-neutral-600">· {relTime(quote.as_of)}(約15分鐘延遲)</span>}
-                </p>
-              )}
+              <p className="mt-1 text-sm text-neutral-500">
+                {data.sector} · 資料日期 {data.trade_date}
+                {quote?.price != null && last !== undefined && (
+                  <span className="ml-2 tabular-nums text-neutral-500">收盤 ${num(last)}</span>
+                )}
+                {quote?.as_of && <span className="ml-1 text-neutral-600">· 即時更新 {relTime(quote.as_of)}</span>}
+              </p>
             </div>
             <div className="flex items-center gap-2">
               <Chip className={regimeClass(data.regime_label)}>

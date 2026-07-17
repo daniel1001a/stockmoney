@@ -18,22 +18,39 @@ const GATE_CLASS: Record<string, string> = {
   unknown: 'text-neutral-400 bg-neutral-500/10 border-neutral-500/40',
 }
 
-// Live (yfinance free tier, ~15min-delayed) price overlay -- clearly labelled
-// as "即時" and visually distinct from the model's own EOD close, so the two
-// are never confused as the same number. Renders nothing when there's no
-// quote yet rather than a misleading "--".
-function LivePrice({ quote }: { quote: Quote | undefined }) {
-  if (!quote || quote.price === null) return null
-  const positive = quote.change_pct !== null && quote.change_pct >= 0
+// Price block for a decision card. The number a day-trader actually watches is
+// the *live* (yfinance free tier, ~15min-delayed) quote, so that is the large,
+// prominent figure. The model's own EOD close is kept as a small secondary
+// caption ("收盤") so the two are never confused as the same number. When there
+// is no live quote yet (market closed / no data), we fall back to showing the
+// EOD close as the main number, honestly labelled, rather than a hollow "--".
+function PriceBlock({ quote, close }: { quote: Quote | undefined; close: number | null }) {
+  const hasLive = !!quote && quote.price !== null
+  if (hasLive) {
+    const positive = quote!.change_pct !== null && quote!.change_pct >= 0
+    return (
+      <div className="text-right">
+        <div className="flex items-baseline justify-end gap-1.5">
+          <span className="text-lg font-semibold tabular-nums text-neutral-50">{`$${num(quote!.price)}`}</span>
+          {quote!.change_pct !== null && (
+            <span className={`text-xs tabular-nums ${positive ? 'text-emerald-400' : 'text-rose-400'}`}>
+              {signedPct(quote!.change_pct, 1)}
+            </span>
+          )}
+        </div>
+        <div className="text-[10px] uppercase tracking-wide text-neutral-500">即時 · 約15分延遲</div>
+        {close !== null && (
+          <div className="mt-0.5 text-xs tabular-nums text-neutral-500">收盤 ${num(close)}</div>
+        )}
+      </div>
+    )
+  }
   return (
-    <div className="mt-0.5 flex items-baseline gap-1.5 text-xs">
-      <span className="tabular-nums text-neutral-300">{`$${num(quote.price)}`}</span>
-      {quote.change_pct !== null && (
-        <span className={`tabular-nums ${positive ? 'text-emerald-400' : 'text-rose-400'}`}>
-          {signedPct(quote.change_pct, 1)}
-        </span>
-      )}
-      <span className="text-neutral-600">即時</span>
+    <div className="text-right">
+      <div className="text-lg font-semibold tabular-nums text-neutral-50">
+        {close !== null ? `$${num(close)}` : '—'}
+      </div>
+      <div className="text-[10px] uppercase tracking-wide text-neutral-500">收盤</div>
     </div>
   )
 }
@@ -427,12 +444,7 @@ function DecisionCard({ card, quote }: { card: CockpitCard; quote: Quote | undef
           <div className="text-lg font-bold text-neutral-50">{card.symbol}</div>
           <div className="text-xs text-neutral-500">{sectorLabel(card.sector)}</div>
         </div>
-        <div className="text-right">
-          <div className="text-lg font-semibold tabular-nums text-neutral-50">
-            {card.price !== null ? `$${num(card.price)}` : '—'}
-          </div>
-          <LivePrice quote={quote} />
-        </div>
+        <PriceBlock quote={quote} close={card.price} />
       </div>
 
       <div className="mt-2 flex flex-wrap items-center gap-1.5">
