@@ -10,33 +10,35 @@ classify_scan.py: that script stays pure/deterministic, no LLM calls). Run
 this after classify_scan.py has produced some scan_classifications rows to
 act on -- with none yet, this is a no-op (nothing to synthesize).
 
-Requires ANTHROPIC_API_KEY in the environment (see .env.example).
+Runs on the Claude Code subscription via the `claude` CLI (see
+`claude_cli_synthesize_fn` in stockmoney.data.catalyst_synthesis) -- NOT the
+paid Anthropic API. ANTHROPIC_API_KEY is intentionally never read here; no
+API key is required or used.
 
 Usage:
-    uv run python scripts/synthesize_catalysts.py [--hours 48] [--model claude-sonnet-5]
+    uv run python scripts/synthesize_catalysts.py [--hours 48] [--model sonnet]
+    uv run python scripts/synthesize_catalysts.py --symbols NVDA AMD  # bounded smoke test
 """
 from __future__ import annotations
 
 import argparse
 import json
 
-from dotenv import load_dotenv
-
-from stockmoney.data.catalyst_synthesis import DEFAULT_HOURS, DEFAULT_MODEL, run_catalyst_synthesis_pass
+from stockmoney.data.catalyst_synthesis import DEFAULT_HOURS, run_catalyst_synthesis_pass
 from stockmoney.data.db import DEFAULT_DB_PATH, get_connection, run_migrations
 
 
 def main(
     *,
     hours: int = DEFAULT_HOURS,
-    model: str = DEFAULT_MODEL,
+    model: str = "sonnet",
     db_path: str = DEFAULT_DB_PATH,
+    symbols: list[str] | None = None,
 ) -> None:
-    load_dotenv()
     conn = get_connection(db_path)
     run_migrations(conn)
     try:
-        counts = run_catalyst_synthesis_pass(conn, hours=hours, model=model)
+        counts = run_catalyst_synthesis_pass(conn, hours=hours, model=model, symbols=symbols)
     finally:
         conn.close()
     print(json.dumps(counts))
@@ -45,6 +47,10 @@ def main(
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--hours", type=int, default=DEFAULT_HOURS)
-    parser.add_argument("--model", default=DEFAULT_MODEL)
+    parser.add_argument("--model", default="sonnet")
+    parser.add_argument(
+        "--symbols", nargs="+", default=None,
+        help="Restrict to this subset of symbols (bounded smoke test); default is all symbols pass 1 found signal on.",
+    )
     args = parser.parse_args()
-    main(hours=args.hours, model=args.model)
+    main(hours=args.hours, model=args.model, symbols=args.symbols)

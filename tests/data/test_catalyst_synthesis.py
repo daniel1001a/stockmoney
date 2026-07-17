@@ -1,11 +1,14 @@
 import json
+import subprocess
 from datetime import date, datetime, timedelta, timezone
+from unittest.mock import patch
 
 import duckdb
 import polars as pl
 import pytest
 
 from stockmoney.data.catalyst_synthesis import (
+    claude_cli_synthesize_fn,
     gather_evidence,
     run_catalyst_synthesis_pass,
     symbols_with_recent_signal,
@@ -177,3 +180,74 @@ def test_run_pass_injection_content_in_summary_is_stored_as_inert_data():
         "SELECT table_name FROM information_schema.tables WHERE table_schema='main'"
     ).fetchall()}
     assert "catalyst_signals" in tables
+
+
+# --- claude_cli_synthesize_fn: claude-cli subprocess path (mocked, no real call) ---
+
+_FAKE_RESULT = {
+    "catalyst_summary": "capex commentary", "transmission_chain": "capex -> demand -> revenue",
+    "novelty_score": 0.7, "sentiment_score": 0.4, "priced_in_estimate": 0.3,
+}
+
+
+def _fake_envelope(result_text: str, *, is_error: bool = False) -> str:
+    return json.dumps({"type": "result", "is_error": is_error, "result": result_text})
+
+
+def test_claude_cli_synthesize_fn_parses_bare_json_result():
+    completed = subprocess.CompletedProcess(
+        args=["claude"], returncode=0, stdout=_fake_envelope(json.dumps(_FAKE_RESULT)), stderr=""
+    )
+    with patch("stockmoney.data.catalyst_synthesis.subprocess.run", return_value=completed) as mock_run:
+        result = claude_cli_synthesize_fn("NVDA", {"symbol": "NVDA"})
+    assert result == _FAKE_RESULT
+    argv = mock_run.call_args.args[0]
+    assert argv[0] == "claude"
+    assert "-p" in argv
+    assert mock_run.call_args.kwargs["timeout"] == 90
+
+
+def test_claude_cli_synthesize_fn_strips_markdown_fence():
+    fenced = "```json\n" + json.dumps(_FAKE_RESULT) + "\n```"
+    completed = subprocess.CompletedProcess(args=["claude"], returncode=0, stdout=_fake_envelope(fenced), stderr="")
+    with patch("stockmoney.data.catalyst_synthesis.subprocess.run", return_value=completed):
+        result = claude_cli_synthesize_fn("NVDA", {"symbol": "NVDA"})
+    assert result == _FAKE_RESULT
+
+
+def test_claude_cli_synthesize_fn_timeout_raises_value_error_not_hang():
+    with patch(
+        "stockmoney.data.catalyst_synthesis.subprocess.run",
+        side_effect=subprocess.TimeoutExpired(cmd=["claude"], timeout=90),
+    ):
+        with pytest.raises(ValueError):
+            claude_cli_synthesize_fn("NVDA", {"symbol": "NVDA"})
+
+
+def test_claude_cli_synthesize_fn_nonzero_exit_raises_value_error():
+    completed = subprocess.CompletedProcess(args=["claude"], returncode=1, stdout="", stderr="not logged in")
+    with patch("stockmoney.data.catalyst_synthesis.subprocess.run", return_value=completed):
+        with pytest.raises(ValueError):
+            claude_cli_synthesize_fn("NVDA", {"symbol": "NVDA"})
+
+
+def test_claude_cli_synthesize_fn_error_envelope_raises_value_error():
+    completed = subprocess.CompletedProcess(
+        args=["claude"], returncode=0, stdout=_fake_envelope("some error text", is_error=True), stderr=""
+    )
+    with patch("stockmoney.data.catalyst_synthesis.subprocess.run", return_value=completed):
+        with pytest.raises(ValueError):
+            claude_cli_synthesize_fn("NVDA", {"symbol": "NVDA"})
+
+
+def test_run_pass_uses_claude_cli_synthesize_fn_by_default_and_counts_timeout_as_error():
+    conn = _conn()
+    _mark_classified(conn, item_id="a1", item_type="news", symbols=["NVDA"])
+
+    with patch(
+        "stockmoney.data.catalyst_synthesis.subprocess.run",
+        side_effect=subprocess.TimeoutExpired(cmd=["claude"], timeout=90),
+    ):
+        counts = run_catalyst_synthesis_pass(conn)
+    assert counts == {"written": 0, "error": 1}
+    assert conn.execute("SELECT count(*) FROM catalyst_signals").fetchone()[0] == 0
