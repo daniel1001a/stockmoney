@@ -1144,6 +1144,51 @@ def leaderboard(conn: duckdb.DuckDBPyConnection, *, window: int = 20) -> list[di
     return out
 
 
+def league_training(conn: duckdb.DuckDBPyConnection, *, window: int = 20) -> list[dict]:
+    """Per-trader training-performance view: the league scorecard (overall /
+    rolling / by-regime, from `league_table`) plus a running win-rate-over-time
+    series and the self-improvement proposal + method-version history -- i.e.
+    everything needed to see whether a trader's model is actually getting better
+    over time, not just where it ranks today. Read-only, settled rows only
+    (win-rate series is ordered by trade_date, so no look-ahead)."""
+    from stockmoney.data.trader_methods import list_proposals
+    from stockmoney.data.trader_predictions import graded_predictions
+
+    proposals_by_trader: dict[str, list[dict]] = {}
+    for p in list_proposals(conn):
+        proposals_by_trader.setdefault(p["trader_id"], []).append(p)
+
+    versions_by_trader: dict[str, list[dict]] = {}
+    for tid, mv, eff, status in conn.execute(
+        "SELECT trader_id, method_version, effective_date, status "
+        "FROM trader_method_versions ORDER BY effective_date, method_version"
+    ).fetchall():
+        versions_by_trader.setdefault(tid, []).append(
+            {"method_version": mv, "effective_date": eff, "status": status}
+        )
+
+    out = []
+    for row in _compute_league_table(conn, window=window):
+        tid = row["trader_id"]
+        graded = [
+            p for p in graded_predictions(conn, trader_id=tid)
+            if p.direction in ("up", "down") and p.outcome is not None
+        ]
+        graded.sort(key=lambda p: (p.trade_date, p.symbol))
+        series, wins = [], 0
+        for i, p in enumerate(graded, start=1):
+            if p.outcome == "win":
+                wins += 1
+            series.append({"trade_date": p.trade_date, "n": i, "hit_rate": wins / i})
+        out.append({
+            **row,
+            "win_rate_series": series,
+            "proposals": proposals_by_trader.get(tid, []),
+            "method_versions": versions_by_trader.get(tid, []),
+        })
+    return out
+
+
 def trader_profile(conn: duckdb.DuckDBPyConnection, trader_id: str) -> dict | None:
     """One trader's full account: contest stats, current open positions (with a
     rough live mark), full trade history, and their recent league calls -- the

@@ -57,6 +57,18 @@ def test_league_equity_route(client):
     assert rows["analyst"]["points"] == []  # ungraded -> honest empty, not omitted
 
 
+def test_league_training_route(client):
+    resp = client.get("/api/league/training")
+    assert resp.status_code == 200
+    rows = {r["trader_id"]: r for r in resp.json()}
+    # chartist has one graded directional win -> a one-point win-rate series at 1.0
+    assert [p["hit_rate"] for p in rows["chartist"]["win_rate_series"]] == [1.0]
+    # every entry carries the training-view fields, honest-empty when nothing yet
+    for r in rows.values():
+        assert "win_rate_series" in r and "proposals" in r and "method_versions" in r
+    assert rows["analyst"]["win_rate_series"] == []
+
+
 def test_traders_route(client):
     resp = client.get("/api/traders")
     assert resp.status_code == 200

@@ -406,6 +406,11 @@ export interface TraderStats {
   high_conviction_threshold: number
   high_conviction_n: number
   high_conviction_precision: number | null
+  // Wave D option metrics (present in the JSON; optional here for back-compat)
+  option_win_rate?: number | null
+  avg_option_pnl?: number | null
+  cum_option_pnl?: number
+  n_option_graded?: number
 }
 
 export interface RollingStats extends TraderStats {
@@ -420,6 +425,37 @@ export interface LeagueEntry {
   overall: TraderStats
   rolling: RollingStats
   by_regime: Record<string, TraderStats>
+}
+
+export interface WinRatePoint {
+  trade_date: string
+  n: number
+  hit_rate: number
+}
+
+export interface MethodProposal {
+  proposal_id: string
+  trader_id: string
+  from_version: string | null
+  to_version: string | null
+  rationale: string
+  status: string
+  reviewed_by: string | null
+  reviewed_date: string | null
+}
+
+export interface MethodVersion {
+  method_version: string
+  effective_date: string
+  status: string
+}
+
+// /api/league/training: per-trader scorecard + win-rate-over-time + the
+// self-improvement proposal / method-version history (是否在進步).
+export interface LeagueTrainingEntry extends LeagueEntry {
+  win_rate_series: WinRatePoint[]
+  proposals: MethodProposal[]
+  method_versions: MethodVersion[]
 }
 
 export interface TraderPredictionEntry {
@@ -639,6 +675,8 @@ export const api = {
   league: (window?: number) =>
     getJson<LeagueEntry[]>(`/league${window !== undefined ? `?window=${window}` : ''}`),
   leagueEquity: () => getJson<LeagueEquityEntry[]>('/league/equity'),
+  leagueTraining: (window?: number) =>
+    getJson<LeagueTrainingEntry[]>(`/league/training${window !== undefined ? `?window=${window}` : ''}`),
   traders: () => getJson<Trader[]>('/traders'),
   tickerTraders: (symbol: string) =>
     getJsonOrNull<TickerTradersResponse>(`/ticker/${encodeURIComponent(symbol)}/traders`),

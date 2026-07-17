@@ -4,6 +4,7 @@ const NAV_ITEMS = [
   { to: '/', label: '今日機會', end: true },
   { to: '/news', label: '消息雷達', end: false },
   { to: '/arena', label: '競技場', end: false },
+  { to: '/training', label: '訓練表現', end: false },
 ]
 
 export default function Layout() {

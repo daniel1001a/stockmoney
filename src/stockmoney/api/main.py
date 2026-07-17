@@ -157,6 +157,15 @@ def league(window: int = 20, cost_bps: float = 0.0) -> list[dict]:
         return queries.league_table(conn, window=window, cost_bps=cost_bps)
 
 
+@app.get("/api/league/training")
+def league_training(window: int = 20) -> list[dict]:
+    """Per-trader training-performance view (訓練表現): scorecard + per-regime
+    breakdown + win-rate-over-time + self-improvement proposal / method-version
+    history -- whether each model is actually getting better."""
+    with ro_connection() as conn:
+        return queries.league_training(conn, window=window)
+
+
 @app.get("/api/league/equity")
 def league_equity(cost_bps: float = 0.0) -> list[dict]:
     """Per-trader equity curves (資金曲線) -- cumulative P&L over settled

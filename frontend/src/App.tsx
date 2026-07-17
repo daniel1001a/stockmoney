@@ -5,6 +5,7 @@ import TickerDetail from './pages/TickerDetail'
 import NewsRadar from './pages/NewsRadar'
 import NewsDetail from './pages/NewsDetail'
 import Arena from './pages/Arena'
+import Training from './pages/Training'
 import TraderProfile from './pages/TraderProfile'
 
 export default function App() {
@@ -17,6 +18,7 @@ export default function App() {
           <Route path="news" element={<NewsRadar />} />
           <Route path="news/:id" element={<NewsDetail />} />
           <Route path="arena" element={<Arena />} />
+          <Route path="training" element={<Training />} />
           <Route path="trader/:id" element={<TraderProfile />} />
           {/* legacy paths from the pre-redesign nav */}
           <Route path="catalysts" element={<Navigate to="/news" replace />} />
