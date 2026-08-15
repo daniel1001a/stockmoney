@@ -442,6 +442,24 @@ export interface MethodProposal {
   status: string
   reviewed_by: string | null
   reviewed_date: string | null
+  source_review_date: string | null
+}
+
+// /api/league/overall: one pooled scorecard across every trader's graded
+// calls -- "what's our overall hit rate/results", not any one trader's.
+export interface OverallStats {
+  window: number | null
+  n_traders: number
+  n_graded: number
+  n_directional: number
+  hit_rate: number | null
+  brier: number | null
+  avg_pnl: number | null
+  cum_pnl: number
+  n_option_graded: number
+  option_win_rate: number | null
+  avg_option_pnl: number | null
+  cum_option_pnl: number
 }
 
 export interface MethodVersion {
@@ -675,6 +693,8 @@ export const api = {
   league: (window?: number) =>
     getJson<LeagueEntry[]>(`/league${window !== undefined ? `?window=${window}` : ''}`),
   leagueEquity: () => getJson<LeagueEquityEntry[]>('/league/equity'),
+  leagueOverall: (window?: number) =>
+    getJson<OverallStats>(`/league/overall${window !== undefined ? `?window=${window}` : ''}`),
   leagueTraining: (window?: number) =>
     getJson<LeagueTrainingEntry[]>(`/league/training${window !== undefined ? `?window=${window}` : ''}`),
   traders: () => getJson<Trader[]>('/traders'),

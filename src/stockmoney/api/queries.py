@@ -28,8 +28,10 @@ from stockmoney.data.positions import list_open_positions
 from stockmoney.data.trader_predictions import predictions_on_date
 from stockmoney.data.trader_review import recent_divergence_rows
 from stockmoney.data.traders import list_all_traders
+from stockmoney.league import ledger as _ledger
 from stockmoney.league.league_table import league_equity_curves as _compute_equity_curves
 from stockmoney.league.league_table import league_table as _compute_league_table
+from stockmoney.league.league_table import overall_stats as _compute_overall_stats
 from stockmoney.models.options_risk import MarketSnapshot, assess_position
 from stockmoney.models.regime import REGIME_OBS_COLUMNS, describe_regimes
 
@@ -664,6 +666,13 @@ def league_table(conn: duckdb.DuckDBPyConnection, *, window: int = 20, cost_bps:
     return _compute_league_table(conn, window=window, cost_bps=cost_bps)
 
 
+def league_overall(conn: duckdb.DuckDBPyConnection, *, window: int | None = None) -> dict:
+    """The app's single pooled scorecard across every trader's graded calls --
+    "what's our overall hit rate/results", not any one trader's. See
+    league_table.overall_stats."""
+    return _compute_overall_stats(conn, window=window)
+
+
 def league_equity(conn: duckdb.DuckDBPyConnection, *, cost_bps: float = 0.0) -> list[dict]:
     """Per-trader cumulative P&L series (資金曲線) over settled predictions,
     ordered by trade_date -- powers the Arena equity-curve chart. See
@@ -986,9 +995,9 @@ def market_summary(conn: duckdb.DuckDBPyConnection) -> dict:
 # --- Trader Arena: leaderboard + per-trader profile -------------------------
 
 CONTEST_RULES = {
-    "starting_capital": 25000.0,
+    "starting_capital": _ledger.STARTING_CAPITAL,
     "instrument": "短天期選擇權(買/賣 call & put,對應核心 1-9 個月風向)",
-    "max_position_pct": 0.20,
+    "max_position_pct": _ledger.MAX_POSITION_PCT,
     "scoring": "以總報酬率排名;方向命中率、Brier、每日對帳為輔助指標。",
     "note": "全部為模擬倉位,系統永遠不下真實訂單(CLAUDE.md 硬邊界)。",
 }
@@ -1107,7 +1116,7 @@ def leaderboard(conn: duckdb.DuckDBPyConnection, *, window: int = 20) -> list[di
             continue
         if portfolio is None:
             portfolio = {
-                "starting_capital": 25000.0, "cash": 25000.0,
+                "starting_capital": _ledger.STARTING_CAPITAL, "cash": _ledger.STARTING_CAPITAL,
                 "max_position_pct": None, "instrument_scope": None, "inception_date": None,
             }
         trades = _trader_trades(conn, trader.trader_id)

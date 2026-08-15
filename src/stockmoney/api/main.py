@@ -166,6 +166,15 @@ def league_training(window: int = 20) -> list[dict]:
         return queries.league_training(conn, window=window)
 
 
+@app.get("/api/league/overall")
+def league_overall(window: int | None = None) -> dict:
+    """Pooled scorecard across every trader's graded calls -- "what's our
+    overall hit rate/results", not any one trader's. window=None pools full
+    history; a window pools each trader's most recent N graded calls."""
+    with ro_connection() as conn:
+        return queries.league_overall(conn, window=window)
+
+
 @app.get("/api/league/equity")
 def league_equity(cost_bps: float = 0.0) -> list[dict]:
     """Per-trader equity curves (資金曲線) -- cumulative P&L over settled

@@ -1,5 +1,5 @@
 import { Link } from 'react-router-dom'
-import { api, type LeaderboardEntry, type DivergenceRow, type TraderTradeFeedEntry, type LeagueEquityEntry } from '../lib/api'
+import { api, type LeaderboardEntry, type DivergenceRow, type TraderTradeFeedEntry, type LeagueEquityEntry, type OverallStats } from '../lib/api'
 import { useApi } from '../lib/useApi'
 import { DIRECTION_LABEL, formatOptionContract, money, num, pct, relTime, signedMoney } from '../lib/format'
 import { Card, Chip, SectionTitle, Return, Loading, ErrorMsg, Empty } from '../components/ui'
@@ -58,12 +58,43 @@ function EquityCurveSection({ entries }: { entries: LeagueEquityEntry[] }) {
   return <EquityCurveChart series={series} />
 }
 
+function OverallBanner({ stats }: { stats: OverallStats }) {
+  return (
+    <Card className="mb-6 p-4">
+      <SectionTitle
+        title="總體戰績(全部交易員合併)"
+        hint="把 5 位交易員已結算的預測當成同一份樣本一起算——這是這個 app 目前實際給出的整體勝率,不是任何單一流派的數字。"
+      />
+      <div className="grid grid-cols-2 gap-4 text-sm sm:grid-cols-4">
+        <div>
+          <div className="text-xs text-neutral-500">方向命中率</div>
+          <div className="font-semibold text-neutral-100">{stats.hit_rate !== null ? pct(stats.hit_rate) : '—'}</div>
+        </div>
+        <div>
+          <div className="text-xs text-neutral-500">選擇權勝率</div>
+          <div className="font-semibold text-neutral-100">{stats.option_win_rate !== null ? pct(stats.option_win_rate) : '—'}</div>
+        </div>
+        <div>
+          <div className="text-xs text-neutral-500">累積選擇權損益(合併)</div>
+          <div className={`font-semibold ${stats.cum_option_pnl > 0 ? 'text-emerald-400' : stats.cum_option_pnl < 0 ? 'text-rose-400' : 'text-neutral-100'}`}>
+            {signedMoney(stats.cum_option_pnl)}
+          </div>
+        </div>
+        <div>
+          <div className="text-xs text-neutral-500">已結算筆數</div>
+          <div className="text-neutral-200">{stats.n_graded}(來自 {stats.n_traders} 位交易員)</div>
+        </div>
+      </div>
+    </Card>
+  )
+}
+
 function RulesBanner() {
   return (
     <Card className="mb-6 p-4">
       <SectionTitle title="比賽規則" hint="每位交易員操作一個模擬短天期選擇權帳戶,以總報酬率一較高下。系統永遠不下真實訂單。" />
       <div className="grid grid-cols-2 gap-4 text-sm sm:grid-cols-4">
-        <div><div className="text-xs text-neutral-500">起始資金</div><div className="font-semibold text-neutral-100">{money(25000)}</div></div>
+        <div><div className="text-xs text-neutral-500">起始資金</div><div className="font-semibold text-neutral-100">{money(100000)}</div></div>
         <div><div className="text-xs text-neutral-500">可用工具</div><div className="text-neutral-200">短天期 call / put</div></div>
         <div><div className="text-xs text-neutral-500">單一部位上限</div><div className="text-neutral-200">資金的 20%</div></div>
         <div><div className="text-xs text-neutral-500">排名依據</div><div className="text-neutral-200">已實現總報酬率</div></div>
@@ -253,16 +284,18 @@ export default function Arena() {
   const { data: equity, loading: equityLoading, error: equityError } = useApi(api.leagueEquity)
   const { data: divergence } = useApi(() => api.divergence(), [])
   const { data: liveBoard, loading: liveBoardLoading, error: liveBoardError } = useApi(() => api.traderTrades(40), [])
+  const { data: overall } = useApi(() => api.leagueOverall(), [])
 
   return (
     <div>
       <div className="mb-5">
         <h1 className="text-2xl font-bold text-neutral-50">交易員競技場</h1>
         <p className="mt-1 text-sm text-neutral-500">
-          六個流派各操一個 $25,000 模擬選擇權帳戶,持續出手、到期用真實選擇權損益對帳。看似比賽,實則是模型策略強弱的即時視覺化——現在哪套邏輯在賺錢一眼看穿。點交易員看他的完整帳戶、持倉與每筆交易紀錄。
+          六個流派各操一個 $100,000 模擬選擇權帳戶,持續出手、到期用真實選擇權損益對帳。看似比賽,實則是模型策略強弱的即時視覺化——現在哪套邏輯在賺錢一眼看穿。點交易員看他的完整帳戶、持倉與每筆交易紀錄。
         </p>
       </div>
 
+      {overall && <OverallBanner stats={overall} />}
       <RulesBanner />
 
       <section className="mb-8">

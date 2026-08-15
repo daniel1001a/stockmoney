@@ -21,7 +21,8 @@ const trainingEntry = (over: Partial<LeagueTrainingEntry> = {}): LeagueTrainingE
   ],
   proposals: [
     { proposal_id: 'p1', trader_id: 'reversion', from_version: 'v1', to_version: null,
-      rationale: '納入成交量確認', status: 'proposed', reviewed_by: null, reviewed_date: null },
+      rationale: '納入成交量確認', status: 'proposed', reviewed_by: null, reviewed_date: null,
+      source_review_date: '2026-07-20' },
   ],
   method_versions: [{ method_version: 'reversion:rsi-meanrev-v1', effective_date: '2026-07-17', status: 'active' }],
   ...over,
@@ -31,10 +32,13 @@ describe('Training', () => {
   it('renders a trader scorecard, win-rate trend and its self-improvement proposal', async () => {
     vi.mocked(api.leagueTraining).mockResolvedValue([trainingEntry()])
     render(<MemoryRouter><Training /></MemoryRouter>)
-    await waitFor(() => expect(screen.getByText('Reversion (反轉派)')).toBeInTheDocument())
+    // "Reversion (反轉派)" and its proposal now render twice on purpose: once
+    // in the per-trader card, once in the shared cross-trader experience board.
+    await waitFor(() => expect(screen.getAllByText('Reversion (反轉派)').length).toBeGreaterThan(0))
     expect(screen.getByText('訓練表現')).toBeInTheDocument()
-    expect(screen.getByText('納入成交量確認')).toBeInTheDocument()
-    expect(screen.getByText('提議中')).toBeInTheDocument()
+    expect(screen.getAllByText('納入成交量確認').length).toBeGreaterThan(0)
+    expect(screen.getAllByText('提議中').length).toBeGreaterThan(0)
+    expect(screen.getByText('共用經驗看板')).toBeInTheDocument()
   })
 
   it('renders honest empty states for a trader with no graded data or proposals', async () => {

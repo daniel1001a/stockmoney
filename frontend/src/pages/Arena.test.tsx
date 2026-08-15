@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from 'vitest'
 import { render, screen, waitFor } from '@testing-library/react'
 import { MemoryRouter } from 'react-router-dom'
 import Arena from './Arena'
-import { api, type LeaderboardEntry, type LeagueEquityEntry, type TraderTradeFeedEntry } from '../lib/api'
+import { api, type LeaderboardEntry, type LeagueEquityEntry, type TraderTradeFeedEntry, type OverallStats } from '../lib/api'
 
 vi.mock('../lib/api')
 
@@ -28,6 +28,12 @@ const equityEntry = (id: string, name: string, points: LeagueEquityEntry['points
   trader_id: id, name, philosophy: 'p', active: true, points,
 })
 
+const overallStats = (over: Partial<OverallStats> = {}): OverallStats => ({
+  window: null, n_traders: 5, n_graded: 40, n_directional: 32, hit_rate: 0.5, brier: 0.24,
+  avg_pnl: 0.02, cum_pnl: 0.6, n_option_graded: 30, option_win_rate: 0.4, avg_option_pnl: -0.05,
+  cum_option_pnl: -300, ...over,
+})
+
 describe('Arena', () => {
   it('renders the contest rules and a return-ranked leaderboard', async () => {
     vi.mocked(api.leaderboard).mockResolvedValue([
@@ -43,6 +49,7 @@ describe('Arena', () => {
     ])
     vi.mocked(api.divergence).mockResolvedValue([])
     vi.mocked(api.traderTrades).mockResolvedValue([])
+    vi.mocked(api.leagueOverall).mockResolvedValue(overallStats())
 
     render(<MemoryRouter><Arena /></MemoryRouter>)
 
@@ -65,6 +72,7 @@ describe('Arena', () => {
     ])
     vi.mocked(api.divergence).mockResolvedValue([])
     vi.mocked(api.traderTrades).mockResolvedValue([])
+    vi.mocked(api.leagueOverall).mockResolvedValue(overallStats())
 
     render(<MemoryRouter><Arena /></MemoryRouter>)
 
@@ -84,6 +92,7 @@ describe('Arena', () => {
         exit_underlying: 198, exit_premium: 1.1, realized_pnl: 250, exit_reason: '達停利目標',
       }),
     ])
+    vi.mocked(api.leagueOverall).mockResolvedValue(overallStats())
 
     render(<MemoryRouter><Arena /></MemoryRouter>)
 

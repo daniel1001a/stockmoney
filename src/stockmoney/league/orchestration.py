@@ -17,6 +17,7 @@ from stockmoney.data import trader_predictions as tp
 from stockmoney.data.positions import price_on_date
 from stockmoney.data.traders import list_active_traders
 from stockmoney.data.watchlist import sector_for_symbol
+from stockmoney.league import ledger
 from stockmoney.league.context import build_context
 from stockmoney.league.engines import ENGINE_REGISTRY
 from stockmoney.league.grading_options import grade_option_pnl
@@ -92,7 +93,7 @@ def run_predictions(
                 call.option_structure = None
                 skips.append(f"{symbol}/{trader.trader_id}: option structure build failed ({exc}), recording call without an instrument")
 
-            tp.record_trader_prediction(
+            prediction_id = tp.record_trader_prediction(
                 conn,
                 trader_id=trader.trader_id,
                 method_version=call.method_version,
@@ -114,6 +115,16 @@ def run_predictions(
                 option_structure=call.option_structure,
             )
             summary[trader.trader_id]["recorded"] += 1
+
+            # Book the paper-trading fill for this call (Wave D). Same
+            # last-line-of-defense reasoning as the option-structure build
+            # above: one trader's booking failure must never abort the whole
+            # league predict pass.
+            if call.option_structure is not None:
+                try:
+                    ledger.open_trade(conn, tp.get_trader_prediction(conn, prediction_id))
+                except Exception as exc:
+                    skips.append(f"{symbol}/{trader.trader_id}: ledger open_trade failed ({exc})")
 
     summary["skips"] = skips
     return summary
@@ -143,5 +154,9 @@ def grade_matured(conn: duckdb.DuckDBPyConnection, *, as_of: date | None = None)
         # grace-window search above found the price a few days later.
         days_held = (p.label_end_date - p.trade_date).days
         grade_option_pnl(conn, p.prediction_id, exit_spot=actual_price, days_held=days_held)
+        # Close the paper-trading position this call opened (Wave D), reusing
+        # the exact same actual_price -- no-op if nothing was ever booked for
+        # it (no instrument, or insufficient cash at entry time).
+        ledger.close_trade(conn, tp.get_trader_prediction(conn, p.prediction_id))
         graded += 1
     return {"graded": graded, "still_pending": still_pending}

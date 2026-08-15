@@ -56,6 +56,49 @@ function RegimeTable({ byRegime }: { byRegime: Record<string, TraderStats> }) {
   )
 }
 
+// 共用經驗看板:把 5 位交易員各自的自我改進提案攤在同一張表裡,依日期排序 --
+// 讓「B 交易員可以看到 A 交易員最近栽在哪裡」變得容易,而不用分別點開 5 張卡片。
+// 純呈現層——不改變任何提案怎麼被產生或審核的邏輯(那仍是 review.py 的工作,
+// 一樣需要人工核准才會真的變更 method)。
+function SharedExperienceBoard({ data }: { data: LeagueTrainingEntry[] }) {
+  const statusCn: Record<string, string> = { proposed: '提議中', accepted: '已採納', rejected: '已駁回' }
+  const nameById = Object.fromEntries(data.map((t) => [t.trader_id, t.name]))
+  const rows = data
+    .flatMap((t) => t.proposals.map((p) => ({ ...p, trader_name: t.name })))
+    .sort((a, b) => (b.source_review_date ?? '').localeCompare(a.source_review_date ?? ''))
+
+  return (
+    <Card className="mb-6 p-4">
+      <div className="mb-1 text-base font-semibold text-neutral-50">共用經驗看板</div>
+      <p className="mb-3 text-xs text-neutral-500">
+        全部交易員的自我改進提案放在一起看,不分誰是誰的——各交易員仍各自遵守自己的方法(不會因為看到別人栽過跟頭就自動改邏輯),但至少「大家都看得到大家在哪裡跌倒」。目前 {rows.filter((r) => r.status === 'proposed').length} 筆待人工審核。
+      </p>
+      {rows.length === 0 ? (
+        <div className="text-sm text-neutral-600">尚無任何交易員提出改進提案。</div>
+      ) : (
+        <ul className="space-y-2">
+          {rows.map((p) => (
+            <li key={p.proposal_id} className="flex flex-wrap items-baseline gap-x-2 text-sm">
+              <span className="font-medium text-neutral-200">{nameById[p.trader_id] ?? p.trader_name}</span>
+              <span
+                className={
+                  p.status === 'accepted' ? 'text-emerald-400'
+                    : p.status === 'rejected' ? 'text-neutral-500'
+                      : 'text-amber-300'
+                }
+              >
+                {statusCn[p.status] ?? p.status}
+              </span>
+              {p.source_review_date && <span className="text-xs text-neutral-600">{p.source_review_date}</span>}
+              <span className="text-neutral-400">{p.rationale}</span>
+            </li>
+          ))}
+        </ul>
+      )}
+    </Card>
+  )
+}
+
 function ProposalLog({ t }: { t: LeagueTrainingEntry }) {
   const statusCn: Record<string, string> = { proposed: '提議中', accepted: '已採納', rejected: '已駁回' }
   return (
@@ -147,10 +190,14 @@ export default function Training() {
         這是整套系統「訓練自己」的可見證據 — 樣本還少時數字會跳動,屬正常。
       </p>
 
-      <div className="mt-5 space-y-4">
+      <div className="mt-5">
         {loading && <Loading />}
         {error && <ErrorMsg error={error} />}
         {!loading && !error && (!data || data.length === 0) && <Empty>尚無交易員訓練紀錄。</Empty>}
+        {data && data.length > 0 && <SharedExperienceBoard data={data} />}
+      </div>
+
+      <div className="space-y-4">
         {data?.map((t) => <TrainingCard key={t.trader_id} t={t} />)}
       </div>
     </div>

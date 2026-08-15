@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 import duckdb
 import polars as pl
 
-from stockmoney.data.ingestion.base import run_ingestion
+from stockmoney.data.ingestion.base import parse_feed_with_timeout, run_ingestion
 
 # Verified working (2026-07-10) free finance RSS feeds. Reuters/Yahoo/FT were
 # tried and rejected (403/401/429 on direct fetch). The "wsj" feed
@@ -54,14 +54,12 @@ def fetch_news(feeds: dict[str, str] | None = None) -> pl.DataFrame:
     schema. A single feed failing to parse doesn't block the others -- for an
     unattended nightly run, one transient network hiccup on one feed
     shouldn't discard the other three. Only raises if every feed fails."""
-    import feedparser
-
     feeds = feeds or DEFAULT_FEEDS
     rows = []
     errors: list[Exception] = []
     for source_name, url in feeds.items():
         try:
-            parsed = feedparser.parse(url)
+            parsed = parse_feed_with_timeout(url)
             for entry in parsed.entries:
                 rows.append(
                     {

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import socket
 import uuid
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
@@ -9,6 +10,29 @@ import duckdb
 import polars as pl
 
 from stockmoney.data.db import append_rows
+
+FEED_FETCH_TIMEOUT_SECONDS = 15.0
+
+
+def parse_feed_with_timeout(url: str, timeout: float = FEED_FETCH_TIMEOUT_SECONDS, **kwargs):
+    """feedparser.parse() over the network with no bound: a server that opens
+    the connection and then never sends data hangs the call indefinitely --
+    confirmed cause of the 2026-08-14 stockmoney-scan-ingest/-classify
+    incident (single feed hang blew a 300s cron timeout out to ~37 minutes,
+    since the per-feed try/except in rss_news.py/reddit_scanner.py can only
+    catch an exception, never a hang). feedparser has no per-call timeout
+    argument; it honors socket.setdefaulttimeout() instead, which is process-
+    global, so it's set immediately before the call and always restored in a
+    finally -- never left mutated for unrelated code elsewhere in the
+    process."""
+    import feedparser
+
+    previous = socket.getdefaulttimeout()
+    socket.setdefaulttimeout(timeout)
+    try:
+        return feedparser.parse(url, **kwargs)
+    finally:
+        socket.setdefaulttimeout(previous)
 
 
 @dataclass

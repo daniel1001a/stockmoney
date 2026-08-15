@@ -153,6 +153,32 @@ def league_equity_curves(conn: duckdb.DuckDBPyConnection, *, cost_bps: float = 0
     return rows
 
 
+def overall_stats(
+    conn: duckdb.DuckDBPyConnection,
+    *,
+    window: int | None = None,
+    high_conviction: float = DEFAULT_HIGH_CONVICTION,
+    cost_bps: float = 0.0,
+) -> dict:
+    """The app's single pooled scorecard -- every trader's graded calls
+    treated as one sample, not five separate ones. Answers "what's our
+    overall hit rate/results" the way a user asking about the app's own
+    predictions (not any one trader's) wants to see it. `window=None` pools
+    the full history; passing a window pools only each trader's most recent
+    `window` graded calls (by label_end_date), same rolling convention
+    `league_table` uses per-trader."""
+    pooled: list[TraderPrediction] = []
+    for trader in list_all_traders(conn):
+        graded = tp.graded_predictions(conn, trader_id=trader.trader_id)
+        graded.sort(key=lambda p: (p.label_end_date, p.symbol))
+        pooled.extend(graded[-window:] if window else graded)
+    return {
+        "window": window,
+        "n_traders": len(list_all_traders(conn)),
+        **compute_stats(pooled, high_conviction=high_conviction, cost_bps=cost_bps),
+    }
+
+
 def _by_regime(
     preds: list[TraderPrediction], *, high_conviction: float, cost_bps: float
 ) -> dict[str, dict]:

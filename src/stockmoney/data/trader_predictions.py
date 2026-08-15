@@ -266,3 +266,13 @@ def predictions_on_date(
         params.append(symbol.upper())
     query += " ORDER BY symbol, trader_id"
     return [_row_to_prediction(r) for r in conn.execute(query, params).fetchall()]
+
+
+def list_predictions_for_trader(
+    conn: duckdb.DuckDBPyConnection, trader_id: str
+) -> list[TraderPrediction]:
+    """Every prediction (any status) for one trader, oldest first -- the raw
+    material league/ledger.py's backfill replays chronologically to rebuild a
+    trader's paper-trading account from scratch."""
+    query = f"SELECT {_SELECT_COLUMNS} FROM trader_predictions WHERE trader_id = ? ORDER BY trade_date, symbol"
+    return [_row_to_prediction(r) for r in conn.execute(query, [trader_id]).fetchall()]

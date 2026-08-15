@@ -22,7 +22,7 @@ from datetime import datetime, timezone
 import duckdb
 import polars as pl
 
-from stockmoney.data.ingestion.base import run_ingestion
+from stockmoney.data.ingestion.base import parse_feed_with_timeout, run_ingestion
 
 DEFAULT_SUBREDDITS = ["wallstreetbets", "stocks", "investing", "semiconductors"]
 DEFAULT_USER_AGENT = "stockmoney-scanner/1.0 (personal research project)"
@@ -63,10 +63,8 @@ def fetch_reddit_posts(
     """Fetch the newest posts from each subreddit's public RSS feed. A single
     subreddit failing (private/banned/renamed/rate-limited) doesn't block the
     others. `fetch_fn(url, user_agent)` is injectable for testing."""
-    import feedparser
-
     subreddits = subreddits or DEFAULT_SUBREDDITS
-    fetch_fn = fetch_fn or (lambda url, ua: feedparser.parse(url, agent=ua))
+    fetch_fn = fetch_fn or (lambda url, ua: parse_feed_with_timeout(url, agent=ua))
 
     rows = []
     errors: list[Exception] = []
