@@ -26,7 +26,7 @@ from datetime import date
 import duckdb
 import polars as pl
 
-from stockmoney.data.ingestion.base import run_ingestion
+from stockmoney.data.ingestion.base import capture_yfinance_errors, run_ingestion
 
 # yfinance index symbol -> tenor in days (matches vix_term_structure_daily.tenor_days)
 VIX_TENORS: dict[str, int] = {"^VIX9D": 9, "^VIX": 30, "^VIX3M": 90, "^VIX6M": 180}
@@ -47,26 +47,34 @@ def fetch_vix_term(start: date, end: date) -> pl.DataFrame:
     import yfinance as yf
 
     rows = []
-    for ysymbol, tenor in VIX_TENORS.items():
-        try:
-            df = yf.download(
-                ysymbol, start=start.isoformat(), end=(end + _one_day()).isoformat(),
-                interval="1d", auto_adjust=False, progress=False,
-            )
-        except Exception:
-            continue
-        if df.empty or "Close" not in df:
-            continue
-        close = df["Close"]
-        if hasattr(close, "columns"):  # single-ticker download -> 1-col DataFrame
-            close = close.iloc[:, 0]
-        close = close.dropna()
-        for ts, val in close.items():
-            d = ts.date()
-            if d < start or d > end:
+    with capture_yfinance_errors() as errors:
+        for ysymbol, tenor in VIX_TENORS.items():
+            try:
+                df = yf.download(
+                    ysymbol, start=start.isoformat(), end=(end + _one_day()).isoformat(),
+                    interval="1d", auto_adjust=False, progress=False,
+                )
+            except Exception as exc:
+                errors.append(str(exc))
                 continue
-            rows.append({"trade_date": d, "tenor_days": tenor, "vix_value": round(float(val), 4), "source": "yfinance"})
+            if df.empty or "Close" not in df:
+                continue
+            close = df["Close"]
+            if hasattr(close, "columns"):  # single-ticker download -> 1-col DataFrame
+                close = close.iloc[:, 0]
+            close = close.dropna()
+            for ts, val in close.items():
+                d = ts.date()
+                if d < start or d > end:
+                    continue
+                rows.append({"trade_date": d, "tenor_days": tenor, "vix_value": round(float(val), 4), "source": "yfinance"})
     if not rows:
+        if errors:
+            raise RuntimeError(
+                f"yfinance fetched 0 usable rows for all {len(VIX_TENORS)} VIX tenors "
+                f"({start}..{end}) and logged {len(errors)} failure(s) -- treating as a "
+                f"fetch failure, not a genuine gap (e.g. {errors[0]!r})"
+            )
         return pl.DataFrame(schema=_SCHEMA)
     return pl.DataFrame(rows, schema=_SCHEMA)
 

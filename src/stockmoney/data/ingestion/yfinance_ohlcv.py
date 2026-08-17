@@ -5,7 +5,7 @@ from datetime import date, timedelta
 import duckdb
 import polars as pl
 
-from stockmoney.data.ingestion.base import run_ingestion
+from stockmoney.data.ingestion.base import capture_yfinance_errors, run_ingestion
 
 _EMPTY_SCHEMA = {
     "symbol": pl.Utf8,
@@ -36,14 +36,15 @@ def fetch_ohlcv(symbols: list[str], start: date, end: date) -> pl.DataFrame:
     """
     import yfinance as yf
 
-    data = yf.download(
-        symbols,
-        start=start,
-        end=end + timedelta(days=1),
-        auto_adjust=False,
-        group_by="ticker",
-        progress=False,
-    )
+    with capture_yfinance_errors() as errors:
+        data = yf.download(
+            symbols,
+            start=start,
+            end=end + timedelta(days=1),
+            auto_adjust=False,
+            group_by="ticker",
+            progress=False,
+        )
 
     frames = []
     for symbol in symbols:
@@ -73,6 +74,13 @@ def fetch_ohlcv(symbols: list[str], start: date, end: date) -> pl.DataFrame:
         )
 
     if not frames:
+        if errors:
+            raise RuntimeError(
+                f"yfinance fetched 0 usable rows for all {len(symbols)} requested "
+                f"symbols ({start}..{end}) and logged {len(errors)} per-ticker "
+                f"failure(s) -- treating as a fetch failure, not a genuine gap "
+                f"(e.g. {errors[0]!r})"
+            )
         return pl.DataFrame(schema=_EMPTY_SCHEMA)
     return pl.concat(frames)
 

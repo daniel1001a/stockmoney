@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import logging
 import socket
 import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from typing import Callable, Mapping
@@ -12,6 +14,37 @@ import polars as pl
 from stockmoney.data.db import append_rows
 
 FEED_FETCH_TIMEOUT_SECONDS = 15.0
+
+
+@contextmanager
+def capture_yfinance_errors():
+    """Capture yfinance's internal per-ticker failure log records.
+
+    yfinance's own downloader (yfinance/base.py) catches connection-level
+    exceptions (proxy blocks, DNS failures, ...) per ticker and only
+    `logger.error()`s them -- it never re-raises, so a total connectivity
+    failure across every requested symbol looks byte-for-byte identical to a
+    legitimate "no data in this date range" response (both are an empty
+    DataFrame, no exception). This is the only place the failure is still
+    visible: yfinance logs it to the 'yfinance' logger. Confirmed against a
+    live 403'd proxy 2026-08-17, where ohlcv_daily/vix_term_structure_daily
+    logged status='success' with 0 rows for exactly this reason. Callers
+    should treat "frame ended up empty AND at least one error was captured"
+    as a hard failure, distinct from "empty, no errors" (genuinely no data).
+    """
+    records: list[str] = []
+
+    class _Handler(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            records.append(record.getMessage())
+
+    handler = _Handler(level=logging.ERROR)
+    logger = logging.getLogger("yfinance")
+    logger.addHandler(handler)
+    try:
+        yield records
+    finally:
+        logger.removeHandler(handler)
 
 
 def parse_feed_with_timeout(url: str, timeout: float = FEED_FETCH_TIMEOUT_SECONDS, **kwargs):
