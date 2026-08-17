@@ -50,7 +50,7 @@
 | 選擇權微結構 | GEX(dealer gamma exposure 近似值)、25-delta skew 變化率 | 日 | 日終 | v1:用 open interest + IV 自行估算;v2 視驗證結果決定是否訂閱 ORATS/CBOE DataShop |
 | 總體經濟 | 利率曲線、DXY、原物料、跨資產相關性矩陣 | 日 | 日終 | FRED API(免費) |
 | 資金流 | ETF淨流入流出、期貨未平倉量 | 日/週 | 日終/週更 | ETF.com / CFTC COT報告(免費) |
-| 另類數據-社群 | 論壇貼文量、情緒分數、熱度一階/二階導數(加速度) | 小時→日 | 每小時爬取,日終聚合 | Reddit API(PRAW),透過 OpenClaw cron 排程 |
+| 另類數據-社群 | 論壇貼文量、情緒分數、熱度一階/二階導數(加速度) | 小時→日 | 每小時爬取,日終聚合 | Reddit API(PRAW),透過 Claude Code cloud routine 排程 |
 | 另類數據-開發者 | GitHub star/commit速度 | 日 | 日終 | GitHub API |
 | 另類數據-搜尋 | Google Trends指數 | 日 | 日終 | pytrends |
 | 事件-日曆 | 財報日曆、Fed會議、CPI/NFP時間 | 事件 | 排程 | 財經日曆API |
@@ -204,11 +204,18 @@ Kelly% = (P(win) × avg_win/avg_loss − P(loss)) / (avg_win/avg_loss)
 
 ---
 
-## 13. OpenClaw 整合(爬蟲自動化)
+## 13. 排程自動化(Claude Code 雲端 routine)
 
 **硬體限制認知**:24GB RAM 不足以支撐高品質本地模型的 agent 推理(官方建議需≥2台滿血Mac Studio或等值GPU rig),量化後的小模型對 prompt injection 防禦力弱,且系統會持續接觸不受信任的網路內容——**不在本地跑思考型模型**。
 
-**兩段式雲端路由架構**:
+**雲端 Routine 架構**:
+排程改用 Claude Code 的雲端 routine(cron 排程的 cloud agent),不依賴任何一台本機保持開機。每次執行都是全新的 session 與全新的 git clone,沒有本機資料庫持久性。`.duckdb` 檔案刻意不進 git,所以狀態必須透過 `data_sync/` 底下的 Parquet 檔案在 session 之間傳遞。
+
+**雙軌同步機制**:
+- **原始擷取資料同步**(`export_for_sync.py` / `import_from_sync.py`):負責唯讀、只新增的原始資料(OHLCV/新聞/選擇權快照等)。採 watermark + anti-join 機制,確保冪等性。
+- **交易員聯盟狀態同步**(`export_league_for_sync.py` / `import_league_from_sync.py`):負責會被「更新」的狀態(判斷會被確認/撤回/評分、帳本現金會變動)。採整表覆寫策略,同步 session 之間的可變狀態。
+
+**模型路由**:
 ```json
 agents: {
   defaults: {
@@ -220,9 +227,7 @@ agents: {
 - **Haiku 4.5(utilityModel)**:爬蟲後的淺層分類、情緒標記、關聯性判斷——高量、低思考任務
 - **Sonnet 5(primary)**:經篩選後的少數關鍵內容做深度傳導邏輯分析
 
-**Cron 排程**:每小時觸發爬蟲 skill(Reddit/GitHub/GDELT),寫入 DuckDB。
-
-**安全規範**:僅用官方內建 skills 或自行撰寫的 skill,不安裝 ClawHub 社群技能(已知存在惡意技能與 typosquatting 攻擊事件,系統會存放交易相關 API 金鑰,風險不可忽視)。
+**安全規範**:僅用官方內建 skills 或自行撰寫的 skill,不安裝來路不明的第三方社群技能(已知存在惡意技能與 typosquatting 攻擊事件,系統會存放交易相關 API 金鑰,風險不可忽視)。
 
 ---
 
@@ -234,9 +239,9 @@ agents: {
 | 資料處理 | polars(優先)+ pandas(相容) | 效能優於 pandas,適合日級批次量 |
 | 模型 | LightGBM + scikit-learn(KMeans/GMM)+ HMM套件(hmmlearn) | 表格特徵最佳實務 |
 | 儲存 | DuckDB(v1) | 本地零設定,分析型查詢效能佳;未來可升級 PostgreSQL |
-| 排程 | OpenClaw cron / APScheduler | 每日batch job不需複雜排程系統 |
+| 排程 | Claude Code cloud routine / APScheduler | 每日batch job採 cron 排程 cloud agent,無需本機保持開機 |
 | Dashboard | Streamlit(v1) | 開發速度最快,先驗證邏輯不雕前端;未來可換 FastAPI+React |
-| Agent自動化 | OpenClaw(Sonnet 5 primary + Haiku 4.5 utilityModel) | 本地gateway,cron排程爬蟲 |
+| Agent自動化 | Claude Code cloud routine(Sonnet 5 primary + Haiku 4.5 utilityModel) | 雲端 routine 排程爬蟲,雙軌 Parquet 同步 |
 
 ---
 
@@ -254,7 +259,7 @@ agents: {
 | 每日歸因覆盤引擎 | Sonnet 5 | medium-high | 資料處理與匹配邏輯 |
 | 選擇權/個股風控模組 | Sonnet 5 | high | 邏輯已在本文件定義清楚,實作為主 |
 | Dashboard(Streamlit) | Sonnet 5 | medium | UI迭代用plan mode反覆調整,不堆effort |
-| OpenClaw cron/utilityModel設定 | Sonnet 5 | medium | 標準設定檔工作 |
+| Cloud routine/Parquet 同步設定 | Sonnet 5 | medium | 標準設定檔工作 |
 | 除錯/測試 | Sonnet 5 | high,卡住才升級Opus | 先加效果,真的是能力不足才換模型 |
 
 **建議操作流程**:
@@ -284,5 +289,21 @@ agents: {
 - 不做全市場橫截面掃描(Phase 1 僅限 watchlist 核心清單 + 次要觀察名單)
 - 不在 Phase 1 建立完整個股論點追蹤系統(僅簡化版)
 - 不在 Phase 1 建日內即時串流系統(僅每日批次)
-- 不安裝 ClawHub 社群技能
+- 不安裝來路不明的第三方社群技能
 - 不在本地(24GB RAM)跑思考型 agent 模型
+
+---
+
+## Agent skills
+
+### Issue tracker
+
+Issues live in GitHub Issues for `daniel1001a/stockmoney`, via the `gh` CLI. See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+Default five canonical labels (`needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, `wontfix`), unmapped. See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Single-context: `CONTEXT.md` + `docs/adr/` at the repo root. See `docs/agents/domain.md`.
