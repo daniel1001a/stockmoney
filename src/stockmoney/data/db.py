@@ -87,16 +87,31 @@ def run_migrations(conn: duckdb.DuckDBPyConnection) -> None:
                 )
             continue
 
-        conn.execute("BEGIN TRANSACTION")
+        # DuckDB refuses to COMMIT a transaction that ALTERed a table which
+        # already holds rows ("Attempting to modify table X but another
+        # transaction has altered this table"), so an ALTER migration can
+        # only be applied to a populated database outside an explicit
+        # transaction. DuckDB executes each DDL statement atomically on its
+        # own, so dropping the wrapper costs no per-statement safety -- it
+        # only means a multi-statement ALTER migration that fails midway
+        # leaves the earlier statements applied and its _schema_migrations
+        # row unwritten. Keep such migrations idempotent (IF NOT EXISTS) so
+        # a re-run recovers. Migrations without ALTER keep the wrapper and
+        # stay all-or-nothing.
+        atomic = "ALTER TABLE" not in sql.upper()
+        if atomic:
+            conn.execute("BEGIN TRANSACTION")
         try:
             conn.execute(sql)
             conn.execute(
                 "INSERT INTO _schema_migrations (filename, checksum, applied_at) VALUES (?, ?, ?)",
                 [path.name, current, datetime.now(timezone.utc)],
             )
-            conn.execute("COMMIT")
+            if atomic:
+                conn.execute("COMMIT")
         except Exception:
-            conn.execute("ROLLBACK")
+            if atomic:
+                conn.execute("ROLLBACK")
             raise
 
 
