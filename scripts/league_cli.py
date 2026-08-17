@@ -2,12 +2,16 @@
 rearchitecture.md, worker-1 arena). Mirrors daily_prediction_cli's style: a
 by-hand tool. `predict` and `review` are also wired into nightly_refresh.py so
 the league advances unattended; `grade` stays a deliberate manual step (same
-discipline as the daily prediction ledger).
+discipline as the daily prediction ledger). `decision-point` (issue #7 P1) is
+the entry point for the day's scheduled checkpoints (盤前/開盤後/收盤後/事件觸發) --
+`predict`/`grade`/`review` above stay the legacy/immediate, decision-point-
+agnostic path (decision_point=None) that nightly_refresh.py still uses.
 
 Usage:
     uv run python scripts/league_cli.py predict
     uv run python scripts/league_cli.py grade
     uv run python scripts/league_cli.py review
+    uv run python scripts/league_cli.py decision-point --point pre_market
     uv run python scripts/league_cli.py table [--window 20] [--cost-bps 5]
     uv run python scripts/league_cli.py traders [--all]
     uv run python scripts/league_cli.py proposals [--status proposed]
@@ -15,6 +19,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 
 from stockmoney.data.db import DEFAULT_DB_PATH, get_connection, run_migrations
@@ -22,7 +27,7 @@ from stockmoney.data.trader_methods import list_proposals
 from stockmoney.data.traders import list_active_traders, list_all_traders
 from stockmoney.league import review as review_mod
 from stockmoney.league.league_table import league_table
-from stockmoney.league.orchestration import grade_matured, run_predictions
+from stockmoney.league.orchestration import grade_matured, run_decision_point, run_predictions
 
 
 def _with_conn(args):
@@ -59,6 +64,16 @@ def _cmd_review(args) -> int:
     conn = _with_conn(args)
     try:
         print(f"review: {review_mod.run_review(conn)}")
+    finally:
+        conn.close()
+    return 0
+
+
+def _cmd_decision_point(args) -> int:
+    conn = _with_conn(args)
+    try:
+        result = run_decision_point(conn, decision_point=args.point, horizon=args.horizon)
+        print(json.dumps(result, default=str, indent=2, ensure_ascii=False))
     finally:
         conn.close()
     return 0
@@ -125,6 +140,15 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("review", help="run per-trader review + divergence + method proposals")
     p.set_defaults(func=_cmd_review)
+
+    p = sub.add_parser(
+        "decision-point",
+        help="run one of the day's scheduled decision points (issue #7 P1: pre_market/post_open/post_close/event)",
+    )
+    p.add_argument("--point", dest="point", required=True,
+                    choices=["pre_market", "post_open", "post_close", "event"])
+    p.add_argument("--horizon", type=int, default=5)
+    p.set_defaults(func=_cmd_decision_point)
 
     p = sub.add_parser("table", help="print the league table")
     p.add_argument("--window", type=int, default=20)
