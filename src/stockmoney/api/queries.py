@@ -59,6 +59,40 @@ def regime_label(regime: int | None, label_map: dict[int, str] | None = None) ->
     return f"regime {regime}"
 
 
+def _latest_by_symbol(
+    conn: duckdb.DuckDBPyConnection, table: str, value_cols: str, order_col: str, *, where: str = "",
+) -> dict:
+    """The freshest `value_cols` per symbol from `table`, ordered by
+    `order_col` desc -- the "one row per key, newest wins" idiom this module
+    (and cockpit.py) used to retype by hand at every call site. Returns
+    {symbol: value} for a single value_cols column, {symbol: (v1, v2, ...)}
+    for several. table/value_cols/order_col/where are always internal
+    literals, never request input -- the same trusted f-string-composition
+    pattern _NEWS_COLS uses further down this module."""
+    rows = conn.execute(
+        f"""
+        WITH latest AS (
+            SELECT symbol, {value_cols},
+                   row_number() OVER (PARTITION BY symbol ORDER BY {order_col} DESC) AS rn
+            FROM {table}
+            {where}
+        )
+        SELECT symbol, {value_cols} FROM latest WHERE rn = 1
+        """
+    ).fetchall()
+    if "," in value_cols:
+        return {r[0]: tuple(r[1:]) for r in rows}
+    return {r[0]: r[1] for r in rows}
+
+
+def latest_regime_by_symbol(conn: duckdb.DuckDBPyConnection) -> dict[str, int | None]:
+    """Each watchlist symbol's most recent regime id from daily_predictions.
+    Shared by positions_with_risk below and cockpit.build_cockpit -- both need
+    "today's regime per symbol" and used to each retype this query by hand
+    (one of them via a private reach-in into this module)."""
+    return _latest_by_symbol(conn, "daily_predictions", "regime", "trade_date")
+
+
 def regime_label_map(conn: duckdb.DuckDBPyConnection) -> dict[int, str]:
     """Build {regime_id: label} from the empirical centroid of each cluster.
 
@@ -266,17 +300,7 @@ def _prediction_row_to_dict(
 
 
 def _latest_catalyst_headlines(conn: duckdb.DuckDBPyConnection) -> dict[str, str]:
-    rows = conn.execute(
-        """
-        WITH latest AS (
-            SELECT symbol, catalyst_summary,
-                   row_number() OVER (PARTITION BY symbol ORDER BY as_of_date DESC) AS rn
-            FROM catalyst_signals
-        )
-        SELECT symbol, catalyst_summary FROM latest WHERE rn = 1
-        """
-    ).fetchall()
-    return {r[0]: r[1] for r in rows}
+    return _latest_by_symbol(conn, "catalyst_signals", "catalyst_summary", "as_of_date")
 
 
 # Only surface news this fresh on the opportunity board. Older items are stale
@@ -301,7 +325,7 @@ _GENERIC_HEADLINE_PATTERNS = (
 
 def is_generic_headline(headline: str | None) -> bool:
     """True for template/no-information headlines (see _GENERIC_HEADLINE_PATTERNS
-    above). Used by both the SQL filter in _latest_symbol_news below and
+    above). Used by both the SQL filter in latest_symbol_news below and
     cockpit.py's macro-narrative headline picker, so "what counts as generic"
     is defined in exactly one place."""
     if not headline:
@@ -309,7 +333,7 @@ def is_generic_headline(headline: str | None) -> bool:
     return any(p.search(headline) for p in _GENERIC_HEADLINE_PATTERNS)
 
 
-def _latest_symbol_news(
+def latest_symbol_news(
     conn: duckdb.DuckDBPyConnection, *, max_age_days: int = OPPORTUNITY_NEWS_MAX_AGE_DAYS
 ) -> dict[str, dict]:
     """The single most relevant RECENT headline per symbol, so every opportunity
@@ -447,7 +471,7 @@ def opportunities(conn: duckdb.DuckDBPyConnection) -> list[dict]:
     """
     snapshots = _latest_snapshot_rows(conn)
     headlines = _latest_catalyst_headlines(conn)
-    symbol_news = _latest_symbol_news(conn)
+    symbol_news = latest_symbol_news(conn)
     rows = _latest_prediction_rows(conn)
     label_map = regime_label_map(conn)
     items = []
@@ -579,31 +603,10 @@ def positions_with_risk(conn: duckdb.DuckDBPyConnection) -> list[dict]:
         return []
 
     snapshots = _latest_snapshot_rows(conn)
-    regime_by_symbol = {
-        r[0]: r[1]
-        for r in conn.execute(
-            """
-            WITH latest AS (
-                SELECT symbol, regime, row_number() OVER (PARTITION BY symbol ORDER BY trade_date DESC) AS rn
-                FROM daily_predictions
-            )
-            SELECT symbol, regime FROM latest WHERE rn = 1
-            """
-        ).fetchall()
-    }
-    latest_price_rows = {
-        r[0]: (r[1], r[2])
-        for r in conn.execute(
-            """
-            WITH latest AS (
-                SELECT symbol, trade_date, close,
-                       row_number() OVER (PARTITION BY symbol ORDER BY trade_date DESC) AS rn
-                FROM ohlcv_daily WHERE close IS NOT NULL
-            )
-            SELECT symbol, trade_date, close FROM latest WHERE rn = 1
-            """
-        ).fetchall()
-    }
+    regime_by_symbol = latest_regime_by_symbol(conn)
+    latest_price_rows = _latest_by_symbol(
+        conn, "ohlcv_daily", "trade_date, close", "trade_date", where="WHERE close IS NOT NULL"
+    )
 
     out = []
     for position in positions:
@@ -1004,18 +1007,7 @@ CONTEST_RULES = {
 
 
 def _current_underlying(conn: duckdb.DuckDBPyConnection) -> dict[str, float]:
-    return {
-        r[0]: r[1]
-        for r in conn.execute(
-            """
-            WITH latest AS (
-                SELECT symbol, close, row_number() OVER (PARTITION BY symbol ORDER BY trade_date DESC) AS rn
-                FROM ohlcv_daily WHERE close IS NOT NULL
-            )
-            SELECT symbol, close FROM latest WHERE rn = 1
-            """
-        ).fetchall()
-    }
+    return _latest_by_symbol(conn, "ohlcv_daily", "close", "trade_date", where="WHERE close IS NOT NULL")
 
 
 def _rough_mark(trade: dict, spot: float | None) -> tuple[float | None, float | None]:

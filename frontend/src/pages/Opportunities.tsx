@@ -478,29 +478,17 @@ type SortKey = 'posture' | 'sector' | 'symbol'
 // v2 homepage default: group by "current posture" -- purely descriptive of
 // where price sits relative to its own recent range/prior day (the same
 // breakout_state string already shown as a chip on each card), NEVER a
-// forecast of which way it goes next. breakout_state strings come straight
-// from cockpit.py's breakout_state(); unrecognized/missing values fall back
-// to the neutral bucket per the task's fallback rule.
+// forecast of which way it goes next. `posture` is computed server-side by
+// cockpit.py's posture_of() and comes straight off the card -- it used to be
+// re-derived here via a hand-matched breakout_state string table, so a
+// wording change on the backend silently reclassified a card with no error;
+// now there's exactly one place ("which state means which bucket") deciding it.
 type PostureKey = 'strong' | 'neutral' | 'weak'
-
-const POSTURE_OF_STATE: Record<string, PostureKey> = {
-  創新高: 'strong',
-  接近區間高點: 'strong',
-  站上前日高點: 'strong',
-  區間內盤整: 'neutral',
-  創新低: 'weak',
-  接近區間低點: 'weak',
-  跌破前日低點: 'weak',
-}
 
 const POSTURE_SECTION: Record<PostureKey, { title: string; hint: string }> = {
   strong: { title: '偏強姿態(站上關鍵價/突破)', hint: '現價站上前日高點、20日高點附近,或創新高——描述現在位置,非漲跌預測。' },
   neutral: { title: '中性(區間內)', hint: '現價落在近期區間或關鍵均線附近,尚未站上或跌破關鍵價。' },
   weak: { title: '偏弱姿態(跌破關鍵價)', hint: '現價跌破前日低點、20日低點附近,或創新低——描述現在位置,非漲跌預測。' },
-}
-
-function postureOf(state: string): PostureKey {
-  return POSTURE_OF_STATE[state] ?? 'neutral'
 }
 
 // "Strength" within a posture group = how far price has already travelled
@@ -511,7 +499,7 @@ function postureOf(state: string): PostureKey {
 function strengthScore(card: CockpitCard): number {
   const { price, levels } = card
   if (price === null) return 0
-  const posture = postureOf(card.breakout_state)
+  const posture = card.posture
   const refLevel = posture === 'strong' ? levels.prev_high ?? levels.nday_high
     : posture === 'weak' ? levels.prev_low ?? levels.nday_low
     : null
@@ -542,7 +530,7 @@ export default function Opportunities() {
   const postureGroups = useMemo(() => {
     if (sort !== 'posture' || !data) return null
     const buckets: Record<PostureKey, CockpitCard[]> = { strong: [], neutral: [], weak: [] }
-    for (const card of data) buckets[postureOf(card.breakout_state)].push(card)
+    for (const card of data) buckets[card.posture].push(card)
     for (const key of Object.keys(buckets) as PostureKey[]) {
       buckets[key].sort((a, b) => strengthScore(b) - strengthScore(a) || a.symbol.localeCompare(b.symbol))
     }

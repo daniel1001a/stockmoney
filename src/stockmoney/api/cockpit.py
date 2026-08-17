@@ -236,6 +236,28 @@ def breakout_state(levels: SymbolLevels) -> str:
     return "區間內盤整"
 
 
+# Machine-readable grouping key for breakout_state's display string, so a
+# frontend that buckets cards into "偏強/中性/偏弱" sections reads a stable
+# key instead of re-matching Chinese text (a wording change here used to
+# silently reclassify a card on the frontend, with no build error and no test
+# failure -- see Opportunities.tsx's POSTURE_OF_STATE, now removed in favour
+# of this being the one place the mapping lives).
+BREAKOUT_POSTURE: dict[str, str] = {
+    "創新高": "strong",
+    "接近區間高點": "strong",
+    "站上前日高點": "strong",
+    "區間內盤整": "neutral",
+    "創新低": "weak",
+    "接近區間低點": "weak",
+    "跌破前日低點": "weak",
+    "資料不足": "neutral",
+}
+
+
+def posture_of(state: str) -> str:
+    return BREAKOUT_POSTURE.get(state, "neutral")
+
+
 def realized_vol_series(rows: list[tuple], *, window: int = SMA_SHORT) -> list[float]:
     """Annualized rolling realized vol from close-to-close log-ish returns
     (simple pct returns, std * sqrt(252) -- consistent with realized_vol_20d
@@ -548,6 +570,7 @@ def cockpit_symbol(
 ) -> dict:
     rows = _price_series(conn, symbol)
     levels = compute_levels(rows)
+    state = breakout_state(levels)
     rv_series = realized_vol_series(rows)
     gate = sellput_gate(levels, rv_series)
     sellput = sellput_suggestion(levels, gate)
@@ -572,7 +595,8 @@ def cockpit_symbol(
             "sma20": levels.sma20,
             "sma50": levels.sma50,
         },
-        "breakout_state": breakout_state(levels),
+        "breakout_state": state,
+        "posture": posture_of(state),
         "regime": regime_label,
         "top_news": top_news,
         "sellput": sellput,
@@ -588,21 +612,6 @@ def cockpit_symbol(
     }
 
 
-def _latest_regime_by_symbol(conn: duckdb.DuckDBPyConnection) -> dict[str, int | None]:
-    return {
-        r[0]: r[1]
-        for r in conn.execute(
-            """
-            WITH latest AS (
-                SELECT symbol, regime, row_number() OVER (PARTITION BY symbol ORDER BY trade_date DESC) AS rn
-                FROM daily_predictions
-            )
-            SELECT symbol, regime FROM latest WHERE rn = 1
-            """
-        ).fetchall()
-    }
-
-
 def build_cockpit(conn: duckdb.DuckDBPyConnection) -> list[dict]:
     """Per-symbol decision cards for the whole core watchlist. Reuses
     queries.py's already-computed regime label map and latest-news lookup
@@ -611,8 +620,8 @@ def build_cockpit(conn: duckdb.DuckDBPyConnection) -> list[dict]:
     regime" or "today's headline" for a symbol."""
     members = queries.watchlist_core(conn)
     label_map = queries.regime_label_map(conn)
-    regimes = _latest_regime_by_symbol(conn)
-    symbol_news = queries._latest_symbol_news(conn)
+    regimes = queries.latest_regime_by_symbol(conn)
+    symbol_news = queries.latest_symbol_news(conn)
     returns = _watchlist_returns(conn)
     linkage_map = sector_linkage_map(members, returns)
     iv_map = _iv_by_symbol(conn)

@@ -518,3 +518,102 @@ def test_market_analyst_sentiment_excludes_thin_coverage_symbols():
     assert result["bullish"] == 1
     assert result["bearish"] == 0
     assert result["neutral"] == 0
+
+
+# --- _rough_mark / _portfolio_stats (Arena mark-to-market, no DB needed) ---
+# Neither function touches a connection -- these back the homepage
+# leaderboard's equity/P&L numbers with zero prior test coverage (grep
+# tests/ for leaderboard/_rough_mark returned nothing before this).
+
+def _trade(**overrides):
+    base = {
+        "trade_id": "t1", "symbol": "NVDA", "option_right": "call", "side": "long",
+        "strike": 190.0, "expiry_date": date(2026, 9, 18), "contracts": 1,
+        "entry_at": None, "entry_underlying": 100.0, "entry_premium": 2.0,
+        "exit_at": None, "exit_underlying": None, "exit_premium": None,
+        "realized_pnl": None, "status": "open", "thesis": "t", "exit_reason": None,
+    }
+    base.update(overrides)
+    return base
+
+
+def test_rough_mark_returns_none_when_spot_unknown():
+    assert queries._rough_mark(_trade(), None) == (None, None)
+
+
+def test_rough_mark_long_call_gains_on_upside_move():
+    est, unreal = queries._rough_mark(_trade(), 104.0)  # +4 move, delta~0.5 -> +2 premium
+    assert est == pytest.approx(4.0)
+    assert unreal == pytest.approx(200.0)  # (4-2) * 100 * 1 contract
+
+
+def test_rough_mark_put_gains_on_downside_move():
+    trade = _trade(option_right="put")
+    est, unreal = queries._rough_mark(trade, 96.0)  # -4 move flips sign for a put
+    assert est == pytest.approx(4.0)
+    assert unreal == pytest.approx(200.0)
+
+
+def test_rough_mark_short_side_inverts_pnl():
+    trade = _trade(side="short")
+    est, unreal = queries._rough_mark(trade, 104.0)
+    assert est == pytest.approx(4.0)
+    assert unreal == pytest.approx(-200.0)  # short loses when premium rises
+
+
+def test_rough_mark_clamped_to_at_most_triple_entry():
+    est, _ = queries._rough_mark(_trade(), 1000.0)  # huge upside move
+    assert est == pytest.approx(6.0)  # 3x entry ceiling
+
+
+def test_rough_mark_clamped_to_at_least_5pct_of_entry():
+    est, _ = queries._rough_mark(_trade(), 0.0)  # huge downside move
+    assert est == pytest.approx(0.10)  # 5% of entry floor
+
+
+def test_rough_mark_scales_with_contracts():
+    _, unreal = queries._rough_mark(_trade(contracts=3), 104.0)
+    assert unreal == pytest.approx(600.0)
+
+
+def test_portfolio_stats_equity_combines_realized_and_unrealized():
+    portfolio = {"starting_capital": 10_000.0}
+    trades = [
+        _trade(status="closed", realized_pnl=500.0),
+        _trade(trade_id="t2", symbol="AMD", status="open"),
+    ]
+    spot = {"AMD": 104.0}  # +4 move -> +2 premium -> +200 unrealized (1 contract)
+    stats = queries._portfolio_stats(portfolio, trades, spot)
+    assert stats["realized_pnl"] == pytest.approx(500.0)
+    assert stats["unrealized_pnl"] == pytest.approx(200.0)
+    assert stats["equity"] == pytest.approx(10_700.0)
+    assert stats["n_closed"] == 1
+    assert stats["n_open"] == 1
+
+
+def test_portfolio_stats_open_trade_with_unknown_spot_contributes_no_unrealized():
+    portfolio = {"starting_capital": 10_000.0}
+    stats = queries._portfolio_stats(portfolio, [_trade(status="open")], spot={})
+    assert stats["unrealized_pnl"] == 0.0
+    assert stats["equity"] == pytest.approx(10_000.0)
+
+
+def test_portfolio_stats_win_rate_and_best_worst_trade():
+    portfolio = {"starting_capital": 10_000.0}
+    trades = [
+        _trade(trade_id="t1", status="closed", realized_pnl=300.0),
+        _trade(trade_id="t2", status="closed", realized_pnl=-100.0),
+        _trade(trade_id="t3", status="closed", realized_pnl=50.0),
+    ]
+    stats = queries._portfolio_stats(portfolio, trades, spot={})
+    assert stats["trade_win_rate"] == pytest.approx(2 / 3)
+    assert stats["best_trade"] == pytest.approx(300.0)
+    assert stats["worst_trade"] == pytest.approx(-100.0)
+
+
+def test_portfolio_stats_no_closed_trades_reports_none_not_zero():
+    portfolio = {"starting_capital": 10_000.0}
+    stats = queries._portfolio_stats(portfolio, [_trade(status="open")], spot={})
+    assert stats["trade_win_rate"] is None
+    assert stats["best_trade"] is None
+    assert stats["worst_trade"] is None

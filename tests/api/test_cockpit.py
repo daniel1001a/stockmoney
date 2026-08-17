@@ -164,7 +164,7 @@ def test_latest_symbol_news_skips_generic_headline_for_real_one():
                        published_at=now, importance=0.9)
     _seed_symbol_news(conn, item_id="n2", symbol="AAPL", headline="Apple unveils new AI chip roadmap",
                        published_at=now, importance=0.5)
-    news = queries._latest_symbol_news(conn)
+    news = queries.latest_symbol_news(conn)
     assert news["AAPL"]["headline"] == "Apple unveils new AI chip roadmap"
 
 
@@ -173,7 +173,7 @@ def test_latest_symbol_news_falls_back_to_none_when_only_generic():
     now = datetime(2026, 7, 13, 12, 0, tzinfo=timezone.utc)
     _seed_symbol_news(conn, item_id="n1", symbol="AAPL", headline="AAPL Stock Quote Price and Forecast - CNN",
                        published_at=now)
-    news = queries._latest_symbol_news(conn)
+    news = queries.latest_symbol_news(conn)
     assert "AAPL" not in news
 
 

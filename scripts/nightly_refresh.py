@@ -38,6 +38,7 @@ Usage:
 from __future__ import annotations
 
 from datetime import date, timedelta
+from typing import Callable
 
 from build_dashboard_snapshot import run_snapshot_build
 from compute_features import run_feature_recompute
@@ -56,6 +57,17 @@ OHLCV_LOOKBACK_DAYS = 10
 MACRO_LOOKBACK_DAYS = 30
 
 
+def _run_step(label: str, fn: Callable[[], str]) -> None:
+    """Run one pipeline step in isolation and print its result line, or
+    log-and-continue on failure -- so one source's exception (e.g. a holiday
+    with no options chain, a transient network error) never blocks the rest
+    of the run. `fn` returns this step's already-formatted result message."""
+    try:
+        print(f"  {fn()}")
+    except Exception as exc:
+        print(f"  {label} FAILED: {exc}")
+
+
 def main(db_path: str = DEFAULT_DB_PATH) -> None:
     conn = get_connection(db_path)
     run_migrations(conn)
@@ -63,56 +75,33 @@ def main(db_path: str = DEFAULT_DB_PATH) -> None:
     today = date.today()
     print(f"[{today}] nightly refresh starting")
 
-    try:
-        n = ingest_watchlist_ohlcv(conn, today - timedelta(days=OHLCV_LOOKBACK_DAYS), today)
-        print(f"  ohlcv_daily: +{n} rows")
-    except Exception as exc:
-        print(f"  ohlcv_daily FAILED: {exc}")
-
-    try:
-        n = ingest_macro_series(conn, today - timedelta(days=MACRO_LOOKBACK_DAYS), today)
-        print(f"  macro_series_daily: +{n} rows")
-    except Exception as exc:
-        print(f"  macro_series_daily FAILED: {exc}")
-
-    try:
-        n = ingest_vix_term(conn, today - timedelta(days=OHLCV_LOOKBACK_DAYS), today)
-        print(f"  vix_term_structure_daily: +{n} rows")
-    except Exception as exc:
-        print(f"  vix_term_structure_daily FAILED: {exc}")
-
-    try:
-        # No explicit trade_date: ingest_watchlist_options resolves the latest
-        # REAL trading day from ohlcv_daily itself, so a run on a weekend/
-        # holiday (wall-clock `today`) never orphans this irreplaceable,
-        # non-backfillable snapshot under a date nothing else ever has.
-        written = ingest_watchlist_options(conn)
-        print(f"  options snapshot: {written}")
-    except Exception as exc:
-        print(f"  options snapshot FAILED: {exc}")
+    _run_step(
+        "ohlcv_daily",
+        lambda: f"ohlcv_daily: +{ingest_watchlist_ohlcv(conn, today - timedelta(days=OHLCV_LOOKBACK_DAYS), today)} rows",
+    )
+    _run_step(
+        "macro_series_daily",
+        lambda: f"macro_series_daily: +{ingest_macro_series(conn, today - timedelta(days=MACRO_LOOKBACK_DAYS), today)} rows",
+    )
+    _run_step(
+        "vix_term_structure_daily",
+        lambda: f"vix_term_structure_daily: +{ingest_vix_term(conn, today - timedelta(days=OHLCV_LOOKBACK_DAYS), today)} rows",
+    )
+    # No explicit trade_date: ingest_watchlist_options resolves the latest
+    # REAL trading day from ohlcv_daily itself, so a run on a weekend/
+    # holiday (wall-clock `today`) never orphans this irreplaceable,
+    # non-backfillable snapshot under a date nothing else ever has.
+    _run_step("options snapshot", lambda: f"options snapshot: {ingest_watchlist_options(conn)}")
 
     # Live news feed (消息雷達): general finance RSS + per-symbol Google News,
     # classified into news_items. Display-only discretion layer (no model
     # feature), so a network hiccup here never blocks the rest of the refresh.
-    try:
-        summary = refresh_news_items(conn)
-        print(f"  news_items: {summary}")
-    except Exception as exc:
-        print(f"  news_items FAILED: {exc}")
+    _run_step("news_items", lambda: f"news_items: {refresh_news_items(conn)}")
 
     run_feature_recompute(conn)
 
-    try:
-        summary = run_snapshot_build(conn)
-        print(f"  dashboard snapshot: {summary}")
-    except Exception as exc:
-        print(f"  dashboard snapshot FAILED: {exc}")
-
-    try:
-        summary = run_attribution(conn)
-        print(f"  attribution: {summary}")
-    except Exception as exc:
-        print(f"  attribution FAILED: {exc}")
+    _run_step("dashboard snapshot", lambda: f"dashboard snapshot: {run_snapshot_build(conn)}")
+    _run_step("attribution", lambda: f"attribution: {run_attribution(conn)}")
 
     # Trader League: every active trader makes today's calls, then we grade any
     # prediction whose horizon has now matured, then the review side-branch
@@ -122,23 +111,12 @@ def main(db_path: str = DEFAULT_DB_PATH) -> None:
     # it introduces no look-ahead -- it is the missing link that lets the league
     # actually score itself and improve unattended (previously grading was a
     # manual step nobody ran, so review perpetually no-oped on 0 graded rows).
-    try:
-        summary = run_predictions(conn)
-        print(f"  league predict: { {k: v for k, v in summary.items() if k != 'skips'} }")
-    except Exception as exc:
-        print(f"  league predict FAILED: {exc}")
-
-    try:
-        summary = grade_matured(conn)
-        print(f"  league grade: {summary}")
-    except Exception as exc:
-        print(f"  league grade FAILED: {exc}")
-
-    try:
-        summary = run_review(conn)
-        print(f"  league review: {summary}")
-    except Exception as exc:
-        print(f"  league review FAILED: {exc}")
+    _run_step(
+        "league predict",
+        lambda: f"league predict: { {k: v for k, v in run_predictions(conn).items() if k != 'skips'} }",
+    )
+    _run_step("league grade", lambda: f"league grade: {grade_matured(conn)}")
+    _run_step("league review", lambda: f"league review: {run_review(conn)}")
 
     conn.close()
     print(f"[{today}] nightly refresh done")

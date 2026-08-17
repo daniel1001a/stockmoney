@@ -40,6 +40,7 @@ const card = (
   sector: string,
   gate: 'green' | 'red' | 'unknown' = 'green',
   breakoutState = '區間內盤整',
+  posture: 'strong' | 'neutral' | 'weak' = 'neutral',
 ): CockpitCard => ({
   symbol,
   sector,
@@ -47,6 +48,7 @@ const card = (
   price: 178.0,
   levels: { nday_high: 190, nday_low: 160, prev_high: 180, prev_low: 175, sma20: 172, sma50: 168 },
   breakout_state: breakoutState,
+  posture,
   regime: '高波動趨勢盤',
   top_news: {
     item_id: 'n1', headline: 'Some fresh headline about ' + symbol, sentiment_score: 0.4,
@@ -139,9 +141,9 @@ describe('Opportunities', () => {
 
   it('defaults to posture grouping and buckets cards by breakout_state, never predicting direction', async () => {
     vi.mocked(api.cockpit).mockResolvedValue([
-      card('NVDA', 'semiconductor', 'green', '站上前日高點'),
-      card('AMD', 'semiconductor', 'green', '區間內盤整'),
-      card('SOXS', 'semiconductor_etf', 'green', '跌破前日低點'),
+      card('NVDA', 'semiconductor', 'green', '站上前日高點', 'strong'),
+      card('AMD', 'semiconductor', 'green', '區間內盤整', 'neutral'),
+      card('SOXS', 'semiconductor_etf', 'green', '跌破前日低點', 'weak'),
     ])
     vi.mocked(api.briefing).mockResolvedValue(briefing)
     vi.mocked(api.quotes).mockResolvedValue({})

@@ -652,6 +652,7 @@ export interface CockpitCard {
   price: number | null
   levels: CockpitLevels
   breakout_state: string
+  posture: 'strong' | 'neutral' | 'weak'
   regime: string
   top_news: {
     item_id: string
