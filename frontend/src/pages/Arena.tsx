@@ -19,6 +19,8 @@ function StandingsCompact({ rows }: { rows: LeaderboardEntry[] }) {
             <th className="px-3 py-2 font-normal">#</th>
             <th className="px-3 py-2 font-normal">交易員</th>
             <th className="px-3 py-2 text-right font-normal">方向命中率</th>
+            <th className="px-3 py-2 text-right font-normal">賺錢率</th>
+            <th className="px-3 py-2 text-right font-normal">期望值</th>
             <th className="px-3 py-2 text-right font-normal">累積選擇權損益</th>
             <th className="px-3 py-2 text-right font-normal">已結算筆數</th>
           </tr>
@@ -31,9 +33,18 @@ function StandingsCompact({ rows }: { rows: LeaderboardEntry[] }) {
                 <Link to={`/trader/${r.trader_id}`} className="font-medium text-neutral-100 hover:text-neutral-300">
                   {r.name}
                 </Link>
+                {r.data_sufficient === false && (
+                  <span className="ml-1.5 text-[11px] text-neutral-600">資料不足</span>
+                )}
               </td>
               <td className="px-3 py-2 text-right tabular-nums text-neutral-300">
                 {r.hit_rate !== null ? pct(r.hit_rate) : '—'}
+              </td>
+              <td className="px-3 py-2 text-right tabular-nums text-neutral-300">
+                {r.profitable_rate != null ? pct(r.profitable_rate) : '—'}
+              </td>
+              <td className="px-3 py-2 text-right tabular-nums text-neutral-300">
+                {r.expected_value != null ? num(r.expected_value, 3) : '—'}
               </td>
               <td className="px-3 py-2 text-right tabular-nums font-semibold">
                 <span className={r.cum_option_pnl > 0 ? 'text-emerald-400' : r.cum_option_pnl < 0 ? 'text-rose-400' : 'text-neutral-400'}>
@@ -41,6 +52,49 @@ function StandingsCompact({ rows }: { rows: LeaderboardEntry[] }) {
                 </span>
               </td>
               <td className="px-3 py-2 text-right tabular-nums text-neutral-500">{r.n_graded}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  )
+}
+
+const HORIZON_LABEL: Record<string, string> = { '1': '1 日', '5': '5 日', '21': '21 日' }
+
+function HorizonBreakdown({ rows }: { rows: LeaderboardEntry[] }) {
+  const withHorizons = rows.filter((r) => r.horizons)
+  if (withHorizons.length === 0) return <Empty>尚無多視野評分紀錄。</Empty>
+  return (
+    <div className="overflow-x-auto rounded-xl border border-neutral-800">
+      <table className="w-full text-sm">
+        <thead>
+          <tr className="border-b border-neutral-800 bg-neutral-900/50 text-left text-neutral-500">
+            <th className="px-3 py-2 font-normal">交易員</th>
+            {['1', '5', '21'].map((h) => (
+              <th key={h} className="px-3 py-2 text-right font-normal">{HORIZON_LABEL[h]}(命中率 / 賺錢率 / 期望值)</th>
+            ))}
+          </tr>
+        </thead>
+        <tbody>
+          {withHorizons.map((r) => (
+            <tr key={r.trader_id} className="border-b border-neutral-900 last:border-0">
+              <td className="px-3 py-2 text-neutral-200">{r.name}</td>
+              {['1', '5', '21'].map((h) => {
+                const s = r.horizons?.[h]
+                return (
+                  <td key={h} className="px-3 py-2 text-right tabular-nums text-neutral-400">
+                    {!s || s.n_graded === 0 ? (
+                      <span className="text-neutral-600">資料不足</span>
+                    ) : (
+                      <>
+                        {s.hit_rate !== null ? pct(s.hit_rate) : '—'} / {s.profitable_rate != null ? pct(s.profitable_rate) : '—'} / {s.expected_value != null ? num(s.expected_value, 3) : '—'}
+                        {s.data_sufficient === false && <span className="ml-1 text-[11px] text-neutral-600">(樣本少)</span>}
+                      </>
+                    )}
+                  </td>
+                )
+              })}
             </tr>
           ))}
         </tbody>
@@ -319,6 +373,13 @@ export default function Arena() {
             {board && <StandingsCompact rows={board} />}
           </div>
         </div>
+      </section>
+
+      <section className="mb-8">
+        <SectionTitle title="評分視野(短/中/長)" hint="同一則判斷在 1 / 5 / 21 交易日三個視野各自獨立評分——一個交易員可能短線常對、長線常錯,反之亦然,兩者都要看。" />
+        {loading && <Loading />}
+        {error && <ErrorMsg error={error} />}
+        {board && <HorizonBreakdown rows={board} />}
       </section>
 
       <section className="mb-8">

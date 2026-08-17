@@ -75,6 +75,18 @@ def test_open_trade_debits_cash_by_the_computed_fill():
     assert cash == pytest.approx(ledger.STARTING_CAPITAL - expected_contracts * expected_fill * 100)
 
 
+def test_open_trade_stamps_quote_lag():
+    """Issue #7 P1: every real fill is honestly marked with the ~15min
+    yfinance quote lag it was actually priced off of."""
+    conn = _conn()
+    prediction = _record(conn, option_structure=_structure())
+    trade_id = ledger.open_trade(conn, prediction)
+    lag = conn.execute(
+        "SELECT quote_lag_minutes FROM trader_trades WHERE trade_id = ?", [trade_id]
+    ).fetchone()[0]
+    assert lag == ledger.QUOTE_LAG_MINUTES == 15
+
+
 def test_open_trade_expiry_is_always_a_friday():
     # dte_days=30 from TRADE_DATE (2026-06-01, a Monday) lands on 2026-07-01,
     # a Wednesday -- regression test for the 2026-08-14 incident where raw

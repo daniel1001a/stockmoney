@@ -58,6 +58,20 @@ def test_chartist_down_when_down_dominates():
     assert call.direction == "down" and call.conviction == 0.6
 
 
+def test_chartist_populates_trade_note():
+    """Issue #7 P1: every engine call carries a structured Trade Note
+    alongside the free-text rationale/invalidation."""
+    conn = _conn()
+    call, _ = ChartistEngine().predict(conn, _ctx(proba=(0.1, 0.2, 0.7)))
+    assert call.thesis and "up" in call.thesis
+    assert call.evidence_chain and 1 <= len(call.evidence_chain) <= 3
+    for layer in call.evidence_chain:
+        assert layer["kind"] in ("observation", "inference")
+        assert 0.0 <= layer["credibility"] <= 1.0
+    assert "down" in call.rejected_alternatives and "range" in call.rejected_alternatives
+    assert call.confidence_rationale
+
+
 # --- Analyst ----------------------------------------------------------------
 
 def _put_catalyst(conn, *, symbol="NVDA", as_of, sentiment, novelty=0.8, priced_in=0.2):
@@ -122,3 +136,15 @@ def test_analyst_treats_scraped_text_as_pure_data():
     assert "DROP TABLE" in call.rationale  # carried verbatim as data
     # tables still exist
     conn.execute("SELECT count(*) FROM trader_predictions")
+
+
+def test_analyst_populates_trade_note():
+    conn = _conn()
+    _put_catalyst(conn, as_of=TRADE_DATE, sentiment=0.5, novelty=0.8, priced_in=0.2)
+    call, _ = AnalystEngine().predict(conn, _ctx())
+    assert call.thesis == "new chip demand"
+    assert len(call.evidence_chain) == 3
+    kinds = [layer["kind"] for layer in call.evidence_chain]
+    assert kinds == ["observation", "inference", "inference"]
+    assert call.rejected_alternatives
+    assert call.confidence_rationale

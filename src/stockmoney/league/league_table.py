@@ -23,6 +23,25 @@ leaks in:
   rows with a non-None option_pnl (a 'range' call, or a day with no usable
   entry IV, has none) -- honest None/0 when that bucket is empty, same as
   every other stat here.
+
+Terminology split (issue #7 P1, CONTEXT.md): "勝率" retires as a catch-all --
+this module always exposes the three distinct numbers CONTEXT.md defines,
+never collapsed into one "win rate":
+- Directional Hit Rate (方向命中率) = hit_rate above. Diagnostic only, never
+  the ranking key on its own (a trader can nail direction and still lose
+  money to theta/IV-crush -- the exact gap option_win_rate/profitable_rate
+  exists to show).
+- Profitable Rate (賺錢率) = profitable_rate, an explicit alias for
+  option_win_rate: the fraction of already-closed positions that were
+  actually profitable. Same computation, new name -- CONTEXT.md's "現有的
+  均勢損益類指標重新定位為...不是新演算法，是重新定位既有數字".
+- Expected Value (期望值) = expected_value/cum_expected_value: the real,
+  option-priced average P&L per call when any exist (avg_option_pnl),
+  falling back to the underlying-return avg_pnl only when no option was ever
+  booked for this bucket. This is the league's primary ranking key -- see
+  `league_table`'s sort.
+`data_sufficient` flags whether n_graded has cleared MIN_GRADED_FOR_RANKING;
+below that a trader/challenger is shown as "資料不足", not ranked or zeroed.
 """
 from __future__ import annotations
 
@@ -30,12 +49,17 @@ from datetime import date
 
 import duckdb
 
+from stockmoney.data import trader_prediction_grades as tpg
 from stockmoney.data import trader_predictions as tp
 from stockmoney.data.traders import list_all_traders
 from stockmoney.data.trader_predictions import TraderPrediction
 
 DEFAULT_HIGH_CONVICTION = 0.6
 DEFAULT_ROLLING_WINDOW = 20
+# Below this many graded predictions, a trader/challenger is shown as "資料
+# 不足" (insufficient data, CONTEXT.md) rather than given a rank or a 0 value
+# -- a lucky/unlucky small sample must not read as a real result.
+MIN_GRADED_FOR_RANKING = 20
 
 
 def _is_directional(p: TraderPrediction) -> bool:
@@ -76,21 +100,32 @@ def compute_stats(
         1 for p in directional if p.outcome == "win" and p.option_pnl is not None and p.option_pnl <= 0
     )
 
+    avg_pnl = (sum(pnls) / len(pnls)) if pnls else None
+    cum_pnl = sum(pnls) if pnls else 0.0
+    option_win_rate = (option_wins / len(option_pnls)) if option_pnls else None
+    avg_option_pnl = (sum(option_pnls) / len(option_pnls)) if option_pnls else None
+    cum_option_pnl = sum(option_pnls) if option_pnls else 0.0
+
     return {
         "n_graded": n_graded,
         "n_directional": n_dir,
         "hit_rate": (wins_dir / n_dir) if n_dir else None,
         "brier": brier,
-        "avg_pnl": (sum(pnls) / len(pnls)) if pnls else None,
-        "cum_pnl": sum(pnls) if pnls else 0.0,
+        "avg_pnl": avg_pnl,
+        "cum_pnl": cum_pnl,
         "high_conviction_threshold": high_conviction,
         "high_conviction_n": len(high_conv),
         "high_conviction_precision": (high_conv_wins / len(high_conv)) if high_conv else None,
         "n_option_graded": len(option_pnls),
-        "option_win_rate": (option_wins / len(option_pnls)) if option_pnls else None,
-        "avg_option_pnl": (sum(option_pnls) / len(option_pnls)) if option_pnls else None,
-        "cum_option_pnl": sum(option_pnls) if option_pnls else 0.0,
+        "option_win_rate": option_win_rate,
+        "avg_option_pnl": avg_option_pnl,
+        "cum_option_pnl": cum_option_pnl,
         "directional_win_option_loss_n": directional_wins_option_losses,
+        # Terminology split (issue #7 P1, CONTEXT.md) -- see module docstring.
+        "profitable_rate": option_win_rate,
+        "expected_value": avg_option_pnl if option_pnls else avg_pnl,
+        "cum_expected_value": cum_option_pnl if option_pnls else cum_pnl,
+        "data_sufficient": n_graded >= MIN_GRADED_FOR_RANKING,
     }
 
 
@@ -193,6 +228,24 @@ def _by_regime(
     }
 
 
+def _horizon_stats(
+    conn: duckdb.DuckDBPyConnection, trader_id: str, *,
+    window: int, high_conviction: float, cost_bps: float,
+) -> dict[str, dict]:
+    """Grading Horizon breakdown (issue #7 P1, CONTEXT.md): the same trader's
+    scorecard computed independently at each of the multi-horizon grading
+    windows, rolling the same way `league_table` rolls its own overall
+    window -- lets a reviewer see whether a trader is short-lived-good or
+    long-lived-good, not just one blended number."""
+    out: dict[str, dict] = {}
+    for horizon_days in tpg.GRADING_HORIZONS:
+        graded = tpg.graded_for_horizon(conn, horizon_days=horizon_days, trader_id=trader_id)
+        graded.sort(key=lambda p: (p.label_end_date, p.symbol))
+        rolling = graded[-window:] if window else graded
+        out[str(horizon_days)] = compute_stats(rolling, high_conviction=high_conviction, cost_bps=cost_bps)
+    return out
+
+
 def league_table(
     conn: duckdb.DuckDBPyConnection,
     *,
@@ -202,8 +255,16 @@ def league_table(
     as_of: date | None = None,
 ) -> list[dict]:
     """Per-trader scorecard: overall + rolling(last `window` graded by
-    label_end_date) + per-regime. Includes every trader that has ever traded,
-    active or retired (retired traders' history stays visible)."""
+    label_end_date) + per-regime + per-grading-horizon. Includes every trader
+    that has ever traded, active or retired (retired traders' history stays
+    visible).
+
+    Ranked by rolling Expected Value (issue #7 P1, CONTEXT.md), NOT
+    Directional Hit Rate -- a trader can be right on direction and still lose
+    to theta/IV-crush, so ranking on hit_rate alone would reward exactly the
+    wrong thing. Traders below MIN_GRADED_FOR_RANKING graded calls are pushed
+    to the bottom regardless of their (statistically meaningless) EV, not
+    given a false #1 off a lucky handful of calls."""
     rows: list[dict] = []
     for trader in list_all_traders(conn):
         graded = tp.graded_predictions(conn, trader_id=trader.trader_id)
@@ -217,7 +278,11 @@ def league_table(
             "overall": compute_stats(graded, high_conviction=high_conviction, cost_bps=cost_bps),
             "rolling": {"window": window, **compute_stats(rolling, high_conviction=high_conviction, cost_bps=cost_bps)},
             "by_regime": _by_regime(graded, high_conviction=high_conviction, cost_bps=cost_bps),
+            "horizons": _horizon_stats(conn, trader.trader_id, window=window,
+                                        high_conviction=high_conviction, cost_bps=cost_bps),
         })
-    # Rank the table by rolling hit_rate (None sorts last), most accurate first.
-    rows.sort(key=lambda r: (r["rolling"]["hit_rate"] is None, -(r["rolling"]["hit_rate"] or 0.0)))
+    rows.sort(key=lambda r: (
+        not r["rolling"]["data_sufficient"],
+        -(r["rolling"]["expected_value"] if r["rolling"]["expected_value"] is not None else -1e18),
+    ))
     return rows

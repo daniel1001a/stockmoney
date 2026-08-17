@@ -6,13 +6,15 @@ import { api, type LeaderboardEntry, type LeagueEquityEntry, type TraderTradeFee
 
 vi.mock('../lib/api')
 
-const entry = (rank: number, id: string, name: string, ret: number): LeaderboardEntry => ({
+const entry = (rank: number, id: string, name: string, ret: number, overrides: Partial<LeaderboardEntry> = {}): LeaderboardEntry => ({
   rank, trader_id: id, name, philosophy: 'p', active: true, starting_capital: 25000,
   realized_pnl: ret * 25000, unrealized_pnl: 0, equity: 25000 * (1 + ret),
   total_return_pct: ret, realized_return_pct: ret, n_closed: 10, n_open: 2,
   trade_win_rate: 0.5, best_trade: 500, worst_trade: -300, hit_rate: 0.5, brier: 0.2,
   n_directional: 8, option_win_rate: 0.45, avg_option_pnl: -0.1,
   cum_option_pnl: ret * 25000, n_graded: 8,
+  profitable_rate: 0.45, expected_value: -0.1, data_sufficient: true,
+  ...overrides,
 })
 
 const tradeRow = (overrides: Partial<TraderTradeFeedEntry> = {}): TraderTradeFeedEntry => ({
@@ -62,6 +64,41 @@ describe('Arena', () => {
     // equity curve + compact standings section
     expect(screen.getByText('資金曲線與戰績')).toBeInTheDocument()
     expect(screen.getByText('+$3,500')).toBeInTheDocument() // cum_option_pnl for momentum in StandingsCompact
+  })
+
+  it('shows the terminology-split scorecard and multi-horizon breakdown (issue #7 P1)', async () => {
+    vi.mocked(api.leaderboard).mockResolvedValue([
+      entry(1, 'momentum', 'Momentum (動能派)', 0.14, {
+        profitable_rate: 0.45, expected_value: -0.123, data_sufficient: true,
+        horizons: {
+          '1': { n_graded: 12, n_directional: 12, hit_rate: 0.6, brier: 0.2, avg_pnl: 0.01, cum_pnl: 0.1,
+                 high_conviction_threshold: 0.6, high_conviction_n: 5, high_conviction_precision: 0.6,
+                 profitable_rate: 0.5, expected_value: 0.02, data_sufficient: false },
+          '5': { n_graded: 0, n_directional: 0, hit_rate: null, brier: null, avg_pnl: null, cum_pnl: 0,
+                 high_conviction_threshold: 0.6, high_conviction_n: 0, high_conviction_precision: null,
+                 data_sufficient: false },
+          '21': { n_graded: 0, n_directional: 0, hit_rate: null, brier: null, avg_pnl: null, cum_pnl: 0,
+                  high_conviction_threshold: 0.6, high_conviction_n: 0, high_conviction_precision: null,
+                  data_sufficient: false },
+        },
+      }),
+      entry(2, 'analyst', 'Analyst (消息派)', -0.05, { data_sufficient: false }),
+    ])
+    vi.mocked(api.leagueEquity).mockResolvedValue([])
+    vi.mocked(api.divergence).mockResolvedValue([])
+    vi.mocked(api.traderTrades).mockResolvedValue([])
+    vi.mocked(api.leagueOverall).mockResolvedValue(overallStats())
+
+    render(<MemoryRouter><Arena /></MemoryRouter>)
+
+    await waitFor(() => expect(screen.getByText('評分視野(短/中/長)')).toBeInTheDocument())
+    // StandingsCompact now shows 賺錢率/期望值 alongside 方向命中率, and flags
+    // an insufficient-sample trader instead of implying its rank is real.
+    expect(screen.getAllByText('45%').length).toBeGreaterThan(0)  // profitable_rate
+    expect(screen.getAllByText('資料不足').length).toBeGreaterThan(0)
+    // The 1/5/21-day horizon breakdown section rendered real numbers for the
+    // graded horizon and an honest "資料不足" for the still-empty ones.
+    expect(screen.getByText('1 日(命中率 / 賺錢率 / 期望值)')).toBeInTheDocument()
   })
 
   it('shows an honest empty state when no trader has graded predictions yet', async () => {

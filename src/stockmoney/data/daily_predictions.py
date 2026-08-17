@@ -52,7 +52,11 @@ class DailyPrediction:
     outcome: str | None = None
 
 
-def _band(feature_values: dict[str, float], *, band_k: float, horizon: int) -> float:
+def band(feature_values: dict[str, float], *, band_k: float, horizon: int) -> float:
+    """The one volatility-band definition every grading path in this
+    codebase shares (daily_predictions/trader_predictions/
+    trader_prediction_grades) -- public because it's genuinely used across
+    module boundaries, not just within this file."""
     daily_vol = feature_values["realized_vol_20d"] / math.sqrt(TRADING_DAYS)
     return band_k * daily_vol * math.sqrt(horizon)
 
@@ -85,7 +89,7 @@ def record_prediction(
 
     direction_class = int(max(range(3), key=lambda i: proba[i]))
     predicted_direction = _DIRECTION_BY_CLASS[direction_class]
-    band = _band(feature_values, band_k=band_k, horizon=horizon)
+    the_band = band(feature_values, band_k=band_k, horizon=horizon)
 
     prediction_id = str(uuid.uuid4())
     conn.execute(
@@ -100,20 +104,23 @@ def record_prediction(
         [
             prediction_id, trade_date, symbol.upper(), sector, horizon, label_end_date,
             regime, proba[DOWN], proba[RANGE], proba[UP], predicted_direction,
-            entry_price, band_k, entry_price * (1 + band), entry_price * (1 - band),
+            entry_price, band_k, entry_price * (1 + the_band), entry_price * (1 - the_band),
             json.dumps(feature_values), model_version, datetime.now(timezone.utc),
         ],
     )
     return prediction_id
 
 
-def _add_trading_days(d: date, n: int) -> date:
+def add_trading_days(d: date, n: int) -> date:
     """Weekend-skipping approximation of "n trading days after d" -- used
     only to set a target label_end_date for a live prediction, where the
     real future trading calendar can't be read from ohlcv_daily yet (that's
     only possible in hindsight, which is exactly what build_feature_matrix
     does for resolved rows). Market holidays aren't accounted for; `grade`'s
-    lookup has a small grace window to tolerate the rare mismatch."""
+    lookup has a small grace window to tolerate the rare mismatch. Public
+    (not underscore-prefixed) because league/context.py and
+    data/trader_prediction_grades.py both genuinely need this same
+    definition across the module boundary."""
     while n > 0:
         d += timedelta(days=1)
         if d.weekday() < 5:
@@ -144,7 +151,7 @@ def record_live_prediction(
     if latest is None:
         return None, "no ohlcv_daily price available"
 
-    label_end_date = _add_trading_days(pred.as_of_date, horizon)
+    label_end_date = add_trading_days(pred.as_of_date, horizon)
     prediction_id = record_prediction(
         conn,
         trade_date=pred.as_of_date, symbol=symbol, sector=sector, horizon=horizon,
@@ -215,10 +222,10 @@ def grade_prediction(
         raise ValueError(f"prediction {prediction_id!r} is already graded")
 
     actual_return = actual_price / prediction.entry_price - 1.0
-    band = _band(prediction.feature_values, band_k=prediction.band_k, horizon=prediction.horizon)
-    if actual_return > band:
+    the_band = band(prediction.feature_values, band_k=prediction.band_k, horizon=prediction.horizon)
+    if actual_return > the_band:
         actual_label = "up"
-    elif actual_return < -band:
+    elif actual_return < -the_band:
         actual_label = "down"
     else:
         actual_label = "range"

@@ -65,6 +65,13 @@ MAX_POSITION_PCT = 0.20
 INSTRUMENT_SCOPE = "short_dated_calls_puts"
 _MARKET_OPEN = time(14, 30)  # ~9:30am US/Eastern, wall-clock stand-in (no intraday data)
 
+# Quote lag (報價延遲, issue #7 P1): every fill in this ledger is priced off
+# entry_price/option_structure, which trace back to the same yfinance
+# free-tier feed data/ingestion/live_quotes.py documents as ~15min delayed.
+# Stamped on every trade so a future backtest/perf accounting can treat this
+# lag as an honest cost rather than silently assuming instant fills.
+QUOTE_LAG_MINUTES = 15
+
 # conviction 0.0 -> 40% of the position cap, conviction 1.0 -> the full cap.
 # Floored at 0.4 rather than 0.0 so even a low-conviction call still puts on a
 # meaningful ticket (a real trader who takes a trade at all rarely sizes it at
@@ -193,13 +200,15 @@ def open_trade(
         """
         INSERT INTO trader_trades (
             trade_id, trader_id, symbol, option_right, side, strike, expiry_date, contracts,
-            entry_at, entry_underlying, entry_premium, status, thesis, linked_prediction_id, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?)
+            entry_at, entry_underlying, entry_premium, status, thesis, linked_prediction_id,
+            quote_lag_minutes, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?)
         """,
         [trade_id, prediction.trader_id, prediction.symbol, "call" if s["is_call"] else "put",
          entry.side, s["strike"], expiry_date, contracts,
          _as_of(prediction.trade_date), s["spot"], round(fill, 4),
-         prediction.rationale, prediction.prediction_id, datetime.now(timezone.utc)],
+         prediction.rationale, prediction.prediction_id,
+         QUOTE_LAG_MINUTES, datetime.now(timezone.utc)],
     )
     conn.execute(
         "UPDATE trader_portfolios SET cash = cash - ?, updated_at = ? WHERE trader_id = ?",

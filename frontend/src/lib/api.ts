@@ -186,6 +186,11 @@ export interface LeaderboardEntry {
   avg_option_pnl: number | null
   cum_option_pnl: number
   n_graded: number
+  // Terminology split (issue #7 P1) -- see TraderStats.
+  profitable_rate?: number | null
+  expected_value?: number | null
+  data_sufficient?: boolean
+  horizons?: HorizonStats
 }
 
 export interface EquityPoint {
@@ -411,11 +416,25 @@ export interface TraderStats {
   avg_option_pnl?: number | null
   cum_option_pnl?: number
   n_option_graded?: number
+  // Terminology split (issue #7 P1, CONTEXT.md): "勝率" retires as a
+  // catch-all -- always show these three distinct numbers instead.
+  // profitable_rate (賺錢率) mirrors option_win_rate; expected_value (期望值,
+  // the league's ranking key) is the real option-priced avg P&L, falling
+  // back to avg_pnl when no option was ever booked. data_sufficient flags
+  // whether n_graded has cleared the ranking threshold ("資料不足" if not).
+  profitable_rate?: number | null
+  expected_value?: number | null
+  cum_expected_value?: number
+  data_sufficient?: boolean
 }
 
 export interface RollingStats extends TraderStats {
   window: number
 }
+
+// Grading Horizon (評分視野, issue #7 P1): the same trader's TraderStats
+// computed independently at 1/5/21 trading days out.
+export type HorizonStats = Record<string, TraderStats>
 
 export interface LeagueEntry {
   trader_id: string
@@ -425,6 +444,7 @@ export interface LeagueEntry {
   overall: TraderStats
   rolling: RollingStats
   by_regime: Record<string, TraderStats>
+  horizons?: HorizonStats
 }
 
 export interface WinRatePoint {

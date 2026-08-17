@@ -117,6 +117,18 @@ def test_flow_skips_without_any_positioning_feature():
     assert call is None and "positioning" in skip
 
 
+def test_flow_populates_trade_note():
+    conn = _conn()
+    _seed_feat(conn, "gex_estimate", -1.0)
+    _seed_feat(conn, "skew_25delta_chg_1d", 0.5)
+    _seed_feat(conn, "put_call_ratio", 1.4)
+    call, _ = FlowEngine().predict(conn, _ctx())
+    assert call.thesis and call.evidence_chain
+    assert 1 <= len(call.evidence_chain) <= 3
+    assert call.evidence_chain[-1]["kind"] == "inference"
+    assert call.rejected_alternatives and call.confidence_rationale
+
+
 # --- Sentiment --------------------------------------------------------------
 
 def test_sentiment_rising_market_tone_goes_up():

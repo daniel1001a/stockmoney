@@ -30,6 +30,32 @@ ANALYST_METHOD_VERSION = "analyst:catalyst-v1"
 
 _DIRECTION_BY_CLASS = {DOWN: "down", RANGE: "range", UP: "up"}
 
+
+def _observation_layers(signals: list[tuple[bool, str]], *, max_observations: int = 2) -> list[dict]:
+    """Trade Note evidence_chain builder shared by every multi-signal engine
+    (Flow/Sentiment): one 'observation' layer per present signal (capped so
+    the trailing 'inference' layer stays within the 3-layer max), each
+    caller appends its own final inference layer describing how the present
+    signals combined into a direction."""
+    layers = []
+    for present, note in signals:
+        if present:
+            layers.append({"layer": len(layers) + 1, "kind": "observation", "credibility": 1.0, "note": note})
+    return layers[:max_observations]
+
+
+def _rejected_alt_from_proba(proba: np.ndarray, chosen_cls: int) -> str:
+    """Trade Note 'rejected_alternatives' for any proba-shaped engine
+    (Chartist): names the two classes NOT chosen and their probability, so a
+    reviewer can see what was considered and discounted, not just the
+    winner."""
+    others = sorted(
+        ((c, float(proba[c])) for c in range(len(proba)) if c != chosen_cls),
+        key=lambda cp: -cp[1],
+    )
+    parts = [f"{_DIRECTION_BY_CLASS[c]} (P={p:.2f})" for c, p in others]
+    return f"Considered and discounted: {', '.join(parts)}."
+
 # Analyst mapping knobs (v1 heuristics, tune as catalyst history grows).
 ANALYST_SENTIMENT_EPS = 0.15   # |sentiment| below this -> a 'range' (no directional conviction)
 ANALYST_MAX_STALE_DAYS = 7     # a catalyst older than this vs the league day is treated as stale -> skip
@@ -46,6 +72,18 @@ class EngineCall:
     invalidation: str
     method_version: str
     engine_payload: dict
+    # Trade Note (交易筆記, issue #7 P1, CONTEXT.md): structured alongside the
+    # free-text rationale/invalidation above, not instead of them (old
+    # graded history has no Trade Note and stays meaningful on rationale/
+    # invalidation alone). thesis is a one-line 論點; evidence_chain is up to
+    # 3 {layer, kind: 'observation'|'inference', credibility, note} dicts --
+    # layer COUNT itself is never scored, only used for readability at
+    # review time. Optional/None so every existing EngineCall construction
+    # (tests, stub engines) keeps working unchanged.
+    thesis: str | None = None
+    evidence_chain: list[dict] | None = None
+    rejected_alternatives: str | None = None
+    confidence_rationale: str | None = None
     # Filled by orchestration.py AFTER predict() returns (league/option_bridge.py),
     # never set by an engine itself -- instrument selection is mechanical and
     # must be identical across every trader for the league to stay comparable,
@@ -96,8 +134,24 @@ class ChartistEngine:
             "regime": ctx.regime, "feature_values": fv,
             "model_version": ctx.production.model_version,
         }
+        thesis = f"Regime {ctx.regime} favours '{direction}' at {conviction:.0%} model probability."
+        evidence_chain = [
+            {"layer": 1, "kind": "observation", "credibility": min(1.0, fv.get("adx_14", 0.0) / 50.0),
+             "note": f"adx_14={fv.get('adx_14', float('nan')):.1f} (trend strength)"},
+            {"layer": 2, "kind": "observation",
+             "credibility": min(1.0, fv.get("xsec_dispersion", 0.0) * 10.0),
+             "note": f"xsec_dispersion={fv.get('xsec_dispersion', float('nan')):.3f} "
+                     "(idiosyncratic vs systematic split)"},
+            {"layer": 3, "kind": "inference", "credibility": conviction,
+             "note": f"regime-conditioned module A/B model puts P({direction})={conviction:.2f}"},
+        ]
+        rejected_alternatives = _rejected_alt_from_proba(proba, cls)
+        confidence_rationale = f"conviction = the model's own P({direction})={conviction:.2f} from its softmax output."
         return EngineCall(direction, conviction, rationale, invalidation,
-                          CHARTIST_METHOD_VERSION, payload), None
+                          CHARTIST_METHOD_VERSION, payload,
+                          thesis=thesis, evidence_chain=evidence_chain,
+                          rejected_alternatives=rejected_alternatives,
+                          confidence_rationale=confidence_rationale), None
 
 
 class AnalystEngine:
@@ -153,8 +207,29 @@ class AnalystEngine:
             "source_refs": signal.source_refs,
             "catalyst_as_of": str(signal.as_of_date),
         }
+        thesis = signal.catalyst_summary[:140]
+        un_priced_in = 1.0 - priced_in
+        evidence_chain = [
+            {"layer": 1, "kind": "observation", "credibility": novelty,
+             "note": f"Catalyst observed: {signal.catalyst_summary}"},
+            {"layer": 2, "kind": "inference", "credibility": un_priced_in,
+             "note": f"Transmission chain, {un_priced_in:.0%} estimated un-priced-in: {signal.transmission_chain}"},
+            {"layer": 3, "kind": "inference", "credibility": abs(sentiment),
+             "note": f"Net sentiment {sentiment:+.2f} maps to direction '{direction}'"},
+        ]
+        rejected_alternatives = (
+            f"Opposite direction and 'range' discounted: net sentiment {sentiment:+.2f} "
+            f"clears the +-{ANALYST_SENTIMENT_EPS} threshold toward '{direction}'."
+        )
+        confidence_rationale = (
+            f"conviction = novelty({novelty:.2f}) x (1-priced_in)({un_priced_in:.2f}) x "
+            f"|sentiment|({abs(sentiment):.2f}) = {conviction:.2f}."
+        )
         return EngineCall(direction, conviction, rationale, invalidation,
-                          ANALYST_METHOD_VERSION, payload), None
+                          ANALYST_METHOD_VERSION, payload,
+                          thesis=thesis, evidence_chain=evidence_chain,
+                          rejected_alternatives=rejected_alternatives,
+                          confidence_rationale=confidence_rationale), None
 
 
 # --- v2 factions (migration 039) --------------------------------------------
@@ -235,8 +310,25 @@ class ReversionEngine:
             "extreme's direction (a trend, which mean-reversion should not fight)."
         )
         payload = {"rsi_14": rsi, "overbought": RSI_OVERBOUGHT, "oversold": RSI_OVERSOLD}
+        thesis = f"RSI-14={rsi:.1f}: {why}."
+        evidence_chain = [
+            {"layer": 1, "kind": "observation", "credibility": 1.0,
+             "note": f"RSI-14={rsi:.1f} as-of {ctx.trade_date} (overbought>={RSI_OVERBOUGHT}, oversold<={RSI_OVERSOLD})"},
+            {"layer": 2, "kind": "inference", "credibility": conviction,
+             "note": f"distance from neutral (50) maps to a fade toward '{direction}'"},
+        ]
+        rejected_alternatives = (
+            f"Trend continuation in the extreme's own direction was considered and rejected -- "
+            f"mean reversion explicitly fades it, not follows it."
+            if direction != "range" else
+            "No mean-reversion edge at mid-range RSI; no directional bet made."
+        )
+        confidence_rationale = f"conviction = |RSI-50|/50 = |{rsi:.1f}-50|/50 = {conviction:.2f}."
         return EngineCall(direction, conviction, rationale, invalidation,
-                          REVERSION_METHOD_VERSION, payload), None
+                          REVERSION_METHOD_VERSION, payload,
+                          thesis=thesis, evidence_chain=evidence_chain,
+                          rejected_alternatives=rejected_alternatives,
+                          confidence_rationale=confidence_rationale), None
 
 
 class FlowEngine:
@@ -278,8 +370,24 @@ class FlowEngine:
         invalidation = "Dealer gamma flips sign, skew/put-call mean-revert, or a catalyst overrides positioning mechanics."
         payload = {"gex_estimate": gex, "skew_25delta_chg_1d": skew_chg,
                    "put_call_ratio": pcr, "pressure_score": score}
+        thesis = f"Positioning pressure score {score:+.2f} favours '{direction}'."
+        layers = _observation_layers([
+            (gex is not None, f"dealer gamma (gex_estimate)={_fmt(gex)}"),
+            (skew_chg is not None, f"25-delta skew change (1d)={_fmt(skew_chg)}"),
+            (pcr is not None, f"put/call ratio={_fmt(pcr)}"),
+        ])
+        layers.append({"layer": len(layers) + 1, "kind": "inference", "credibility": conviction,
+                        "note": f"mean vote across {len(votes)} present signal(s) = {score:+.2f} -> '{direction}'"})
+        rejected_alternatives = (
+            f"Opposing-direction pressure discounted: net vote score is {score:+.2f} across "
+            f"{len(votes)} present input(s)."
+        )
+        confidence_rationale = f"conviction = |mean vote| = |{score:+.2f}| = {conviction:.2f}."
         return EngineCall(direction, conviction, rationale, invalidation,
-                          FLOW_METHOD_VERSION, payload), None
+                          FLOW_METHOD_VERSION, payload,
+                          thesis=thesis, evidence_chain=layers,
+                          rejected_alternatives=rejected_alternatives,
+                          confidence_rationale=confidence_rationale), None
 
 
 class SentimentEngine:
@@ -339,8 +447,24 @@ class SentimentEngine:
         invalidation = "The heat decelerates (attention fades) or reverses sign on fresh news."
         payload = {"social_sentiment_accel": accel, "market_tone_now": tone_now,
                    "market_tone_prev": tone_prev, "tone_heat": tone_heat, "net_heat": net}
+        thesis = f"Sentiment heat net {net:+.2f} ({'accelerating' if net > 0 else 'decelerating' if net < 0 else 'flat'}) favours '{direction}'."
+        layers = _observation_layers([
+            (accel is not None, f"per-symbol social sentiment acceleration={_fmt(accel)}"),
+            (tone_heat is not None,
+             f"market-wide news tone change over {SENTIMENT_TONE_LOOKBACK_DAYS}d={_fmt(tone_heat)} "
+             f"(now {_fmt(tone_now)} vs {_fmt(tone_prev)})"),
+        ])
+        layers.append({"layer": len(layers) + 1, "kind": "inference", "credibility": conviction,
+                        "note": f"net heat {net:+.2f} across {len(signals)} present signal(s) -> '{direction}'"})
+        rejected_alternatives = (
+            f"Opposing-direction heat discounted: net signal is {net:+.2f} across {len(signals)} present input(s)."
+        )
+        confidence_rationale = f"conviction = |net heat| = |{net:+.2f}| = {conviction:.2f}."
         return EngineCall(direction, conviction, rationale, invalidation,
-                          SENTIMENT_METHOD_VERSION, payload), None
+                          SENTIMENT_METHOD_VERSION, payload,
+                          thesis=thesis, evidence_chain=layers,
+                          rejected_alternatives=rejected_alternatives,
+                          confidence_rationale=confidence_rationale), None
 
 
 def _fmt(x: float | None) -> str:

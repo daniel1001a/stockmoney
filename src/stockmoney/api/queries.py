@@ -1129,16 +1129,30 @@ def leaderboard(conn: duckdb.DuckDBPyConnection, *, window: int = 20) -> list[di
             "avg_option_pnl": rolling.get("avg_option_pnl"),
             "cum_option_pnl": rolling.get("cum_option_pnl", 0.0),
             "n_graded": rolling.get("n_graded", 0),
+            # Terminology split + multi-horizon breakdown (issue #7 P1,
+            # CONTEXT.md) -- riding straight through from league_table's row,
+            # not recomputed here.
+            "profitable_rate": rolling.get("profitable_rate"),
+            "expected_value": rolling.get("expected_value"),
+            "data_sufficient": rolling.get("data_sufficient", False),
+            "horizons": league.get("horizons"),
         })
     # Ranked on REALIZED (booked) return -- a contest is scored on closed
     # results; open positions are marked-to-market for display but their rough
     # mark shouldn't decide the standings.
+    # Issue #7 P1: a trader below MIN_GRADED_FOR_RANKING graded calls is
+    # pushed to the bottom regardless of its (statistically meaningless)
+    # realized return -- a single lucky/unlucky trade must never claim rank
+    # #1 (CONTEXT.md's "資料不足", Implementation Decision "...而非給予名次").
+    # Within a data-sufficient tier, ranking stays on REALIZED account return
+    # (the actual dollar contest result), not hit_rate -- already exactly the
+    # "never rank on hit rate alone" discipline Story 11 asks for.
     out.sort(
         key=lambda r: (
-            r["realized_return_pct"] if r["realized_return_pct"] is not None else -1e9,
-            r["cum_option_pnl"] if r["cum_option_pnl"] is not None else -1e9,
+            not r["data_sufficient"],
+            -(r["realized_return_pct"] if r["realized_return_pct"] is not None else -1e9),
+            -(r["cum_option_pnl"] if r["cum_option_pnl"] is not None else -1e9),
         ),
-        reverse=True,
     )
     for i, r in enumerate(out):
         r["rank"] = i + 1

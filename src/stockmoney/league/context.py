@@ -22,7 +22,7 @@ from datetime import date, datetime
 
 import duckdb
 
-from stockmoney.data.daily_predictions import _add_trading_days
+from stockmoney.data.daily_predictions import add_trading_days
 from stockmoney.data.positions import latest_underlying_price
 from stockmoney.models import production
 from stockmoney.models.production import ProductionPrediction
@@ -73,7 +73,7 @@ def build_context(
         sector=sector,
         trade_date=pred.as_of_date,
         horizon=horizon,
-        label_end_date=_add_trading_days(pred.as_of_date, horizon),
+        label_end_date=add_trading_days(pred.as_of_date, horizon),
         entry_price=latest[1],
         grade_vol=float(grade_vol),
         band_k=band_k,
