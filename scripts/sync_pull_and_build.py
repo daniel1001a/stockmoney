@@ -16,10 +16,20 @@ recompute locally from the raw data with the in-repo LightGBM/logistic pipeline
 (no OpenClaw, no paid API needed for the core dashboard). So the flow is:
 
     git pull                          # you run this (or pass --git-pull)
-    import_from_sync   -> working DB  # raw tables land in data/stockmoney.duckdb
-    compute_features   -> working DB  # realized_vol / adx / dispersion / ...
-    build_dashboard_snapshot          # per-symbol prediction + backtest cache
-    refresh_live_db    -> live DB     # atomic publish to data/stockmoney_live.duckdb
+    import_from_sync         -> working DB  # raw tables land in data/stockmoney.duckdb
+    import_league_from_sync  -> working DB  # League's own mutable state (issue #7 follow-up)
+    compute_features         -> working DB  # realized_vol / adx / dispersion / ...
+    build_dashboard_snapshot                # per-symbol prediction + backtest cache
+    refresh_live_db          -> live DB     # atomic publish to data/stockmoney_live.duckdb
+
+League state (issue #7 follow-up, since the stateless cloud routines that
+replaced OpenClaw): ``trader_predictions``/``trader_trades``/etc. are NOT
+part of ``import_from_sync.py``'s raw-table contract (that sync is
+insert-only/anti-join, but League rows get UPDATED after insertion -- a call
+gets confirmed/withdrawn/graded). ``import_league_from_sync.py`` is a
+separate, full-table-replace sync for exactly those tables -- see its
+docstring and ``export_league_for_sync.py``'s for why a full replace, not an
+incremental merge, is the correct design there.
 
 Bootstrapping note: the sync only ships recent watermarked *deltas*, not the
 full multi-year history. The very first time you set up the second machine, copy
@@ -69,19 +79,25 @@ def main() -> None:
         [PY, "scripts/import_from_sync.py", "--db", args.working_db],
         label="import_from_sync",
     )
+    # 2. League's own mutable state -> working DB (issue #7 follow-up: a
+    #    separate full-table-replace sync, not the raw-table anti-join above).
+    _run(
+        [PY, "scripts/import_league_from_sync.py", "--db", args.working_db],
+        label="import_league_from_sync",
+    )
     # compute_features / build_dashboard_snapshot only honour DEFAULT_DB_PATH
     # (i.e. the STOCKMONEY_DB env var), not a positional arg -- so point them at
     # the working DB that way.
     child_env = {**os.environ, "STOCKMONEY_DB": args.working_db}
-    # 2. Recompute derived features from the freshly-imported raw data.
+    # 3. Recompute derived features from the freshly-imported raw data.
     _run([PY, "scripts/compute_features.py"], label="compute_features", env=child_env)
-    # 3. Rebuild per-symbol prediction + backtest snapshot cache the API reads.
+    # 4. Rebuild per-symbol prediction + backtest snapshot cache the API reads.
     _run(
         [PY, "scripts/build_dashboard_snapshot.py"],
         label="build_dashboard_snapshot",
         env=child_env,
     )
-    # 4. Atomically publish the complete working DB to the app-served live DB.
+    # 5. Atomically publish the complete working DB to the app-served live DB.
     _run(
         [PY, "scripts/refresh_live_db.py", "--source", args.working_db],
         label="refresh_live_db",
