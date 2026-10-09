@@ -22,6 +22,7 @@ dependencies = [
     "pytz>=2026.2",
     "requests>=2.34.2",
     "scikit-learn>=1.9.0",
+    "streamlit>=1.65.0",
     "uvicorn[standard]>=0.51.0",
     "yfinance>=1.5.1",
 ]
