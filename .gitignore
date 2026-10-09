@@ -30,3 +30,6 @@ secrets/
 # DB safety backups (never commit)
 *.duckdb.bak*
 data/desk/
+
+# Phase 1 research data cache (regenerable via research/phase1)
+data/research/
