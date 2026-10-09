@@ -29,6 +29,10 @@ JOBS = {
 }
 
 
+# bridge needs the Muse mailbox configured; crypto is a Phase 1 placeholder. Both are opt-in.
+DEFAULT_JOBS = ["premarket", "postopen", "postclose"]
+
+
 def plist(name: str, spec: dict) -> dict:
     d = {
         "Label": LABEL.format(name),
@@ -52,12 +56,18 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--install", action="store_true")
     ap.add_argument("--uninstall", action="store_true")
+    ap.add_argument("--jobs", default=",".join(DEFAULT_JOBS),
+                    help="comma-separated subset of: " + ",".join(JOBS) + f" (default {','.join(DEFAULT_JOBS)})")
     args = ap.parse_args()
+    chosen = args.jobs.split(",")
+    unknown = set(chosen) - set(JOBS)
+    if unknown:
+        raise SystemExit(f"unknown job(s): {sorted(unknown)}")
     out = ROOT / "data/desk/launchd"
     out.mkdir(parents=True, exist_ok=True)
     (ROOT / "data/desk/logs").mkdir(parents=True, exist_ok=True)
     agents = Path.home() / "Library/LaunchAgents"
-    for name, spec in JOBS.items():
+    for name, spec in ((n, JOBS[n]) for n in chosen):
         path = out / f"{LABEL.format(name)}.plist"
         path.write_bytes(plistlib.dumps(plist(name, spec)))
         target = agents / path.name

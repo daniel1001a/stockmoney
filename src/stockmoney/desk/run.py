@@ -42,6 +42,8 @@ from stockmoney.desk.universe import sector_name, sector_of
 
 log = logging.getLogger("desk.run")
 ET = ZoneInfo("America/New_York")
+OPG_CUTOFF = (9, 25)     # ET: from here on, market-on-open is no longer accepted
+ENTRY_CUTOFF = (10, 30)  # ET: new entries from a stale plan are dropped after this
 JOB_TIMEOUT_S = 900  # the Alpaca SDK sets no HTTP timeout; never let a job hang forever
 
 # Stock-book sizing (backtested values; see docs/desk/OPERATING_PLAN.md)
@@ -339,10 +341,20 @@ def premarket(con, broker: Broker, now: datetime, limits: Limits | None = None, 
         "SELECT * FROM planned_orders WHERE status='planned' AND plan_date < ? ORDER BY side DESC", (today,)).fetchall()
     lines, n = [], 0
     latest = max((p["plan_date"] for p in plans), default=None)
+    et = now.astimezone(ET)
+    # Market-on-open is only accepted until ~09:28 ET. A late run (Mac was asleep)
+    # falls back to a plain market order, and gives up on new entries after 10:30
+    # so we never chase a stale plan deep into the session.
+    late = (et.hour, et.minute) >= OPG_CUTOFF
+    entries_closed = (et.hour, et.minute) >= ENTRY_CUTOFF
     for p in plans:
         sym, side = p["symbol"], Side(p["side"])
         if p["plan_date"] != latest:  # a plan older than the last session is stale
             _mark(con, p, "expired", "過期計畫")
+            continue
+        if side == Side.BUY and entries_closed:
+            _mark(con, p, "expired", f"錯過進場時間窗(執行於 {et:%H:%M} ET,超過 10:30)")
+            lines.append(f"錯過進場 {sym}:執行太晚")
             continue
         if side == Side.BUY and sym in flags.blocked:
             _mark(con, p, "blocked", flags.blocked[sym])
@@ -363,7 +375,8 @@ def premarket(con, broker: Broker, now: datetime, limits: Limits | None = None, 
                     continue
                 con.execute("UPDATE position_meta SET stop_order_id=NULL WHERE symbol=?", (sym,))
         intent = OrderIntent(p["client_order_id"], sym, AssetClass(p["asset_class"]), side, qty=qty,
-                             order_type=OrderType.MARKET, tif=TIF.OPG, strategy=p["strategy"], reason=p["reason"])
+                             order_type=OrderType.MARKET, tif=TIF.DAY if late else TIF.OPG,
+                             strategy=p["strategy"], reason=p["reason"])
         d = risk.check(intent, snap, ref_price=p["ref_price"], orders_this_run=n)
         if not d.allow:
             _mark(con, p, "blocked", d.reason)
@@ -372,7 +385,7 @@ def premarket(con, broker: Broker, now: datetime, limits: Limits | None = None, 
         _submit(con, broker, d.intent, "entry" if side == Side.BUY else "exit", p["stop"])
         _mark(con, p, "submitted", d.reason)
         n += 1
-        lines.append(f"{'買' if side == Side.BUY else '賣'} {sym} {d.intent.qty:g} 股(開盤市價)")
+        lines.append(f"{'買' if side == Side.BUY else '賣'} {sym} {d.intent.qty:g} 股({'盤中市價' if late else '開盤市價'})")
     msg = f"{today} 盤前送單 {n} 筆\n" + "\n".join(lines)
     for note in flags.notify:
         _notify_once(con, f"muse:{note[:100]}", "Muse 警報", note, notify.WARN)

@@ -124,3 +124,37 @@ def test_muse_alert_blocks_planned_entry(tmp_path):
                           (planned[0]["client_order_id"],)).fetchone()
         assert row["status"] == "blocked", out
         assert target not in {o.symbol for o in broker.orders.values() if o.status == OrderStatus.FILLED}
+
+
+@pytest.fixture
+def planned_book(tmp_path):
+    """Cycles postclose until a buy is planned, then yields the next session's date."""
+    bars = synthetic_bars(n=560, seed=7)
+    broker = FakeBroker(cash=100_000)
+    limits = Limits(halt_file=tmp_path / "HALT")
+    with store.connect(tmp_path / "desk.sqlite") as con:
+        for t in bars.dates[-130:]:
+            broker.prices.update({s: float(v) for s, v in bars.close.loc[t].items()})
+            run.postclose(con, broker, _at(t, 17, 0), bars=bars.upto(t), limits=limits)
+            if con.execute("SELECT 1 FROM planned_orders WHERE status='planned' AND side='buy'").fetchone():
+                nxt = bars.dates[bars.dates.get_loc(t) + 1]
+                broker.prices.update({s: float(v) for s, v in bars.open.loc[nxt].items()})
+                yield con, broker, nxt, limits
+                return
+    raise AssertionError("no plan produced")
+
+
+@pytest.mark.parametrize("hour,minute,tif", [(8, 45, "opg"), (9, 40, "day")])
+def test_premarket_order_type_depends_on_clock(planned_book, hour, minute, tif):
+    con, broker, nxt, limits = planned_book
+    run.premarket(con, broker, _at(nxt, hour, minute), limits)
+    assert broker.orders and {o.tif.value for o in broker.orders.values()} == {tif}
+
+
+def test_premarket_drops_entries_after_cutoff(planned_book):
+    con, broker, nxt, limits = planned_book
+    out = run.premarket(con, broker, _at(nxt, 11, 0), limits)
+    assert not broker.orders
+    assert "錯過進場" in out
+    rows = con.execute("SELECT status FROM planned_orders WHERE side='buy' AND plan_date < ?", (str(nxt.date()),)).fetchall()
+    assert rows and all(r[0] == "expired" for r in rows)
