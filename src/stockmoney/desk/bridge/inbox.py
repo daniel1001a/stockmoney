@@ -80,6 +80,20 @@ def _validation_reason(e: ValidationError) -> str:
     return "schema_invalid " + "; ".join(parts)
 
 
+_FENCE_RE = re.compile(r"```(?:json)?\s*(\{.*?\})\s*```", re.S)
+
+
+def extract_json(body: str) -> str:
+    """The JSON object inside a mail body. LLM agents often wrap it in a code
+    fence or add a greeting/signature; take the fenced block if present, else
+    the span from the first '{' to the last '}'. Validation stays strict."""
+    m = _FENCE_RE.search(body)
+    if m:
+        return m.group(1)
+    start, end = body.find("{"), body.rfind("}")
+    return body[start:end + 1] if 0 <= start < end else body
+
+
 def _process(con, mail: RawMail, config: BridgeConfig, received_at: datetime) -> bool:
     """Validate and store one mail. True if accepted. Rejects are recorded."""
     if mail.error:
@@ -100,7 +114,7 @@ def _process(con, mail: RawMail, config: BridgeConfig, received_at: datetime) ->
         _reject(con, received_at, mail, "oversized", config, subj_id)
         return False
     try:
-        msg = _INBOUND.validate_json(mail.body, strict=True)
+        msg = _INBOUND.validate_json(extract_json(mail.body), strict=True)
     except ValidationError as e:
         _reject(con, received_at, mail, _validation_reason(e), config, subj_id)
         return False

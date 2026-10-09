@@ -96,7 +96,29 @@ class Idea(_Msg):
     source_urls: list[HttpUrl] = Field(default_factory=list, max_length=10)
 
 
-Inbound = Annotated[Union[SocialDaily, Alert, ResearchReply, Idea], Field(discriminator="type")]
+class Call(BaseModel):
+    """One concrete, public call by a social-media account, recorded verbatim
+    so we can grade every account's track record later."""
+    model_config = ConfigDict(extra="forbid")
+    author: Annotated[str, StringConstraints(max_length=80)]  # handle as shown on the platform
+    platform: Platform
+    followers: int | None = Field(default=None, ge=0)
+    ticker: Ticker
+    direction: Literal["long", "short", "exit"]
+    target_price: float | None = Field(default=None, gt=0)
+    horizon_text: ShortText = ""  # what they said, e.g. "this week", "by earnings"
+    posted_at: datetime  # when the post went up, as shown on the platform
+    post_url: HttpUrl
+
+
+class Calls(_Msg):
+    """Daily log of influencer calls. Stored for grading only; never traded."""
+    type: Literal["CALLS"] = "CALLS"
+    collected_at: datetime
+    calls: list[Call] = Field(max_length=300)
+
+
+Inbound = Annotated[Union[SocialDaily, Alert, ResearchReply, Idea, Calls], Field(discriminator="type")]
 
 
 # ---------------------------------------------------------------- outbound (desk -> Muse)

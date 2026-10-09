@@ -103,13 +103,36 @@ def _subject_of(msg) -> str:
 
 
 def _text_body(msg) -> str:
-    part = msg.get_body(preferencelist=("plain",))
+    """text/plain if present; otherwise text/html reduced to its text (agents
+    sending through Gmail sometimes produce HTML-only mail)."""
+    part = msg.get_body(preferencelist=("plain", "html"))
     if part is None:
-        raise ValueError("no text/plain body")
+        raise ValueError("no text body")
     payload = part.get_payload(decode=True)
     if payload is None:
         raise ValueError("empty body")
-    return payload.decode(part.get_content_charset() or "utf-8")
+    text = payload.decode(part.get_content_charset() or "utf-8")
+    if part.get_content_type() == "text/html":
+        text = _html_to_text(text)
+    return text
+
+
+def _html_to_text(markup: str) -> str:
+    import html
+    from html.parser import HTMLParser
+
+    chunks: list[str] = []
+
+    class _P(HTMLParser):
+        def handle_data(self, d):
+            chunks.append(d)
+
+        def handle_starttag(self, tag, attrs):
+            if tag in ("br", "p", "div"):
+                chunks.append("\n")
+
+    _P(convert_charrefs=True).feed(markup)
+    return html.unescape("".join(chunks))
 
 
 def parse_raw_mail(uid: str, raw: bytes, size: int) -> RawMail:

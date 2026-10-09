@@ -233,12 +233,13 @@ def test_transport_error_and_non_json_rejected(con):
     mb = FakeMailbox()
     mb.inject(MUSE, f"[SMD/ALERT/alert-0001] {TOKEN}", "", error="body: ValueError: no text/plain body")
     mb.inject(MUSE, f"[SMD/ALERT/alert-0002] {TOKEN}", "not json at all")
+    # a valid object followed by a sign-off is accepted (agents add pleasantries)
     mb.inject(MUSE, f"[SMD/ALERT/alert-0003] {TOKEN}", json.dumps(alert(msg_id="alert-0003")) + "\nThanks!")
-    assert poll(con, mb) == 0
+    assert poll(con, mb) == 1
     got = rejects(con)
     assert got[0].startswith("transport_error")
     assert all(r.startswith(("schema_invalid", "body_not_json")) for r in got[1:])
-    assert len(got) == 3
+    assert len(got) == 2
 
 
 def test_poll_never_raises_on_garbage(con):
@@ -464,7 +465,8 @@ def test_imap_mailbox_end_to_end_with_stub(con):
     stub = StubImap({"11": good, "12": html, "13": spoof, "14": big})
     mb = ImapSmtpMailbox(CONFIG, imap_factory=lambda: stub)
     assert poll(con, mb) == 1
-    assert rejects(con)[0].startswith("transport_error body")
+    # HTML-only mail is now read as text; "<p>x</p>" is then not valid JSON
+    assert rejects(con)[0].startswith(("schema_invalid", "body_not_json"))
     assert rejects(con)[1] == "sender_not_allowed"  # two From headers -> no trusted sender
     assert rejects(con)[2] == "oversized"
     fetched = [c for c in stub.calls if c[0] == "FETCH"]
@@ -557,3 +559,36 @@ def test_policy_output_is_only_restrictions_and_text(con):
     assert set(policy.BridgeFlags.__dataclass_fields__) == {"blocked", "no_add", "notify"}
     assert all(isinstance(v, str) for v in (*flags.blocked.values(), *flags.no_add.values(), *flags.notify))
     assert all(isinstance(k, str) for k in (*flags.blocked, *flags.no_add))
+
+
+def test_extract_json_tolerates_agent_formatting():
+    from stockmoney.desk.bridge.inbox import extract_json
+    obj = '{"a": 1, "b": {"c": 2}}'
+    assert extract_json(obj) == obj
+    assert extract_json(f"Hi Desk,\n```json\n{obj}\n```\nSent by Muse") == obj
+    assert extract_json(f"Here you go: {obj}\n-- Muse") == obj
+    assert extract_json("no json here") == "no json here"
+
+
+def test_html_only_mail_body_is_read():
+    from email.message import EmailMessage
+    from stockmoney.desk.bridge.mailbox import _text_body
+    m = EmailMessage()
+    m.set_content('<div>{&quot;x&quot;: 1}</div>', subtype="html")
+    assert _text_body(m).strip() == '{"x": 1}'
+
+
+def test_calls_are_stored_and_produce_no_flags(con):
+    mb = FakeMailbox()
+    now = datetime.now(timezone.utc)
+    send(mb, {
+        "msg_id": "calls-0001", "sent_at": now.isoformat(), "type": "CALLS",
+        "collected_at": now.isoformat(),
+        "calls": [{"author": "@somefinfluencer", "platform": "threads", "followers": 120000,
+                   "ticker": "PLTR", "direction": "long", "target_price": 250.0,
+                   "horizon_text": "by earnings", "posted_at": now.isoformat(),
+                   "post_url": "https://www.threads.net/@somefinfluencer/post/abc"}],
+    })
+    assert poll(con, mb) == 1
+    flags = policy.active_flags(con, now, held=())
+    assert not flags.blocked and not flags.no_add
