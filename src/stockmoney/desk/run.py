@@ -403,20 +403,24 @@ def crypto(con, broker: Broker, now: datetime) -> str:
 
 
 def bridge(con, now: datetime, mailbox=None) -> str:
+    from stockmoney.desk import muse_ops
     from stockmoney.desk.bridge import inbox, mailbox as mb
     from stockmoney.desk.bridge.policy import active_flags
     ensure_schema(con)
+    muse_ops.ensure_schema(con)
     if mailbox is None:
         if not bridge_configured():
             return "Muse 橋樑未設定,跳過。"
         with mb.ImapSmtpMailbox(mb.BridgeConfig.from_env()) as box:
             n = inbox.poll(con, box)
+            ops = muse_ops.run_checks(con, now, box)
     else:
         n = inbox.poll(con, mailbox)
+        ops = muse_ops.run_checks(con, now, mailbox)
     held = set(Ledger(con).positions())
     for note in active_flags(con, now, held).notify:
         _notify_once(con, f"muse:{note[:100]}", "Muse 警報", note, notify.WARN)
-    return f"Muse 新訊息 {n} 則"
+    return f"Muse 新訊息 {n} 則" + (f"\n{ops}" if ops else "")
 
 
 # ---------------------------------------------------------------- bridge glue
@@ -445,15 +449,19 @@ def _bridge_outbound(con, ledger: Ledger, planned: list[dict], report: str, now:
         items = [WatchItem(ticker=s, status="held") for s in ledger.positions()]
         items += [WatchItem(ticker=p["symbol"], status="candidate", note=p["strategy"]) for p in planned]
         deadline = (now.astimezone(ET) + timedelta(days=1)).replace(hour=8, minute=30, second=0, microsecond=0)
+        from stockmoney.desk import muse_ops
+        muse_ops.ensure_schema(con)
+        msgs = [Watchlist(msg_id=outbox.new_msg_id("wl"), sent_at=now, items=items)]
+        msgs += [ResearchRequest(
+            msg_id=outbox.new_msg_id("rq"), sent_at=now, ticker=p["symbol"], deadline=deadline,
+            questions=["明天開盤前有沒有會推翻做多的消息(財報、監管、訴訟、併購、高層異動)?",
+                       "社群情緒近 3 天是否急遽轉向?"]) for p in planned]
+        msgs.append(Report(msg_id=outbox.new_msg_id("rp"), sent_at=now,
+                           title=f"Desk 盤後報告 {_today(now)}", body_markdown=report))
         with mb.ImapSmtpMailbox(mb.BridgeConfig.from_env()) as box:
-            outbox.send(box, Watchlist(msg_id=outbox.new_msg_id(), sent_at=now, items=items))
-            for p in planned:
-                outbox.send(box, ResearchRequest(
-                    msg_id=outbox.new_msg_id(), sent_at=now, ticker=p["symbol"], deadline=deadline,
-                    questions=["明天開盤前有沒有會推翻做多的消息(財報、監管、訴訟、併購、高層異動)?",
-                               "社群情緒近 3 天是否急遽轉向?"]))
-            outbox.send(box, Report(msg_id=outbox.new_msg_id(), sent_at=now,
-                                    title=f"Desk 盤後報告 {_today(now)}", body_markdown=report))
+            for m in msgs:
+                outbox.send(box, m)
+                muse_ops.log_outbound(con, m)
     except Exception as e:
         log.warning("bridge outbound failed: %s", e)
 

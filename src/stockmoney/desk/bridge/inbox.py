@@ -27,7 +27,8 @@ log = logging.getLogger(__name__)
 
 MAX_RAW_BYTES = 200 * 1024
 EXCERPT_CHARS = 2000
-SUBJECT_RE = re.compile(r"^\[SMD/([A-Z_]{1,32})/([A-Za-z0-9_\-]{6,64})\] (\S{1,256})$")
+# Tolerates reply/forward prefixes an email client may add; the tag itself stays exact.
+SUBJECT_RE = re.compile(r"^(?:(?i:re|fw|fwd)\s*:\s*)*\[SMD/([A-Z_]{1,32})/([A-Za-z0-9_\-]{6,64})\] (\S{1,256})\s*$")
 _INBOUND = TypeAdapter(Inbound)
 
 BRIDGE_SCHEMA = """

@@ -151,4 +151,13 @@ class Report(_Msg):
     body_markdown: Annotated[str, StringConstraints(max_length=20000)]
 
 
-Outbound = Annotated[Union[Watchlist, ResearchRequest, Report], Field(discriminator="type")]
+class Feedback(_Msg):
+    """Tells Muse exactly why one of its messages was rejected, so it can
+    correct itself. Only sent for mail that passed sender and token checks."""
+    type: Literal["FEEDBACK"] = "FEEDBACK"
+    about_msg_id: str
+    problem: Annotated[str, StringConstraints(max_length=1000)]
+    how_to_fix: Annotated[str, StringConstraints(max_length=1000)]
+
+
+Outbound = Annotated[Union[Watchlist, ResearchRequest, Report, Feedback], Field(discriminator="type")]

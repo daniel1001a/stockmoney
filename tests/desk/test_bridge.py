@@ -592,3 +592,11 @@ def test_calls_are_stored_and_produce_no_flags(con):
     assert poll(con, mb) == 1
     flags = policy.active_flags(con, now, held=())
     assert not flags.blocked and not flags.no_add
+
+
+def test_reply_prefixes_on_subject_are_tolerated(con):
+    mb = FakeMailbox()
+    send(mb, alert(msg_id="alert-0101"))
+    for prefix, mid in (("Re: ", "alert-0102"), ("FWD: RE: ", "alert-0103")):
+        mb.inject(MUSE, f"{prefix}[SMD/ALERT/{mid}] {TOKEN}", json.dumps(alert(msg_id=mid)))
+    assert poll(con, mb) == 3

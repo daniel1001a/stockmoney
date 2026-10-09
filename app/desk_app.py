@@ -108,6 +108,17 @@ elif page == "Muse":
         from stockmoney.desk.bridge.inbox import ensure_schema as bridge_schema
         with store.connect() as con:
             bridge_schema(con)
+        from datetime import datetime, timezone
+        from stockmoney.desk import muse_ops
+        with store.connect() as con:
+            card = muse_ops.scorecard(con, datetime.now(timezone.utc))
+            stage = store.get_setting(con, "muse_stage", "0")
+        st.subheader(f"Muse 成績單(近 7 天,上線階段 {stage})")
+        c = st.columns(4)
+        for i, (k, v) in enumerate(card["deliveries"].items()):
+            c[i % 3].metric(v["name"], f"{v['on_time']}/{v['due']}", help="準時送達 / 應送達")
+        c[3].metric("查核回覆", f"{card['research']['answered']}/{card['research']['requested']}")
+        st.caption(f"通過驗證 {card['accepted']} 封,被拒 {card['rejected']} 封。上線步驟見 docs/desk/MUSE_ONBOARDING.md")
         st.subheader("收到的訊息")
         st.dataframe(_q("SELECT received_at, type, msg_id, parsed_json FROM bridge_messages ORDER BY received_at DESC LIMIT 100"),
                      hide_index=True, use_container_width=True)
