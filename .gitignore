@@ -30,3 +30,4 @@ secrets/
 # DB safety backups (never commit)
 *.duckdb.bak*
 data/desk/
+.claude/worktrees/
