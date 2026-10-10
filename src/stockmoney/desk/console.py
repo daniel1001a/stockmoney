@@ -58,17 +58,26 @@ def set_halt(con, halt: bool, reason: str) -> None:
     stops are unaffected. Logged in ``param_changes`` under strategy 'desk'.
     A manual halt is recorded as ``halt_source=manual`` and stays until the
     owner lifts it; pausing while an automatic (reconcile) halt is in force
-    turns it into a manual one."""
+    turns it into a manual one. Read and write run in one IMMEDIATE
+    transaction (committed here), so a job lifting a reconcile halt cannot
+    slip in between them."""
     reason = (reason or "").strip()
     if not halt and not reason:
         raise ValueError("解除暫停必須寫理由")
-    old = store.get_setting(con, "halt_new_entries", "0") == "1"
-    if old == halt:
-        src = store.get_setting(con, "halt_source", "")
-        if halt and src != "manual":
-            store.set_setting(con, "halt_source", "manual")
-            _log(con, "desk", "halt_source", src, "manual", reason or "手動暫停")
-        return
-    store.set_setting(con, "halt_new_entries", "1" if halt else "0")
-    store.set_setting(con, "halt_source", "manual" if halt else "")
-    _log(con, "desk", "halt_new_entries", old, halt, reason or "手動暫停")
+    con.commit()
+    con.execute("BEGIN IMMEDIATE")
+    try:
+        old = store.get_setting(con, "halt_new_entries", "0") == "1"
+        if old == halt:
+            src = store.get_setting(con, "halt_source", "")
+            if halt and src != "manual":
+                store.set_setting(con, "halt_source", "manual")
+                _log(con, "desk", "halt_source", src, "manual", reason or "手動暫停")
+        else:
+            store.set_setting(con, "halt_new_entries", "1" if halt else "0")
+            store.set_setting(con, "halt_source", "manual" if halt else "")
+            _log(con, "desk", "halt_new_entries", old, halt, reason or "手動暫停")
+    except BaseException:
+        con.rollback()
+        raise
+    con.commit()

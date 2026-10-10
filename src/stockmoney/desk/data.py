@@ -7,6 +7,7 @@ system actually had the data), per the project's look-ahead rule.
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -130,7 +131,14 @@ def refresh(data_dir: Path = DEFAULT_DIR, start: date = date(2014, 1, 1), lookba
     else:
         merged = download(ALL_SYMBOLS, start)
     merged = merged.drop_duplicates(["symbol", "date"], keep="last").sort_values(["symbol", "date"])
-    merged.to_parquet(path, index=False)
+    # the refresh runs outside the job lock: write a temp file next to the cache and swap it in,
+    # so a crash or a full disk mid-write never leaves a half-written cache behind
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        merged.to_parquet(tmp, index=False)
+        os.replace(tmp, path)
+    finally:
+        tmp.unlink(missing_ok=True)
     return merged
 
 

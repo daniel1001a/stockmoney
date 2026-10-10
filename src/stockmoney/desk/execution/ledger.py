@@ -115,8 +115,9 @@ class Ledger:
         ``cumulative=True``: ``qty``/``price`` are the order's cumulative
         filled qty and average price so far (a partial fill, as the broker
         reports it). Only the part not yet booked for this order is added;
-        the idempotency key is client_order_id plus that cumulative qty (the
-        first booking of an order keeps the plain client_order_id)."""
+        the idempotency key is client_order_id plus that cumulative qty in
+        full precision (the first booking of an order keeps the plain
+        client_order_id)."""
         if qty <= 0 or price <= 0:
             raise LedgerError(f"fill needs qty>0 and price>0, got qty={qty} price={price}")
         if cumulative:
@@ -125,9 +126,11 @@ class Ledger:
             if delta <= QTY_EPS:
                 return False
             if done_qty > QTY_EPS:
+                if self._seen_cumulative(client_order_id, qty):
+                    return False
                 px = (qty * price - done_cost) / delta
                 price = px if math.isfinite(px) and px > 0 else price
-                client_order_id = f"{client_order_id}#{qty:g}"
+                client_order_id = f"{client_order_id}#{float(qty)!r}"
             qty = delta
         seen = self.con.execute("SELECT 1 FROM fills WHERE client_order_id=?", (client_order_id,)).fetchone()
         if seen:
@@ -179,6 +182,21 @@ class Ledger:
             "WHERE client_order_id=? OR substr(client_order_id, 1, ?)=?",
             (client_order_id, len(client_order_id) + 1, client_order_id + "#")).fetchone()
         return float(r[0]), float(r[1])
+
+    def _seen_cumulative(self, client_order_id: str, qty: float) -> bool:
+        """Whether a ``<id>#<cumulative qty>`` row for this cumulative qty is
+        already booked. Compared by value, so rows written with the older
+        6-significant-digit key are still recognised."""
+        rows = self.con.execute(
+            "SELECT client_order_id FROM fills WHERE substr(client_order_id, 1, ?)=?",
+            (len(client_order_id) + 1, client_order_id + "#")).fetchall()
+        for (key,) in rows:
+            try:
+                if abs(float(key[len(client_order_id) + 1:]) - qty) <= QTY_EPS:
+                    return True
+            except ValueError:
+                continue
+        return False
 
     # ------------------------------------------------------------------ P&L
     def realized_pnl(self, strategy: str | None = None) -> float:

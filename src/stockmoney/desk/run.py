@@ -17,7 +17,8 @@ Flow of one stock trade:
                  exit re-places its stop and is retried), then a stop pass
                  over every other held symbol, then entries
   postopen       an exit premarket had to defer (stop cancel not confirmed)
-                 is sent as a DAY market sell
+                 is sent as a DAY market sell; an opening sell that ended
+                 unfilled gets its stop back and is re-planned for the next run
 The broker holds the truth. A reconcile mismatch halts new entries and pages
 the owner; exits and protective stops keep running for every symbol that still
 reconciles (a mismatched symbol is left alone for a human, and its exit stays
@@ -180,13 +181,17 @@ def _halt(con, reason: str, day: str, source: str) -> None:
 
 def _lift_reconcile_halt(con, day: str) -> None:
     """A clean reconcile lifts a halt that reconcile itself set. Logged in
-    param_changes like a console change, and the owner is told."""
-    if store.get_setting(con, "halt_new_entries", "0").strip() != "1":
+    param_changes like a console change, and the owner is told. The check is
+    the UPDATE itself, which holds the write lock from its first read, so a
+    manual pause written by another process in between is never overwritten."""
+    con.commit()
+    claimed = con.execute(
+        "UPDATE settings SET value='' WHERE key=? AND value='reconcile' AND EXISTS "
+        "(SELECT 1 FROM settings WHERE key='halt_new_entries' AND TRIM(value)='1')", (HALT_SOURCE_KEY,)).rowcount
+    if claimed != 1:
+        con.commit()
         return
-    if store.get_setting(con, HALT_SOURCE_KEY, "") != "reconcile":
-        return
-    store.set_setting(con, "halt_new_entries", "0")
-    store.set_setting(con, HALT_SOURCE_KEY, "")
+    con.execute("UPDATE settings SET value='0' WHERE key='halt_new_entries'")  # same transaction, still locked
     why = "對帳已恢復一致,自動解除對帳造成的新進場暫停"
     con.execute("INSERT INTO param_changes (strategy, param, old, new, reason, changed_at) VALUES (?,?,?,?,?,?)",
                 ("desk", "halt_new_entries", "true", "false", why, store.now()))
@@ -284,7 +289,10 @@ def sync_fills(con, broker: Broker, ledger: Ledger, day: str | None = None) -> l
     row is closed (recorded=1) once its order is final. Each
     row is its own transaction: a row that cannot be booked (for example a
     SleeveConflict) halts new entries and pages the owner, and the remaining
-    rows are still booked."""
+    rows are still booked. A broker that cannot be reached (network error,
+    timeout, BrokerUnavailable) ends the pass without a halt; the rows stay
+    open for the next run. An exit that ended unfilled while shares are still
+    held is re-planned (see _reopen_exit)."""
     day = day or _today(datetime.now(timezone.utc))
     events = []
     con.commit()
@@ -297,12 +305,30 @@ def sync_fills(con, broker: Broker, ledger: Ledger, day: str | None = None) -> l
                 events.append(ev)
         except Exception as e:
             con.rollback()
+            if _unreachable(e):
+                # the broker could not be read: nothing was booked, the rows stay open and
+                # the next run retries them; a sticky halt here would outlive a Wi-Fi blip
+                log.warning("fill sync stopped at %s, broker unreachable: %s", r["client_order_id"], e)
+                events.append(f"成交同步中斷(券商連線失敗),下次執行再試:{type(e).__name__}: {e}")
+                break
             log.exception("could not book order %s", r["client_order_id"])
             why = f"成交入帳失敗 {r['symbol']}({r['client_order_id']}):{type(e).__name__}: {e}"
             _halt(con, why, day, "sync")
             con.commit()
             events.append(why)
     return events
+
+
+def _unreachable(e: BaseException) -> bool:
+    """A network or broker-availability failure (not a booking error)."""
+    if isinstance(e, (TimeoutError, ConnectionError)):
+        return True
+    try:
+        from requests import RequestException
+        from stockmoney.desk.execution.alpaca import BrokerUnavailable
+    except ImportError:
+        return False
+    return isinstance(e, (RequestException, BrokerUnavailable))
 
 
 def _sync_one(con, broker: Broker, ledger: Ledger, r, day: str) -> str | None:
@@ -341,9 +367,52 @@ def _sync_one(con, broker: Broker, ledger: Ledger, r, day: str) -> str | None:
                 con.execute("DELETE FROM position_meta WHERE symbol=?", (r["symbol"],))
     elif final and (o.status != OrderStatus.CANCELED or r["kind"] != "stop"):
         ev = f"未成交 {r['symbol']} {r['side']}:{o.status.value}"
+    if final and r["kind"] == "exit" and o.status != OrderStatus.FILLED and ledger.position(r["symbol"]) is not None:
+        ev = ";".join(x for x in (ev, _reopen_exit(con, r, o, day)) if x)
     if final:
         con.execute("UPDATE submitted SET recorded=1 WHERE client_order_id=?", (r["client_order_id"],))
     return ev
+
+
+def _reopen_exit(con, r, o: BrokerOrder, day: str) -> str | None:
+    """An exit order ended (expired, cancelled, rejected) without selling every
+    share while the position is still held. Its stop was cancelled before the
+    sell, so the plan goes back to ``planned``: the stop pass restores the
+    stop and the next exit run sends a new order (see _exit_cid). After
+    MAX_EXIT_ATTEMPTS in one day the plan becomes ``error`` and the owner is
+    paged."""
+    cid = r["client_order_id"]
+    p = con.execute("SELECT * FROM planned_orders WHERE side='sell' AND status='submitted' "
+                    "AND (client_order_id=? OR ? LIKE client_order_id || '-r%')", (cid, cid)).fetchone()
+    if p is None:
+        return None
+    sym, key = r["symbol"], f"{day}:{p['client_order_id']}"
+    con.execute("INSERT INTO plan_attempts VALUES (?, 1) ON CONFLICT(key) DO UPDATE SET n=n+1", (key,))
+    n = con.execute("SELECT n FROM plan_attempts WHERE key=?", (key,)).fetchone()[0]
+    why = f"出場單 {cid} 結束為 {o.status.value},仍有持倉"
+    if n >= MAX_EXIT_ATTEMPTS:
+        _mark(con, p, "error", f"{why};出場連續失敗 {n} 次,待人工處理")
+        notify.send(f"Desk 出場失敗 {sym}", f"{why}。今天第 {n} 次,不再自動重試,請人工處理。", notify.CRITICAL)
+        return f"出場失敗 {sym}(第 {n} 次,已停止重試):{why}"
+    _mark(con, p, "planned", f"{why};第 {n}/{MAX_EXIT_ATTEMPTS} 次,先補回停損單,下次執行再出場")
+    notify.send(f"Desk 出場未成交 {sym}", f"{why}。先補回停損單,下次執行重送出場單({n}/{MAX_EXIT_ATTEMPTS})。",
+                notify.WARN)
+    return f"{sym} 出場未成交,保留計畫待重送(第 {n} 次)"
+
+
+_UNFILLED = (OrderStatus.CANCELED.value, OrderStatus.EXPIRED.value, OrderStatus.REJECTED.value)
+
+
+def _exit_cid(con, cid: str) -> str:
+    """Order id for the next attempt of exit plan ``cid``: the plan id itself,
+    then ``<cid>-r1``, ``-r2``... past every attempt that ended unfilled (the
+    broker never accepts one client_order_id twice)."""
+    k, out = 0, cid
+    while (row := con.execute("SELECT status, recorded FROM submitted WHERE client_order_id=?", (out,)).fetchone()) \
+            and row["recorded"] == 1 and row["status"] in _UNFILLED:
+        k += 1
+        out = f"{cid}-r{k}"
+    return out
 
 
 def _submit(con, broker: Broker, intent: OrderIntent, kind: str, stop: float | None = None, *,
@@ -886,7 +955,7 @@ def _exit_failed(con, broker: Broker, risk: RiskEngine, p, st: _Run, why: str, t
     con.execute("INSERT INTO plan_attempts VALUES (?, 1) ON CONFLICT(key) DO UPDATE SET n=n+1", (key,))
     n = con.execute("SELECT n FROM plan_attempts WHERE key=?", (key,)).fetchone()[0]
     con.commit()
-    restored = _restore_stop(con, broker, risk, sym, cid, today)
+    restored = _restore_stop(con, broker, risk, sym, _exit_cid(con, cid), today)
     if n >= MAX_EXIT_ATTEMPTS:
         _mark(con, p, "error", f"出場連續失敗 {n} 次,待人工處理:{why}")
         con.commit()
@@ -925,7 +994,9 @@ def _restore_stop(con, broker: Broker, risk: RiskEngine, sym: str, exit_cid: str
 def _premarket_one(con, broker: Broker, risk: RiskEngine, ledger: Ledger, snap: AccountSnapshot, p, st: _Run,
                    *, bad, flags, through, last_session, et, today) -> None:
     sym, side, cid = p["symbol"], Side(p["side"]), p["client_order_id"]
-    prior = con.execute("SELECT status FROM submitted WHERE client_order_id=?", (cid,)).fetchone()
+    if side == Side.SELL:
+        cid = _exit_cid(con, cid)  # a retry after an attempt that ended unfilled gets a fresh id
+    prior =con.execute("SELECT status FROM submitted WHERE client_order_id=?", (cid,)).fetchone()
     if prior and prior["status"] not in (PENDING_SUBMIT, NOT_SENT):
         # the broker already has this order (a job died after submit, before marking the plan)
         _mark(con, p, "submitted", "重跑時發現已送出")
@@ -1088,11 +1159,20 @@ def postopen(con, broker: Broker, now: datetime, limits: Limits | None = None) -
     today = _today(now)
     risk = RiskEngine(limits or Limits(), con)
     ledger = risk.ledger
+    waiting = {r[0] for r in con.execute("SELECT client_order_id FROM planned_orders WHERE status='planned' "
+                                         "AND side='sell'")}
     events = sync_fills(con, broker, ledger, today)
     snap = broker.account()
     bad = _check_reconcile(con, ledger, snap, today)
     sells = con.execute("SELECT * FROM planned_orders WHERE status='planned' AND side='sell' AND plan_date < ? "
                         "ORDER BY client_order_id", (today,)).fetchall()
+    # an exit the sync just re-planned (its opening sell ended unfilled) gets its stop back
+    # before anything else, and is sent by the next run instead of right away
+    for r in sells:
+        if r["client_order_id"] not in waiting and norm(r["symbol"]) not in bad:
+            events.append(f"{r['symbol']} 出場單未成交,補回停損單:"
+                          + _restore_stop(con, broker, risk, r["symbol"], r["client_order_id"], today))
+    sells = [r for r in sells if r["client_order_id"] in waiting]
     if sells and broker.is_equity_market_open():
         kw = dict(bad=bad, flags=None, through="", last_session="", et=now.astimezone(ET), today=today)
         _send_exits(con, broker, risk, ledger, snap, sells, st, kw)
