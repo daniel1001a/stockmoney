@@ -28,7 +28,12 @@ log = logging.getLogger(__name__)
 MAX_RAW_BYTES = 200 * 1024
 EXCERPT_CHARS = 2000
 # Tolerates reply/forward prefixes an email client may add; the tag itself stays exact.
-SUBJECT_RE = re.compile(r"^(?:(?i:re|fw|fwd)\s*:\s*)*\[SMD/([A-Z_]{1,32})/([A-Za-z0-9_\-]{6,64})\] (\S{1,256})\s*$")
+# Group 1 is the prefix (possibly empty): a prefixed mail is a reply to something the
+# desk sent, so one that fails validation is never answered with feedback (see _process).
+SUBJECT_RE = re.compile(r"^((?:(?i:re|fw|fwd)\s*:\s*)*)\[SMD/([A-Z_]{1,32})/([A-Za-z0-9_\-]{6,64})\] (\S{1,256})\s*$")
+# Types only the desk sends. Mail carrying one is an echo of our own mail (a reply
+# or forward whose client stripped the prefix) and is never correctable.
+OUTBOUND_ONLY_TYPES = frozenset({"WATCHLIST", "RESEARCH_REQUEST", "REPORT", "FEEDBACK"})
 _INBOUND = TypeAdapter(Inbound)
 
 BRIDGE_SCHEMA = """
@@ -75,6 +80,13 @@ def _reject(con, received_at: datetime, mail: RawMail, reason: str, config: Brid
     )
 
 
+def is_echo_subject(subject: str | None) -> bool:
+    """True for a subject that quotes the desk's own mail: reply/forward
+    prefix or an outbound-only type. Such rejects must never trigger feedback."""
+    m = SUBJECT_RE.match(subject or "")
+    return bool(m) and (bool(m.group(1)) or m.group(2) in OUTBOUND_ONLY_TYPES)
+
+
 def _validation_reason(e: ValidationError) -> str:
     # location + error type only: error text can echo attacker-controlled input
     parts = [".".join(str(p) for p in err["loc"]) + ":" + err["type"] for err in e.errors()[:5]]
@@ -107,30 +119,39 @@ def _process(con, mail: RawMail, config: BridgeConfig, received_at: datetime) ->
     if not m:
         _reject(con, received_at, mail, "bad_subject", config)
         return False
-    subj_type, subj_id, token = m.groups()
+    prefix, subj_type, subj_id, token = m.groups()
     if not _token_ok(token, config.shared_token):
         _reject(con, received_at, mail, "bad_token", config, subj_id)
         return False
-    if mail.oversized or mail.size > MAX_RAW_BYTES or len(mail.body.encode("utf-8", "replace")) > MAX_RAW_BYTES:
-        _reject(con, received_at, mail, "oversized", config, subj_id)
+    if subj_type in OUTBOUND_ONLY_TYPES:
+        # an echo of the desk's own mail: a correction request would be answered
+        # by another echo. Kept under the historical "schema_invalid" code (an
+        # outbound type never validates as Inbound); muse_ops never answers it
+        # because is_echo_subject() recognises the stored subject.
+        _reject(con, received_at, mail, "schema_invalid outbound_only_type", config, subj_id)
         return False
+    replied = bool(prefix)
+
+    def fail(reason: str) -> bool:
+        # a Re:/Fwd: mail that is not valid as it stands is a reply to something
+        # the desk sent; "reply_prefix" is not in muse_ops.FIXES, so no feedback
+        _reject(con, received_at, mail, f"reply_prefix {reason}" if replied else reason, config, subj_id)
+        return False
+
+    if mail.oversized or mail.size > MAX_RAW_BYTES or len(mail.body.encode("utf-8", "replace")) > MAX_RAW_BYTES:
+        return fail("oversized")
     try:
         msg = _INBOUND.validate_json(extract_json(mail.body), strict=True)
     except ValidationError as e:
-        _reject(con, received_at, mail, _validation_reason(e), config, subj_id)
-        return False
+        return fail(_validation_reason(e))
     except ValueError:  # not JSON at all / lone surrogates etc.
-        _reject(con, received_at, mail, "body_not_json", config, subj_id)
-        return False
+        return fail("body_not_json")
     if msg.type != subj_type:
-        _reject(con, received_at, mail, "type_mismatch", config, subj_id)
-        return False
+        return fail("type_mismatch")
     if msg.msg_id != subj_id:
-        _reject(con, received_at, mail, "msg_id_mismatch", config, subj_id)
-        return False
+        return fail("msg_id_mismatch")
     if con.execute("SELECT 1 FROM bridge_messages WHERE msg_id=?", (msg.msg_id,)).fetchone():
-        _reject(con, received_at, mail, "duplicate_msg_id", config, subj_id)
-        return False
+        return fail("duplicate_msg_id")
     con.execute(
         "INSERT INTO bridge_messages (msg_id, type, sender, sent_at, received_at, raw_body, parsed_json) "
         "VALUES (?,?,?,?,?,?,?)",

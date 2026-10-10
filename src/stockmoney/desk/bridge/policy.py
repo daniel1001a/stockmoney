@@ -27,9 +27,12 @@ from stockmoney.desk.bridge.schema import Alert, Inbound, ResearchReply, Severit
 
 FLAG_DAYS = 3
 NOTIFY_HOURS = 24
+# Rows older than the longest effect window (plus slack for clock skew) can
+# never produce a flag; the SQL lower bound keeps the scan from growing forever.
+_SCAN_MARGIN = timedelta(days=1)
 _INBOUND = TypeAdapter(Inbound)
 # Noise, not signal: stray senders and re-polled duplicates are logged but never pushed.
-_QUIET_REJECTS = ("sender_not_allowed", "duplicate_msg_id")
+_QUIET_REJECTS = ("sender_not_allowed", "duplicate_msg_id", "reply_prefix duplicate_msg_id")
 
 
 @dataclass(frozen=True)
@@ -63,9 +66,11 @@ def active_flags(con, now: datetime, held: Collection[str] = ()) -> BridgeFlags:
     no_add: dict[str, str] = {}
     notify: list[str] = []
 
+    scan_from = now - max(timedelta(days=FLAG_DAYS), timedelta(hours=NOTIFY_HOURS)) - _SCAN_MARGIN
     rows = con.execute(
         "SELECT type, received_at, parsed_json FROM bridge_messages "
-        "WHERE type IN ('ALERT','RESEARCH_REPLY') ORDER BY received_at"
+        "WHERE type IN ('ALERT','RESEARCH_REPLY') AND received_at >= ? ORDER BY received_at",
+        (scan_from.isoformat(timespec="seconds"),),
     ).fetchall()
     for typ, received_at, parsed in rows:
         try:

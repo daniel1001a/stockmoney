@@ -13,16 +13,29 @@ import os
 import pandas as pd
 import streamlit as st
 
-from stockmoney.desk import backtest, data, run, store
+from stockmoney.desk import backtest, console, data, run, store
 from stockmoney.desk.execution.ledger import Ledger
 from stockmoney.desk.strategies import REGISTRY
 
 st.set_page_config(page_title="Trading Desk", layout="wide")
 
 
+NO_PRICES = "找不到價格快取(data/desk/ohlcv.parquet)。先跑一次 scripts/desk_daily.py 下載價格,這一頁才有圖與最新價。"
+
+
 @st.cache_data(ttl=600)
 def _bars():
     return data.to_bars(data.load())
+
+
+def _bars_or_none():
+    """Bars, or None when the price cache has not been downloaded yet."""
+    if not (data.DEFAULT_DIR / "ohlcv.parquet").exists():
+        return None
+    try:
+        return _bars()
+    except FileNotFoundError:
+        return None
 
 
 def _q(sql: str, params=()) -> pd.DataFrame:
@@ -55,19 +68,32 @@ if page == "總覽":
         peak = eq.system_equity.cummax().iloc[-1]
         c2.metric("距高點回撤", f"{last.system_equity / peak - 1:.2%}")
         c3.metric("狀態", last["mode"])
-        bars = _bars()
+        bars = _bars_or_none()
         df = eq.set_index(pd.to_datetime(eq.date))[["system_equity"]] / 50_000 - 1
-        spy = bars.close["SPY"].reindex(df.index).ffill()
-        df["SPY"] = spy / spy.iloc[0] - 1
+        if bars is None:
+            st.warning(NO_PRICES)
+        else:
+            spy = bars.close["SPY"].reindex(df.index).ffill()
+            df["SPY"] = spy / spy.iloc[0] - 1
         st.line_chart(df * 100, y_label="累計報酬 %")
     else:
         st.info("尚無淨值紀錄。第一次盤後任務執行後會出現。")
 
     st.subheader("總開關")
-    new_halt = st.toggle("暫停所有新進場(出場與停損照常運作)", value=halt)
-    if new_halt != halt:
+    st.caption("暫停所有新進場(出場與停損照常運作)。解除暫停必須寫理由,會記入參數變更紀錄。")
+    halt_reason = st.text_input("理由(解除暫停時必填)", key="halt_reason")
+    if halt:
+        if st.button("解除暫停新進場", type="primary"):
+            try:
+                with store.connect() as con:
+                    console.set_halt(con, False, halt_reason)
+            except ValueError as e:
+                st.error(str(e))
+            else:
+                st.rerun()
+    elif st.button("暫停所有新進場"):
         with store.connect() as con:
-            store.set_setting(con, "halt_new_entries", "1" if new_halt else "0")
+            console.set_halt(con, True, halt_reason)
         st.rerun()
 
     j = _q("SELECT date, auto_summary FROM journal ORDER BY date DESC LIMIT 1")
@@ -83,10 +109,14 @@ elif page == "持倉與委託":
     if pos.empty:
         st.caption("空手")
     else:
-        close = _bars().close.iloc[-1]
-        pos["last"] = pos.symbol.map(lambda s: float(close.get(s, float("nan"))))
-        pos["損益%"] = (pos["last"] / pos.avg_price - 1) * 100
-        pos["距停損%"] = (pos["last"] / pos.stop - 1) * 100
+        bars = _bars_or_none()
+        if bars is None:
+            st.warning(NO_PRICES)
+        else:
+            close = bars.close.iloc[-1]
+            pos["last"] = pos.symbol.map(lambda s: float(close.get(s, float("nan"))))
+            pos["損益%"] = (pos["last"] / pos.avg_price - 1) * 100
+            pos["距停損%"] = (pos["last"] / pos.stop - 1) * 100
         st.dataframe(pos.round(2), hide_index=True, use_container_width=True)
     st.subheader("明日計畫")
     st.dataframe(_q("SELECT plan_date, symbol, side, qty, strategy, stop, status, note, reason FROM planned_orders "
@@ -158,27 +188,37 @@ elif page == "策略實驗室":
     name = st.selectbox("策略", list(REGISTRY), format_func=lambda n: f"{REGISTRY[n].label} ({n})")
     cls = REGISTRY[name]
     st.write(cls.description)
-    cur = {**cls.params, **params.get(name, {})}
-    edited = {k: st.number_input(k, value=float(v), key=f"p{name}{k}") for k, v in cur.items()}
+    stored = params.get(name, {})
+    if set(stored) - set(cls.params):
+        st.warning(f"已儲存的參數含未知鍵 {sorted(set(stored) - set(cls.params))},每日任務建立策略時會報錯;請移除。")
+    cur = {k: stored.get(k, v) for k, v in cls.params.items()}
+    edited = {k: st.number_input(k, value=float(v), key=f"p{name}{k}", help=f"合法範圍 {cls.bounds[k].describe()}")
+              for k, v in cur.items()}
     enabled = st.checkbox("啟用", value=name not in disabled)
     c1, c2 = st.columns(2)
     if c1.button("用新參數回測(2015 至今)"):
-        with st.spinner("回測中(約 1 分鐘)..."):
-            bars = _bars()
-            out = {"目前": backtest.run_single(bars, cls(**cur)), "新參數": backtest.run_single(bars, cls(**edited))}
-            st.dataframe(pd.DataFrame(out).T)
-            st.caption("注意:在同一段歷史上反覆調參數會過擬合。只採用有事前理由、且改善幅度明顯的變更。")
+        try:
+            new_strategy = cls(**edited)
+            old_strategy = cls(**cur)
+        except ValueError as e:
+            st.error(f"參數不合法:{e}")
+        else:
+            bars = _bars_or_none()
+            if bars is None:
+                st.error(NO_PRICES)
+            else:
+                with st.spinner("回測中(約 1 分鐘)..."):
+                    out = {"目前": backtest.run_single(bars, old_strategy), "新參數": backtest.run_single(bars, new_strategy)}
+                    st.dataframe(pd.DataFrame(out).T)
+                    st.caption("注意:在同一段歷史上反覆調參數會過擬合。只採用有事前理由、且改善幅度明顯的變更。")
     reason = c2.text_input("套用理由(必填)")
     if c2.button("套用", type="primary"):
-        if not reason:
-            st.error("請寫理由")
-        else:
+        try:
             with store.connect() as con:
-                for k, v in edited.items():
-                    if v != float(cur[k]):
-                        store.change_param(con, name, k, v, reason)
-                d = disabled - {name} if enabled else disabled | {name}
-                store.set_setting(con, "disabled_strategies", json.dumps(sorted(d)))
-            st.success("已套用,下次盤後任務生效")
+                applied = console.apply_strategy_changes(con, name, edited, enabled, reason)
+        except ValueError as e:
+            st.error(str(e))
+        else:
+            st.success("已套用,下次盤後任務生效:" + ";".join(applied) if applied else "沒有任何變更")
     st.subheader("參數變更紀錄")
     st.dataframe(changes, hide_index=True, use_container_width=True)

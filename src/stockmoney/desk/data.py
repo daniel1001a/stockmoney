@@ -6,6 +6,7 @@ system actually had the data), per the project's look-ahead rule.
 """
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -14,8 +15,11 @@ import pandas as pd
 
 from stockmoney.desk.universe import ALL_SYMBOLS
 
+log = logging.getLogger(__name__)
+
 DEFAULT_DIR = Path("data/desk")
 FIELDS = ("open", "high", "low", "close", "volume")
+RESTATE_TOL = 1e-6  # relative close difference that marks a changed adjustment basis
 
 
 @dataclass
@@ -69,19 +73,60 @@ def download(symbols: list[str], start: date, end: date | None = None) -> pd.Dat
     return out
 
 
+def restated_symbols(cached: pd.DataFrame, fresh: pd.DataFrame, tol: float = RESTATE_TOL) -> list[str]:
+    """Symbols whose freshly downloaded closes differ from the cached closes on
+    the overlapping dates. ``auto_adjust`` rewrites the whole history after a
+    split or dividend, so any such difference means the cached rows sit on a
+    different adjustment basis than the new ones and must be replaced."""
+    both = cached[["symbol", "date", "close"]].merge(
+        fresh[["symbol", "date", "close"]], on=["symbol", "date"], suffixes=("_old", "_new"))
+    if both.empty:
+        return []
+    rel = (both["close_new"] / both["close_old"] - 1).abs()
+    bad = both.loc[(rel > tol) | rel.isna(), "symbol"]
+    return sorted(set(bad))
+
+
+def _restate(symbols: list[str], start: date) -> pd.DataFrame:
+    """Full-history download for symbols whose adjustment basis changed. Empty
+    frame (and a warning) when it fails: the caller then keeps the old rows."""
+    if not symbols:
+        return pd.DataFrame(columns=["symbol", "date", *FIELDS, "fetched_at"])
+    log.info("price basis changed for %s; re-downloading full history", symbols)
+    try:
+        return download(symbols, start)
+    except Exception as e:  # never splice two bases together
+        log.warning("full re-download of %s failed (%s); keeping cached history", symbols, e)
+        return pd.DataFrame(columns=["symbol", "date", *FIELDS, "fetched_at"])
+
+
 def refresh(data_dir: Path = DEFAULT_DIR, start: date = date(2014, 1, 1), lookback_days: int = 10) -> pd.DataFrame:
     """Incrementally update the cache. Re-downloads the last ``lookback_days``
-    to pick up late corrections; full download when the cache is missing."""
+    to pick up late corrections; full download when the cache is missing.
+
+    Adjusted prices change retroactively (splits, dividends), so the overlap
+    between cache and download is compared per symbol; a symbol whose overlap
+    disagrees gets its full history re-downloaded and replaced, never spliced.
+    ``fetched_at`` stays per row: untouched cached rows keep their own stamp."""
     data_dir.mkdir(parents=True, exist_ok=True)
     path = data_dir / "ohlcv.parquet"
     if path.exists():
         cached = pd.read_parquet(path)
         missing = sorted(set(ALL_SYMBOLS) - set(cached["symbol"]))
-        since = (cached["date"].max() - pd.Timedelta(days=lookback_days)).date()
-        parts = [cached[cached["date"] < pd.Timestamp(since)], download(ALL_SYMBOLS, since)]
+        since = pd.Timestamp((cached["date"].max() - pd.Timedelta(days=lookback_days)).date())
+        fresh = download(ALL_SYMBOLS, since.date())
+        stale = restated_symbols(cached[cached["date"] >= since], fresh)
+        full = _restate(stale, start)
+        redone = set(full["symbol"])
+        # restated symbols take their whole history from the full download; one
+        # that could not be restated keeps its old, internally consistent rows
+        # and gets none of the new-basis ones
+        keep = cached[(cached["date"] < since) | cached["symbol"].isin(set(stale) - redone)]
+        keep = keep[~keep["symbol"].isin(redone)]
+        parts = [keep, fresh[~fresh["symbol"].isin(stale)], full]
         if missing:
             parts.append(download(missing, start))
-        merged = pd.concat(parts, ignore_index=True)
+        merged = pd.concat([p for p in parts if not p.empty], ignore_index=True)
     else:
         merged = download(ALL_SYMBOLS, start)
     merged = merged.drop_duplicates(["symbol", "date"], keep="last").sort_values(["symbol", "date"])

@@ -1,6 +1,8 @@
 """Backtest = replay engine.morning/evening over history. No fitting happens
 here (rules are fixed a priori), so there is no train/test split to leak; the
-leak risk is indicator look-ahead, covered by tests/desk/test_leak.py."""
+leak risk is indicator look-ahead, covered by
+tests/desk/test_desk.py::test_indicators_have_no_lookahead and
+test_signals_identical_on_truncated_history."""
 from __future__ import annotations
 
 import numpy as np
