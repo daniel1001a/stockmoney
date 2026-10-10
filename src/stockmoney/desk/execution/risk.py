@@ -32,6 +32,7 @@ MIN_ORDER_NOTIONAL = 1.0  # a buy resized below this is blocked instead
 CRYPTO_SELL_TOL = 1e-6
 EQUITY_SELL_TOL = 1e-9
 HWM_KEY = "equity_hwm"
+HWM_BUDGET_KEY = "equity_hwm_budget"  # the capital_budget the stored peak was measured against
 SLEEVE_PEAK_KEY = "sleeve_peak_pnl:"
 
 
@@ -39,7 +40,7 @@ SLEEVE_PEAK_KEY = "sleeve_peak_pnl:"
 class Limits:
     capital_budget: float = 50_000      # the system treats only this much as its own money
     max_order_notional_pct: float = 0.25
-    max_position_pct: float = 0.25
+    max_position_pct: float = 0.20      # OPERATING_PLAN.md: at most 20% of equity in one name
     max_gross_exposure_pct: float = 1.0
     max_crypto_exposure_pct: float = 0.30
     max_orders_per_run: int = 20
@@ -61,6 +62,23 @@ class RiskEngine:
         self.limits = limits
         self.con = con
         self.ledger = Ledger(con)  # also creates the ledger/risk tables
+        # Notional of buys already sent during this run (one engine = one run).
+        # Added to existing exposure so caps hold across several orders that
+        # are all checked against the same start-of-run snapshot.
+        self._pending: dict[str, float] = {}
+        self._pending_crypto: dict[str, bool] = {}
+
+    def reserve(self, intent: OrderIntent, price: float) -> None:
+        """Record a buy that was just submitted so later checks in the same run
+        count it toward the per-position, gross and crypto caps."""
+        if intent.side != Side.BUY:
+            return
+        n = intent.qty * price if intent.qty is not None else intent.notional
+        if not (_is_num(n) and n > 0):
+            return
+        key = norm(intent.symbol)
+        self._pending[key] = self._pending.get(key, 0.0) + n
+        self._pending_crypto[key] = intent.asset_class == AssetClass.CRYPTO
 
     # ------------------------------------------------------------ equity
     @staticmethod
@@ -73,8 +91,17 @@ class RiskEngine:
 
     def high_water_mark(self, equity: float | None = None) -> float:
         """Persisted equity peak (starts at capital_budget). Passing the current
-        equity raises and persists the peak when it is exceeded."""
+        equity raises and persists the peak when it is exceeded. A peak that
+        was measured against a different capital_budget is discarded and the
+        peak restarts at the current budget."""
+        budget = repr(float(self.limits.capital_budget))
         raw = self.ledger.get_state(HWM_KEY)
+        stored_budget = self.ledger.get_state(HWM_BUDGET_KEY)
+        if stored_budget is None:
+            self.ledger.set_state(HWM_BUDGET_KEY, budget)  # legacy peak: adopt it for the current budget
+        elif stored_budget != budget:
+            raw = None
+            self.ledger.set_state(HWM_BUDGET_KEY, budget)
         hwm = float(raw) if raw is not None else self.limits.capital_budget
         if equity is not None and equity > hwm:
             hwm = equity
@@ -140,15 +167,20 @@ class RiskEngine:
         for p in snapshot.positions:
             values[norm(p.symbol)] = abs(p.market_value) if p.market_value else abs(p.qty * p.current_price)
             crypto[norm(p.symbol)] = p.asset_class == AssetClass.CRYPTO
+        for key, n in self._pending.items():
+            values[key] = values.get(key, 0.0) + n
+            crypto[key] = crypto.get(key, False) or self._pending_crypto.get(key, False)
         gross = sum(values.values())
         return values, gross, sum(v for k, v in values.items() if crypto[k])
 
     # --------------------------------------------------------------- check
     def check(self, intent: OrderIntent, snapshot: AccountSnapshot, ref_price: float,
               orders_this_run: int, market_price: float | None = None) -> RiskDecision:
-        """``ref_price``: the reference price for sizing and the price band
-        (previous close / signal price). ``market_price`` (optional): a live
-        quote; for buys it is also held against the band."""
+        """``ref_price``: the reference price for the price band (previous
+        close / signal price) and for sizing. ``market_price`` (optional): a
+        live quote; for buys it is held against the band and, when valid, it
+        replaces ref_price for sizing, so caps are measured at the price the
+        order will actually pay."""
         if (intent.qty is None) == (intent.notional is None):
             return self._block("invalid intent: exactly one of qty/notional must be set")
         if (intent.qty if intent.qty is not None else intent.notional) <= 0:
@@ -229,10 +261,11 @@ class RiskEngine:
                 return self._block(f"buy blocked: {v}")
 
         equity = self.system_equity(snapshot)
-        if equity <= 0:
+        if not _is_num(equity) or equity <= 0:
             return self._block(f"buy blocked: system equity {equity:,.0f} <= 0")
+        price = market_price if (_is_num(market_price) and market_price > 0) else ref_price
         values, gross, crypto_exp = self._exposure(snapshot)
-        n0 = intent.qty * ref_price if intent.qty is not None else intent.notional
+        n0 = intent.qty * price if intent.qty is not None else intent.notional
         n = n0
         cuts: list[str] = []
         if md == "reduced":
@@ -255,7 +288,7 @@ class RiskEngine:
             if n > room * (1 + 1e-9):
                 n = room
                 cuts.append(f"cut to {room:,.0f} by {label} cap ({desc})")
-        return self._finish_buy(intent, ref_price, n0, n, cuts)
+        return self._finish_buy(intent, price, n0, n, cuts)
 
     def _finish_buy(self, intent: OrderIntent, ref_price: float, n0: float, n: float,
                     cuts: list[str]) -> RiskDecision:

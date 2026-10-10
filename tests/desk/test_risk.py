@@ -119,7 +119,7 @@ def test_hwm_uses_ledger_equity_and_persists(make_engine, broker, hold):
 
 def test_system_equity_ignores_broker_equity(make_engine, broker, hold):
     broker.cash = 100_000.0  # paper account is much richer than the budget
-    e = make_engine()
+    e = make_engine(max_position_pct=0.25)  # isolate the per-order cap
     snap = broker.account()
     assert snap.equity == 100_000.0
     assert e.system_equity(snap) == pytest.approx(50_000)
@@ -141,12 +141,12 @@ def test_per_order_cap_allows_small(make_engine, broker):
 
 
 def test_notional_order_resized_to_cap(make_engine, broker):
-    d = decide(make_engine(), broker, buy(notional=30_000))
+    d = decide(make_engine(max_position_pct=0.25), broker, buy(notional=30_000))
     assert d.allow and d.intent.notional == pytest.approx(12_500) and d.intent.qty is None
 
 
 def test_whole_shares_stay_whole(make_engine, broker):
-    d = decide(make_engine(), broker, buy(qty=200), ref=99.0)  # 12,500/99 = 126.26
+    d = decide(make_engine(max_position_pct=0.25), broker, buy(qty=200), ref=99.0)  # 12,500/99 = 126.26
     assert d.allow and d.intent.qty == 126
 
 
@@ -158,7 +158,7 @@ def test_resize_to_nothing_is_blocked(make_engine, broker):
 # ----------------------------------------------------------- per-position
 def test_per_position_cap_resizes(make_engine, broker, hold):
     hold("AAPL", "breakout", 100)  # 10k held; cap 12.5k -> room 2.5k
-    d = decide(make_engine(), broker, buy(qty=50))
+    d = decide(make_engine(max_position_pct=0.25), broker, buy(qty=50))
     assert d.allow and d.intent.qty == 25 and "per-position" in d.reason
 
 
@@ -184,7 +184,7 @@ def test_gross_cap_blocks_when_full(make_engine, broker, hold):
 
 
 def test_gross_cap_resizes_to_room(make_engine, broker, hold):
-    e = make_engine(max_gross_exposure_pct=0.4)
+    e = make_engine(max_gross_exposure_pct=0.4, max_position_pct=0.25)
     hold("AAPL", "breakout", 100)
     d = decide(e, broker, buy("NVDA", qty=120, strategy="rotation"))  # room 10k
     assert d.allow and d.intent.qty == 100 and "gross" in d.reason
@@ -380,7 +380,7 @@ def test_default_limits_match_spec():
     l = Limits()
     assert (l.capital_budget, l.max_order_notional_pct, l.max_position_pct, l.max_gross_exposure_pct,
             l.max_crypto_exposure_pct, l.max_orders_per_run, l.price_band_equity, l.price_band_crypto,
-            l.dd_reduce, l.dd_halt) == (50_000, 0.25, 0.25, 1.0, 0.30, 20, 0.10, 0.20, 0.20, 0.35)
+            l.dd_reduce, l.dd_halt) == (50_000, 0.25, 0.20, 1.0, 0.30, 20, 0.10, 0.20, 0.20, 0.35)
 
 
 def test_resized_intent_is_new_object_and_original_untouched(make_engine, broker):

@@ -17,6 +17,42 @@ def signal_id(s: Signal) -> str:
     return hashlib.sha1(f"{s.strategy}|{s.symbol}|{s.date.date()}".encode()).hexdigest()[:12]
 
 
+# Tie-break when two signals rank equally: earlier in this tuple wins.
+STRATEGY_ORDER = ("breakout", "pullback", "rotation")
+
+
+def rank_signals(signals: list[Signal]) -> list[Signal]:
+    """Order signals for slot allocation, one signal per symbol.
+
+    Raw scores are in different units per strategy (rotation's momentum score
+    would always beat a breakout's), so each signal is ranked by the
+    percentile of its score within its own strategy (best = 1.0) and the
+    strategies interleave on that scale. Ties go to STRATEGY_ORDER, then the
+    raw score, then the symbol, so the order is deterministic. When several
+    strategies signal one symbol only the best-ranked signal is kept."""
+    by_strat: dict[str, list[Signal]] = {}
+    for s in signals:
+        by_strat.setdefault(s.strategy, []).append(s)
+    pct: dict[int, float] = {}
+    for group in by_strat.values():
+        ranks = pd.Series([s.score for s in group], dtype=float).rank(method="max", pct=True)
+        for s, r in zip(group, ranks):
+            pct[id(s)] = 0.0 if pd.isna(r) else float(r)
+
+    def order(s: Signal):
+        o = STRATEGY_ORDER.index(s.strategy) if s.strategy in STRATEGY_ORDER else len(STRATEGY_ORDER)
+        score = s.score if pd.notna(s.score) else float("-inf")
+        return (-pct[id(s)], o, s.strategy, -score, s.symbol)
+
+    out, seen = [], set()
+    for s in sorted(signals, key=order):
+        if s.symbol in seen:
+            continue
+        seen.add(s.symbol)
+        out.append(s)
+    return out
+
+
 def day_context(ind: Ind, t: pd.Timestamp) -> Context:
     return build_context(ind, t, market_state(ind, t))
 
@@ -56,10 +92,11 @@ def evening(
     per_sector: dict[str | None, int] = {}
     for sym in held:
         per_sector[sector_of(sym)] = per_sector.get(sector_of(sym), 0) + 1
-    for s in sorted(signals, key=lambda s: -s.score):
+    planned: set[str] = set()  # one symbol takes at most one slot, whichever strategy signals it
+    for s in rank_signals([s for s in signals if s.strategy in strategies]):
         if slots <= 0:
             break
-        if s.symbol in acct.positions or s.strategy not in strategies:
+        if s.symbol in acct.positions or s.symbol in planned:
             continue
         sec = sector_of(s.symbol)
         if per_sector.get(sec, 0) >= acct.max_per_sector:
@@ -68,6 +105,7 @@ def evening(
         if shares <= 0:
             continue
         invested += shares * s.ref_price
+        planned.add(s.symbol)
         slots -= 1
         per_sector[sec] = per_sector.get(sec, 0) + 1
         new.append(

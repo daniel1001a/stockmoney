@@ -19,6 +19,7 @@ import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
+from stockmoney.desk.execution.symbols import from_broker
 from stockmoney.desk.execution.types import Side
 
 QTY_EPS = 1e-9  # below this a position counts as closed
@@ -45,8 +46,9 @@ class SleeveConflict(LedgerError):
 
 
 def norm(symbol: str) -> str:
-    """Comparison key: 'BTC/USD' and 'BTCUSD' are the same instrument."""
-    return symbol.replace("/", "").upper()
+    """Comparison key: 'BTC/USD' and 'BTCUSD' are the same instrument, and so
+    are the universe spelling 'BRK-B' and the broker spelling 'BRK.B'."""
+    return from_broker(symbol).replace("/", "").upper()
 
 
 def is_crypto_symbol(symbol: str) -> bool:

@@ -148,7 +148,11 @@ def planned_book(tmp_path):
 def test_premarket_order_type_depends_on_clock(planned_book, hour, minute, tif):
     con, broker, nxt, limits = planned_book
     run.premarket(con, broker, _at(nxt, hour, minute), limits)
-    assert broker.orders and {o.tif.value for o in broker.orders.values()} == {tif}
+    entries = [o for o in broker.orders.values() if o.order_type == OrderType.MARKET]
+    assert entries and {o.tif.value for o in entries} == {tif}
+    if tif == "day":  # a late run fills at once and must protect the fills right away
+        stops = {o.symbol for o in broker.open_orders() if o.order_type == OrderType.STOP}
+        assert stops == {o.symbol for o in entries}
 
 
 def test_premarket_drops_entries_after_cutoff(planned_book):
