@@ -15,6 +15,7 @@ Rules:
 """
 from __future__ import annotations
 
+import math
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -106,12 +107,28 @@ class Ledger:
     # ---------------------------------------------------------------- fills
     def apply_fill(self, *, client_order_id: str, symbol: str, strategy: str, side: Side,
                    qty: float, price: float, filled_at: str | None = None,
-                   stop: float | None = None) -> bool:
+                   stop: float | None = None, cumulative: bool = False) -> bool:
         """Record one completed fill. Returns False (no-op) if this
         client_order_id was already recorded. Raises on rule violations
-        (strategy conflict, oversell) without writing anything."""
+        (strategy conflict, oversell) without writing anything.
+
+        ``cumulative=True``: ``qty``/``price`` are the order's cumulative
+        filled qty and average price so far (a partial fill, as the broker
+        reports it). Only the part not yet booked for this order is added;
+        the idempotency key is client_order_id plus that cumulative qty (the
+        first booking of an order keeps the plain client_order_id)."""
         if qty <= 0 or price <= 0:
             raise LedgerError(f"fill needs qty>0 and price>0, got qty={qty} price={price}")
+        if cumulative:
+            done_qty, done_cost = self.booked(client_order_id)
+            delta = qty - done_qty
+            if delta <= QTY_EPS:
+                return False
+            if done_qty > QTY_EPS:
+                px = (qty * price - done_cost) / delta
+                price = px if math.isfinite(px) and px > 0 else price
+                client_order_id = f"{client_order_id}#{qty:g}"
+            qty = delta
         seen = self.con.execute("SELECT 1 FROM fills WHERE client_order_id=?", (client_order_id,)).fetchone()
         if seen:
             return False
@@ -153,6 +170,15 @@ class Ledger:
                 "VALUES (?,?,?,?,?,?,?,?,?)",
                 (client_order_id, symbol, owner, side.value, qty, price, filled_at, realized, _now()))
         return True
+
+    def booked(self, client_order_id: str) -> tuple[float, float]:
+        """(qty, qty * price) already booked for one broker order, over its
+        plain row and every ``<id>#<cumulative qty>`` partial-fill row."""
+        r = self.con.execute(
+            "SELECT COALESCE(SUM(qty),0), COALESCE(SUM(qty*price),0) FROM fills "
+            "WHERE client_order_id=? OR substr(client_order_id, 1, ?)=?",
+            (client_order_id, len(client_order_id) + 1, client_order_id + "#")).fetchone()
+        return float(r[0]), float(r[1])
 
     # ------------------------------------------------------------------ P&L
     def realized_pnl(self, strategy: str | None = None) -> float:

@@ -25,7 +25,7 @@ from stockmoney.desk.execution.types import (
 from test_desk import synthetic_bars
 from test_run_safety import PLAN_DAY, WED, _at, _bars_and_broker, hold, market_orders, plan, sig, stops
 
-OPEN_STATES = (OrderStatus.NEW, OrderStatus.PENDING, OrderStatus.PARTIALLY_FILLED)
+OPEN_STATES = (OrderStatus.NEW, OrderStatus.PENDING, OrderStatus.PARTIALLY_FILLED, OrderStatus.PENDING_CANCEL)
 
 
 @pytest.fixture(autouse=True)

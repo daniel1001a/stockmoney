@@ -1,6 +1,6 @@
 #!/bin/zsh
 # Wrapper used by launchd: loads .env, runs one desk job, appends to a dated log.
-# Usage: scripts/desk_job.sh <premarket|postopen|postclose|crypto|bridge>
+# Usage: scripts/desk_job.sh <premarket|postopen|postclose|recover|crypto|bridge>
 set -u
 ROOT="${0:A:h:h}"
 cd "$ROOT" || exit 1

@@ -26,7 +26,7 @@ from test_desk import synthetic_bars
 
 PLAN_DAY = "2026-09-08"  # a Tuesday
 WED = datetime(2026, 9, 9, 8, 45, tzinfo=run.ET)
-OPEN_STATES = (OrderStatus.NEW, OrderStatus.PENDING, OrderStatus.PARTIALLY_FILLED)
+OPEN_STATES = (OrderStatus.NEW, OrderStatus.PENDING, OrderStatus.PARTIALLY_FILLED, OrderStatus.PENDING_CANCEL)
 
 
 @pytest.fixture(autouse=True)

@@ -26,11 +26,14 @@ JOBS = {
     "postclose": {"times": [(16, 45)], "weekdays": True},  # reconcile, trail stops, new signals, report
     "crypto": {"times": [(20, 0)], "weekdays": False},     # daily crypto sleeve, 7 days
     "bridge": {"interval": 900},                           # poll Muse every 15 minutes
+    # launchd replays a missed calendar job after sleep but not after a power-off;
+    # at every load (boot, login, install) recover books fills and restores stops
+    "recover": {"run_at_load": True},
 }
 
 
 # bridge needs the Muse mailbox configured; crypto is a Phase 1 placeholder. Both are opt-in.
-DEFAULT_JOBS = ["premarket", "postopen", "postclose"]
+DEFAULT_JOBS = ["premarket", "postopen", "postclose", "recover"]
 
 
 def plist(name: str, spec: dict) -> dict:
@@ -41,7 +44,9 @@ def plist(name: str, spec: dict) -> dict:
         "StandardOutPath": str(ROOT / f"data/desk/logs/launchd-{name}.out"),
         "StandardErrorPath": str(ROOT / f"data/desk/logs/launchd-{name}.err"),
     }
-    if "interval" in spec:
+    if spec.get("run_at_load"):
+        d["RunAtLoad"] = True
+    elif "interval" in spec:
         d["StartInterval"] = spec["interval"]
     else:
         days = WEEKDAYS if spec["weekdays"] else [None]

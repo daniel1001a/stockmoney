@@ -233,7 +233,7 @@ def test_crypto_notional_request():
     ("expired", OrderStatus.EXPIRED),
     ("accepted", OrderStatus.PENDING),
     ("pending_new", OrderStatus.PENDING),
-    ("pending_cancel", OrderStatus.PENDING),
+    ("pending_cancel", OrderStatus.PENDING_CANCEL),
     ("pending_replace", OrderStatus.PENDING),
     ("done_for_day", OrderStatus.PENDING),
     ("replaced", OrderStatus.PENDING),

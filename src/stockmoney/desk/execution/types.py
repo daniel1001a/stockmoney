@@ -44,7 +44,8 @@ class OrderStatus(str, Enum):
     CANCELED = "canceled"
     REJECTED = "rejected"
     EXPIRED = "expired"
-    PENDING = "pending"  # any not-yet-accepted state
+    PENDING = "pending"  # accepted / pending_new / other non-final states; still a live order
+    PENDING_CANCEL = "pending_cancel"  # a cancel was requested: not live, but it can still fill
 
 
 @dataclass(frozen=True)

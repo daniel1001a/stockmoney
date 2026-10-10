@@ -82,7 +82,7 @@ def test_fake_async_cancel_keeps_shares_reserved_until_settle():
                        tif=TIF.GTC, stop_price=90.0)
     b.submit(stop)
     b.cancel("s0")
-    assert b.get_order("s0").status == OrderStatus.PENDING
+    assert b.get_order("s0").status == OrderStatus.PENDING_CANCEL
     assert [o.client_order_id for o in b.open_orders()] == ["s0"]
     with pytest.raises(Exception, match="insufficient qty"):
         b.submit(OrderIntent("s1", "AAPL", AssetClass.EQUITY, Side.SELL, qty=10, order_type=OrderType.STOP,

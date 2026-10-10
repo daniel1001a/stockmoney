@@ -25,11 +25,13 @@ Design notes:
     free data plan may query; US feed for crypto).
 
 Order status mapping (Alpaca -> OrderStatus). Everything not listed maps to
-PENDING (accepted, pending_new, pending_cancel, pending_replace, pending_review,
+PENDING (accepted, pending_new, pending_replace, pending_review,
 accepted_for_bidding, done_for_day, replaced, stopped, suspended, calculated,
-held):
+held); a PENDING order is still working (a stop placed after the close stays
+``accepted`` until the next open):
     new -> NEW, partially_filled -> PARTIALLY_FILLED, filled -> FILLED,
-    canceled -> CANCELED, rejected -> REJECTED, expired -> EXPIRED
+    canceled -> CANCELED, rejected -> REJECTED, expired -> EXPIRED,
+    pending_cancel -> PENDING_CANCEL (no longer protects, may still fill)
 """
 from __future__ import annotations
 
@@ -83,6 +85,7 @@ _STATUS_MAP = {
     AlpacaOrderStatus.CANCELED: OrderStatus.CANCELED,
     AlpacaOrderStatus.REJECTED: OrderStatus.REJECTED,
     AlpacaOrderStatus.EXPIRED: OrderStatus.EXPIRED,
+    AlpacaOrderStatus.PENDING_CANCEL: OrderStatus.PENDING_CANCEL,
 }
 _TERMINAL = frozenset({OrderStatus.FILLED, OrderStatus.CANCELED, OrderStatus.REJECTED, OrderStatus.EXPIRED})
 _TRANSIENT_HTTP = frozenset({429, 500, 502, 503, 504})
@@ -421,16 +424,24 @@ class AlpacaBroker:
         return [self._map_order(o) for o in orders]
 
     def cancel(self, client_order_id: str) -> None:
+        """Request a cancel. Returns without raising when the order is already
+        terminal or already being cancelled, and when a 404/422 answer shows
+        the order is in flight (accepted, pending_new, pending_cancel): the
+        caller polls get_order for the outcome. A 404/422 on an order that is
+        still plainly working (new, partially_filled) is raised."""
         order = self.get_order(client_order_id)
-        if order is None or order.status in _TERMINAL:
+        if order is None or order.status in _TERMINAL or order.status == OrderStatus.PENDING_CANCEL:
             return
         try:
             self._retry(lambda: self._client.cancel_order_by_id(order.broker_order_id), "cancel_order_by_id")
         except APIError as e:
-            # Raced with a fill/expiry: fine if the order is now terminal, otherwise surface it.
+            # Raced with a fill/expiry, or the order is between states: re-read it.
             if _api_status(e) in (404, 422):
                 again = self.get_order(client_order_id)
-                if again is None or again.status in _TERMINAL:
+                if again is None or again.status in _TERMINAL or again.status in (
+                        OrderStatus.PENDING_CANCEL, OrderStatus.PENDING):
+                    log.warning("cancel %s answered %s, order is %s; the caller polls for the outcome",
+                                client_order_id, _api_status(e), again.status.value if again else "gone")
                     return
             raise
 
