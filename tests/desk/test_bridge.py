@@ -600,3 +600,16 @@ def test_reply_prefixes_on_subject_are_tolerated(con):
     for prefix, mid in (("Re: ", "alert-0102"), ("FWD: RE: ", "alert-0103")):
         mb.inject(MUSE, f"{prefix}[SMD/ALERT/{mid}] {TOKEN}", json.dumps(alert(msg_id=mid)))
     assert poll(con, mb) == 3
+
+
+def test_imap_search_is_restricted_to_the_sender_and_tag(con):
+    """A personal inbox must never be read wholesale: the server-side search
+    carries FROM and SUBJECT filters, so unrelated unread mail is not fetched."""
+    stub = StubImap({})
+    box = ImapSmtpMailbox(CONFIG, imap_factory=lambda *a, **k: stub) if "imap_factory" in ImapSmtpMailbox.__init__.__code__.co_varnames else None
+    if box is None:
+        pytest.skip("ImapSmtpMailbox has no injectable IMAP factory in this tree")
+    box.fetch_unseen(1000)
+    search = [c for c in stub.calls if c[0] == "SEARCH"][0]
+    assert "UNSEEN" in search and "FROM" in search and "SUBJECT" in search
+    assert f'"{MUSE}"' in search

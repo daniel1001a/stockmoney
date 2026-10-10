@@ -232,12 +232,19 @@ class ImapSmtpMailbox:
 
     # -- Mailbox protocol
     def fetch_unseen(self, max_bytes: int) -> list[RawMail]:
-        """Unread mail in INBOX. Uses BODY.PEEK so nothing is marked seen until
-        ``mark_seen``. Messages larger than ``max_bytes`` are not downloaded."""
+        """Unread bridge mail in INBOX (from the configured sender, subject tagged
+        SMD). Uses BODY.PEEK so nothing is marked seen until ``mark_seen``.
+        Messages larger than ``max_bytes`` are not downloaded."""
         imap = self._conn()
-        typ, data = imap.uid("SEARCH", None, "UNSEEN")
+        # Server-side filter: only unread mail FROM the configured sender whose
+        # subject carries the bridge tag. The mailbox may be a personal inbox;
+        # everything else is never downloaded, stored or marked read.
+        sender = self.config.muse_address.replace('"', "").replace("\\", "").strip()
+        if not sender:
+            raise imaplib.IMAP4.error("MUSE_ADDRESS is required to search the mailbox")
+        typ, data = imap.uid("SEARCH", None, "UNSEEN", "FROM", f'"{sender}"', "SUBJECT", '"SMD"')
         if typ != "OK":
-            raise imaplib.IMAP4.error("UID SEARCH UNSEEN failed")
+            raise imaplib.IMAP4.error("UID SEARCH failed")
         uids = [u.decode("ascii") for u in (data[0] or b"").split()]
         out: list[RawMail] = []
         for uid in uids:
