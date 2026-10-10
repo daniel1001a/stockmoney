@@ -27,9 +27,9 @@ def test_desk_examples_valid_and_cover_all_types():
 
 def test_prompt_keeps_placeholders_and_core_rules():
     text = DOC.read_text()
-    assert all(ph in text for ph in ("<密鑰>", "<測試通道>", "<TO_DESK>", "<TO_MUSE>", "<通知管道>"))
+    assert all(ph in text for ph in ("<密鑰>", "<DESK信箱>", "<通知管道>"))
     for needle in ("[SMD/<類型>/<訊息編號>]", "BTC/USD", "200KB", "通知管道", "不要交易", "America/New_York",
-                   "不要發文", "抽樣計數", "沒通過就在這裡停止"):
+                   "不要發文", "抽樣計數", "批次寄送", "純文字", "ntfy"):
         assert needle in text
     # WhatsApp may only appear in the correction table and cleanup step (as the thing being retracted)
     assert text.split("`````")[1].count("WhatsApp") == 3

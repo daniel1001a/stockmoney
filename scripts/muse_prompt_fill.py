@@ -31,9 +31,7 @@ def main() -> int:
     env = load_env(ROOT / ".env")
     values = {
         "<密鑰>": env.get("MUSE_SHARED_TOKEN", ""),
-        "<測試通道>": env.get("NTFY_TEST_TO_DESK", ""),
-        "<TO_DESK>": env.get("NTFY_BRIDGE_TO_DESK", ""),
-        "<TO_MUSE>": env.get("NTFY_BRIDGE_TO_MUSE", ""),
+        "<DESK信箱>": env.get("DESK_MAIL_ADDRESS", ""),
         "<通知管道>": env.get("MUSE_CHANNEL", "Muse app 裡跟我的對話"),
     }
     missing = [k for k, v in values.items() if not v]
@@ -46,7 +44,7 @@ def main() -> int:
     body = text[start:end]
     for placeholder, value in values.items():
         body = body.replace(placeholder, value)
-    leftover = re.findall(r"<(?:密鑰|測試通道|TO_DESK|TO_MUSE|通知管道)>", body)
+    leftover = re.findall(r"<(?:密鑰|DESK信箱|通知管道)>", body)
     if leftover:
         print("仍有未填的佔位符:", set(leftover), file=sys.stderr)
         return 3
