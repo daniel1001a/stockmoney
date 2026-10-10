@@ -66,11 +66,32 @@ JSON_INVALID_FIX = (
 )
 
 
+def fields_hint(reason: str) -> str:
+    """For a schema rejection that names a message type (loc 'ALERT.ticker'),
+    list that type's required and optional top-level fields from the real
+    model, so the sender can fix a missing or misplaced field without guessing."""
+    import re
+    from stockmoney.desk.bridge.schema import Alert, Calls, Idea, ResearchReply, SocialDaily
+    models = {"SOCIAL_DAILY": SocialDaily, "CALLS": Calls, "ALERT": Alert,
+              "RESEARCH_REPLY": ResearchReply, "IDEA": Idea}
+    m = re.match(r"schema_invalid\s+([A-Z_]+)\.", reason)
+    model = models.get(m.group(1)) if m else None
+    if model is None:
+        return ""
+    required = [n for n, f in model.model_fields.items() if f.is_required() or n == "type"]
+    optional = [n for n, f in model.model_fields.items() if n not in required]
+    return (f"{m.group(1)} 的頂層必填欄位:{', '.join(required)};選填:{', '.join(optional) or '無'}。"
+            "多出範例沒有的欄位(extra_forbidden)與缺少必填欄位(missing)都會被拒絕;"
+            "別的類型的欄位不能搬過來用。")
+
+
 def fix_for(reason: str) -> str:
     """The correction text for a stored reject reason."""
     if "json_invalid" in reason:
         return JSON_INVALID_FIX
-    return FIXES[reason.split(" ")[0]]
+    base = FIXES[reason.split(" ")[0]]
+    hint = fields_hint(reason)
+    return f"{hint} {base}" if hint else base
 
 
 # Hard ceiling on correction mail so that no loop, whatever its cause, can

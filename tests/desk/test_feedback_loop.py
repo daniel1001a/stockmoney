@@ -187,3 +187,15 @@ def test_active_flags_does_not_rescan_old_messages(con, monkeypatch):
     flags = policy.active_flags(con, NOW, held=())
     assert "NVDA" in flags.blocked
     assert len(seen) == 1  # only the recent row was read and parsed
+
+
+
+def test_feedback_lists_the_fields_of_the_rejected_type():
+    from stockmoney.desk.muse_ops import fix_for
+    reason = ("schema_invalid ALERT.window_start:extra_forbidden; ALERT.window_end:extra_forbidden; "
+              "ALERT.ticker:missing; ALERT.observed_at:missing")
+    text = fix_for(reason)
+    for name in ("ticker", "severity", "headline", "source_urls", "observed_at"):
+        assert name in text.split("選填")[0]
+    assert "window_start" not in text.split("選填")[0]
+    assert len(text) < 1000  # fits the FEEDBACK how_to_fix limit
