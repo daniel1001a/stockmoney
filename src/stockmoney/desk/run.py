@@ -12,14 +12,19 @@ Flow of one stock trade:
   premarket(T+1) Muse flags + risk check -> OPG market buy      [submitted]
   postopen(T+1)  fill -> ledger; GTC stop placed at broker      [ledger, position_meta]
   postclose(...) trail the stop up; rule exit -> planned sell
-  premarket      cancel stop, OPG market sell
+  premarket      cancel stop, OPG market sell (exits never expire; a failed
+                 exit re-places its stop and is retried), then a stop pass
+                 over every other held symbol, then entries
 The broker holds the truth. A reconcile mismatch halts new entries and pages
 the owner; exits and protective stops keep running for every symbol that still
-reconciles (a mismatched symbol is left alone for a human).
+reconciles (a mismatched symbol is left alone for a human). Postopen and
+postclose end by cancelling any sell stop for a symbol the ledger does not hold.
 
-Crash safety: every broker side effect (submit, cancel) is committed to the
-database right after it happens, so a later exception cannot roll back the
-record of an order the broker already holds. Jobs never run concurrently (an
+Crash safety: an order is written to ``submitted`` as ``pending_submit`` and
+committed before broker.submit is called (sync_fills resolves such rows by
+client_order_id), and a cancel is committed right after it happens, so neither
+a crash nor a later exception can lose the record of an order the broker
+already holds. Jobs never run concurrently (an
 exclusive lock on data/desk/run.lock), and a job that exceeds JOB_TIMEOUT_S is
 aborted with JobTimeout, a BaseException that no retry layer can swallow.
 """
@@ -42,6 +47,7 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 
 from stockmoney.desk import data, engine, notify, store
+from stockmoney.desk.calendar import is_trading_day
 from stockmoney.desk.execution.broker import Broker
 from stockmoney.desk.execution.ledger import Ledger, norm
 from stockmoney.desk.execution.reconcile import mismatches
@@ -63,6 +69,9 @@ CANCEL_WAIT_S = 20.0     # how long to wait for an asynchronous cancel or fill t
 LOCK_PATH = Path("data/desk/run.lock")
 LOCK_WAIT_S = 300.0      # a job waits this long for the previous one, then gives up
 PLAN_THROUGH_KEY = "last_postclose_through"  # session date the newest valid plans were made from
+MAX_EXIT_ATTEMPTS = 3    # a failing exit is retried this many times per day, then left for a human
+PENDING_SUBMIT = "pending_submit"  # written before broker.submit; resolved by sync_fills
+NOT_SENT = "not_sent"    # a pending_submit row the broker never received
 
 # Stock-book sizing (backtested values; see docs/desk/OPERATING_PLAN.md)
 RISK_PER_TRADE = 0.0075
@@ -95,6 +104,7 @@ CREATE TABLE IF NOT EXISTS equity_history (
   date TEXT PRIMARY KEY, system_equity REAL, broker_equity REAL, mode TEXT, n_positions INTEGER,
   recorded_at TEXT);
 CREATE TABLE IF NOT EXISTS notified (key TEXT PRIMARY KEY, at TEXT);
+CREATE TABLE IF NOT EXISTS plan_attempts (key TEXT PRIMARY KEY, n INTEGER);
 """
 
 
@@ -188,26 +198,35 @@ def _last_complete(bars: data.Bars, now: datetime) -> pd.Timestamp:
     return last_complete_session(bars, now.astimezone(ET))
 
 
+def _broker_call(broker: Broker, fn, what: str):
+    """Run a direct client call through the broker's own retry layer when it
+    has one (AlpacaBroker._retry), so a transient error is retried like every
+    other broker read."""
+    retry = getattr(broker, "_retry", None)
+    return retry(fn, what) if callable(retry) else fn()
+
+
 def _last_closed_session(broker: Broker, now: datetime) -> str:
     """ISO date of the most recent regular session that has closed by ``now``.
-    Uses the broker's market calendar when it has one (Alpaca), else weekdays
-    (FakeBroker, or a calendar outage)."""
+    Uses the broker's market calendar when it has one (Alpaca), else the
+    built-in NYSE calendar (FakeBroker, or a calendar outage)."""
     et = now.astimezone(ET)
     client = getattr(broker, "client", None)
     if client is not None:
         try:
             from alpaca.trading.requests import GetCalendarRequest
-            cal = client.get_calendar(GetCalendarRequest(start=et.date() - timedelta(days=14), end=et.date()))
+            req = GetCalendarRequest(start=et.date() - timedelta(days=14), end=et.date())
+            cal = _broker_call(broker, lambda: client.get_calendar(req), "get_calendar")
             local = et.replace(tzinfo=None)  # the calendar's open/close are naive ET wall-clock times
             closed = [c.date for c in cal if c.close <= local]
             if closed:
                 return max(closed).isoformat()
         except Exception as e:
-            log.warning("market calendar unavailable, falling back to weekdays: %s", e)
+            log.warning("market calendar unavailable, falling back to the NYSE calendar: %s", e)
     d = et.date()
-    if not (d.weekday() < 5 and (et.hour, et.minute) >= SESSION_CLOSE):
+    if not (is_trading_day(d) and (et.hour, et.minute) >= SESSION_CLOSE):
         d -= timedelta(days=1)
-        while d.weekday() >= 5:
+        while not is_trading_day(d):
             d -= timedelta(days=1)
     return d.isoformat()
 
@@ -235,7 +254,7 @@ def sync_fills(con, broker: Broker, ledger: Ledger, day: str | None = None) -> l
     rows = con.execute("SELECT * FROM submitted WHERE recorded=0 ORDER BY submitted_at, client_order_id").fetchall()
     for r in rows:
         try:
-            ev = _sync_one(con, broker, ledger, r)
+            ev = _sync_one(con, broker, ledger, r, day)
             con.commit()
             if ev:
                 events.append(ev)
@@ -249,9 +268,15 @@ def sync_fills(con, broker: Broker, ledger: Ledger, day: str | None = None) -> l
     return events
 
 
-def _sync_one(con, broker: Broker, ledger: Ledger, r) -> str | None:
+def _sync_one(con, broker: Broker, ledger: Ledger, r, day: str) -> str | None:
     o = broker.get_order(r["client_order_id"])
     if o is None:
+        if r["status"] == PENDING_SUBMIT and _today(datetime.fromisoformat(r["submitted_at"])) < day:
+            # written ahead of a submit the broker never received (the call failed or the job died
+            # before it); a day later the broker would show it if it existed
+            con.execute("UPDATE submitted SET status=?, recorded=1 WHERE client_order_id=?",
+                        (NOT_SENT, r["client_order_id"]))
+            return f"未送達券商 {r['symbol']} {r['side']}({r['client_order_id']})"
         return None
     con.execute("UPDATE submitted SET status=? WHERE client_order_id=?", (o.status.value, r["client_order_id"]))
     if o.status not in _TERMINAL:
@@ -282,20 +307,28 @@ def _sync_one(con, broker: Broker, ledger: Ledger, r) -> str | None:
 
 def _submit(con, broker: Broker, intent: OrderIntent, kind: str, stop: float | None = None, *,
             plan=None, note: str = "", stop_for: str | None = None, day: str = ""):
-    """Send one order and commit its bookkeeping at once, so nothing that fails
-    later in the job can roll back the record of an order the broker already
-    holds. ``plan``: the planned_orders row to mark submitted. ``stop_for``:
-    the symbol whose position_meta.stop_order_id this order becomes."""
-    o = broker.submit(intent)
+    """Send one order with write-ahead bookkeeping: the ``submitted`` row (and
+    the stop id) is committed as ``pending_submit`` BEFORE the broker call, so a
+    crash between the call and the commit cannot orphan an order the broker
+    holds; sync_fills resolves the row by client_order_id. A retry with the
+    same id reuses the row (the broker side is idempotent on the id).
+    ``plan``: the planned_orders row to mark submitted. ``stop_for``: the
+    symbol whose position_meta.stop_order_id this order becomes."""
+    cid = intent.client_order_id
     con.execute(
-        "INSERT OR IGNORE INTO submitted (client_order_id, kind, symbol, asset_class, strategy, side, qty, stop, submitted_at, status) "
-        "VALUES (?,?,?,?,?,?,?,?,?,?)",
-        (intent.client_order_id, kind, intent.symbol, intent.asset_class.value, intent.strategy,
-         intent.side.value, intent.qty, stop, store.now(), o.status.value))
+        "INSERT INTO submitted (client_order_id, kind, symbol, asset_class, strategy, side, qty, stop, submitted_at, status) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?) ON CONFLICT(client_order_id) DO UPDATE SET qty=excluded.qty, stop=excluded.stop, "
+        "submitted_at=excluded.submitted_at, status=excluded.status, recorded=0 "
+        "WHERE submitted.status IN (?, ?)",
+        (cid, kind, intent.symbol, intent.asset_class.value, intent.strategy,
+         intent.side.value, intent.qty, stop, store.now(), PENDING_SUBMIT, PENDING_SUBMIT, NOT_SENT))
+    if stop_for is not None:
+        _set_stop_id(con, stop_for, cid, stop, day)
+    con.commit()
+    o = broker.submit(intent)
+    con.execute("UPDATE submitted SET status=? WHERE client_order_id=? AND recorded=0", (o.status.value, cid))
     if plan is not None:
         _mark(con, plan, "submitted", note)
-    if stop_for is not None:
-        _set_stop_id(con, stop_for, intent.client_order_id, stop, day)
     con.commit()
     return o
 
@@ -317,15 +350,20 @@ def ensure_stops(con, broker: Broker, ledger: Ledger, risk: RiskEngine, snap: Ac
     stop price. A stop whose price changed is replaced only after the broker
     confirms the old one is cancelled (a pending cancel still reserves the
     shares); an untracked stop is adopted or cancelled; a missing one is
-    re-created. ``skip``: normalized symbols that failed reconciliation and are
-    left for a human. One symbol's failure is reported and the rest continue."""
+    re-created. A recorded stop that is gone from the open orders is looked up
+    first: if it filled, the fill is booked and nothing new is placed for the
+    shares it sold. New stops are sized from a fresh broker position read made
+    just before the submit, never from ``snap`` (kept for the call signature).
+    ``skip``: normalized symbols that failed reconciliation or are being
+    exited, left alone here. One symbol's failure is reported and the rest
+    continue."""
     events = []
     open_orders = broker.open_orders()
     for sym, pos in ledger.positions().items():
         if "/" in sym or norm(sym) in skip:
             continue  # crypto stops are managed by the crypto job (Phase 1)
         try:
-            ev = _ensure_stop(con, broker, risk, snap, day, sym, pos, open_orders)
+            ev = _ensure_stop(con, broker, risk, day, sym, pos, open_orders)
         except Exception as e:
             con.commit()  # keep the record of whatever the broker already did
             log.exception("stop management failed for %s", sym)
@@ -335,8 +373,28 @@ def ensure_stops(con, broker: Broker, ledger: Ledger, risk: RiskEngine, snap: Ac
     return events
 
 
-def _ensure_stop(con, broker: Broker, risk: RiskEngine, snap: AccountSnapshot, day: str, sym: str, pos,
-                 open_orders: list[BrokerOrder]) -> str | None:
+def _stop_filled(con, broker: Broker, risk: RiskEngine, day: str, sym: str, depth: int) -> str:
+    """A stop of ``sym`` filled (fully or partly): book it now, forget the stop
+    id, and re-evaluate the position that is left (if any) once."""
+    events = sync_fills(con, broker, risk.ledger, day)
+    # UPDATE, not _set_stop_id: a closed position's meta row was deleted by the sync and must stay gone
+    con.execute("UPDATE position_meta SET stop_order_id=NULL WHERE symbol=?", (sym,))
+    con.commit()
+    msg = f"{sym} 停損單已成交,已同步入帳" + ("(" + ";".join(events) + ")" if events else "")
+    left = risk.ledger.position(sym)
+    if left is None or depth > 0:
+        return msg
+    ev = _ensure_stop(con, broker, risk, day, left.symbol, left, broker.open_orders(), depth=1)
+    return msg + (f";{ev}" if ev else "")
+
+
+def _broker_qty(broker: Broker, sym: str) -> float:
+    live = broker.account()
+    return next((bp.qty for bp in live.positions if norm(bp.symbol) == norm(sym)), 0.0)
+
+
+def _ensure_stop(con, broker: Broker, risk: RiskEngine, day: str, sym: str, pos,
+                 open_orders: list[BrokerOrder], depth: int = 0) -> str | None:
     if not (_finite(pos.stop) and pos.stop > 0):
         return None
     qty = floor(pos.qty + 1e-9)
@@ -350,6 +408,13 @@ def _ensure_stop(con, broker: Broker, risk: RiskEngine, snap: AccountSnapshot, d
     meta = con.execute("SELECT stop_order_id FROM position_meta WHERE symbol=?", (sym,)).fetchone()
     cur_id = meta["stop_order_id"] if meta else None
     cur = next((o for o in open_orders if cur_id and o.client_order_id == cur_id), None)
+    if cur_id and cur is None:
+        # not in the open orders: it may have filled since the fills were synced
+        o = broker.get_order(cur_id)
+        if o is not None and o.status not in _TERMINAL:
+            cur = o  # still working (accepted after the open-orders read)
+        elif _filled_any(o):
+            return _stop_filled(con, broker, risk, day, sym, depth)
     if cur and cur.status != OrderStatus.PENDING and matches(cur):
         return None
     strays = [o for o in open_orders
@@ -371,20 +436,64 @@ def _ensure_stop(con, broker: Broker, risk: RiskEngine, snap: AccountSnapshot, d
         if not _cancel_and_wait(broker, old.client_order_id):
             return f"{sym} 舊停損單取消未確認,下次再換"
         if _filled_any(broker.get_order(old.client_order_id)):
-            return f"{sym} 停損單已成交,待下次同步入帳"
+            return _stop_filled(con, broker, risk, day, sym, depth)
     if cur_id:
         _set_stop_id(con, sym, None)
         con.commit()
+    # size from what the broker holds right now: a stop that fired a moment ago
+    # must not be followed by a new stop for shares that are already gone
+    held = _broker_qty(broker, sym)
+    qty = min(qty, floor(held + 1e-9))
+    if qty <= 0:
+        return f"{sym} 券商已無持倉,不掛停損單"
     n = con.execute("SELECT COUNT(*) FROM submitted WHERE symbol=? AND kind='stop'", (sym,)).fetchone()[0]
     intent = OrderIntent(
         _cid(day, f"s{n}", sym), sym, AssetClass.EQUITY, Side.SELL, qty=qty,
         order_type=OrderType.STOP, tif=TIF.GTC, stop_price=want,
         strategy=pos.strategy, reason="protective stop")
-    d = risk.check(intent, snap, ref_price=want, orders_this_run=0)
+    d = risk.check(intent, broker.account(), ref_price=want, orders_this_run=0)
     if not d.allow:
         return f"停損單被風控擋下 {sym}:{d.reason}"
     _submit(con, broker, d.intent, "stop", want, stop_for=sym, day=day)
     return f"停損單 {sym} @ {want:.2f}"
+
+
+def sweep_orphan_stops(con, broker: Broker, ledger: Ledger, day: str) -> list[str]:
+    """Cancel (and wait for) every open SELL stop at the broker for a symbol
+    the ledger does not hold. Such a stop protects nothing, and on a margin
+    account it could open a short when it triggers. A symbol the broker still
+    holds is a reconcile mismatch and is left for a human."""
+    events: list[str] = []
+    try:
+        held = {norm(s) for s in ledger.positions()}
+        orphans = [o for o in broker.open_orders()
+                   if o.side == Side.SELL and o.order_type in (OrderType.STOP, OrderType.STOP_LIMIT)
+                   and norm(o.symbol) not in held]
+        if not orphans:
+            return events
+        at_broker = {norm(p.symbol) for p in broker.account().positions if abs(p.qty) > 0}
+        for o in orphans:
+            if norm(o.symbol) in at_broker:
+                events.append(f"{o.symbol} 帳本無持倉但券商有,停損單 {o.client_order_id} 留待人工")
+                continue
+            if not _cancel_and_wait(broker, o.client_order_id):
+                events.append(f"孤兒停損單 {o.symbol}({o.client_order_id})取消未確認,下次再試")
+                continue
+            con.execute("UPDATE position_meta SET stop_order_id=NULL WHERE stop_order_id=?", (o.client_order_id,))
+            con.commit()
+            if _filled_any(broker.get_order(o.client_order_id)):
+                events.append(f"孤兒停損單 {o.symbol}({o.client_order_id})在取消前成交,請人工確認")
+            else:
+                events.append(f"已取消孤兒停損單 {o.symbol}({o.client_order_id})")
+    except Exception as e:
+        con.commit()
+        log.exception("orphan stop sweep failed")
+        events.append(f"孤兒停損單清理失敗:{type(e).__name__}: {e}")
+    if events:
+        _notify_once(con, "orphanstops:" + ";".join(events)[:80], "Desk 孤兒停損單", "\n".join(events),
+                     notify.WARN, day)
+        con.commit()
+    return events
 
 
 # ---------------------------------------------------------------- jobs
@@ -409,6 +518,7 @@ def postclose(con, broker: Broker, now: datetime, bars: data.Bars | None = None,
     expected = _last_closed_session(broker, now)
     if day != expected:
         events += ensure_stops(con, broker, ledger, risk, snap, today, skip=set(bad))
+        events += sweep_orphan_stops(con, broker, ledger, today)
         return head + f"{today} 非交易日或資料未更新(最新 {day},應為 {expected}),跳過規劃。" + (
             "\n" + "\n".join(events) if events else "")
     bars = bars.upto(through)
@@ -420,7 +530,16 @@ def postclose(con, broker: Broker, now: datetime, bars: data.Bars | None = None,
     # manage open stock positions: trail stops, rule exits (reconciled symbols only)
     exits = []
     for sym, pos in ledger.positions().items():
-        if "/" in sym or norm(sym) in bad or sym not in close or pd.isna(close[sym]):
+        if "/" in sym or norm(sym) in bad:
+            continue
+        if sym not in close or pd.isna(close[sym]):
+            # no bar for the managed session: the trailing stop and the exit rules cannot run,
+            # but the existing stop is still maintained by ensure_stops below
+            why = f"{sym} 缺少 {day} 的日線資料,今天不更新移動停損與出場判斷(既有停損單照常維護)"
+            log.warning("held symbol %s has no bar for %s", sym, day)
+            events.append(why)
+            _notify_once(con, f"nobar:{sym}", f"Desk 持倉缺資料 {sym}", why, notify.WARN, day)
+            con.commit()
             continue
         try:
             meta = con.execute("SELECT * FROM position_meta WHERE symbol=?", (sym,)).fetchone()
@@ -437,12 +556,17 @@ def postclose(con, broker: Broker, now: datetime, bars: data.Bars | None = None,
             reason = strat.exit_reason(ctx, sym, lp)
             if reason:
                 exits.append(sym)
-                _plan(con, day, sym, Side.SELL, pos.qty, pos.strategy, None, float(close[sym]), reason, "")
+                # an exit still waiting from an earlier session (premarket missed or retried) is kept;
+                # planning a second one would make two sells compete for the same shares
+                if not con.execute("SELECT 1 FROM planned_orders WHERE symbol=? AND side='sell' AND status='planned'",
+                                   (sym,)).fetchone():
+                    _plan(con, day, sym, Side.SELL, pos.qty, pos.strategy, None, float(close[sym]), reason, "")
         except Exception as e:
             log.exception("position management failed for %s", sym)
             events.append(f"持倉管理失敗 {sym}:{type(e).__name__}: {e}")
         con.commit()
     events += ensure_stops(con, broker, ledger, risk, snap, day, skip=set(bad))
+    events += sweep_orphan_stops(con, broker, ledger, day)
     con.commit()
 
     # new entries for the next open; a failure here must not undo the stop bookkeeping above
@@ -498,15 +622,24 @@ def _plan_entries(con, day, ledger: Ledger, risk: RiskEngine, snap, ctx, signals
     Account: risk per trade (or target weight), capped at MAX_POSITION_PCT of
     equity, the market exposure cap and available system cash. Signals are
     ranked by engine.rank_signals, and one symbol is planned at most once,
-    whichever strategies signal it."""
+    whichever strategies signal it.
+
+    Buys already planned for ``day`` (a rerun of the same postclose) are kept
+    even when they are no longer signalled, and they use up slots, sector
+    room, exposure and cash first, so a rerun never plans beyond the caps."""
     positions = ledger.positions()
     held = {s for s in positions if "/" not in s} - exiting
+    existing = [r for r in con.execute(
+        "SELECT * FROM planned_orders WHERE plan_date=? AND side='buy' AND status='planned' "
+        "ORDER BY created_at, client_order_id", (day,)).fetchall() if r["symbol"] not in held]
+    out = [{"symbol": r["symbol"], "strategy": r["strategy"], "qty": r["qty"], "ref": r["ref_price"],
+            "stop": r["stop"]} for r in existing]
     if ctx.market.exposure_cap <= 0 or not signals:
-        return []
+        return out
     equity = risk.system_equity(snap)
     if not (_finite(equity) and equity > 0):
         log.warning("system equity %s is not usable; no entries planned", equity)
-        return []
+        return out
     prices = {p.symbol: p.current_price for p in snap.positions}
 
     def value(s: str) -> float:
@@ -520,7 +653,13 @@ def _plan_entries(con, day, ledger: Ledger, risk: RiskEngine, snap, ctx, signals
     for s in held:
         per_sector[sector_of(s)] = per_sector.get(sector_of(s), 0) + 1
     planned_syms: set[str] = set()
-    out = []
+    for r in existing:
+        cost = float(r["qty"] or 0) * float(r["ref_price"] or 0)
+        invested += cost
+        cash -= cost
+        slots -= 1
+        per_sector[sector_of(r["symbol"])] = per_sector.get(sector_of(r["symbol"]), 0) + 1
+        planned_syms.add(r["symbol"])
     for s in engine.rank_signals(signals):
         if slots <= 0:
             break
@@ -566,9 +705,14 @@ class _Run:
     n: int = 0
     lines: list[str] = field(default_factory=list)
     sent: list[str] = field(default_factory=list)
+    exiting: set[str] = field(default_factory=set)  # normalized symbols whose exit was sent this run
 
 
 def premarket(con, broker: Broker, now: datetime, limits: Limits | None = None, mailbox=None) -> str:
+    """Exits first, then a protective-stop pass over every held symbol that is
+    not being exited this morning, then entries. Exits never expire: a planned
+    sell runs whenever its position is still held. A failed exit re-places its
+    stop at once and stays planned for a rerun (MAX_EXIT_ATTEMPTS per day)."""
     ensure_schema(con)
     today = _today(now)
     if not broker.is_equity_market_open() and not _opens_today(broker, now):
@@ -592,10 +736,26 @@ def premarket(con, broker: Broker, now: datetime, limits: Limits | None = None, 
     late = (et.hour, et.minute) >= OPG_CUTOFF
     entries_closed = (et.hour, et.minute) >= ENTRY_CUTOFF
     st = _Run(lines=["對帳不一致,只允許出場:" + ";".join(bad.values())] if bad else [])
+    kw = dict(bad=bad, flags=flags, through=through, last_session=last_session, late=late,
+              entries_closed=entries_closed, et=et, today=today)
     for p in plans:
+        if p["side"] != Side.SELL.value:
+            continue
         try:
-            _premarket_one(con, broker, risk, ledger, snap, p, st, bad=bad, flags=flags, through=through,
-                           last_session=last_session, late=late, entries_closed=entries_closed, et=et, today=today)
+            _premarket_one(con, broker, risk, ledger, snap, p, st, **kw)
+        except Exception as e:
+            log.exception("premarket exit %s failed", p["client_order_id"])
+            _exit_failed(con, broker, risk, p, st, f"{type(e).__name__}: {e}", today)
+    con.commit()
+    # Every held symbol keeps a stop unless it is being sold this morning: a stop
+    # replacement that postclose could not finish (unconfirmed cancel) or a stop
+    # lost to a failure is restored here, before any new money goes in.
+    st.lines += _premarket_stops(con, broker, risk, today, bad, st)
+    for p in plans:
+        if p["side"] != Side.BUY.value:
+            continue
+        try:
+            _premarket_one(con, broker, risk, ledger, snap, p, st, **kw)
         except Exception as e:
             log.exception("premarket plan %s failed", p["client_order_id"])
             why = f"{type(e).__name__}: {e}"
@@ -614,11 +774,80 @@ def premarket(con, broker: Broker, now: datetime, limits: Limits | None = None, 
     return msg
 
 
+def _premarket_stops(con, broker: Broker, risk: RiskEngine, today: str, bad: dict[str, str], st: _Run) -> list[str]:
+    try:
+        exiting = set(st.exiting) | {
+            norm(o.symbol) for o in broker.open_orders()
+            if o.side == Side.SELL and o.order_type not in (OrderType.STOP, OrderType.STOP_LIMIT)}
+        return ensure_stops(con, broker, risk.ledger, risk, broker.account(), today, skip=set(bad) | exiting)
+    except Exception as e:
+        con.commit()
+        log.exception("premarket stop pass failed")
+        why = f"{type(e).__name__}: {e}"
+        notify.send("Desk 盤前停損單檢查失敗", why[:1000], notify.CRITICAL)
+        return [f"盤前停損單檢查失敗:{why}"]
+
+
+def _exit_failed(con, broker: Broker, risk: RiskEngine, p, st: _Run, why: str, today: str) -> None:
+    """An exit raised somewhere after (or while) its stop was cancelled. Put
+    the protective stop back from a fresh broker read right away, and leave
+    the plan ``planned`` so a rerun the same morning retries it; after
+    MAX_EXIT_ATTEMPTS failures in one day it becomes ``error`` and the owner
+    is paged."""
+    sym, cid = p["symbol"], p["client_order_id"]
+    key = f"{today}:{cid}"
+    con.execute("INSERT INTO plan_attempts VALUES (?, 1) ON CONFLICT(key) DO UPDATE SET n=n+1", (key,))
+    n = con.execute("SELECT n FROM plan_attempts WHERE key=?", (key,)).fetchone()[0]
+    con.commit()
+    restored = _restore_stop(con, broker, risk, sym, cid, today)
+    if n >= MAX_EXIT_ATTEMPTS:
+        _mark(con, p, "error", f"出場連續失敗 {n} 次,待人工處理:{why}")
+        con.commit()
+        st.lines.append(f"出場失敗 {sym}(第 {n} 次,已停止重試):{why};{restored}")
+        notify.send(f"Desk 出場失敗 {sym}", f"今天第 {n} 次失敗,不再自動重試,請人工處理。\n{why}\n{restored}"[:1000],
+                    notify.CRITICAL)
+    else:
+        _mark(con, p, "planned", f"出場失敗 {n}/{MAX_EXIT_ATTEMPTS} 次,待重跑:{why}")
+        con.commit()
+        st.lines.append(f"出場失敗 {sym}(第 {n} 次,保留計畫待重跑):{why};{restored}")
+        notify.send(f"Desk 出場失敗 {sym}", f"第 {n}/{MAX_EXIT_ATTEMPTS} 次,重跑盤前會再試。\n{why}\n{restored}"[:1000],
+                    notify.WARN)
+
+
+def _restore_stop(con, broker: Broker, risk: RiskEngine, sym: str, exit_cid: str, today: str) -> str:
+    """Re-place the protective stop of ``sym`` after a failed exit, unless the
+    exit order did reach the broker (then it is the protection, or it filled)."""
+    try:
+        o = broker.get_order(exit_cid)
+        if o is not None and o.status not in (OrderStatus.CANCELED, OrderStatus.REJECTED, OrderStatus.EXPIRED):
+            return "出場單已在券商,不補停損單"
+        pos = risk.ledger.position(sym)
+        if pos is None:
+            return "帳本已無持倉"
+        ev = _ensure_stop(con, broker, risk, today, pos.symbol, pos, broker.open_orders())
+        con.commit()
+        return ev or "停損單仍在"
+    except Exception as e:
+        con.commit()
+        log.exception("could not restore the stop for %s", sym)
+        why = f"停損單補掛失敗 {sym}:{type(e).__name__}: {e}"
+        notify.send(f"Desk 停損單補掛失敗 {sym}", why[:1000], notify.CRITICAL)
+        return why
+
+
 def _premarket_one(con, broker: Broker, risk: RiskEngine, ledger: Ledger, snap: AccountSnapshot, p, st: _Run,
                    *, bad, flags, through, last_session, late, entries_closed, et, today) -> None:
-    sym, side = p["symbol"], Side(p["side"])
-    if p["plan_date"] != through or through != last_session:
-        # only plans from the postclose of the last completed session are valid
+    sym, side, cid = p["symbol"], Side(p["side"]), p["client_order_id"]
+    prior = con.execute("SELECT status FROM submitted WHERE client_order_id=?", (cid,)).fetchone()
+    if prior and prior["status"] not in (PENDING_SUBMIT, NOT_SENT):
+        # the broker already has this order (a job died after submit, before marking the plan)
+        _mark(con, p, "submitted", "重跑時發現已送出")
+        if side == Side.SELL:
+            st.exiting.add(norm(sym))
+        return
+    if side == Side.BUY and (p["plan_date"] != through or through != last_session):
+        # only entries from the postclose of the last completed session are valid;
+        # exits never expire (a held position must still be sold)
         _mark(con, p, "expired", f"過期計畫:計畫日 {p['plan_date']},最近一次盤後規劃 {through or '無'},"
                                  f"上一個交易日 {last_session}")
         return
@@ -636,7 +865,7 @@ def _premarket_one(con, broker: Broker, risk: RiskEngine, ledger: Ledger, snap: 
             _mark(con, p, "blocked", flags.blocked[sym])
             st.lines.append(f"擋下 {sym}:{flags.blocked[sym]}")
             return
-        if (why := _order_conflict(con, broker, sym, p["client_order_id"])):
+        if (why := _order_conflict(con, broker, sym, cid)):
             _mark(con, p, "blocked", why)
             st.lines.append(f"擋下 {sym}:{why}")
             return
@@ -647,7 +876,7 @@ def _premarket_one(con, broker: Broker, risk: RiskEngine, ledger: Ledger, snap: 
         if qty <= 0:
             _mark(con, p, "blocked", f"以即時價 {px:g} 重算後股數為 0")
             return
-        intent = OrderIntent(p["client_order_id"], sym, AssetClass(p["asset_class"]), side, qty=qty,
+        intent = OrderIntent(cid, sym, AssetClass(p["asset_class"]), side, qty=qty,
                              order_type=OrderType.MARKET, tif=tif, strategy=p["strategy"], reason=p["reason"])
         d = risk.check(intent, snap, ref_price=p["ref_price"], orders_this_run=st.n, market_price=px)
         if not d.allow:
@@ -663,7 +892,17 @@ def _premarket_one(con, broker: Broker, risk: RiskEngine, ledger: Ledger, snap: 
             st.lines.append(f"{sym} 對帳不一致,出場待人工確認")
             return
         if ledger.position(sym) is None:
-            _mark(con, p, "cancelled", "已無持倉")
+            _mark(con, p, "cancelled", f"已無持倉(計畫日 {p['plan_date']})")
+            return
+        if norm(sym) in st.exiting:
+            _mark(con, p, "cancelled", "同一檔的另一張出場單已送出")
+            return
+        dup = con.execute("SELECT client_order_id FROM submitted WHERE symbol=? AND kind='exit' AND recorded=0 "
+                          "AND client_order_id<>? AND status NOT IN (?, ?)",
+                          (sym, cid, PENDING_SUBMIT, NOT_SENT)).fetchone()
+        if dup:
+            _mark(con, p, "cancelled", f"已有未入帳的出場單 {dup[0]}")
+            st.exiting.add(norm(sym))
             return
         meta = con.execute("SELECT stop_order_id FROM position_meta WHERE symbol=?", (sym,)).fetchone()
         if meta and meta["stop_order_id"]:
@@ -681,20 +920,20 @@ def _premarket_one(con, broker: Broker, risk: RiskEngine, ledger: Ledger, snap: 
                     _mark(con, p, "cancelled", "停損單已先成交,不再賣出")
                     st.lines.append(f"{sym} 停損已成交,取消出場單")
                     return
-        live = broker.account()  # size the exit from what the broker holds now, not the job-start snapshot
-        held = next((bp.qty for bp in live.positions if norm(bp.symbol) == norm(sym)), 0.0)
+        held = _broker_qty(broker, sym)  # size the exit from what the broker holds now
         qty = floor(held + 1e-9)
         if qty <= 0:
             _mark(con, p, "cancelled", "券商已無持倉")
             return
-        intent = OrderIntent(p["client_order_id"], sym, AssetClass(p["asset_class"]), side, qty=qty,
+        intent = OrderIntent(cid, sym, AssetClass(p["asset_class"]), side, qty=qty,
                              order_type=OrderType.MARKET, tif=tif, strategy=p["strategy"], reason=p["reason"])
-        d = risk.check(intent, live, ref_price=p["ref_price"], orders_this_run=st.n)
+        d = risk.check(intent, broker.account(), ref_price=p["ref_price"], orders_this_run=st.n)
         if not d.allow:
             _mark(con, p, "blocked", d.reason)
             st.lines.append(f"風控擋下 {sym}:{d.reason}")
             return
         _submit(con, broker, d.intent, "exit", None, plan=p, note=d.reason)
+        st.exiting.add(norm(sym))
     st.n += 1
     st.sent.append(d.intent.client_order_id)
     st.lines.append(f"{'買' if side == Side.BUY else '賣'} {sym} {d.intent.qty:g} 股({'盤中市價' if late else '開盤市價'})")
@@ -755,6 +994,7 @@ def postopen(con, broker: Broker, now: datetime, limits: Limits | None = None) -
     snap = broker.account()
     bad = _check_reconcile(con, ledger, snap, today)
     events += ensure_stops(con, broker, ledger, risk, snap, today, skip=set(bad))
+    events += sweep_orphan_stops(con, broker, ledger, today)
     if bad:
         return "對帳不一致:\n" + "\n".join(bad.values()) + ("\n" + "\n".join(events) if events else "")
     if events:
@@ -863,8 +1103,8 @@ def _mark(con, p, status: str, note: str) -> None:
 def _opens_today(broker: Broker, now: datetime) -> bool:
     client = getattr(broker, "client", None)
     if client is None:
-        return now.astimezone(ET).weekday() < 5
-    clock = client.get_clock()
+        return is_trading_day(now.astimezone(ET).date())
+    clock = _broker_call(broker, client.get_clock, "get_clock")
     return clock.next_open.astimezone(ET).date() == now.astimezone(ET).date()
 
 
