@@ -59,6 +59,20 @@ FIXES = {
 }
 
 
+JSON_INVALID_FIX = (
+    "JSON 無法解析。最常見的原因:字串值裡出現換行(例如「AI 概念股」的空格被換成換行)。"
+    "請讓每個字串值保持在同一行,拉丁字母與中文之間不要放空格(寫成「AI概念股」),"
+    "也可以把整個 JSON 壓成單行。protocol 欄位可以省略;要寫就必須是字串 \"1\",不能是整數 1。"
+)
+
+
+def fix_for(reason: str) -> str:
+    """The correction text for a stored reject reason."""
+    if "json_invalid" in reason:
+        return JSON_INVALID_FIX
+    return FIXES[reason.split(" ")[0]]
+
+
 # Hard ceiling on correction mail so that no loop, whatever its cause, can
 # flood Muse's mailbox: 10 per rolling 24 hours, the owner told once.
 FEEDBACK_CAP = 10
@@ -99,7 +113,7 @@ def send_feedback(con, box, now: datetime) -> int:
     for key, about, reason in pending[: max(budget, 0)]:
         code = reason.split(" ")[0]
         msg = Feedback(msg_id=outbox.new_msg_id("fb"), sent_at=now, about_msg_id=about[:64],
-                       problem=f"訊息 {about} 被拒絕:{reason}"[:1000], how_to_fix=FIXES[code])
+                       problem=f"訊息 {about} 被拒絕:{reason}"[:1000], how_to_fix=fix_for(reason))
         outbox.send(box, msg)
         log_outbound(con, msg)
         _once(con, key)

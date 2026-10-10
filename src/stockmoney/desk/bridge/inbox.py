@@ -89,7 +89,15 @@ def is_echo_subject(subject: str | None) -> bool:
 
 def _validation_reason(e: ValidationError) -> str:
     # location + error type only: error text can echo attacker-controlled input
-    parts = [".".join(str(p) for p in err["loc"]) + ":" + err["type"] for err in e.errors()[:5]]
+    parts = []
+    for err in e.errors()[:5]:
+        part = ".".join(str(p) for p in err["loc"]) + ":" + err["type"]
+        if err["type"] == "json_invalid":
+            # the parser message names the problem and a line/column, not the input
+            detail = re.sub(r"[^A-Za-z0-9 ._:,()\\-]", "", str((err.get("ctx") or {}).get("error", "")))[:100]
+            if detail:
+                part += f" ({detail})"
+        parts.append(part)
     return "schema_invalid " + "; ".join(parts)
 
 
@@ -105,6 +113,39 @@ def extract_json(body: str) -> str:
         return m.group(1)
     start, end = body.find("{"), body.rfind("}")
     return body[start:end + 1] if 0 <= start < end else body
+
+
+def repair_string_newlines(text: str) -> str:
+    """Undo mail-tool line wrapping inside JSON string values.
+
+    JSON forbids raw control characters in strings, but some mail composers turn
+    the space between a Latin word and CJK text into a newline (seen in real
+    Muse mail: "AI\n概念股"). Outside strings whitespace is untouched; inside a
+    string a raw CR/LF becomes one space, or is dropped when the string is a URL
+    (a wrap mid-URL has no space to restore). Nothing else changes, and the
+    result still goes through strict validation."""
+    out: list[str] = []
+    in_str = escaped = False
+    start = 0  # index in `out` where the current string's content begins
+    for ch in text:
+        if in_str:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_str = False
+            elif ch in "\r\n":
+                body = "".join(out[start:])
+                if body.startswith(("http://", "https://")):
+                    continue  # inside a URL: drop the break
+                if out and out[-1] != " ":
+                    out.append(" ")  # collapse CRLF and runs into one space
+                continue
+        elif ch == '"':
+            in_str, start = True, len(out) + 1
+        out.append(ch)
+    return "".join(out)
 
 
 def _process(con, mail: RawMail, config: BridgeConfig, received_at: datetime) -> bool:
@@ -141,7 +182,7 @@ def _process(con, mail: RawMail, config: BridgeConfig, received_at: datetime) ->
     if mail.oversized or mail.size > MAX_RAW_BYTES or len(mail.body.encode("utf-8", "replace")) > MAX_RAW_BYTES:
         return fail("oversized")
     try:
-        msg = _INBOUND.validate_json(extract_json(mail.body), strict=True)
+        msg = _INBOUND.validate_json(repair_string_newlines(extract_json(mail.body)), strict=True)
     except ValidationError as e:
         return fail(_validation_reason(e))
     except ValueError:  # not JSON at all / lone surrogates etc.
