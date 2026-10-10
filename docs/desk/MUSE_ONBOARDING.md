@@ -1,7 +1,7 @@
 # Muse 上線手冊:三段提示詞 + 驗收
 
 一次只教 Muse 一件事,每階段都有明確的通過條件。前一階段沒過,不進下一階段。
-設計原理見 `MUSE_BRIDGE.md`;這份是操作手冊。
+設計原理見 `MUSE_BRIDGE.md`;這份是操作手冊。提示詞裡的「通知管道」是 Muse 平常聯絡你的方式(Muse app 或 WhatsApp 等,以你實際使用的為準)。要一次貼完整版,見 `MUSE_PROMPT.md`。
 
 ## 總覽
 
@@ -10,7 +10,7 @@
 | 0 準備 | 建 Desk 專用 Gmail、密鑰,填 `.env` | - | `muse_check.py mailbox` 測連線 | IMAP 登入成功 |
 | 1 握手 | 貼「提示詞 1」 | 寄一封測試快照 | 收信、驗證;格式錯就自動寄修正說明給 Muse | 24 小時內收到 1 封通過驗證的 `SOCIAL_DAILY` |
 | 2 每日任務 | 貼「提示詞 2」,執行 `muse_check.py stage 2` | 每天 2 次快照 + 1 次喊單紀錄 | 漏交就推播你;每天抽查連結 | 連續 3 天:準時率 ≥ 5/6(快照)與 3/3(喊單),每天被拒 ≤ 1 封,抽查連結都真實存在 |
-| 3 查核與警報 | 貼「提示詞 3」,執行 `muse_check.py drill` | 回覆查核請求、演練警報、WhatsApp 轉告你 | 收回覆、統計 | 演練請求 2 小時內有回覆;演練警報通過驗證;你在 WhatsApp 收到報告摘要 |
+| 3 查核與警報 | 貼「提示詞 3」,執行 `muse_check.py drill` | 回覆查核請求、演練警報、通知管道 轉告你 | 收回覆、統計 | 演練請求 2 小時內有回覆;演練警報通過驗證;你在通知管道收到報告摘要 |
 | 4 正式運作 | 每週看一次 `muse_check.py status` | 持續 | 持續監控 | 兩週準時率 ≥ 90%(之後才把社群資料納入研究) |
 
 隨時檢查狀態:
@@ -192,8 +192,8 @@ sentiment_shift 只能是:more_bullish、more_bearish、unchanged、unknown。
 ```
 
 任務 E:轉告我
-- Desk 每天美東傍晚會寄 REPORT 到我的信箱(主旨開頭 [SMD/REPORT/])。請把重點摘要成 3 到 5 句,用 WhatsApp 傳給我。
-- 收到 critical 等級的事件時,寄 ALERT 給 Desk 的同時也立刻 WhatsApp 告訴我。
+- Desk 每天美東傍晚會寄 REPORT 到我的信箱(主旨開頭 [SMD/REPORT/])。請把重點摘要成 3 到 5 句,用通知管道傳給我。
+- 收到 critical 等級的事件時,寄 ALERT 給 Desk 的同時也立刻通知管道告訴我。
 
 最後做兩個演練:
 1. 我等一下會讓 Desk 寄一封 ticker 為 DRILL 的查核請求,請照任務 C 回覆。
@@ -207,7 +207,7 @@ sentiment_shift 只能是:more_bullish、more_bearish、unchanged、unknown。
 - 演練用的 DRILL 不在交易清單內,擋了也不影響任何交易。
 - 查核請求過了期限沒回覆會推播你。
 
-**驗收**:`status` 顯示 research `answered` = `requested`;收到 DRILL 的 ALERT;你在 WhatsApp 收到至少一次報告摘要。
+**驗收**:`status` 顯示 research `answered` = `requested`;收到 DRILL 的 ALERT;你在通知管道收到至少一次報告摘要。
 
 ## 階段 4:正式運作
 
