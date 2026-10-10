@@ -1,6 +1,7 @@
 """Causal indicator frames. Every value at row t uses only rows <= t, so the
-engine can read row t on day t without look-ahead (tests/desk/test_leak.py
-checks this by recomputing on truncated data)."""
+engine can read row t on day t without look-ahead
+(tests/desk/test_desk.py::test_indicators_have_no_lookahead checks this by
+recomputing on truncated data)."""
 from __future__ import annotations
 
 from dataclasses import dataclass

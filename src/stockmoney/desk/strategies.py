@@ -8,10 +8,13 @@ month's own results without logging the change (see desk/store.py).
 """
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
+from numbers import Real
 
 import pandas as pd
 
+from stockmoney.desk.calendar import is_last_trading_day_of_month
 from stockmoney.desk.indicators import Ind, MarketState, sector_ranking
 from stockmoney.desk.universe import STOCKS, sector_name
 
@@ -66,19 +69,85 @@ def _sector_layer(ctx: Context, sym: str) -> dict:
     )
 
 
+@dataclass(frozen=True)
+class Bound:
+    """Declared legal range of one strategy parameter."""
+
+    lo: float | None = None
+    hi: float | None = None
+    lo_open: bool = False  # True: value must be > lo
+    hi_open: bool = False  # True: value must be < hi
+    integer: bool = False
+
+    def describe(self) -> str:
+        lo = "-inf" if self.lo is None else f"{self.lo:g}"
+        hi = "inf" if self.hi is None else f"{self.hi:g}"
+        left = "(" if self.lo is None or self.lo_open else "["
+        right = ")" if self.hi is None or self.hi_open else "]"
+        return f"{left}{lo}, {hi}{right}" + (" integer" if self.integer else "")
+
+    def contains(self, v: float) -> bool:
+        if self.lo is not None and (v <= self.lo if self.lo_open else v < self.lo):
+            return False
+        if self.hi is not None and (v >= self.hi if self.hi_open else v > self.hi):
+            return False
+        return True
+
+
+def _ok_signal(s: Signal) -> bool:
+    """A signal must carry a finite, positive reference price and stop; a NaN
+    ATR would otherwise give a NaN stop and bypass risk-based sizing."""
+    return all(isinstance(x, Real) and math.isfinite(x) and x > 0 for x in (s.ref_price, s.stop))
+
+
 class Strategy:
     name = "base"
     label = ""
     description = ""
     params: dict = {}
+    # One declared Bound per parameter (checked in __init__ and by the console).
+    bounds: dict[str, Bound] = {}
 
     def __init__(self, **overrides):
-        defaults = type(self).params
-        # console inputs arrive as floats; keep ints where the default is an int
-        cast = {k: int(v) if isinstance(defaults.get(k), int) else v for k, v in overrides.items()}
-        self.params = {**defaults, **cast}
+        self.params = type(self).validate_params(overrides)
+
+    @classmethod
+    def validate_params(cls, overrides: dict | None = None) -> dict:
+        """Defaults merged with ``overrides``, checked against ``bounds``.
+        Returns the cleaned dict (ints as int, others as float). Raises
+        ValueError naming the offending parameter; never truncates silently."""
+        overrides = dict(overrides or {})
+        unknown = sorted(set(overrides) - set(cls.params))
+        if unknown:
+            raise ValueError(f"{cls.name}: unknown parameter(s) {unknown}; allowed: {sorted(cls.params)}")
+        out: dict = {}
+        for k, default in cls.params.items():
+            v = overrides.get(k, default)
+            b = cls.bounds.get(k)
+            if isinstance(v, bool) or not isinstance(v, Real) or not math.isfinite(float(v)):
+                raise ValueError(f"{cls.name}.{k}: {v!r} is not a finite number")
+            is_int = isinstance(default, int) or (b is not None and b.integer)
+            if is_int:
+                if float(v) != math.floor(float(v)):
+                    raise ValueError(f"{cls.name}.{k}: {v!r} must be a whole number")
+                v = int(v)
+            else:
+                v = float(v)
+            if b is not None and not b.contains(v):
+                raise ValueError(f"{cls.name}.{k}: {v!r} outside allowed range {b.describe()}")
+            out[k] = v
+        cls._cross_check(out)
+        return out
+
+    @classmethod
+    def _cross_check(cls, params: dict) -> None:
+        """Relations between parameters; subclasses override."""
 
     def candidates(self, ctx: Context) -> list[Signal]:
+        """Entry signals for ``ctx.t``; only those with a usable price and stop."""
+        return [s for s in self._candidates(ctx) if _ok_signal(s)]
+
+    def _candidates(self, ctx: Context) -> list[Signal]:
         raise NotImplementedError
 
     def exit_reason(self, ctx: Context, sym: str, pos) -> str | None:
@@ -101,10 +170,19 @@ class Strategy:
 class Breakout(Strategy):
     name = "breakout"
     label = "強勢突破"
-    description = "大盤順風 + 領漲板塊 + 個股多頭排列,收盤突破55日新高且放量。"
+    description = (
+        "大盤非空頭(多頭順風或中性皆可進場;僅空頭時停手,中性時總曝險上限降為 50%)"
+        " + 領漲板塊 + 個股多頭排列,收盤突破55日新高且放量。"
+    )
     params = {"stop_atr": 2.5, "trail_atr": 3.0, "min_vol_ratio": 1.3, "max_hold_days": 60}
+    bounds = {
+        "stop_atr": Bound(0.5, 10, lo_open=True),
+        "trail_atr": Bound(0.5, 10, lo_open=True),
+        "min_vol_ratio": Bound(0.5, 10),
+        "max_hold_days": Bound(5, 400, integer=True),
+    }
 
-    def candidates(self, ctx: Context) -> list[Signal]:
+    def _candidates(self, ctx: Context) -> list[Signal]:
         p, out = self.params, []
         if ctx.market.regime == "risk_off":
             return out
@@ -143,8 +221,14 @@ class Pullback(Strategy):
     label = "多頭回檔"
     description = "大盤多頭 + 相對強勢股,回測20日均線後轉強收紅,低風險上車。"
     params = {"trail_atr": 3.0, "max_stop_atr": 3.0, "rs_quantile": 0.7, "max_hold_days": 40}
+    bounds = {
+        "trail_atr": Bound(0.5, 10, lo_open=True),
+        "max_stop_atr": Bound(0.5, 10, lo_open=True),
+        "rs_quantile": Bound(0, 1, lo_open=True, hi_open=True),
+        "max_hold_days": Bound(5, 400, integer=True),
+    }
 
-    def candidates(self, ctx: Context) -> list[Signal]:
+    def _candidates(self, ctx: Context) -> list[Signal]:
         p, out = self.params, []
         if ctx.market.regime != "risk_on":
             return out
@@ -192,6 +276,19 @@ class Rotation(Strategy):
     label = "動能輪動"
     description = "每月第一個交易日,持有 12-1 月動能最強且站上200日線的前5檔;大盤轉空即清倉。"
     params = {"top_n": 5, "keep_rank": 10, "trail_atr": 4.0, "stop_atr": 4.0}
+    bounds = {
+        "top_n": Bound(1, 20, integer=True),
+        "keep_rank": Bound(1, None, integer=True),  # and >= top_n, see _cross_check
+        "trail_atr": Bound(0.5, 10, lo_open=True),
+        "stop_atr": Bound(0.5, 10, lo_open=True),
+    }
+
+    @classmethod
+    def _cross_check(cls, params: dict) -> None:
+        if params["keep_rank"] < params["top_n"]:
+            raise ValueError(
+                f"{cls.name}.keep_rank: {params['keep_rank']} must be >= top_n ({params['top_n']})"
+            )
 
     def _ranked(self, ctx: Context) -> pd.Series:
         stocks = [s for s in STOCKS if s in ctx.ind.close]
@@ -201,13 +298,11 @@ class Rotation(Strategy):
 
     @staticmethod
     def _rebalance_day(ctx: Context) -> bool:
-        idx = ctx.ind.close.index
-        i = idx.get_loc(ctx.t)
-        if i + 1 < len(idx):
-            return idx[i + 1].month != ctx.t.month
-        return _is_month_end(ctx.t)
+        """Last NYSE session of the month. Decided from the exchange calendar
+        alone, so a live run (no future bar) and a backtest cannot disagree."""
+        return is_last_trading_day_of_month(ctx.t)
 
-    def candidates(self, ctx: Context) -> list[Signal]:
+    def _candidates(self, ctx: Context) -> list[Signal]:
         p = self.params
         if ctx.market.regime == "risk_off" or not self._rebalance_day(ctx):
             return []
@@ -240,12 +335,6 @@ class Rotation(Strategy):
             if sym not in ranked:
                 return f"月度再平衡:掉出前{self.params['keep_rank']}名"
         return None
-
-
-def _is_month_end(t: pd.Timestamp) -> bool:
-    """Live run on the last available bar: treat as rebalance if the next
-    business day falls in a new month."""
-    return (t + pd.offsets.BDay(1)).month != t.month
 
 
 REGISTRY: dict[str, type[Strategy]] = {s.name: s for s in (Breakout, Pullback, Rotation)}
