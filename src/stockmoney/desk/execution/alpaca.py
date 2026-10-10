@@ -15,6 +15,14 @@ Design notes:
     errors and 5xx, with exponential backoff.
   * Invalid asset-class / TIF / order-type combinations raise ValueError before
     anything is sent, instead of being rejected by the broker.
+  * alpaca-py sets no HTTP timeout (alpaca/common/rest.py calls
+    ``self._session.request`` without one), so a stalled socket would block
+    forever. Every client this adapter builds or is given gets a default
+    per-request timeout (HTTP_TIMEOUT_S) unless the call passes its own.
+  * Symbols are translated with execution.symbols on the way in and out, so
+    the rest of the system only sees the universe spelling ("BRK-B").
+  * latest_price uses the market-data clients (IEX feed for equities, which a
+    free data plan may query; US feed for crypto).
 
 Order status mapping (Alpaca -> OrderStatus). Everything not listed maps to
 PENDING (accepted, pending_new, pending_cancel, pending_replace, pending_review,
@@ -52,6 +60,8 @@ from alpaca.trading.requests import (
 )
 from requests.exceptions import RequestException
 
+from stockmoney.desk.execution.symbols import from_broker, to_broker
+
 from stockmoney.desk.execution.types import (
     TIF, AccountSnapshot, AssetClass, BrokerOrder, BrokerPosition, OrderIntent,
     OrderStatus, OrderType, Side,
@@ -77,6 +87,7 @@ _STATUS_MAP = {
 _TERMINAL = frozenset({OrderStatus.FILLED, OrderStatus.CANCELED, OrderStatus.REJECTED, OrderStatus.EXPIRED})
 _TRANSIENT_HTTP = frozenset({429, 500, 502, 503, 504})
 _CRYPTO_QUOTES = ("USDT", "USDC", "USD")
+HTTP_TIMEOUT_S = 30.0  # per HTTP request; the job-level alarm is the outer bound
 
 T = TypeVar("T")
 
@@ -158,11 +169,28 @@ def validate_intent(intent: OrderIntent) -> None:
             raise ValueError(f"{name} must be positive, got {v}")
 
 
+def install_timeout(client: Any, seconds: float = HTTP_TIMEOUT_S) -> None:
+    """Give every request made through an alpaca-py RESTClient a default
+    timeout. alpaca/common/rest.py keeps a requests.Session in ``_session``
+    and calls ``self._session.request(method, url, **opts)``; opts never
+    carries a timeout. Clients without a session (test fakes) are left alone."""
+    session = getattr(client, "_session", None)
+    if session is None or getattr(session, "_desk_timeout", None) is not None:
+        return
+    inner = session.request
+
+    def request(method, url, **kw):
+        kw.setdefault("timeout", seconds)
+        return inner(method, url, **kw)
+    session.request = request
+    session._desk_timeout = seconds
+
+
 def build_request(intent: OrderIntent) -> OrderRequest:
     """Validate and translate an intent into the matching alpaca-py request."""
     validate_intent(intent)
     common: dict[str, Any] = dict(
-        symbol=intent.symbol,
+        symbol=to_broker(intent.symbol),
         side=OrderSide(intent.side.value),
         time_in_force=TimeInForce(intent.tif.value),
         client_order_id=intent.client_order_id,
@@ -196,7 +224,7 @@ def _norm_symbol(symbol: str | None, crypto: bool) -> str:
         for q in _CRYPTO_QUOTES:
             if symbol.endswith(q) and len(symbol) > len(q):
                 return f"{symbol[:-len(q)]}/{q}"
-    return symbol
+    return from_broker(symbol)
 
 
 def _api_status(exc: BaseException) -> int | None:
@@ -223,6 +251,7 @@ class AlpacaBroker:
         max_attempts: int = 4,
         backoff_seconds: float = 1.0,
         sleep: Callable[[float], None] = time.sleep,
+        data_clients: tuple[Any, Any] | None = None,
     ):
         env = environ if environ is not None else os.environ
         mode = resolve_env(env)  # live guard runs first, before anything else
@@ -233,7 +262,10 @@ class AlpacaBroker:
             if not key or not secret:
                 raise MissingCredentials("ALPACA_API_KEY and ALPACA_SECRET_KEY must both be set")
             client = TradingClient(api_key=key, secret_key=secret, paper=self.is_paper)
+        install_timeout(client)  # no-op for test fakes without a requests session
         self._client = client
+        self._keys = (env.get("ALPACA_API_KEY"), env.get("ALPACA_SECRET_KEY"))
+        self._data = data_clients  # (stock, crypto) market-data clients, built lazily
         self._max_attempts = max(1, max_attempts)
         self._backoff = backoff_seconds
         self._sleep = sleep
@@ -410,3 +442,33 @@ class AlpacaBroker:
 
     def is_equity_market_open(self) -> bool:
         return bool(self._retry(self._client.get_clock, "get_clock").is_open)
+
+    def _data_clients(self) -> tuple[Any, Any] | None:
+        if self._data is None:
+            key, secret = self._keys
+            if not key or not secret:
+                return None
+            from alpaca.data.historical.crypto import CryptoHistoricalDataClient
+            from alpaca.data.historical.stock import StockHistoricalDataClient
+            self._data = (StockHistoricalDataClient(api_key=key, secret_key=secret),
+                          CryptoHistoricalDataClient(api_key=key, secret_key=secret))
+            for c in self._data:
+                install_timeout(c)
+        return self._data
+
+    def latest_price(self, symbol: str) -> float | None:
+        """Latest trade price, or None when market data is unavailable."""
+        clients = self._data_clients()
+        if clients is None:
+            return None
+        from alpaca.data.enums import DataFeed
+        from alpaca.data.requests import CryptoLatestTradeRequest, StockLatestTradeRequest
+        stock, crypto = clients
+        sym = to_broker(symbol)
+        if "/" in symbol:
+            fn = lambda: crypto.get_crypto_latest_trade(CryptoLatestTradeRequest(symbol_or_symbols=sym))
+        else:
+            fn = lambda: stock.get_stock_latest_trade(StockLatestTradeRequest(symbol_or_symbols=sym, feed=DataFeed.IEX))
+        trade = self._retry(fn, "latest_trade").get(sym)
+        price = _f(getattr(trade, "price", None))
+        return price if price is not None and price > 0 else None
