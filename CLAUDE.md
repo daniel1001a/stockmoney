@@ -2,6 +2,23 @@
 
 > **2026-10-09 主線變更**:現行主線是 Trading Desk(`src/stockmoney/desk/`):多策略(股票、槓桿 ETF、加密貨幣,之後選擇權)、全自動執行、經券商無關介面下單(現為 Alpaca 紙上帳戶)。營運計畫見 `docs/desk/OPERATING_PLAN.md`,Muse 橋樑見 `docs/desk/MUSE_BRIDGE.md`,第 0 階段規格見 `docs/desk/PHASE0_SPEC.md`。下方規格中的 1-3 天選擇權方向模型與交易員聯盟已暫停(實驗證明無 edge),程式碼保留。第 0 節的下單邊界已於同日由使用者明確修改,見下。
 
+## AI Collaboration
+
+This project is part of a multi-AI system. Roles:
+
+- **Claude Code**: sole executor for all code changes. Reads this file and `docs/desk/` for project state.
+- **Grok Build** (via `grok-build-plugin-cc`): read-only review and second opinion. Never edits files. Use `/grok-build:review` after significant changes.
+- **Grok chat**: research, X platform intelligence, strategy validation. Produces `GROK_DAILY` reports (see `docs/desk/GROK_PROMPT.md`).
+- **Grok Bot**: background sentinel. Runs daily post-close summaries and paper trading data checks. Does not modify code.
+- **Muse**: social intelligence and life manager. Sends `SOCIAL_DAILY`, `CALLS`, `ALERT`, `IDEA` via Gmail bridge (see `docs/desk/MUSE_BRIDGE.md`). Inputs can only reduce risk, never open positions or change parameters.
+
+Rules:
+- New ideas enter through Muse (trend scan) then Grok (validation). Only validated ideas reach Claude Code.
+- All project state lives in `docs/desk/` (OPERATING_PLAN, MUSE_BRIDGE, GROK_PROMPT, EDGE_PLAN). Do not create parallel status docs.
+- Every trade outcome (win or loss) must be recorded with the messages, fund flows, and market sentiment at the time. Weekly reflection extracts patterns into memory.
+- Grok Build reviews must pass before merging non-trivial changes.
+- Live trading requires explicit user approval after Grok produces an evaluation report. Paper trading continues until the EDGE_PLAN gates are met.
+
 ## 0. 專案定位與邊界(必讀,優先於一切實作細節)
 
 **這是什麼**:一套多源異質資訊融合的短中期市場情緒/風向預測引擎,產出每日觀察清單 + 決策提示 dashboard,供人工在選擇權與個股交易時參考。
@@ -33,7 +50,7 @@
         ↓
 特徵工程層(Feature Store,統一 schema、時間戳精確、防 look-ahead)
         ↓
-模型層 ─┬─ 模組 A:方向擇時模型(內含 regime detection 雙軌驗證)
+模型層 ── 模組 A:方向擇時模型(內含 regime detection 雙軌驗證)
         └─ 模組 B:EV 交易閘門(動態校準)
         ↓(訊號衝突 = 有價值訊息,用跨資產/跨股離散度指標融合,不用人工規則仲裁)
 裁量層(三層分離架構,見第 7 節)
@@ -118,7 +135,7 @@ EV = P(win) × avg_win_size - P(loss) × avg_loss_size - transaction_cost
 
 ## 7. 裁量層:三層分離架構(人為輸入介面)
 
-**核心原則**:人為輸入只影響「這一筆交易的部位大小」,絕不回寫模型或訓練資料,避免回饋迴圈污染。
+**核心原則**:人為輸入只影響「這一筆交易的部位大小」,絕不回寫模型或訓練資料,避免回饋迴圈汙染。
 
 1. **Model Layer**:純資料驅動輸出機率分佈,不接受人為修改,永遠保持乾淨可回測
 2. **Discretion Layer**:人的信心調整只作用在 Kelly 部位大小的乘數(見第 9 節),不影響模型輸出本身
@@ -158,7 +175,7 @@ Kelly% = (P(win) × avg_win/avg_loss − P(loss)) / (avg_win/avg_loss)
 1. Watchlist 標的依歷史已實現波動率分桶(低/中/高波動)
 2. 桶內標的共享同一組風控參數,對 Z值停損門檻 × 停利倍數 × regime條件做網格搜索
 3. 目標函數:**風險調整後勝率/期望報酬**(非原始勝率,避免用超緊停利製造虛假高勝率)
-4. 貝氏收縮:樣本數少的桶,參數向業界慣例(v1起點值,見下)收斂;樣本數多、統計顯著的桶,允許更大偏離
+4. 貝氏收縮:樣本數少的桶,參數向業界慣例(v1起點值,見下)收敛;樣本數多、統計顯著的桶,允許更大偏離
 
 **v1 起點值(未優化前的預設,待資料驗證後校準)**:
 - 價格停損:進場價反向 -2 個隱含波動率標準差(Z值框架,呼應板塊五)
