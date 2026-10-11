@@ -207,3 +207,22 @@ def test_learn_package_cannot_reach_orders():
     src = "".join(p.read_text() for p in pathlib.Path("src/stockmoney/desk/learn").glob("*.py"))
     for banned in ("execution.alpaca", "execution.broker", "execution.risk", "RiskEngine", ".submit(", "make_broker"):
         assert banned not in src, banned
+
+
+def test_grok_chains_are_ingested_with_our_clock_and_once(con):
+    msg = {"type": "GROK_DAILY", "events": [], "calls": [], "attention": [], "tracked_accounts": [],
+           "chains": [{"trigger": "supplier warns", "urls": ["https://x.com/a/status/1"], "steps": ["s1", "s2"],
+                       "impacts": [{"ticker": "MU", "direction": "down", "horizon_days": 20},
+                                   {"ticker": "BTC/USD", "direction": "up", "horizon_days": 5}],
+                       "checkpoints": [{"what": "earnings", "date": "2026-11-05"}], "confidence": 0.4,
+                       "created_at": "2020-01-01T00:00:00-05:00"},
+                      {"trigger": "bad", "steps": [], "impacts": [], "confidence": 2}]}
+    from stockmoney.desk.bridge.inbox import ensure_schema as bridge_schema
+    bridge_schema(con)
+    con.execute("INSERT INTO bridge_messages VALUES (?,?,?,?,?,?,?)",
+                ("grok-20261012-0730", "GROK_DAILY", "x", "2026-10-12T07:30:00-04:00",
+                 "2026-10-12T11:40:00+00:00", "{}", json.dumps(msg)))
+    assert chains.ingest_grok(con) == {"added": 1, "skipped": 1}
+    row = con.execute("SELECT created_at, source FROM chains").fetchone()
+    assert row["source"] == "grok" and row["created_at"].startswith("2026-10-12T11:40")  # our received_at
+    assert chains.ingest_grok(con)["added"] == 0  # idempotent

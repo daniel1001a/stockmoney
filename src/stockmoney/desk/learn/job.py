@@ -68,6 +68,10 @@ def run(con, now: datetime, bars: data.Bars | None = None, shadow_start: str | N
     rep, hyps = guarded("symptom_report", lambda: postmortem.symptom_report(con, day)) or ("", [])
     sh = guarded("shadow", lambda: shadow.step(con, bars, ind, through, start=shadow_start))
     con.commit()
+    ig = guarded("grok_ingest", lambda: chains.ingest_grok(con))
+    con.commit()
+    if ig and (ig["added"] or ig["skipped"]):
+        parts.append(f"Grok 事件鏈:新增 {ig['added']},略過 {ig['skipped']}。")
     sc = guarded("chains", lambda: chains.score_due(con, bars, through))
     con.commit()
     if sc:

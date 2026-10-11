@@ -58,6 +58,40 @@ class Chain(BaseModel):
     source: Literal["claude", "owner", "grok", "muse"] = "claude"
 
 
+def ingest_grok(con) -> dict:
+    """Copy chains out of stored GROK_DAILY messages into the chains table.
+
+    Reads ``bridge_messages`` (already sender/token/schema validated by the
+    bridge) and never writes to it. ``created_at`` is OUR ``received_at``, not
+    anything Grok wrote, so a chain cannot be back-dated. Idempotent: the chain
+    id is derived from source + trigger + received day. A chain that does not
+    validate here is skipped and counted, never raised."""
+    if con.execute("SELECT 1 FROM sqlite_master WHERE name='bridge_messages'").fetchone() is None:
+        return {"added": 0, "skipped": 0}
+    added = skipped = 0
+    for r in con.execute("SELECT parsed_json, received_at FROM bridge_messages WHERE type='GROK_DAILY' "
+                         "ORDER BY received_at").fetchall():
+        try:
+            msg = json.loads(r["parsed_json"])
+            raw_chains = msg.get("chains", [])
+        except (ValueError, AttributeError):
+            skipped += 1
+            continue
+        for c in raw_chains:
+            try:
+                chain = Chain.model_validate({
+                    "trigger": c["trigger"], "urls": [str(u) for u in c.get("urls", [])], "steps": c["steps"],
+                    "impacts": [{**i, "ticker": i["ticker"].replace("/USD", "")} for i in c["impacts"]],
+                    "checkpoints": [{"what": k["what"], "date": k.get("date")} for k in c.get("checkpoints", [])],
+                    "confidence": c["confidence"], "source": "grok"})
+                before = con.total_changes
+                add_chain(con, chain, datetime.fromisoformat(r["received_at"]))
+                added += con.total_changes > before
+            except Exception:
+                skipped += 1
+    return {"added": added, "skipped": skipped}
+
+
 def _sym(t: str) -> str:
     return t.replace(".", "-")
 
