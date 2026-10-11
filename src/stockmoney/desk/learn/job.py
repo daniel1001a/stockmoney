@@ -1,0 +1,132 @@
+"""The scheduled learning job: ``python -m stockmoney.desk.learn.job``.
+
+Runs after postclose (17:15 ET). Reads the ledger and price cache, writes only
+learning tables and a report file. Own lock, own failure handling: a crash
+here is logged and never touches an order or the trading lock.
+
+Steps (each isolated, a failure in one does not stop the others):
+  1. post-mortem cards for closed trades
+  2. advance shadow books
+  3. score due event chains
+  4. allocator recommendation (Fridays or when none logged this week)
+  5. report -> data/desk/learn/<date>.md and learn_reports; Friday push summary
+"""
+from __future__ import annotations
+
+import fcntl
+import logging
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+from zoneinfo import ZoneInfo
+
+import pandas as pd
+
+from stockmoney.desk import data, notify, store
+from stockmoney.desk.indicators import compute
+from stockmoney.desk.learn import allocator, chains, postmortem, shadow, tables
+
+log = logging.getLogger(__name__)
+ET = ZoneInfo("America/New_York")
+LOCK = Path("data/desk/learn.lock")
+OUT_DIR = Path("data/desk/learn")
+
+
+def _through(bars: data.Bars, now: datetime) -> pd.Timestamp:
+    """Last COMPLETE session: today's bar only counts after 16:05 ET."""
+    et = now.astimezone(ET)
+    d = bars.dates
+    done = d[d < pd.Timestamp(et.date())]
+    if len(d) and d[-1] == pd.Timestamp(et.date()) and (et.hour, et.minute) >= (16, 5):
+        return d[-1]
+    return done[-1]
+
+
+def run(con, now: datetime, bars: data.Bars | None = None, shadow_start: str | None = None,
+        with_allocator: bool | None = None) -> str:
+    tables.ensure_schema(con)
+    bars = bars or data.to_bars(data.load())
+    through = _through(bars, now)
+    bars = bars.upto(through)
+    ind = compute(bars)
+    day = str(through.date())
+    parts, problems = [f"# Desk 學習日報 {day}", ""], []
+
+    def guarded(name: str, fn):
+        try:
+            return fn()
+        except Exception as e:  # one step failing must not hide the others
+            log.exception("learn step %s failed", name)
+            problems.append(f"{name} 失敗:{type(e).__name__}: {e}")
+            con.rollback()
+            return None
+
+    pm = guarded("postmortem", lambda: postmortem.update_cards(con, bars, ind))
+    con.commit()
+    if pm is not None:
+        parts.append(f"驗屍卡:新增 {pm['new']},更新 {pm['updated']}。")
+    rep, hyps = guarded("symptom_report", lambda: postmortem.symptom_report(con, day)) or ("", [])
+    sh = guarded("shadow", lambda: shadow.step(con, bars, ind, through, start=shadow_start))
+    con.commit()
+    sc = guarded("chains", lambda: chains.score_due(con, bars, through))
+    con.commit()
+    if sc:
+        parts.append(f"事件鏈新評分 {sc} 筆。")
+
+    friday = through.weekday() == 4
+    do_alloc = friday if with_allocator is None else with_allocator
+    if do_alloc:
+        def _alloc():
+            runs = allocator.sleeve_runs(bars, ind)
+            wf = allocator.walk_forward(runs, ind)
+            rec = allocator.recommend(runs, ind, through)
+            allocator.log_recommendation(con, rec)
+            return allocator.report_text(wf, rec)
+        alloc_text = guarded("allocator", _alloc)
+        con.commit()
+    else:
+        alloc_text = None
+
+    parts += ["", rep, "", guarded("shadow_report", lambda: shadow.report(con)) or "", "",
+              guarded("chain_report", lambda: chains.report(con)) or ""]
+    if alloc_text:
+        parts += ["", alloc_text]
+    if problems:
+        parts += ["", "## 本次失敗的步驟", *[f"- {p}" for p in problems]]
+    body = "\n".join(parts)
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    (OUT_DIR / f"{day}.md").write_text(body + "\n")
+    con.execute("INSERT OR REPLACE INTO learn_reports VALUES (?,?,?)", (day, body, store.now()))
+    con.commit()
+    if problems:
+        notify.send(f"Desk 學習任務有失敗步驟 {day}", "\n".join(problems)[:1000], notify.WARN)
+    elif friday and (hyps or alloc_text):
+        notify.send(f"Desk 學習週報 {day}", "\n".join(hyps + ([alloc_text.split("\n")[-6]] if alloc_text else []))[:900],
+                    notify.INFO)
+    return body
+
+
+def main() -> int:
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    LOCK.parent.mkdir(parents=True, exist_ok=True)
+    fh = open(LOCK, "a+")
+    try:
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        log.error("another learn job is running")
+        return 1
+    try:
+        with store.connect() as con:
+            print(run(con, datetime.now(timezone.utc)))
+        return 0
+    except Exception as e:
+        log.exception("learn job failed")
+        notify.send("Desk 學習任務失敗", f"{type(e).__name__}: {e}", notify.WARN)
+        return 1
+    finally:
+        fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+        fh.close()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

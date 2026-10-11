@@ -1,0 +1,209 @@
+"""Learning layer: trade rebuild, symptom rules, shadow idempotency, allocator
+look-ahead guard, chain scoring. Offline, synthetic bars."""
+import json
+from pathlib import Path
+from datetime import datetime, timezone
+
+import numpy as np
+import pandas as pd
+import pytest
+
+from stockmoney.desk import store
+from stockmoney.desk.data import Bars
+from stockmoney.desk.indicators import compute
+from stockmoney.desk.learn import allocator, chains, postmortem, shadow, tables
+from stockmoney.desk.learn.trades import closed_trades
+from stockmoney.desk.run import ensure_schema as run_schema
+from stockmoney.desk.execution.ledger import ensure_schema as ledger_schema
+from stockmoney.desk.universe import ALL_SYMBOLS, MARKET
+
+
+@pytest.fixture
+def con(tmp_path):
+    with store.connect(tmp_path / "d.sqlite") as c:
+        run_schema(c)
+        ledger_schema(c)
+        tables.ensure_schema(c)
+        yield c
+
+
+def make_bars(n=420, seed=1, drift=0.0006):
+    rng = np.random.default_rng(seed)
+    idx = pd.bdate_range("2025-01-01", periods=n)
+    close = pd.DataFrame(
+        {s: 100 * np.exp(np.cumsum(rng.normal(drift, 0.012, n))) for s in ALL_SYMBOLS}, index=idx)
+    op = close.shift(1).fillna(close.iloc[0]) * (1 + rng.normal(0, 0.002, close.shape))
+    hi = np.maximum(op, close) * 1.004
+    lo = np.minimum(op, close) * 0.996
+    vol = pd.DataFrame(1e6 * (1 + rng.random(close.shape)), index=idx, columns=close.columns)
+    return Bars(op, hi, lo, close, vol)
+
+
+def fill(con, cid, sym, side, qty, px, at, strat="breakout", pnl=0.0):
+    con.execute("INSERT INTO fills (client_order_id, symbol, strategy, side, qty, price, filled_at, realized_pnl, recorded_at) "
+                "VALUES (?,?,?,?,?,?,?,?,?)", (cid, sym, strat, side, qty, px, at, pnl, at))
+
+
+def test_closed_trades_roundtrip_and_open_position_excluded(con):
+    fill(con, "b1", "AAPL", "buy", 10, 100, "2026-01-05T14:35:00+00:00")
+    fill(con, "s1", "AAPL", "sell", 10, 110, "2026-01-20T14:35:00+00:00", pnl=100)
+    fill(con, "b2", "MSFT", "buy", 5, 200, "2026-01-06T14:35:00+00:00")  # still open
+    con.execute("INSERT INTO submitted (client_order_id, kind, symbol, strategy, side, qty, status) "
+                "VALUES ('s1','stop','AAPL','breakout','sell',10,'filled')")
+    tr = closed_trades(con)
+    assert len(tr) == 1
+    t = tr[0]
+    assert (t.symbol, t.entry_day, t.exit_day, t.exit_kind) == ("AAPL", "2026-01-05", "2026-01-20", "stop")
+    assert t.pnl == 100 and t.ret == pytest.approx(0.10)
+
+
+def test_partial_fills_aggregate_into_one_trade(con):
+    fill(con, "b1", "AAPL", "buy", 6, 100, "2026-01-05T14:35:00+00:00")
+    fill(con, "b1#6", "AAPL", "buy", 4, 105, "2026-01-05T15:00:00+00:00")
+    fill(con, "s1", "AAPL", "sell", 10, 110, "2026-01-20T14:35:00+00:00", pnl=80)
+    t = closed_trades(con)[0]
+    assert t.qty == 10 and t.entry_px == pytest.approx(102.0)
+
+
+def test_postmortem_symptoms_and_idempotent(con):
+    bars = make_bars()
+    ind = compute(bars)
+    d = bars.dates
+    e, x = d[300], d[310]
+    px_in = float(bars.open.at[e, "AAPL"])
+    px_out = float(bars.open.at[x, "AAPL"]) * 0.90  # filled 10% below the open: execution symptom
+    fill(con, "b1", "AAPL", "buy", 10, px_in, f"{e.date()}T14:35:00+00:00")
+    fill(con, "s1", "AAPL", "sell", 10, px_out, f"{x.date()}T14:35:00+00:00", pnl=(px_out - px_in) * 10)
+    con.execute("INSERT INTO submitted (client_order_id, kind, symbol, strategy, side, qty, status) "
+                "VALUES ('s1','stop','AAPL','breakout','sell',10,'filled')")
+    r1 = postmortem.update_cards(con, bars, ind)
+    assert r1["new"] == 1
+    row = con.execute("SELECT * FROM trade_postmortem").fetchone()
+    assert "S8" in row["symptoms"].split(",")
+    assert row["status"] == "final"  # 10+ sessions exist after the exit
+    con.execute("UPDATE trade_postmortem SET lesson='x'")
+    assert postmortem.update_cards(con, bars, ind) == {"new": 0, "updated": 0}
+    assert con.execute("SELECT lesson FROM trade_postmortem").fetchone()[0] == "x"
+
+
+def test_postmortem_provisional_until_whipsaw_window_closes(con):
+    bars = make_bars()
+    ind = compute(bars)
+    d = bars.dates
+    e, x = d[-8], d[-4]
+    fill(con, "b1", "AAPL", "buy", 1, 100, f"{e.date()}T14:35:00+00:00")
+    fill(con, "s1", "AAPL", "sell", 1, 90, f"{x.date()}T14:35:00+00:00", pnl=-10)
+    postmortem.update_cards(con, bars, ind)
+    assert con.execute("SELECT status FROM trade_postmortem").fetchone()[0] == "provisional"
+
+
+def test_symptom_report_needs_two_consecutive_weeks(con):
+    base = pd.Timestamp("2026-03-27")
+    for i, wk in enumerate((0, 1)):
+        day = str((base - pd.Timedelta(days=7 * wk)).date())
+        con.execute("INSERT INTO trade_postmortem (trade_id, symbol, strategy, exit_day, pnl, symptoms) "
+                    "VALUES (?,?,?,?,?,?)", (f"t{i}", "AAPL", "breakout", day, -100.0, "S2"))
+    text, hyp = postmortem.symptom_report(con, "2026-03-27")
+    assert any("S2" in h for h in hyp)
+    con.execute("DELETE FROM trade_postmortem WHERE trade_id='t1'")
+    assert postmortem.symptom_report(con, "2026-03-27")[1] == []
+
+
+def test_shadow_step_is_idempotent_and_resumes(con):
+    bars = make_bars(n=330)
+    ind = compute(bars)
+    d = bars.dates
+    start = str(d[260].date())
+    ran = shadow.step(con, bars, ind, d[270], start=start)
+    assert ran["shadow:combined"] == 11
+    eq1 = con.execute("SELECT COUNT(*) FROM shadow_equity WHERE name='shadow:combined'").fetchone()[0]
+    assert shadow.step(con, bars, ind, d[270], start=start)["shadow:combined"] == 0
+    ran2 = shadow.step(con, bars, ind, d[275])
+    assert ran2["shadow:combined"] == 5
+    assert con.execute("SELECT COUNT(*) FROM shadow_equity WHERE name='shadow:combined'").fetchone()[0] == eq1 + 5
+    # resuming equals running straight through
+    with store.connect(Path(con.execute("PRAGMA database_list").fetchone()[2] + ".b")) as c2:
+        tables.ensure_schema(c2)
+        shadow.step(c2, bars, ind, d[275], start=start)
+        a = {r[0]: r[1] for r in con.execute("SELECT date, equity FROM shadow_equity WHERE name='shadow:random_trend_0'")}
+        b = {r[0]: r[1] for r in c2.execute("SELECT date, equity FROM shadow_equity WHERE name='shadow:random_trend_0'")}
+        assert a == pytest.approx(b)
+
+
+def test_allocator_weights_ignore_future_trades():
+    ind_close = pd.Series(["risk_on|低波動"] * 6, index=pd.bdate_range("2024-01-01", periods=6))
+    ent = ind_close
+    def tr(rets):
+        return pd.DataFrame({"strategy": "a", "ret": rets, "entry_date": [str(ent.index[0].date())] * len(rets),
+                             "exit_date": ["2024-01-05"] * len(rets)})
+    w1, _ = allocator.weights_from({"a": tr([0.05] * 40), "b": tr([-0.05] * 40)}, "risk_on|低波動", ent)
+    assert w1["a"] > 0 and w1["b"] == 0
+    w0, _ = allocator.weights_from({"a": tr([-0.05] * 40), "b": tr([-0.05] * 40)}, "risk_on|低波動", ent)
+    assert w0 == {"a": 0.0, "b": 0.0}
+
+
+def test_allocator_shrinks_small_cells_toward_overall_mean():
+    idx = pd.bdate_range("2024-01-01", periods=3)
+    cell = pd.Series(["X", "X", "Y"], index=idx)
+    t = pd.DataFrame({"strategy": "a", "ret": [0.20, 0.20, 0.01] + [0.01] * 60,
+                      "entry_date": [str(idx[0].date())] * 2 + [str(idx[2].date())] * 61})
+    est, se, n = allocator.shrunk(t, "a", "X", cell)
+    assert n == 2 and est < 0.05  # two big wins in the cell do not dominate
+
+
+def _chain(direction="up", horizon=5, conf=0.7, ticker="AAPL"):
+    return chains.Chain(trigger="t", steps=["s"], impacts=[chains.Impact(ticker=ticker, direction=direction,
+                        horizon_days=horizon)], confidence=conf, source="owner")
+
+
+def test_chain_scoring_uses_prior_close_and_declared_horizon(con):
+    bars = make_bars()
+    d = bars.dates
+    created = datetime(d[300].year, d[300].month, d[300].day, 15, 0, tzinfo=timezone.utc)  # 10-11am ET, intraday
+    cid = chains.add_chain(con, _chain("up", 5), created)
+    assert chains.add_chain(con, _chain("up", 5), created) == cid  # same chain, same day: no duplicate
+    n = chains.score_due(con, bars, d[-1])
+    rows = con.execute("SELECT * FROM chain_scores WHERE chain_id=?", (cid,)).fetchall()
+    assert n == len(rows) == 3
+    assert {r["horizon"] for r in rows} == {5, 20, 60}
+    r5 = [r for r in rows if r["horizon"] == 5][0]
+    assert r5["declared"] == 1 and r5["base_date"] == str(d[299].date())  # intraday -> previous close
+    exp = (bars.close.at[d[304], "AAPL"] / bars.close.at[d[299], "AAPL"] - 1) - \
+          (bars.close.at[d[304], MARKET] / bars.close.at[d[299], MARKET] - 1)
+    assert r5["excess_ret"] == pytest.approx(exp)
+    assert chains.score_due(con, bars, d[-1]) == 0  # idempotent
+
+
+def test_chain_after_close_uses_same_day_close(con):
+    bars = make_bars()
+    d = bars.dates
+    created = datetime(d[300].year, d[300].month, d[300].day, 22, 0, tzinfo=timezone.utc)  # after 16:05 ET in both EST and EDT
+    chains.add_chain(con, _chain(), created)
+    chains.score_due(con, bars, d[-1])
+    assert con.execute("SELECT base_date FROM chain_scores LIMIT 1").fetchone()[0] == str(d[300].date())
+
+
+def test_chain_authority_stays_log_only_until_enough_good_samples(con):
+    assert chains.authority(con)[0] == "log_only"
+    for i in range(60):
+        con.execute("INSERT INTO chain_scores VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                    (f"c{i}", "AAPL", 20, 1, "up", "2026-01-01", "2026-02-01", 0.01, int(i % 10 != 0), 0.7, "x"))
+    assert chains.authority(con)[0] == "eligible_for_review"
+    con.execute("UPDATE chain_scores SET hit=0")
+    assert chains.authority(con)[0] == "log_only"
+
+
+def test_chain_schema_rejects_bad_horizon_and_extra_fields():
+    with pytest.raises(Exception):
+        chains.Chain(trigger="t", steps=["s"], impacts=[{"ticker": "AAPL", "direction": "up", "horizon_days": 7}],
+                     confidence=0.5)
+    with pytest.raises(Exception):
+        chains.Chain(trigger="t", steps=["s"], impacts=[{"ticker": "AAPL", "direction": "up", "horizon_days": 5}],
+                     confidence=0.5, place_order=True)
+
+
+def test_learn_package_cannot_reach_orders():
+    import pathlib, re
+    src = "".join(p.read_text() for p in pathlib.Path("src/stockmoney/desk/learn").glob("*.py"))
+    for banned in ("execution.alpaca", "execution.broker", "execution.risk", "RiskEngine", ".submit(", "make_broker"):
+        assert banned not in src, banned

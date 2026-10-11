@@ -25,6 +25,7 @@ JOBS = {
     "postopen": {"times": [(9, 50)], "weekdays": True},    # sync fills, place protective stops
     "postclose": {"times": [(16, 45)], "weekdays": True},  # reconcile, trail stops, new signals, report
     "crypto": {"times": [(20, 0)], "weekdays": False},     # daily crypto sleeve, 7 days
+    "learn": {"times": [(17, 15)], "weekdays": True},      # read-only: post-mortems, shadow books, chain scoring
     "bridge": {"interval": 900},                           # poll Muse every 15 minutes
     # launchd replays a missed calendar job after sleep but not after a power-off;
     # at every load (boot, login, install) recover books fills and restores stops
@@ -33,7 +34,7 @@ JOBS = {
 
 
 # bridge needs the Muse mailbox configured; crypto is a Phase 1 placeholder. Both are opt-in.
-DEFAULT_JOBS = ["premarket", "postopen", "postclose", "recover"]
+DEFAULT_JOBS = ["premarket", "postopen", "postclose", "recover", "learn"]
 
 
 def plist(name: str, spec: dict) -> dict:
