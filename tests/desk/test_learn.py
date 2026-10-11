@@ -223,6 +223,7 @@ def test_grok_chains_are_ingested_with_our_clock_and_once(con):
                 ("grok-20261012-0730", "GROK_DAILY", "x", "2026-10-12T07:30:00-04:00",
                  "2026-10-12T11:40:00+00:00", "{}", json.dumps(msg)))
     assert chains.ingest_grok(con) == {"added": 1, "skipped": 1}
-    row = con.execute("SELECT created_at, source FROM chains").fetchone()
+    row = con.execute("SELECT created_at, source, impacts_json FROM chains").fetchone()
     assert row["source"] == "grok" and row["created_at"].startswith("2026-10-12T11:40")  # our received_at
+    assert [i["ticker"] for i in json.loads(row["impacts_json"])] == ["MU"]  # crypto impact dropped, not renamed
     assert chains.ingest_grok(con)["added"] == 0  # idempotent

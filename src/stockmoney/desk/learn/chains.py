@@ -81,7 +81,9 @@ def ingest_grok(con) -> dict:
             try:
                 chain = Chain.model_validate({
                     "trigger": c["trigger"], "urls": [str(u) for u in c.get("urls", [])], "steps": c["steps"],
-                    "impacts": [{**i, "ticker": i["ticker"].replace("/USD", "")} for i in c["impacts"]],
+                    # crypto (BTC/USD) has no price series in the stock cache; dropping it beats
+                    # renaming it to "BTC", which is also the ticker of a listed bitcoin ETF
+                    "impacts": [i for i in c["impacts"] if "/" not in i["ticker"]],
                     "checkpoints": [{"what": k["what"], "date": k.get("date")} for k in c.get("checkpoints", [])],
                     "confidence": c["confidence"], "source": "grok"})
                 before = con.total_changes
