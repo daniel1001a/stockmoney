@@ -9,8 +9,9 @@ Symptom rules (all computed from bars known at the time, or after exit for S2):
   S3 追高        signal-day close more than 2.5 ATR above its 20-day average
   S4 大盤翻轉    regime fell from risk_on to a worse state, or neutral to risk_off, while held
   S5 板塊退潮    sector was a leader at the signal day and not at exit
-  S6 事件跳空    during the hold a session opened >= 1.5 ATR below the prior close on >= 2x volume
-                 (proxy for earnings/news gaps; no earnings calendar is wired in)
+  S6 事件跳空    a loss while an earnings date fell inside the hold (learn/earnings.py, only when
+                 the span was fully scanned), or a session that opened >= 1.5 ATR below the prior
+                 close on >= 2x volume (price proxy for any news gap)
   S7 獲利回吐    best excursion >= 2R but closed below 0.5R
   S8 執行異常    entry or exit fill more than 0.5% away from that session's open
   S9 消息面     a Muse/Grok ALERT for the ticker arrived while held
@@ -138,6 +139,10 @@ def build_card(con, t: ClosedTrade, bars: Bars, ind: Ind) -> dict | None:
     slip_out = abs(t.exit_px / open_out - 1) if open_out else None
 
     alerts = _alerts(con, sym, t.entry_at, t.exit_at)
+    from stockmoney.desk.learn import earnings as _earn
+    span = (entry_day.date(), exit_day.date())
+    earn_known = _earn.covered(con, *span)
+    earn_dates = _earn.in_span(con, sym, *span) if earn_known else []
 
     s: list[str] = []
     if t.exit_kind == "stop" and exit_gap is not None and exit_gap <= -1.0:
@@ -151,7 +156,7 @@ def build_card(con, t: ClosedTrade, bars: Bars, ind: Ind) -> dict | None:
         s.append("S4")
     if lead_entry and lead_exit is False:
         s.append("S5")
-    if gap_hits:
+    if gap_hits or (earn_dates and t.pnl <= 0):
         s.append("S6")
     if mfe_r is not None and r_mult is not None and mfe_r >= 2 and r_mult < 0.5:
         s.append("S7")
@@ -166,7 +171,7 @@ def build_card(con, t: ClosedTrade, bars: Bars, ind: Ind) -> dict | None:
         "regime_entry": reg_entry, "regime_exit": reg_exit, "sector": sec,
         "sector_leading_entry": lead_entry, "sector_leading_exit": lead_exit,
         "ext_atr": ext_atr, "mfe": mfe, "mae": mae, "mfe_r": mfe_r, "exit_gap_atr": exit_gap,
-        "gap_events": gap_hits, "back_above_entry_10d": back_above if complete else None,
+        "gap_events": gap_hits, "earnings_in_hold": earn_dates if earn_known else None, "back_above_entry_10d": back_above if complete else None,
         "slip_entry": slip_in, "slip_exit": slip_out, "hold_sessions": len(held) - 1,
         "alerts": alerts, "signal_id": t.signal_id, "initial_stop": t.initial_stop,
     }

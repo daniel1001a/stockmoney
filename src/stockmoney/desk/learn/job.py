@@ -24,7 +24,7 @@ import pandas as pd
 
 from stockmoney.desk import data, notify, store
 from stockmoney.desk.indicators import compute
-from stockmoney.desk.learn import allocator, chains, postmortem, shadow, tables
+from stockmoney.desk.learn import allocator, chains, earnings, postmortem, shadow, tables
 
 log = logging.getLogger(__name__)
 ET = ZoneInfo("America/New_York")
@@ -40,6 +40,28 @@ def _through(bars: data.Bars, now: datetime) -> pd.Timestamp:
     if len(d) and d[-1] == pd.Timestamp(et.date()) and (et.hour, et.minute) >= (16, 5):
         return d[-1]
     return done[-1]
+
+
+def _earnings_watch(con, day) -> str:
+    """Held positions and already-planned buys that report within 7 days.
+    Read-only: this only informs, it never changes a plan."""
+    held = [r["symbol"] for r in con.execute("SELECT symbol FROM sleeve_positions").fetchall()] \
+        if con.execute("SELECT 1 FROM sqlite_master WHERE name='sleeve_positions'").fetchone() else []
+    planned = [r["symbol"] for r in con.execute(
+        "SELECT symbol FROM planned_orders WHERE side='buy' AND status IN ('planned','submitted')").fetchall()] \
+        if con.execute("SELECT 1 FROM sqlite_master WHERE name='planned_orders'").fetchone() else []
+    up = earnings.upcoming(con, held + planned, day, 7)
+    if not up:
+        return "## 財報提醒\n\n持倉與已規劃的買單,7 天內沒有已知的財報日(資料不足的日子不會被當成沒有)。"
+    lines = ["## 財報提醒(7 天內)", ""]
+    for s, d in sorted(up.items(), key=lambda x: x[1]):
+        kind = "持倉" if norm_in(s, held) else "已規劃買進"
+        lines.append(f"- {s}:{d}({kind})")
+    return "\n".join(lines)
+
+
+def norm_in(sym: str, group: list[str]) -> bool:
+    return sym in {earnings.norm(g) for g in group}
 
 
 def run(con, now: datetime, bars: data.Bars | None = None, shadow_start: str | None = None,
@@ -61,6 +83,10 @@ def run(con, now: datetime, bars: data.Bars | None = None, shadow_start: str | N
             con.rollback()
             return None
 
+    er = guarded("earnings", lambda: earnings.refresh(con, through.date()))
+    con.commit()
+    if er is not None:
+        parts.append(f"財報日:掃描 {er['scanned']} 天,失敗 {er['failed']} 天,略過 {er['skipped']} 天。")
     pm = guarded("postmortem", lambda: postmortem.update_cards(con, bars, ind))
     con.commit()
     if pm is not None:
@@ -91,6 +117,9 @@ def run(con, now: datetime, bars: data.Bars | None = None, shadow_start: str | N
     else:
         alloc_text = None
 
+    watch = guarded("earnings_watch", lambda: _earnings_watch(con, through.date()))
+    if watch:
+        parts += ["", watch]
     parts += ["", rep, "", guarded("shadow_report", lambda: shadow.report(con)) or "", "",
               guarded("chain_report", lambda: chains.report(con)) or ""]
     if alloc_text:

@@ -29,16 +29,40 @@ START_KEY = "shadow_start"
 RANDOM_SEEDS = 5
 
 
-def _book(**params) -> Callable[[str], dict[str, Strategy]]:
-    return lambda day: {n: REGISTRY[n](**params.get(n, {})) for n in REGISTRY}
+class EarningsGuard:
+    """Wraps a strategy and drops entry signals whose earnings fall within the
+    window (point-in-time). Exits, stops and sizing are the inner strategy's."""
+
+    def __init__(self, inner: Strategy, blocked: Callable):
+        self._inner, self._blocked = inner, blocked
+        self.name, self.params = inner.name, inner.params
+
+    def candidates(self, ctx):
+        return [s for s in self._inner.candidates(ctx) if not self._blocked(s.symbol, ctx.t)]
+
+    def __getattr__(self, item):
+        return getattr(self._inner, item)
 
 
-def _single(name: str) -> Callable[[str], dict[str, Strategy]]:
-    return lambda day: {name: REGISTRY[name]()}
+def _book(**params) -> Callable:
+    return lambda day, con=None: {n: REGISTRY[n](**params.get(n, {})) for n in REGISTRY}
 
 
-def _random(k: int, trend: bool) -> Callable[[str], dict[str, Strategy]]:
-    def make(day: str) -> dict[str, Strategy]:
+def _guarded_book(window_days: int) -> Callable:
+    from stockmoney.desk.learn import earnings
+
+    def make(day: str, con=None) -> dict[str, Strategy]:
+        blocked = earnings.blocked_fn(con, window_days)
+        return {n: EarningsGuard(REGISTRY[n](), blocked) for n in REGISTRY}
+    return make
+
+
+def _single(name: str) -> Callable:
+    return lambda day, con=None: {name: REGISTRY[name]()}
+
+
+def _random(k: int, trend: bool) -> Callable:
+    def make(day: str, con=None) -> dict[str, Strategy]:
         seed = int(hashlib.sha1(f"{k}|{trend}|{day}".encode()).hexdigest()[:8], 16)
         return {"random": RandomEntry(seed, 0.8, trend)}
     return make
@@ -46,8 +70,10 @@ def _random(k: int, trend: bool) -> Callable[[str], dict[str, Strategy]]:
 
 # name -> strategy factory (day -> strategies). Random controls are re-seeded
 # per day from (index, day), so a rerun or a crash gives the identical path.
-VARIANTS: dict[str, Callable[[str], dict[str, Strategy]]] = {
+VARIANTS: dict[str, Callable] = {
     "shadow:combined": _book(),
+    # no new entry within 7 calendar days of a known earnings date (EDGE_PLAN S6)
+    "shadow:combined_earn7": _guarded_book(7),
     # H1 in docs/desk/EDGE_PLAN.md: wider trailing stop on the two stop-driven strategies
     "shadow:combined_t35": _book(breakout={"trail_atr": 3.5}, pullback={"trail_atr": 3.5}),
     "shadow:breakout": _single("breakout"),
@@ -83,7 +109,7 @@ def step(con, bars: Bars, ind: Ind, through: pd.Timestamp, start: str | None = N
             if t not in ctxs:
                 ctxs[t] = engine.day_context(ind, t)
             ctx = ctxs[t]
-            strats = make(str(t.date()))
+            strats = make(str(t.date()), con)
             engine.morning(acct, bars, t)
             engine.evening(acct, strats, ctx, engine.scan(strats, ctx))
         if todo:
@@ -137,7 +163,7 @@ def report(con) -> str:
     lines = [f"## 影子帳戶({first} 到 {last},{len(eq)} 個交易日)", "",
              "| 帳戶 | 累計報酬 | 最大回撤 |", "|---|---|---|"]
     for c in [c for c in eq.columns if c.startswith("bench:") or c in
-              ("shadow:combined", "shadow:combined_t35", "shadow:breakout", "shadow:pullback", "shadow:rotation")]:
+              ("shadow:combined", "shadow:combined_t35", "shadow:combined_earn7", "shadow:breakout", "shadow:pullback", "shadow:rotation")]:
         lines.append(f"| {c} | {ret[c]:+.2%} | {dd[c]:.2%} |")
     for label, cols in (("隨機進場(多頭排列)", rnd_t), ("隨機進場(不限)", rnd_a)):
         if cols:

@@ -227,3 +227,103 @@ def test_grok_chains_are_ingested_with_our_clock_and_once(con):
     assert row["source"] == "grok" and row["created_at"].startswith("2026-10-12T11:40")  # our received_at
     assert [i["ticker"] for i in json.loads(row["impacts_json"])] == ["MU"]  # crypto impact dropped, not renamed
     assert chains.ingest_grok(con)["added"] == 0  # idempotent
+
+
+# ------------------------------------------------------------------ earnings
+from datetime import date as _date, timedelta as _td
+
+from stockmoney.desk.learn import earnings
+
+
+def _fetcher(table):
+    """table: {date: rows | None}; unknown days answer with no rows."""
+    return lambda d: table.get(d, [])
+
+
+def test_earnings_refresh_failed_day_never_marks_stock_safe(con):
+    d0 = _date(2026, 10, 12)  # Monday
+    ok = {d0 + _td(days=1): [{"symbol": "NVDA", "time": "time-after-hours"}, {"symbol": "ZZZZ"}]}
+    r = earnings.refresh(con, d0, days=3, fetch=_fetcher(ok), pause_s=0)
+    assert r["failed"] == 0
+    assert earnings.upcoming(con, ["NVDA", "ZZZZ"], d0, 7) == {"NVDA": "2026-10-13"}  # non-universe symbol ignored
+    # tomorrow's listing now fails: the known date must survive
+    r2 = earnings.refresh(con, d0, days=3, fetch=lambda d: None, pause_s=0)
+    assert r2["failed"] == 3
+    assert earnings.upcoming(con, ["NVDA"], d0, 7) == {"NVDA": "2026-10-13"}
+    assert earnings.covered(con, d0 + _td(days=1), d0 + _td(days=1)) is True  # earlier ok scan still counts
+
+
+def test_earnings_date_moved_is_retired_but_remembered(con):
+    d0 = _date(2026, 10, 12)
+    earnings.refresh(con, d0, days=3, fetch=_fetcher({d0 + _td(days=1): [{"symbol": "AAPL"}]}), pause_s=0)
+    earnings.refresh(con, d0, days=3, fetch=_fetcher({d0 + _td(days=2): [{"symbol": "AAPL"}]}), pause_s=0)
+    assert earnings.upcoming(con, ["AAPL"], d0, 7) == {"AAPL": "2026-10-14"}
+    old = con.execute("SELECT removed_at FROM earnings WHERE symbol='AAPL' AND date='2026-10-13'").fetchone()
+    assert old["removed_at"] is not None
+
+
+def test_earnings_guard_is_point_in_time(con):
+    d0 = _date(2026, 10, 12)
+    earnings.refresh(con, d0, days=3, fetch=_fetcher({d0 + _td(days=1): [{"symbol": "NVDA"}]}), pause_s=0,
+                     now=datetime(2026, 10, 12, 21, 0, tzinfo=timezone.utc))  # first seen Monday 17:00 ET
+    blocked = earnings.blocked_fn(con, 7)
+    assert blocked("NVDA", pd.Timestamp("2026-10-12")) is True    # known by the end of Monday
+    assert blocked("NVDA", pd.Timestamp("2026-10-09")) is False   # Friday: we did not know yet
+    assert blocked("AAPL", pd.Timestamp("2026-10-12")) is False
+    assert blocked("NVDA", pd.Timestamp("2026-10-14")) is False   # already reported
+
+
+def test_postmortem_s6_when_a_loss_spans_known_earnings(con):
+    bars = make_bars()
+    ind = compute(bars)
+    d = bars.dates
+    e, x = d[300], d[308]
+    start = e.date()
+    earnings.ensure_schema(con)
+    day = start
+    while day <= x.date():
+        con.execute("INSERT OR REPLACE INTO earnings_scan VALUES (?,?,?,?)", (day.isoformat(), 1, 0, "x"))
+        day += _td(days=1)
+    con.execute("INSERT INTO earnings VALUES ('AAPL', ?, '', 'x', 'x', NULL)", ((e + pd.Timedelta(days=3)).date().isoformat(),))
+    px = float(bars.open.at[e, "AAPL"])
+    fill(con, "b1", "AAPL", "buy", 10, px, f"{e.date()}T14:35:00+00:00")
+    fill(con, "s1", "AAPL", "sell", 10, px * float(bars.open.at[x, "AAPL"]) / float(bars.open.at[x, "AAPL"]) * 0.97,
+         f"{x.date()}T14:35:00+00:00", pnl=-1)
+    postmortem.update_cards(con, bars, ind)
+    row = con.execute("SELECT symptoms, facts_json FROM trade_postmortem").fetchone()
+    assert "S6" in row["symptoms"].split(",")
+    assert json.loads(row["facts_json"])["earnings_in_hold"]
+
+
+def test_postmortem_earnings_unknown_when_span_not_scanned(con):
+    bars = make_bars()
+    ind = compute(bars)
+    d = bars.dates
+    px = float(bars.open.at[d[300], "AAPL"])
+    fill(con, "b1", "AAPL", "buy", 10, px, f"{d[300].date()}T14:35:00+00:00")
+    fill(con, "s1", "AAPL", "sell", 10, px * 0.97, f"{d[308].date()}T14:35:00+00:00", pnl=-1)
+    postmortem.update_cards(con, bars, ind)
+    assert json.loads(con.execute("SELECT facts_json FROM trade_postmortem").fetchone()[0])["earnings_in_hold"] is None
+
+
+def test_earnings_guard_drops_only_blocked_entries_and_delegates_the_rest():
+    from types import SimpleNamespace
+    from stockmoney.desk.learn.shadow import EarningsGuard
+    from stockmoney.desk.strategies import Signal
+
+    t = pd.Timestamp("2026-10-12")
+    sigs = [Signal("breakout", "NVDA", t, 100, 90, 1.0, "x", "y"), Signal("breakout", "AAPL", t, 100, 90, 1.0, "x", "y")]
+    inner = SimpleNamespace(name="breakout", params={"a": 1}, candidates=lambda ctx: sigs,
+                            exit_reason=lambda *a: "inner-exit", trail_stop=lambda *a: 42.0)
+    g = EarningsGuard(inner, lambda sym, day: sym == "NVDA")
+    out = g.candidates(SimpleNamespace(t=t))
+    assert [s.symbol for s in out] == ["AAPL"]
+    assert g.name == "breakout" and g.exit_reason() == "inner-exit" and g.trail_stop() == 42.0
+
+
+def test_shadow_step_runs_the_earnings_guarded_book(con):
+    bars = make_bars(n=330)
+    ind = compute(bars)
+    d = bars.dates
+    shadow.step(con, bars, ind, d[300], start=str(d[280].date()))
+    assert "shadow:combined_earn7" in store.load_accounts(con)
