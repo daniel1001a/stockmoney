@@ -6,8 +6,9 @@
 - ``notify``: lines to push to the owner
 
 There is deliberately no output here that opens a position, raises a size or
-changes a parameter, and no code path from a message to an order. IDEA and
-SOCIAL_DAILY produce no flags (they are incubator / feature-store data).
+changes a parameter, and no code path from a message to an order. IDEA,
+SOCIAL_DAILY, CALLS and GROK_DAILY produce no flags (incubator / feature-store
+data; GROK_DAILY stays store-only until Grok has its own token).
 
 Timing uses ``received_at`` (set by our inbox), never Muse's own timestamps, so
 a message can neither back-date nor extend its own effect. Whether a ticker is

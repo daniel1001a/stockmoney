@@ -43,6 +43,18 @@ Desk ──(寄到你的 Gmail)──> Muse 讀你的信箱 ──> 需要時用
 | `RESEARCH_REPLY` 有風險旗標 | 取消這次進場 | |
 | `SOCIAL_DAILY`、`CALLS` | 只存資料,累積後做統計檢驗 | 驗證通過前不影響任何交易 |
 | `IDEA` | 寫進孵化器 | 不交易 |
+| `GROK_DAILY`(Grok) | 只存資料;事件鏈交給學習層評分 | v1 不擋進場、不推播,驗證通過前不影響任何交易 |
+
+### Grok 日報 `GROK_DAILY`
+
+Grok 是第二個情報員(看 X),說明與完整格式在 `docs/desk/GROK_PROMPT.md`。
+
+- 通道:和 Muse 相同的寄件人(`MUSE_ADDRESS`)、相同的共享密鑰、相同的主旨格式 `[SMD/GROK_DAILY/grok-…] <token>`。`grok-` 開頭的訊息編號只保留給 `GROK_DAILY`,其他類型用了會被拒絕。
+- 時間:每天美東 07:30(最晚 08:10 寄出)和 20:00 各一封,週末也寄,由 Pika 從 dnial1001a@gmail.com 寄出。只有早上那封計分、做漏交檢查:08:30 前要收到,只算 NYSE 交易日,而且 `collected_at` 要是當天(美東)中午以前;晚上那封照收照存,不計分、不檢查漏交。用 `scripts/muse_check.py grok on|off` 單獨開關,`stage N` 不會影響它。
+- 儲存:存進 `bridge_messages`,和 Muse 的訊息放在一起;`learn/chains.py` 的 `ingest_grok()` 讀出事件鏈並評分。時間一律以 Desk 的 `received_at` 為準,Grok 自己寫的時間只用來稽核。
+- 權限:v1 只存資料,`policy.active_flags` 不會讀它。要接進風控,得等 Grok 有自己的密鑰(v1.1)之後另外決定。
+- 範圍:清單(universe 加上 QQQ、TQQQ、BTC/USD)以外的標的,一封超過 5 檔只通知你一次,不拒絕。
+- 格式錯誤:FEEDBACK 會寄到 `MUSE_ADDRESS`,`problem` 開頭是「【給 Grok】」;Muse 的提示詞要它忽略這種 FEEDBACK。修正信每 24 小時最多 10 封,Muse 和 Grok 共用這個上限。
 
 ## 4. 安全
 

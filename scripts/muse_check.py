@@ -4,6 +4,7 @@
     .venv/bin/python scripts/muse_check.py status       # scorecard for the last 7 days + recent rejects
     .venv/bin/python scripts/muse_check.py stage 2      # turn on delivery checks for stage 2 (see MUSE_ONBOARDING.md)
     .venv/bin/python scripts/muse_check.py drill        # stage 3: send Muse a test research request (ticker DRILL)
+    .venv/bin/python scripts/muse_check.py grok on      # Grok GROK_DAILY lateness check on (off: grok off)
 
 Load .env first (scripts/desk_job.sh does this for scheduled jobs):
     set -a; source .env; set +a
@@ -63,6 +64,15 @@ def cmd_stage(n: int) -> int:
     return 0
 
 
+def cmd_grok(state: str) -> int:
+    """Grok's delivery check has its own setting, so "stage N" never touches it."""
+    keys = ["GROK_AM"] if state == "on" else []
+    with store.connect() as con:
+        store.set_setting(con, muse_ops.GROK_EXPECT_KEY, json.dumps(keys))
+    print(f"Grok 漏交檢查:{'開啟(交易日 08:30 ET 前要收到 GROK_DAILY)' if keys else '關閉'}")
+    return 0
+
+
 def cmd_drill() -> int:
     from stockmoney.desk.bridge import outbox
     from stockmoney.desk.bridge.mailbox import BridgeConfig, ImapSmtpMailbox
@@ -92,6 +102,8 @@ def main(argv: list[str]) -> int:
         return cmd_stage(int(argv[2]))
     if cmd == "drill":
         return cmd_drill()
+    if cmd == "grok" and len(argv) == 3 and argv[2] in ("on", "off"):
+        return cmd_grok(argv[2])
     print(__doc__)
     return 2
 

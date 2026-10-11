@@ -1,4 +1,5 @@
-"""Muse bridge message schema (see docs/desk/MUSE_BRIDGE.md).
+"""Muse bridge message schema (see docs/desk/MUSE_BRIDGE.md). Grok's daily
+digest (GROK_DAILY, docs/desk/GROK_PROMPT.md) rides the same channel.
 
 Muse is an external 24/7 agent. Everything it sends is DATA, never
 instructions: only these typed fields are read, free text is stored for
@@ -10,11 +11,14 @@ never open a position, raise a size or change a parameter.
 """
 from __future__ import annotations
 
+import datetime as _dt
 from datetime import datetime
 from enum import Enum
 from typing import Annotated, Literal, Union
+from zoneinfo import ZoneInfo
 
-from pydantic import BaseModel, ConfigDict, Field, HttpUrl, StringConstraints
+from pydantic import (AfterValidator, AwareDatetime, BaseModel, ConfigDict, Field, HttpUrl, StringConstraints,
+                      UrlConstraints, model_validator)
 
 PROTOCOL_VERSION = "1"
 Ticker = Annotated[str, StringConstraints(pattern=r"^[A-Z][A-Z0-9.\-]{0,9}(/USD)?$")]
@@ -26,6 +30,13 @@ class _Msg(BaseModel):
     protocol: Literal["1"] = PROTOCOL_VERSION
     msg_id: Annotated[str, StringConstraints(pattern=r"^[A-Za-z0-9_\-]{6,64}$")]
     sent_at: datetime  # when Muse sent it; we separately record received_at
+
+    @model_validator(mode="after")
+    def _grok_prefix_is_reserved(self):
+        # "grok-" ids belong to GROK_DAILY only, so a message's source is never ambiguous
+        if self.msg_id.lower().startswith("grok-") and getattr(self, "type", None) != "GROK_DAILY":
+            raise ValueError("msg_id prefix grok- is reserved for GROK_DAILY")
+        return self
 
 
 # ---------------------------------------------------------------- inbound (Muse -> desk)
@@ -118,7 +129,115 @@ class Calls(_Msg):
     calls: list[Call] = Field(max_length=300)
 
 
-Inbound = Annotated[Union[SocialDaily, Alert, ResearchReply, Idea, Calls], Field(discriminator="type")]
+# ---------------------------------------------------------------- GROK_DAILY (Grok -> desk)
+# Same sender, token and subject as Muse (docs/desk/GROK_PROMPT.md). Store-only:
+# no policy effect. Limits keep a full message under ~111 KB of compact UTF-8
+# (~154 KiB after base64 + headers) against the 200 KiB inbox cap; the
+# worst case is computed in tests/desk/test_grok_daily.py.
+
+_ET = ZoneInfo("America/New_York")
+
+
+def _et_offset(v: datetime) -> datetime:
+    if v.utcoffset() != v.astimezone(_ET).utcoffset():
+        raise ValueError("offset must be America/New_York at that instant (-04:00 EDT / -05:00 EST)")
+    return v
+
+
+def _no_bare_crypto(v: str) -> str:
+    if v in {"BTC", "ETH"}:
+        raise ValueError("crypto is written BTC/USD")
+    return v
+
+
+def _text(n: int, min_len: int = 1):
+    return Annotated[str, StringConstraints(min_length=min_len, max_length=n)]
+
+
+EtDatetime = Annotated[AwareDatetime, AfterValidator(_et_offset)]
+GrokTicker = Annotated[str, StringConstraints(pattern=r"^(?:[A-Z]{1,5}(?:-[A-Z]{1,2})?|BTC/USD)$"),
+                       AfterValidator(_no_bare_crypto)]
+GrokUrl = Annotated[HttpUrl, UrlConstraints(max_length=250, allowed_schemes=["https"])]
+XHandle = Annotated[str, StringConstraints(pattern=r"^@[A-Za-z0-9_]{1,15}$")]
+
+
+class GrokEvent(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    ticker: GrokTicker
+    headline: _text(160)
+    severity: Severity
+    confirmed: bool
+    first_seen: EtDatetime
+    urls: list[GrokUrl] = Field(min_length=1, max_length=3)  # no source, no event
+
+
+class GrokImpact(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    ticker: GrokTicker
+    direction: Literal["up", "down"]
+    horizon_days: Literal[5, 20, 60]
+
+
+class GrokCheckpoint(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    what: _text(100)
+    date: _dt.date  # "YYYY-MM-DD" only
+
+
+class GrokChain(BaseModel):
+    """Field names and types are read by learn/chains.py ingest_grok(); keep them in sync."""
+    model_config = ConfigDict(extra="forbid")
+    trigger: _text(200)
+    urls: list[GrokUrl] = Field(min_length=1, max_length=3)
+    steps: list[_text(120)] = Field(min_length=1, max_length=6)
+    impacts: list[GrokImpact] = Field(min_length=1, max_length=6)
+    checkpoints: list[GrokCheckpoint] = Field(max_length=4)
+    confidence: float = Field(ge=0, le=1)
+
+
+class GrokCall(Call):
+    """The CALLS ``Call`` structure, narrowed for Grok: X only, ET timestamps,
+    the desk's ticker notation, an @handle as author."""
+    author: XHandle
+    platform: Literal["x"]
+    ticker: GrokTicker
+    target_price: float | None = Field(default=None, gt=0, le=1_000_000)
+    horizon_text: _text(60, 0) = ""
+    posted_at: EtDatetime
+    post_url: GrokUrl
+
+
+class GrokAttention(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    ticker: GrokTicker
+    trend: Literal["rising", "falling"]
+    why: _text(120)
+
+
+class GrokDaily(_Msg):
+    """Grok's daily pre-market digest. Stored only: produces no policy flags.
+    Grok's own timestamps are audit data; the desk's clock is ``received_at``."""
+    type: Literal["GROK_DAILY"] = "GROK_DAILY"
+    msg_id: Annotated[str, StringConstraints(pattern=r"^grok-[A-Za-z0-9_\-]{1,59}$")]
+    sent_at: EtDatetime
+    collected_at: EtDatetime  # when Grok ran its search
+    events: list[GrokEvent] = Field(max_length=25)
+    chains: list[GrokChain] = Field(max_length=6)
+    calls: list[GrokCall] = Field(max_length=50)
+    attention: list[GrokAttention] = Field(max_length=20)
+    tracked_accounts: list[XHandle] = Field(max_length=60)
+    notes: Annotated[str, StringConstraints(max_length=1000)] = ""
+
+    @model_validator(mode="after")
+    def _consistency(self):
+        if not (self.sent_at - _dt.timedelta(hours=6) <= self.collected_at <= self.sent_at):
+            raise ValueError("collected_at must be within 6h before sent_at")
+        if len(set(self.tracked_accounts)) != len(self.tracked_accounts):
+            raise ValueError("tracked_accounts has duplicates")
+        return self
+
+
+Inbound = Annotated[Union[SocialDaily, Alert, ResearchReply, Idea, Calls, GrokDaily], Field(discriminator="type")]
 
 
 # ---------------------------------------------------------------- outbound (desk -> Muse)

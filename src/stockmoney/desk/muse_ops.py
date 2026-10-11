@@ -71,9 +71,9 @@ def fields_hint(reason: str) -> str:
     list that type's required and optional top-level fields from the real
     model, so the sender can fix a missing or misplaced field without guessing."""
     import re
-    from stockmoney.desk.bridge.schema import Alert, Calls, Idea, ResearchReply, SocialDaily
+    from stockmoney.desk.bridge.schema import Alert, Calls, GrokDaily, Idea, ResearchReply, SocialDaily
     models = {"SOCIAL_DAILY": SocialDaily, "CALLS": Calls, "ALERT": Alert,
-              "RESEARCH_REPLY": ResearchReply, "IDEA": Idea}
+              "RESEARCH_REPLY": ResearchReply, "IDEA": Idea, "GROK_DAILY": GrokDaily}
     m = re.match(r"schema_invalid\s+([A-Z_]+)\.", reason)
     model = models.get(m.group(1)) if m else None
     if model is None:
@@ -85,13 +85,23 @@ def fields_hint(reason: str) -> str:
             "別的類型的欄位不能搬過來用。")
 
 
+# Rules a GROK_DAILY can break that the bare error code ("value_error",
+# "string_pattern_mismatch") does not explain.
+GROK_RULES = (
+    "GROK_DAILY 規則:msg_id 以 grok- 開頭;所有時間帶美東偏移(夏令 -04:00、冬令 -05:00),不能用 Z;"
+    "collected_at 在 sent_at 之前 6 小時內;比特幣寫 BTC/USD,股票寫 BRK-B;網址只能 https 且不超過 250 字元;"
+    "帳號寫成 @handle;calls 的 platform 一律 \"x\";checkpoints 的 date 寫 YYYY-MM-DD。"
+)
+
+
 def fix_for(reason: str) -> str:
     """The correction text for a stored reject reason."""
     if "json_invalid" in reason:
         return JSON_INVALID_FIX
     base = FIXES[reason.split(" ")[0]]
     hint = fields_hint(reason)
-    return f"{hint} {base}" if hint else base
+    text = f"{hint} {base}" if hint else base
+    return f"{text} {GROK_RULES}" if "GROK_DAILY" in reason else text
 
 
 # Hard ceiling on correction mail so that no loop, whatever its cause, can
@@ -132,9 +142,11 @@ def send_feedback(con, box, now: datetime) -> int:
     budget = FEEDBACK_CAP - len(feedback_sent_since(con, now - FEEDBACK_WINDOW))
     n = 0
     for key, about, reason in pending[: max(budget, 0)]:
-        code = reason.split(" ")[0]
+        # Grok sends from the same address, so its corrections land in the mailbox
+        # Muse reads; the tag tells Muse to leave them alone (MUSE_PROMPT.md)
+        tag = "【給 Grok】" if about.lower().startswith("grok-") else ""
         msg = Feedback(msg_id=outbox.new_msg_id("fb"), sent_at=now, about_msg_id=about[:64],
-                       problem=f"訊息 {about} 被拒絕:{reason}"[:1000], how_to_fix=fix_for(reason))
+                       problem=f"{tag}訊息 {about} 被拒絕:{reason}"[:1000], how_to_fix=fix_for(reason))
         outbox.send(box, msg)
         log_outbound(con, msg)
         _once(con, key)
@@ -160,25 +172,60 @@ class Expectation:
     type: str
     window_start: time  # ET; a message received after this time counts for today
     deadline: time      # ET
+    who: str = "Muse"
+    trading_days_only: bool = False      # weekends / NYSE holidays: still stored, never "missed"
+    match_collected_date: bool = False   # only a message collected that ET day counts (no stale resends)
+    collected_before: time | None = None  # ET; with match_collected_date: a later run (the evening one) never counts
 
 
 EXPECTATIONS = {
     "SOCIAL_AM": Expectation("早盤社群快照", "SOCIAL_DAILY", time(5, 0), time(8, 30)),
     "SOCIAL_PM": Expectation("盤後社群快照", "SOCIAL_DAILY", time(17, 0), time(21, 0)),
     "CALLS": Expectation("網紅喊單紀錄", "CALLS", time(17, 0), time(21, 30)),
+    # Grok also sends an evening digest (20:00); it is stored but never scored
+    # or checked, and collected_before keeps it from passing as the morning one.
+    "GROK_AM": Expectation("Grok 盤前日報", "GROK_DAILY", time(4, 0), time(8, 30), who="Grok",
+                           trading_days_only=True, match_collected_date=True, collected_before=time(12, 0)),
 }
+
+# Grok's checks live under their own setting: muse_check.py "stage N" rewrites
+# muse_expect wholesale and must not switch Grok's off.
+GROK_EXPECT_KEY = "grok_expect"
 
 
 def enabled_expectations(con) -> list[str]:
     """Which deliveries are expected; turned on stage by stage during onboarding
-    (see docs/desk/MUSE_ONBOARDING.md) so the owner is not nagged early."""
-    return json.loads(store.get_setting(con, "muse_expect", "[]"))
+    (see docs/desk/MUSE_ONBOARDING.md) so the owner is not nagged early. Grok's
+    are switched separately (muse_check.py grok on|off)."""
+    keys = json.loads(store.get_setting(con, "muse_expect", "[]"))
+    keys += [k for k in json.loads(store.get_setting(con, GROK_EXPECT_KEY, "[]")) if k not in keys]
+    return keys
 
 
-def _received(con, typ: str, start: datetime, end: datetime) -> bool:
-    return con.execute(
-        "SELECT 1 FROM bridge_messages WHERE type=? AND received_at>=? AND received_at<=?",
-        (typ, _iso(start), _iso(end))).fetchone() is not None
+def _due(e: Expectation, day) -> bool:
+    from stockmoney.desk.calendar import is_trading_day
+    return not e.trading_days_only or is_trading_day(day)
+
+
+def _received(con, typ: str, start: datetime, end: datetime, collected_on=None,
+              collected_before: time | None = None) -> bool:
+    sql = "SELECT 1 FROM bridge_messages WHERE type=? AND received_at>=? AND received_at<=?"
+    args: tuple = (typ, _iso(start), _iso(end))
+    if collected_on is not None:
+        # collected_at keeps its ET offset in parsed_json ("2026-10-12T07:05:00-04:00"):
+        # chars 1-10 are the ET date, chars 12-16 the ET wall-clock HH:MM
+        sql += " AND substr(json_extract(parsed_json,'$.collected_at'),1,10)=?"
+        args += (collected_on.isoformat(),)
+        if collected_before is not None:
+            sql += " AND substr(json_extract(parsed_json,'$.collected_at'),12,5)<?"
+            args += (f"{collected_before:%H:%M}",)
+    return con.execute(sql, args).fetchone() is not None
+
+
+def _delivered(con, e: Expectation, day, start: datetime, end: datetime) -> bool:
+    if e.match_collected_date:
+        return _received(con, e.type, start, end, day, e.collected_before)
+    return _received(con, e.type, start, end)
 
 
 def _iso(dt: datetime) -> str:
@@ -193,11 +240,12 @@ def check_deliveries(con, now: datetime) -> list[str]:
     misses = []
     for key in enabled_expectations(con):
         e = EXPECTATIONS.get(key)
-        if e is None or local.time() < e.deadline:
+        if e is None or local.time() < e.deadline or not _due(e, day):
             continue
         start = datetime.combine(day, e.window_start, ET)
-        if not _received(con, e.type, start, now) and _once(con, f"miss:{key}:{day}"):
-            misses.append(f"Muse 今天沒有準時送出「{e.name}」(期限 {e.deadline:%H:%M} ET)")
+        got = _delivered(con, e, day, start, now)
+        if not got and _once(con, f"miss:{key}:{day}"):
+            misses.append(f"{e.who} 今天沒有準時送出「{e.name}」(期限 {e.deadline:%H:%M} ET)")
     for r in con.execute(
         "SELECT msg_id, ticker, deadline FROM bridge_outbox WHERE type='RESEARCH_REQUEST' AND deadline < ?",
         (_iso(now),),
@@ -210,6 +258,39 @@ def check_deliveries(con, now: datetime) -> list[str]:
     return misses
 
 
+# ------------------------------------------------------------------ Grok scope
+
+GROK_EXTRA_SCOPE = ("QQQ", "TQQQ", "BTC/USD")
+GROK_MAX_OFF_LIST = 5
+
+
+def grok_scope() -> frozenset[str]:
+    from stockmoney.desk.universe import ALL_SYMBOLS
+    return frozenset(ALL_SYMBOLS) | frozenset(GROK_EXTRA_SCOPE)
+
+
+def grok_off_list(parsed: dict) -> list[str]:
+    """Distinct tickers in a stored GROK_DAILY that are outside the Grok scope."""
+    tickers = {x["ticker"] for k in ("events", "calls", "attention") for x in parsed.get(k, [])}
+    tickers |= {i["ticker"] for c in parsed.get("chains", []) for i in c.get("impacts", [])}
+    return sorted(tickers - grok_scope())
+
+
+def check_grok_scope(con, since: datetime) -> list[str]:
+    """More than GROK_MAX_OFF_LIST off-list tickers in one GROK_DAILY: tell the
+    owner once per message. Never rejects: the message is already stored."""
+    out = []
+    for r in con.execute("SELECT msg_id, parsed_json FROM bridge_messages WHERE type='GROK_DAILY' AND received_at>=?",
+                         (_iso(since),)).fetchall():
+        try:
+            extra = grok_off_list(json.loads(r[1]))
+        except (ValueError, TypeError, KeyError, AttributeError):
+            continue
+        if len(extra) > GROK_MAX_OFF_LIST and _once(con, f"grokscope:{r[0]}"):
+            out.append(f"Grok 日報 {r[0]} 有 {len(extra)} 檔清單外標的(上限 {GROK_MAX_OFF_LIST}):{', '.join(extra[:12])}")
+    return out
+
+
 def run_checks(con, now: datetime, box=None) -> str:
     ensure_schema(con)
     lines = []
@@ -218,7 +299,10 @@ def run_checks(con, now: datetime, box=None) -> str:
         if n:
             lines.append(f"已寄 {n} 則格式修正給 Muse")
     for m in check_deliveries(con, now):
-        notify.send("Muse 漏交", m, notify.WARN)
+        notify.send("Grok 漏交" if m.startswith("Grok ") else "Muse 漏交", m, notify.WARN)
+        lines.append(m)
+    for m in check_grok_scope(con, now - timedelta(days=2)):
+        notify.send("Grok 範圍", m, notify.INFO)
         lines.append(m)
     return "\n".join(lines)
 
@@ -237,12 +321,12 @@ def scorecard(con, now: datetime, days: int = 7) -> dict:
         hit = total = 0
         for i in range(days):
             d = local.date() - timedelta(days=i)
-            if datetime.combine(d, e.deadline, ET) > local:
+            if datetime.combine(d, e.deadline, ET) > local or not _due(e, d):
                 continue
             total += 1
             start = datetime.combine(d, e.window_start, ET)
             end = datetime.combine(d, e.deadline, ET)
-            hit += _received(con, e.type, start, end)
+            hit += _delivered(con, e, d, start, end)
         out["deliveries"][key] = {"name": e.name, "on_time": hit, "due": total}
     out["accepted"] = con.execute("SELECT COUNT(*) FROM bridge_messages WHERE received_at>=?", (_iso(since),)).fetchone()[0]
     out["rejected"] = con.execute("SELECT COUNT(*) FROM bridge_rejects WHERE received_at>=?", (_iso(since),)).fetchone()[0]
