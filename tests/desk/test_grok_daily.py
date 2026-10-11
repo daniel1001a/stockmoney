@@ -104,7 +104,8 @@ def test_stored_message_feeds_the_learning_layer(con):
     assert row["source"] == "grok" and row["created_at"].startswith("2026-10-12T11:40")
     assert json.loads(row["urls_json"]) == ["https://x.com/a/status/1"]
     assert json.loads(row["checkpoints_json"]) == [{"what": "Final rule text", "date": "2026-10-20"}]
-    assert {i["ticker"] for i in json.loads(row["impacts_json"])} == {"NVDA", "BTC"}
+    # crypto impacts are dropped (no price series; "BTC" alone is also a listed ETF ticker)
+    assert {i["ticker"] for i in json.loads(row["impacts_json"])} == {"NVDA"}
 
 
 def test_chain_serialisation_matches_ingest_grok_fields():
