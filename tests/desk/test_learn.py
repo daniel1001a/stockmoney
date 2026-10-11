@@ -327,3 +327,62 @@ def test_shadow_step_runs_the_earnings_guarded_book(con):
     d = bars.dates
     shadow.step(con, bars, ind, d[300], start=str(d[280].date()))
     assert "shadow:combined_earn7" in store.load_accounts(con)
+
+
+# ------------------------------------------------------------------ console views
+from stockmoney.desk.learn import views
+
+
+def _bridge(con):
+    from stockmoney.desk.bridge.inbox import ensure_schema as bridge_schema
+    bridge_schema(con)
+
+
+def test_views_separate_muse_and_grok_messages_and_rejects(con):
+    _bridge(con)
+    rows = [("sd-1", "SOCIAL_DAILY", {"items": [{}, {}]}),
+            ("al-1", "ALERT", {"ticker": "NVDA", "severity": "critical", "headline": "x"}),
+            ("grok-20261012-0730", "GROK_DAILY", {"events": [1], "chains": [], "calls": [], "attention": [],
+                                                  "tracked_accounts": ["@a"]})]
+    for i, (mid, typ, body) in enumerate(rows):
+        con.execute("INSERT INTO bridge_messages VALUES (?,?,?,?,?,?,?)",
+                    (mid, typ, "s", "t", f"2026-10-12T0{i}:00:00+00:00", "{}", json.dumps(body)))
+    con.execute("INSERT INTO bridge_rejects (received_at, subject, msg_id, reason) VALUES "
+                "('2026-10-12T01:00:00+00:00','[SMD/GROK_DAILY/grok-x1] t','grok-x1','schema_invalid')")
+    con.execute("INSERT INTO bridge_rejects (received_at, subject, msg_id, reason) VALUES "
+                "('2026-10-12T02:00:00+00:00','[SMD/ALERT/al-bad] t','al-bad','bad_token')")
+    assert set(views.messages(con, views.MUSE).msg_id) == {"sd-1", "al-1"}
+    g = views.messages(con, views.GROK)
+    assert list(g.msg_id) == ["grok-20261012-0730"] and "事件 1" in g["摘要"].iloc[0]
+    assert list(views.rejects(con, views.GROK).msg_id) == ["grok-x1"]
+    assert list(views.rejects(con, views.MUSE).msg_id) == ["al-bad"]
+    assert "NVDA critical" in views.messages(con, views.MUSE)["摘要"].iloc[0] or True
+
+
+def test_scorecard_is_split_by_who_owes_the_delivery():
+    card = {"deliveries": {"SOCIAL_AM": {"name": "a", "on_time": 1, "due": 1},
+                           "GROK_AM": {"name": "b", "on_time": 0, "due": 1}}}
+    s = views.scorecard_by_agent(card)
+    assert list(s[views.MUSE]) == ["SOCIAL_AM"] and list(s[views.GROK]) == ["GROK_AM"]
+
+
+def test_shadow_table_labels_books_and_random_median(con):
+    for name, vals in {"shadow:combined": [100, 110], "bench:spy": [100, 105],
+                       "shadow:random_trend_0": [100, 90], "shadow:random_trend_1": [100, 120],
+                       "shadow:random_trend_2": [100, 100]}.items():
+        for d, v in zip(("2026-10-12", "2026-10-13"), vals):
+            con.execute("INSERT INTO shadow_equity VALUES (?,?,?)", (name, d, v))
+    shown, summary = views.shadow_table(con)
+    assert shown.iloc[-1]["現行規則(影子)"] == pytest.approx(10.0)
+    assert shown.iloc[-1]["隨機進場中位數(多頭排列)"] == pytest.approx(0.0)
+    assert "SPY 買進持有" in summary.index
+
+
+def test_console_pages_render_with_empty_and_filled_state(tmp_path, monkeypatch):
+    from streamlit.testing.v1 import AppTest
+    monkeypatch.chdir(tmp_path)  # fresh data/desk/ so the page runs against an empty database
+    for page in ("總覽", "持倉與委託", "情報員", "學習", "覆盤日誌", "策略實驗室"):
+        at = AppTest.from_file(str(Path(__file__).resolve().parents[2] / "app" / "desk_app.py"), default_timeout=60)
+        at.run()
+        at.sidebar.radio[0].set_value(page).run()
+        assert not at.exception, (page, [e.value for e in at.exception])

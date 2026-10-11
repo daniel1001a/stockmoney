@@ -56,7 +56,7 @@ if halt or halt_file:
     st.sidebar.error("新進場已暫停" + ("(HALT 檔案)" if halt_file else ""))
 else:
     st.sidebar.success("自動交易中")
-page = st.sidebar.radio("頁面", ["總覽", "持倉與委託", "Muse", "覆盤日誌", "策略實驗室"])
+page = st.sidebar.radio("頁面", ["總覽", "持倉與委託", "情報員", "學習", "覆盤日誌", "策略實驗室"])
 
 # ===================================================================== overview
 if page == "總覽":
@@ -131,31 +131,142 @@ elif page == "持倉與委託":
         st.subheader("各策略已實現損益")
         st.dataframe(fills.groupby("strategy").realized_pnl.agg(["count", "sum"]), use_container_width=True)
 
-# ===================================================================== muse
-elif page == "Muse":
-    st.caption("Muse 的訊息只能降低風險(擋進場、禁止加碼、通知),不能開倉或改參數。文字內容僅供閱讀。")
+# ===================================================================== agents
+elif page == "情報員":
+    from datetime import datetime, timezone
+
+    from stockmoney.desk import muse_ops
+    from stockmoney.desk.bridge.inbox import ensure_schema as bridge_schema
+    from stockmoney.desk.learn import views
+
+    st.caption("兩位情報員是不同的 agent,資料分開記錄。它們的訊息只能降低風險(擋進場、禁止加碼、通知),"
+               "不能開倉或改參數。Pika(Grok)v1 只儲存,不影響任何交易。文字內容僅供閱讀。")
     try:
-        from stockmoney.desk.bridge.inbox import ensure_schema as bridge_schema
         with store.connect() as con:
             bridge_schema(con)
-        from datetime import datetime, timezone
-        from stockmoney.desk import muse_ops
-        with store.connect() as con:
             card = muse_ops.scorecard(con, datetime.now(timezone.utc))
             stage = store.get_setting(con, "muse_stage", "0")
-        st.subheader(f"Muse 成績單(近 7 天,上線階段 {stage})")
-        c = st.columns(4)
-        for i, (k, v) in enumerate(card["deliveries"].items()):
-            c[i % 3].metric(v["name"], f"{v['on_time']}/{v['due']}", help="準時送達 / 應送達")
-        c[3].metric("查核回覆", f"{card['research']['answered']}/{card['research']['requested']}")
-        st.caption(f"通過驗證 {card['accepted']} 封,被拒 {card['rejected']} 封。上線步驟見 docs/desk/MUSE_ONBOARDING.md")
-        st.subheader("收到的訊息")
-        st.dataframe(_q("SELECT received_at, type, msg_id, parsed_json FROM bridge_messages ORDER BY received_at DESC LIMIT 100"),
-                     hide_index=True, use_container_width=True)
-        st.subheader("被拒絕的訊息")
-        st.dataframe(_q("SELECT * FROM bridge_rejects ORDER BY rowid DESC LIMIT 50"), hide_index=True, use_container_width=True)
+            grok_on = bool(json.loads(store.get_setting(con, muse_ops.GROK_EXPECT_KEY, "[]")))
+            split = views.scorecard_by_agent(card)
+            last_msg = {a: con.execute("SELECT MAX(received_at) FROM bridge_messages WHERE type" +
+                                       ("='GROK_DAILY'" if a == views.GROK else "!='GROK_DAILY'")).fetchone()[0]
+                        for a in (views.MUSE, views.GROK)}
+            tabs = st.tabs(["總覽", views.MUSE, views.GROK])
+            with tabs[0]:
+                col_m, col_g = st.columns(2)
+                with col_m.container(border=True):
+                    st.subheader(views.MUSE)
+                    st.caption(f"Threads、Instagram、Reddit 等的社群快照、喊單、警示、查核回覆。上線階段 {stage}")
+                    if stage == "0":
+                        st.caption("上線階段 0:漏交檢查尚未啟用,下面的 0 不代表漏交,只是還沒開始計。")
+                    for k, v in split[views.MUSE].items():
+                        st.metric(v["name"], f"{v['on_time']}/{v['due']}", help="近 7 天準時送達 / 應送達")
+                    st.metric("查核回覆", f"{card['research']['answered']}/{card['research']['requested']}")
+                    st.caption(f"最近一封:{last_msg[views.MUSE] or '尚無'}")
+                with col_g.container(border=True):
+                    st.subheader(views.GROK)
+                    st.caption("X 上的事件、事件鏈、喊單、熱度。" + ("漏交檢查已開啟" if grok_on else "漏交檢查尚未開啟"))
+                    for k, v in split[views.GROK].items():
+                        label = v["name"] if grok_on else f"{v['name']}(檢查未啟用)"
+                        st.metric(label, f"{v['on_time']}/{v['due']}", help="近 7 天準時送達 / 應送達(只算交易日早報)")
+                    n_chain = con.execute("SELECT COUNT(*) FROM chains WHERE source='grok'").fetchone()[0]
+                    st.metric("已進入評分的事件鏈", n_chain)
+                    st.caption(f"最近一封:{last_msg[views.GROK] or '尚無'}")
+                st.caption(f"通過驗證 {card['accepted']} 封,被拒 {card['rejected']} 封(近 7 天,兩者合計)。"
+                           "上線步驟見 docs/desk/MUSE_ONBOARDING.md、docs/desk/GROK_PROMPT.md")
+            with tabs[1]:
+                st.subheader("收到的訊息")
+                st.dataframe(views.messages(con, views.MUSE), hide_index=True, alt="Muse 收到的訊息")
+                st.subheader("被拒絕的訊息")
+                st.dataframe(views.rejects(con, views.MUSE), hide_index=True, alt="Muse 被拒絕的訊息")
+            with tabs[2]:
+                g = views.latest_grok(con)
+                if g is None:
+                    st.info("尚未收到 GROK_DAILY。第一封預計由 Pika 在 20:00 ET(晚報)或 07:30 ET(早報)寄出。")
+                else:
+                    d = g["data"]
+                    st.caption(f"最新一封:{g['msg_id']},我們收到的時間 {g['received_at']}")
+                    st.subheader("事件")
+                    st.dataframe(pd.DataFrame(d["events"]), hide_index=True, alt="Grok 事件")
+                    st.subheader("事件鏈")
+                    for c in d["chains"]:
+                        with st.container(border=True):
+                            st.markdown(f"**{c['trigger']}**(信心 {c['confidence']:.0%})")
+                            st.write(" -> ".join(c["steps"]))
+                            st.caption("影響:" + "、".join(f"{i['ticker']} {i['direction']} {i['horizon_days']} 天"
+                                                         for i in c["impacts"]))
+                    st.subheader("喊單")
+                    st.dataframe(pd.DataFrame(d["calls"]), hide_index=True, alt="Grok 記錄的喊單")
+                    st.subheader("熱度變化")
+                    st.dataframe(pd.DataFrame(d["attention"]), hide_index=True, alt="Grok 熱度變化")
+                st.subheader("收到的訊息")
+                st.dataframe(views.messages(con, views.GROK), hide_index=True, alt="Pika 收到的訊息")
+                st.subheader("被拒絕的訊息")
+                st.dataframe(views.rejects(con, views.GROK), hide_index=True, alt="Pika 被拒絕的訊息")
     except Exception as e:
-        st.info(f"Muse 橋樑尚未啟用:{e}")
+        st.info(f"橋樑尚未啟用:{e}")
+
+# ===================================================================== learning
+elif page == "學習":
+    from datetime import date
+
+    from stockmoney.desk.learn import chains as chain_mod
+    from stockmoney.desk.learn import earnings, tables, views
+    from stockmoney.desk.universe import STOCKS
+
+    st.caption("學習層只讀取帳本與價格,不會下單。每個交易日 17:15 ET 更新一次。"
+               "樣本很少時,所有數字只當流程驗證,不要當結論。")
+    with store.connect() as con:
+        tables.ensure_schema(con)
+        tabs = st.tabs(["影子帳戶", "驗屍卡", "事件鏈", "財報日"])
+        with tabs[0]:
+            shown, summary = views.shadow_table(con)
+            if shown.empty:
+                st.info("影子帳戶尚無資料。從 2026-10-12 起每個交易日 17:15 ET 累積。")
+            else:
+                st.line_chart(shown, y_label="累計報酬 %")
+                st.dataframe(summary, alt="影子帳戶累計報酬與最大回撤")
+                st.caption("對照組:隨機進場用同一份清單、同樣的停損與大盤濾網。現行規則要穩定贏過它,才算進場訊號有價值。")
+        with tabs[1]:
+            pm = views.postmortems(con)
+            if pm.empty:
+                st.info("尚無平倉交易,沒有驗屍卡。")
+            else:
+                st.dataframe(pm.drop(columns=["lesson"]).assign(ret=lambda d: (d.ret * 100).round(2)),
+                             hide_index=True, alt="驗屍卡")
+                st.caption("S1 跳空穿停損、S2 被洗出場、S3 追高、S4 大盤翻轉、S5 板塊退潮、S6 事件或財報跳空、"
+                           "S7 獲利回吐、S8 執行異常、S9 消息面、S0 正常虧損。規則見 learn/postmortem.py。")
+                with st.form("lesson"):
+                    tid = st.selectbox("交易", pm.trade_id.tolist(),
+                                       format_func=lambda t: f"{pm.set_index('trade_id').loc[t, 'exit_day']} "
+                                                             f"{pm.set_index('trade_id').loc[t, 'symbol']}")
+                    text = st.text_input("學到什麼(一句話)")
+                    if st.form_submit_button("儲存") and text.strip():
+                        con.execute("UPDATE trade_postmortem SET lesson=? WHERE trade_id=?", (text.strip(), tid))
+                        con.commit()
+                        st.success("已儲存")
+        with tabs[2]:
+            level, why = chain_mod.authority(con)
+            sm = chain_mod.summary(con)
+            c1, c2, c3 = st.columns(3)
+            c1.metric("事件鏈", sm["chains"])
+            c2.metric("已評分", sm["scored"])
+            c3.metric("命中率", "-" if sm["hit_rate"] is None else f"{sm['hit_rate']:.0%}")
+            st.caption(f"權限階段:{level}。{why}")
+            ct = views.chain_table(con)
+            if not ct.empty:
+                st.dataframe(ct, hide_index=True, alt="事件鏈與評分")
+        with tabs[3]:
+            held = [r[0] for r in con.execute("SELECT symbol FROM sleeve_positions").fetchall()] \
+                if con.execute("SELECT 1 FROM sqlite_master WHERE name='sleeve_positions'").fetchone() else []
+            up = earnings.upcoming(con, list(STOCKS), date.today(), 30)
+            if not up:
+                st.info("尚無財報日資料(學習任務第一次執行後出現)。")
+            else:
+                held_n = {earnings.norm(h) for h in held}
+                df = pd.DataFrame([{"symbol": s, "財報日": d, "持倉": s in held_n} for s, d in sorted(up.items(), key=lambda x: x[1])])
+                st.dataframe(df, hide_index=True, alt="未來 30 天的財報日")
+                st.caption("來源:Nasdaq 免費清單。抓不到的日子不會被當成沒有財報。")
 
 # ===================================================================== journal
 elif page == "覆盤日誌":
