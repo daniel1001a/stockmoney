@@ -3,8 +3,7 @@ tests prove the stock jobs never see, count, cancel, close or halt on option
 positions and option orders, and that stock behaviour is unchanged by them."""
 from __future__ import annotations
 
-from dataclasses import replace
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, timezone
 
 import pandas as pd
 import pytest
