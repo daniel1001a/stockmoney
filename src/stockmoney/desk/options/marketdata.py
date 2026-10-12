@@ -50,7 +50,8 @@ def bars_frame(raw: list[dict]) -> pd.DataFrame:
 
 def contract_from_snapshot(occ: str, snap: dict, today: date | None = None,
                            oi: int | None = None) -> OptionContract:
-    und, expiry, right, strike = parse_occ(occ)
+    o = parse_occ(occ)
+    und, expiry, right, strike = o.root, o.expiry, o.right, o.strike
     q = snap.get("latestQuote") or {}
     tr = snap.get("latestTrade") or {}
     g = snap.get("greeks") or {}

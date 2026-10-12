@@ -12,7 +12,7 @@ import pandas as pd
 
 from stockmoney.desk.options._iface import (
     AccountSnapshot, AssetClass, BrokerOrder, BrokerPosition, OptionContract, OrderIntent, OrderStatus, OrderType,
-    RiskDecision, Side, occ_symbol,
+    RiskDecision, Side, occ_symbol, parse_occ,
 )
 from stockmoney.desk.options.config import OptionsConfig
 
@@ -136,18 +136,18 @@ class FakeOptionsBroker:
         t = self.templates.get(occ)
         if t is None:
             return None
-        from stockmoney.desk.options._iface import parse_occ
-        und, exp, right, strike = parse_occ(occ)
+        o = parse_occ(occ)
+        und, exp, right, strike = o.root, o.expiry, o.right, o.strike
         m = t["mid"] * (self.mult_fn(occ, self.clock.now) if self.mult_fn else self.mult.get(occ, 1.0))
         bid, ask = round(max(m - self.half_spread, 0.0), 2), round(m + self.half_spread, 2)
         return OptionContract(occ, und, right, float(strike), exp, bid, ask, m, self.volume, self.oi,
                               t.get("delta"), t.get("iv"), self.clock.now - timedelta(seconds=self.quote_age_s))
 
     def option_chain(self, underlying: str, expiry_min: date, expiry_max: date) -> list[OptionContract]:
-        from stockmoney.desk.options._iface import parse_occ
         out = []
         for occ in self.templates:
-            und, exp, _, _ = parse_occ(occ)
+            o = parse_occ(occ)
+            und, exp = o.root, o.expiry
             if und == underlying and expiry_min <= exp <= expiry_max:
                 out.append(self.option_quote(occ))
         return out
@@ -159,7 +159,7 @@ class FakeOptionsBroker:
             return replace(self.orders[intent.client_order_id])
         o = BrokerOrder(str(next(self._ids)), intent.client_order_id, intent.symbol, intent.side, OrderStatus.NEW,
                         intent.qty, 0.0, None, self.clock.now, None, intent.order_type, intent.tif, None,
-                        intent.limit_price)
+                        intent.limit_price, AssetClass.OPTION)
         self.orders[o.client_order_id] = o
         if self.fail_submit_once:
             self.fail_submit_once = False
@@ -192,17 +192,45 @@ class FakeOptionsBroker:
         if o is not None and o.status == OrderStatus.NEW:
             o.status = OrderStatus.CANCELED
 
+    def open_orders(self) -> list[BrokerOrder]:
+        return [replace(o) for o in self.orders.values() if o.status in (OrderStatus.NEW, OrderStatus.PARTIALLY_FILLED)]
+
     def account(self) -> AccountSnapshot:
-        pos = [BrokerPosition(s, AssetClass.OPTION, q, 0, 0, 0) for s, q in self.positions.items()]
+        pos = []
+        for s, q in self.positions.items():
+            k = self.option_quote(s)
+            m = k.mid if k is not None and k.mid is not None else 0.0
+            pos.append(BrokerPosition(s, AssetClass.OPTION, q, 0, q * m * 100, m))
         return AccountSnapshot(0, 0, 0, pos + list(self.extra_positions), self.clock.now)
 
 
-def allow_gate(calls: list | None = None):
-    def gate(intent, contract, premium, now):
-        if calls is not None:
-            calls.append((intent, contract, premium, now))
-        return RiskDecision(True, "ok", intent)
-    return gate
+class FnGate:
+    """A RiskGate whose check is ``fn(intent, contract, now) -> RiskDecision``;
+    records every call, reservation, release and booked fill."""
+
+    def __init__(self, fn, calls: list | None = None):
+        self.fn = fn
+        self.calls = calls if calls is not None else []
+        self.reserved: list = []
+        self.released: list = []
+        self.booked: list = []
+
+    def check(self, intent, contract, now, *, marks=None, blocked=None):
+        self.calls.append((intent, contract, now))
+        return self.fn(intent, contract, now)
+
+    def reserve(self, intent, price):
+        self.reserved.append((intent.symbol, intent.qty, price))
+
+    def release(self, occ):
+        self.released.append(occ)
+
+    def book_fill(self, **kw):
+        self.booked.append(kw)
+
+
+def allow_gate(calls: list | None = None) -> FnGate:
+    return FnGate(lambda intent, contract, now: RiskDecision(True, "ok", intent), calls)
 
 
 def spy_cfg(tmp_path, **kw) -> OptionsConfig:

@@ -10,9 +10,10 @@ Session safety:
 - its own lock (data/desk/options.lock): two sessions can never run, and it
   never holds the stock jobs' run.lock (it lives all day);
 - data/desk/HALT blocks new entries (shadow keeps recording), exits continue;
-- real (paper) orders need line A's broker AND risk gate (see _iface.py);
-  until they are integrated the session is shadow-only by construction.
-  ``DESK_OPTIONS_ORDERS=off`` forces shadow-only even after integration;
+- real (paper) orders go through line A's AlpacaBroker and every entry
+  through line A's OptionsRiskEngine (_iface.LineAGate). AlpacaBroker
+  refuses the live endpoint unless the owner set the live flags.
+  ``DESK_OPTIONS_ORDERS=off`` forces a shadow-only session (DenyAllGate);
 - every exit is forced by 15:45 ET and flatness is verified at the end; the
   owner is paged when it is not.
 """
@@ -79,16 +80,12 @@ def _muse_flags(con):
 
 
 def make_session_engine(con, cfg: OptionsConfig, clock=_now) -> tuple[Engine, str]:
-    """(engine, mode). Live only when line A's broker and gate are integrated."""
-    mode = "paper"
-    try:
-        broker = _iface.make_trading_broker()
-        gate = _iface.make_risk_gate(con)
-    except NotImplementedError as e:
-        from stockmoney.desk.options.marketdata import AlpacaOptionsData
-        broker, gate, mode = AlpacaOptionsData(stock_feed="iex"), _iface.deny_all_gate, "shadow"
-        log.warning("shadow-only session: %s", e)
-    live = mode == "paper" and os.environ.get("DESK_OPTIONS_ORDERS", "paper").strip().lower() != "off"
+    """(engine, mode). Paper orders unless DESK_OPTIONS_ORDERS=off; the
+    Engine itself also refuses to trade through a non-paper broker while
+    ``cfg.paper_only`` is set."""
+    broker = _iface.make_trading_broker()
+    live = os.environ.get("DESK_OPTIONS_ORDERS", "paper").strip().lower() != "off"
+    gate = _iface.make_risk_gate(con, broker, cfg) if live else _iface.DenyAllGate()
     eng = Engine(con, broker, cfg, clock=clock, risk_gate=gate, live=live, flags_fn=_muse_flags(con))
     return eng, ("paper" if eng.live else "shadow")
 

@@ -79,16 +79,24 @@ def test_session_skips_non_trading_day(tmp_path):
     assert orun.session(spy_cfg(tmp_path), tmp_path / "d.sqlite", clock=sat, engine_factory=_factory([])) == 0
 
 
-def test_shadow_only_without_line_a(tmp_path, monkeypatch):
-    """With the shim in place there is no trading broker and no gate: the
-    session builds a data-only adapter and never goes live."""
-    class Data:
-        is_paper = True
-    import stockmoney.desk.options.marketdata as md
-    monkeypatch.setattr(md, "AlpacaOptionsData", lambda **kw: Data())
+def test_session_engine_wires_line_a_broker_and_gate(tmp_path, monkeypatch):
+    """The session trades through line A's broker and OptionsRiskEngine;
+    DESK_OPTIONS_ORDERS=off gives a shadow-only engine with a deny-all gate."""
+    from stockmoney.desk.options import _iface
+    b = FakeOptionsBroker(Clock(et(9, 20)))
+    monkeypatch.setattr(_iface, "make_trading_broker", lambda: b)
+    monkeypatch.delenv("DESK_OPTIONS_ORDERS", raising=False)
     with store.connect(tmp_path / "d.sqlite") as con:
         eng, mode = orun.make_session_engine(con, spy_cfg(tmp_path))
-    assert mode == "shadow" and eng.live is False
+        assert mode == "paper" and eng.live and isinstance(eng.risk_gate, _iface.LineAGate)
+        assert eng.risk_gate.engine.limits.max_spread_pct == spy_cfg(tmp_path).max_spread_pct
+        monkeypatch.setenv("DESK_OPTIONS_ORDERS", "off")
+        eng, mode = orun.make_session_engine(con, spy_cfg(tmp_path))
+        assert mode == "shadow" and eng.live is False and isinstance(eng.risk_gate, _iface.DenyAllGate)
+        b.is_paper = False
+        monkeypatch.delenv("DESK_OPTIONS_ORDERS")
+        eng, mode = orun.make_session_engine(con, spy_cfg(tmp_path))
+        assert mode == "shadow" and eng.live is False  # never trades through a non-paper broker
 
 
 def test_report_sections(tmp_path):

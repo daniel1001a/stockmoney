@@ -12,7 +12,7 @@ from stockmoney.desk.options import store as ostore
 from stockmoney.desk.options._iface import AssetClass, BrokerPosition, OrderType, RiskDecision, Side, occ_symbol
 from stockmoney.desk.options.engine import Engine
 
-from opt_fakes import DAY, Clock, FakeOptionsBroker, allow_gate, chain, day_bars, et, orb_breakout_day, spy_cfg
+from opt_fakes import DAY, Clock, FakeOptionsBroker, FnGate, allow_gate, chain, day_bars, et, orb_breakout_day, spy_cfg
 
 C601 = occ_symbol("SPY", DAY, "C", 601)
 
@@ -63,10 +63,12 @@ def test_trigger_opens_shadow_variants_and_one_live_order(tmp_path, con):
     assert all(p["dte_label"] == "0dte" and p["state"] == "ENTERED" for p in shadow)
     live = r.pos("live")
     assert len(live) == 1 and live[0]["occ"] == C601 and live[0]["state"] == "ENTERED"
-    intent, contract, premium, _ = r.gate_calls[0]
+    intent, contract, _ = r.gate_calls[0]
     assert intent.asset_class == AssetClass.OPTION and intent.side == Side.BUY
     assert intent.order_type == OrderType.LIMIT and intent.limit_price == 0.97 and intent.qty == 10
-    assert premium == pytest.approx(10 * 0.97 * 100)
+    assert contract.occ == C601 and contract.as_of is not None
+    assert r.gate.reserved == [(C601, 10, 0.97)] and r.gate.released == [C601]
+    assert r.gate.booked[0]["side"] == Side.BUY and r.gate.booked[0]["qty"] == 10
     # every 1-3 DTE variant was logged as a filtered opportunity (no expiry in the fake chain)
     n = con.execute("SELECT COUNT(*) FROM options_filtered WHERE reason='no_expiry_in_bucket'").fetchone()[0]
     assert n == 3
@@ -206,7 +208,7 @@ def test_unfilled_entry_cancelled_after_20s(tmp_path, con):
 
 
 def test_risk_gate_deny_shrink_and_grow(tmp_path, con):
-    deny = lambda i, c, p, n: RiskDecision(False, "daily loss stop")
+    deny = FnGate(lambda i, c, n: RiskDecision(False, "daily loss stop"))
     r = Rig(tmp_path, con, gate=deny)
     r.run(et(9, 52))
     assert not r.pos("live") and len(r.pos("shadow")) == 3 and not r.broker.submit_calls
@@ -215,12 +217,12 @@ def test_risk_gate_deny_shrink_and_grow(tmp_path, con):
 
 def test_risk_gate_may_shrink_never_grow(tmp_path, con):
     from dataclasses import replace
-    shrink = lambda i, c, p, n: RiskDecision(True, "resized", replace(i, qty=2))
+    shrink = FnGate(lambda i, c, n: RiskDecision(True, "resized", replace(i, qty=2)))
     r = Rig(tmp_path, con, gate=shrink)
     r.run(et(9, 52))
     assert r.broker.orders[r.broker.submit_calls[0]].qty == 2
     with store.connect(tmp_path / "b.sqlite") as con2:
-        grow = lambda i, c, p, n: RiskDecision(True, "bigger", replace(i, qty=50))
+        grow = FnGate(lambda i, c, n: RiskDecision(True, "bigger", replace(i, qty=50)))
         r2 = Rig(tmp_path, con2, gate=grow)
         r2.run(et(9, 52))
         assert not r2.broker.submit_calls
@@ -354,3 +356,41 @@ def test_avoid_list_blocks_live_rule_setups(tmp_path, con):
     r = Rig(tmp_path, con)
     r.run(et(9, 52))
     assert not r.pos("live") and r.pos("shadow")
+
+
+def test_real_line_a_gate_books_fills_and_releases(tmp_path, con):
+    """The engine against line A's OptionsRiskEngine and OptionsBook (no
+    stand-in): the entry passes every section 3 rule, every live fill is
+    booked once, the reservation is released, and the book ends flat."""
+    from stockmoney.desk.options import _iface
+    r = Rig(tmp_path, con)
+    r.gate = _iface.make_risk_gate(con, r.broker, r.cfg)
+    r.eng = r.new_engine()
+    r.run(et(9, 52))
+    lp = r.pos("live")[0]
+    assert lp["state"] == "ENTERED"
+    book = r.gate.engine.book
+    assert book.position(C601).qty == lp["qty_initial"] and book.position(C601).strategy == "options:orb15"
+    assert r.gate.engine._reserved == {}
+    r.eng.tick()  # re-resolving the same fills books nothing twice
+    assert con.execute("SELECT COUNT(*) FROM options_book_fills").fetchone()[0] == 1
+    r.broker.mult[C601] = 0.6
+    r.run(et(9, 54))
+    assert r.pos("live")[0]["exit_reason"] == "premium_stop"
+    assert book.position(C601) is None and not r.broker.positions
+
+
+def test_real_line_a_gate_refuses_a_stale_quote(tmp_path, con):
+    from stockmoney.desk.options import _iface
+    from stockmoney.desk.options._iface import OrderIntent, TIF
+    r = Rig(tmp_path, con)
+    gate = _iface.make_risk_gate(con, r.broker, r.cfg)
+    r.clock.set(et(10, 0))
+    r.broker.quote_age_s = r.cfg.max_quote_age_s + 5
+    q = r.broker.option_quote(C601)
+    intent = OrderIntent("t1", C601, AssetClass.OPTION, Side.BUY, qty=1, order_type=OrderType.LIMIT, tif=TIF.DAY,
+                         limit_price=q.ask)
+    dec = gate.check(intent, q, r.clock.now)
+    assert not dec.allow and "old" in dec.reason
+    r.broker.quote_age_s = 1
+    assert gate.check(intent, r.broker.option_quote(C601), r.clock.now).allow

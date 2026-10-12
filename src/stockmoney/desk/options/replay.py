@@ -16,8 +16,9 @@ What is real and what is modelled (stated in every replay report):
 - the underlying quote is the last bar close -/+ 1 bp (synthetic);
 - order fills: a buy limit fills at the modelled ask once the limit reaches
   it, a sell limit at the modelled bid; market orders fill immediately;
-- the risk gate is a STAND-IN for line A's OptionsRiskEngine (section 3 caps
-  only), clearly not the production gate.
+- the risk gate is line A's real OptionsRiskEngine (via _iface.LineAGate)
+  on the replay database, with the contract volume filter off because the
+  synthetic quotes carry no traded volume.
 Shadow results from a replay therefore measure the engine's mechanics and the
 trigger logic on real price paths, NOT a trustworthy expectancy: the spread
 and the option price path are modelled.
@@ -38,9 +39,10 @@ from stockmoney.desk import store
 from stockmoney.desk.options import plan as oplan
 from stockmoney.desk.options import select as sel
 from stockmoney.desk.options import store as ostore
+from stockmoney.desk.options import _iface
 from stockmoney.desk.options._iface import (
     AccountSnapshot, AssetClass, BrokerOrder, BrokerPosition, OptionContract, OrderIntent, OrderStatus, OrderType,
-    RiskDecision, Side,
+    Side,
 )
 from stockmoney.desk.options.config import OptionsConfig
 from stockmoney.desk.options.engine import Engine
@@ -215,7 +217,7 @@ class ReplayBroker:
             raise RuntimeError("insufficient qty (replay broker: no short options)")
         o = BrokerOrder(str(next(self._ids)), intent.client_order_id, intent.symbol, intent.side, OrderStatus.NEW,
                         intent.qty, 0.0, None, self.clock.now, None, intent.order_type, intent.tif,
-                        None, intent.limit_price)
+                        None, intent.limit_price, AssetClass.OPTION)
         self.orders[o.client_order_id] = o
         self._try_fill(o)
         return replace(o)
@@ -248,29 +250,17 @@ class ReplayBroker:
         if o is not None and o.status in (OrderStatus.NEW, OrderStatus.PARTIALLY_FILLED):
             o.status = OrderStatus.CANCELED
 
+    def open_orders(self) -> list[BrokerOrder]:
+        return [replace(o) for o in self.orders.values()
+                if o.status in (OrderStatus.NEW, OrderStatus.PARTIALLY_FILLED, OrderStatus.PENDING)]
+
     def account(self) -> AccountSnapshot:
-        return AccountSnapshot(0.0, 0.0, 0.0, [BrokerPosition(s, AssetClass.OPTION, q, 0.0, 0.0, 0.0)
-                                               for s, q in self.positions.items()], self.clock.now)
-
-
-def standin_gate(con, cfg: OptionsConfig):
-    """Replay-only stand-in for line A's OptionsRiskEngine: per-trade premium
-    cap, open premium within the sleeve budget, daily realized loss stop.
-    NOT the production gate."""
-    def gate(intent: OrderIntent, contract: OptionContract, premium: float, now: datetime) -> RiskDecision:
-        day = str(now.astimezone(ET).date())
-        if premium > cfg.max_premium_per_trade + 1e-9:
-            return RiskDecision(False, "premium above per-trade cap")
-        open_prem = con.execute("SELECT COALESCE(SUM(qty_open * entry_price), 0) FROM options_positions "
-                                "WHERE day=? AND mode='live' AND state IN ('PENDING','ENTERED')", (day,)).fetchone()[0]
-        if open_prem * cfg.contract_multiplier + premium > cfg.sleeve_budget:
-            return RiskDecision(False, "sleeve budget")
-        pnl = con.execute("SELECT COALESCE(SUM(realized_usd - fees_usd), 0) FROM options_positions "
-                          "WHERE day=? AND mode='live'", (day,)).fetchone()[0]
-        if pnl <= -1000:
-            return RiskDecision(False, "daily loss stop")
-        return RiskDecision(True, "ok (replay stand-in gate)", intent)
-    return gate
+        pos = []
+        for s, q in self.positions.items():
+            k = self._q(s)
+            m = k.mid if k is not None and k.mid is not None else 0.0
+            pos.append(BrokerPosition(s, AssetClass.OPTION, q, 0.0, q * m * 100, m))
+        return AccountSnapshot(0.0, 0.0, 0.0, pos, self.clock.now)
 
 
 @dataclass
@@ -298,8 +288,8 @@ def run(day: date, cfg: OptionsConfig, cache_dir: Path, out_dir: Path, feed: str
             rec = plan_received_at or datetime.combine(day, time(8, 0), ET)
             res = oplan.ingest(con, plan_file.read_text(encoding="utf-8"), rec, cfg)
             ostore.event(con, str(day), clock.now, "info", "plan", f"replay plan ingest: {res}")
-        eng = Engine(con, broker, cfg, clock=clock, risk_gate=standin_gate(con, cfg), live=True,
-                     notifier=lambda *a: sent.append(a))
+        gate = _iface.make_risk_gate(con, broker, replace(cfg, min_volume=0))
+        eng = Engine(con, broker, cfg, clock=clock, risk_gate=gate, live=True, notifier=lambda *a: sent.append(a))
         end = datetime.combine(day, time(*cfg.session_end), ET)
         while clock.now <= end:
             eng.tick()
@@ -307,7 +297,7 @@ def run(day: date, cfg: OptionsConfig, cache_dir: Path, out_dir: Path, feed: str
         eng.finish()
         header = (f"> 重播模式:{day},標的 K 線為真實資料(Alpaca {feed.upper()}),期權價格為半合成模型"
                   f"(有成交的合約用最近 1 分鐘成交價當中價,否則用 Black-Scholes;買賣價差為模型假設,非實測)。"
-                  f"風控為重播替身,不是 A 線的正式風控。報價來源次數:{json.dumps(broker.sources)}")
+                  f"風控為 A 線正式風控(OptionsRiskEngine),但合成報價沒有成交量,成交量門檻在重播中關閉。報價來源次數:{json.dumps(broker.sources)}")
         rep = oreport.build(con, str(day), cfg, header=header)
     return ReplayResult(db, rep, dict(broker.sources), sent)
 

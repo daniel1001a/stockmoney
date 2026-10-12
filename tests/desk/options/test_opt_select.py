@@ -26,8 +26,9 @@ def c(strike, right="C", delta=None, bid=1.00, ask=1.04, expiry=DAY, oi=5000, vo
 def test_occ_round_trip():
     s = occ_symbol("SPY", date(2026, 10, 13), "C", 781)
     assert s == "SPY261013C00781000"
-    assert parse_occ(s) == ("SPY", date(2026, 10, 13), "C", 781.0)
-    assert parse_occ(occ_symbol("TSLA", date(2026, 10, 16), "P", 452.5))[3] == 452.5
+    o = parse_occ(s)
+    assert (o.root, o.expiry, o.right, o.strike) == ("SPY", date(2026, 10, 13), "C", 781.0)
+    assert parse_occ(occ_symbol("TSLA", date(2026, 10, 16), "P", 452.5)).strike == 452.5
     with pytest.raises(ValueError):
         parse_occ("SPY 261013C781")
 

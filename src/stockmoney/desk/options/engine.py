@@ -19,7 +19,11 @@ session is live, the broker is paper unless config says otherwise, the plan
 arrived before 09:20 ET, no Grok avoid entry) additionally sends ONE real
 order for its live variant, but only if HALT is absent, Muse has no block
 flag on the underlying, the engine's own position cap is free and the
-injected risk gate allows it. The risk gate may shrink an order, never grow it.
+injected risk gate (_iface.RiskGate: line A's OptionsRiskEngine in a live
+session) allows it. The risk gate may shrink an order, never grow it. After
+a submit the gate RESERVES the premium; every live fill is booked in line
+A's OptionsBook (idempotent per client_order_id) and the reservation is
+RELEASED once the entry is booked or ends unfilled.
 
 Exits (OPTIONS_PLAN.md section 5, the same for shadow and live, checked in
 this order): forced flat at 15:45 ET; underlying invalidation level; time
@@ -124,14 +128,16 @@ class Engine:
         halted = self.cfg.halt_file.exists()
         if halted and ostore.notify_once(self.con, f"{self._dstr}:halt"):
             self._notify("期權軌道:HALT 生效", "data/desk/HALT 存在:新進場全擋(影子照記),出場照常。", notify.WARN)
+        # resolve working orders and exits before any new entry, so the risk
+        # gate sees a book that already includes this tick's fills
+        self._manage_pending(now)
+        self._manage_open(now)
         if et >= _at(day, self.cfg.open_time):
             for m in ostore.universe(self.con, self._dstr):
                 try:
                     self._scan_symbol(m, now, halted)
                 except Exception as e:  # one symbol's bad data must not stop the loop
                     self._error("scan", f"{m['symbol']}: {type(e).__name__}: {e}")
-        self._manage_pending(now)
-        self._manage_open(now)
         self._roll_setups()
         self._errors = 0 if self._tick_errors == 0 else self._errors
         self.con.commit()
@@ -440,7 +446,7 @@ class Engine:
                              order_type=OrderType.LIMIT, tif=TIF.DAY, limit_price=limit,
                              strategy=f"options:{s['source']}", reason=sig.reason[:200])
         try:
-            dec = self.risk_gate(intent, c, qty * limit * cfg.contract_multiplier, now)
+            dec = self.risk_gate.check(intent, c, now, marks=self._live_marks(), blocked=flags)
         except Exception as e:  # a failing gate is a "no"
             self._error("risk_gate", str(e))
             return block("risk_gate_error", {"error": str(e)[:200]})
@@ -457,7 +463,24 @@ class Engine:
         if not ostore.insert_position(self.con, row):
             return True  # already exists (re-run): the pending order is resolved by _manage_pending
         self._submit(pid, final, "entry", "entry", now)
+        # reserved even when the submit outcome is unknown: counting a buy
+        # that never reached the broker only blocks entries, never adds risk
+        self.risk_gate.reserve(final, final.limit_price)
         return True
+
+    def _live_marks(self) -> dict[str, float]:
+        """OCC -> mid of the live positions' latest quotes (the gate values
+        the open book with them)."""
+        out = {}
+        for p in ostore.positions(self.con, self._dstr, "live", (ENTERED,)):
+            if p["last_bid"] is not None and p["last_ask"] is not None and p["last_ask"] >= p["last_bid"]:
+                out[p["occ"]] = (p["last_bid"] + p["last_ask"]) / 2
+        return out
+
+    def _book(self, p: dict, cid: str, side: Side, o) -> None:
+        """Book a live fill (cumulative qty / average price) in line A's book."""
+        self.risk_gate.book_fill(client_order_id=cid, occ=p["occ"], strategy=f"options:{p['source']}", side=side,
+                                 qty=o.filled_qty, price=o.filled_avg_price, filled_at=o.filled_at or self._now)
 
     def _submit(self, pid: str, intent: OrderIntent, kind: str, reason: str, now: datetime) -> None:
         """Commit the order row first, then submit. A second call for the same
@@ -500,10 +523,12 @@ class Engine:
         row = ostore.order(self.con, ecid)
         if row is None:  # crashed between the position and the order row: nothing was sent
             ostore.update_position(self.con, pid, state=ABANDONED, exit_reason="entry_not_sent", exit_time=ostore.iso(now))
+            self.risk_gate.release(p["occ"])
             return
         o, gone = self._broker_order(row, now)
         if gone:
             ostore.update_position(self.con, pid, state=ABANDONED, exit_reason="entry_not_sent", exit_time=ostore.iso(now))
+            self.risk_gate.release(p["occ"])
             return
         if o is None:
             return
@@ -516,9 +541,11 @@ class Engine:
                                    spread_cost_usd=sh.half_spread_cost(p["entry_bid"], p["entry_ask"], o.filled_qty, cfg))
             ostore.update_order(self.con, ecid, booked_qty=o.filled_qty, filled_qty=o.filled_qty,
                                 avg_price=o.filled_avg_price)
+            self._book(p, ecid, Side.BUY, o)
         status = o.status.value
         ostore.update_order(self.con, ecid, status=status)
         if status in _TERMINAL_ORDER:
+            self.risk_gate.release(p["occ"])
             if o.filled_qty and o.filled_qty > 0:
                 ostore.update_position(self.con, pid, state=ENTERED, qty_initial=o.filled_qty,
                                        entry_time=ostore.iso(o.filled_at or now))
@@ -668,6 +695,7 @@ class Engine:
                             client_order_id=f"{cid}#{o.filled_qty:g}")
             ostore.update_order(self.con, cid, booked_qty=o.filled_qty, filled_qty=o.filled_qty,
                                 avg_price=o.filled_avg_price)
+            self._book(p, cid, Side.SELL, o)
             p = ostore.position(self.con, p["position_id"])
             if p["state"] == EXITED:
                 self._notify("期權紙上出場", f"{p['underlying']} {p['occ']}:{p['exit_reason']},"
@@ -705,7 +733,7 @@ class Engine:
             try:
                 snap = self.broker.account()
                 problems += [f"broker {bp.symbol} x{bp.qty:g}" for bp in snap.positions
-                             if getattr(bp.asset_class, "value", bp.asset_class) == AssetClass.OPTION.value]
+                             if bp.asset_class == AssetClass.OPTION and abs(bp.qty) > 1e-9]
             except Exception as e:
                 problems.append(f"cannot read broker positions: {e}")
         self.con.commit()
