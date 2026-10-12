@@ -131,7 +131,7 @@ def postmortems(con, limit: int = 200) -> pd.DataFrame:
 
 def chain_table(con) -> pd.DataFrame:
     rows = con.execute(
-        "SELECT c.chain_id, c.created_at, c.source, c.trigger_text, c.confidence, "
+        "SELECT c.chain_id, c.created_at, c.source, c.trigger_text, c.confidence, c.falsifiable, "
         "(SELECT COUNT(*) FROM chain_scores s WHERE s.chain_id=c.chain_id AND s.declared=1) AS scored, "
         "(SELECT SUM(hit) FROM chain_scores s WHERE s.chain_id=c.chain_id AND s.declared=1) AS hits "
         "FROM chains c ORDER BY c.created_at DESC LIMIT 100").fetchall()

@@ -7,7 +7,10 @@ here is logged and never touches an order or the trading lock.
 Steps (each isolated, a failure in one does not stop the others):
   1. post-mortem cards for closed trades
   2. advance shadow books
-  3. score due event chains
+  3. score due event chains, judge due invalidation conditions, label
+     Muse/Grok source independence
+  3b. score author calls (informational only)
+  3c. sample source URLs and record whether they resolve (network failure is non-fatal)
   4. allocator recommendation (Fridays or when none logged this week)
   5. report -> data/desk/learn/<date>.md and learn_reports; Friday push summary
 """
@@ -24,7 +27,8 @@ import pandas as pd
 
 from stockmoney.desk import data, notify, store
 from stockmoney.desk.indicators import compute
-from stockmoney.desk.learn import allocator, chains, earnings, postmortem, shadow, tables
+from stockmoney.desk.learn import (allocator, calls, chains, corroboration, earnings, invalidation, links,
+                                   postmortem, shadow, tables)
 
 log = logging.getLogger(__name__)
 ET = ZoneInfo("America/New_York")
@@ -40,6 +44,18 @@ def _through(bars: data.Bars, now: datetime) -> pd.Timestamp:
     if len(d) and d[-1] == pd.Timestamp(et.date()) and (et.hour, et.minute) >= (16, 5):
         return d[-1]
     return done[-1]
+
+
+def _notify_once(con, key: str, title: str, msg: str, priority: int, day: str) -> None:
+    """Same contract as run._notify_once (one push per key per day, recorded in
+    the shared ``notified`` table); duplicated here because importing run would
+    pull the broker and risk modules into the learning layer."""
+    con.execute("CREATE TABLE IF NOT EXISTS notified (key TEXT PRIMARY KEY, at TEXT)")
+    key = f"{day}:{key}"
+    if con.execute("SELECT 1 FROM notified WHERE key=?", (key,)).fetchone():
+        return
+    notify.send(title, msg, priority)
+    con.execute("INSERT INTO notified VALUES (?,?)", (key, store.now()))
 
 
 def _earnings_watch(con, day) -> str:
@@ -102,6 +118,24 @@ def run(con, now: datetime, bars: data.Bars | None = None, shadow_start: str | N
     con.commit()
     if sc:
         parts.append(f"事件鏈新評分 {sc} 筆。")
+    iv = guarded("invalidation", lambda: invalidation.judge_due(con, bars, through))
+    con.commit()
+    if iv:
+        parts.append(f"事件鏈推翻條件新判定 {iv} 筆。")
+    co = guarded("corroboration", lambda: corroboration.refresh(con))
+    con.commit()
+    if co and co["added"]:
+        parts.append(f"Muse 與 Grok 同標的新增 {co['added']} 組來源比對。")
+    ci = guarded("calls_ingest", lambda: calls.ingest(con))
+    con.commit()
+    cs = guarded("calls_score", lambda: calls.score_due(con, bars, through))
+    con.commit()
+    if (ci and ci["added"]) or cs:
+        parts.append(f"喊單:新增 {ci['added'] if ci else 0},新評分 {cs or 0} 筆。")
+    lk = guarded("links", lambda: links.step(con, day))
+    con.commit()
+    if lk and lk["checked"]:
+        parts.append(f"來源連結抽查:{lk['checked']} 筆(真實 {lk['ok']}、失效 {lk['dead']}、無法驗證 {lk['unverifiable']})。")
 
     friday = through.weekday() == 4
     do_alloc = friday if with_allocator is None else with_allocator
@@ -121,7 +155,9 @@ def run(con, now: datetime, bars: data.Bars | None = None, shadow_start: str | N
     if watch:
         parts += ["", watch]
     parts += ["", rep, "", guarded("shadow_report", lambda: shadow.report(con)) or "", "",
-              guarded("chain_report", lambda: chains.report(con)) or ""]
+              guarded("chain_report", lambda: chains.report(con)) or "", "",
+              guarded("calls_report", lambda: calls.report(con)) or "", "",
+              guarded("link_report", lambda: links.report(con)) or ""]
     if alloc_text:
         parts += ["", alloc_text]
     if problems:
@@ -131,11 +167,17 @@ def run(con, now: datetime, bars: data.Bars | None = None, shadow_start: str | N
     (OUT_DIR / f"{day}.md").write_text(body + "\n")
     con.execute("INSERT OR REPLACE INTO learn_reports VALUES (?,?,?)", (day, body, store.now()))
     con.commit()
+    # Friday push always carries the one-line scoreboard (live vs SPY vs random median);
+    # "no data" when a curve is missing, never an estimate.
+    weekly = (guarded("weekly_line", lambda: shadow.weekly_line(con, day))
+              or "本期實盤(紙上) no data / SPY no data / 隨機對照中位數 no data") if friday else ""
     if problems:
-        notify.send(f"Desk 學習任務有失敗步驟 {day}", "\n".join(problems)[:1000], notify.WARN)
-    elif friday and (hyps or alloc_text):
-        notify.send(f"Desk 學習週報 {day}", "\n".join(hyps + ([alloc_text.split("\n")[-6]] if alloc_text else []))[:900],
-                    notify.INFO)
+        notify.send(f"Desk 學習任務有失敗步驟 {day}",
+                    "\n".join(problems + ([weekly] if weekly else []))[:1000], notify.WARN)
+    elif friday:
+        lines = [weekly] + hyps + ([alloc_text.split("\n")[-6]] if alloc_text else [])
+        _notify_once(con, "learn_weekly", f"Desk 學習週報 {day}", "\n".join(lines)[:900], notify.INFO, day)
+        con.commit()
     return body
 
 

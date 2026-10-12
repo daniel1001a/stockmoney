@@ -111,12 +111,43 @@ def test_stored_message_feeds_the_learning_layer(con):
 def test_chain_serialisation_matches_ingest_grok_fields():
     from stockmoney.desk.learn.chains import Chain
     dumped = json.loads(GrokChain.model_validate(grok_daily()["chains"][0]).model_dump_json())
-    assert set(dumped) == {"trigger", "urls", "steps", "impacts", "checkpoints", "confidence"}
+    assert set(dumped) == {"trigger", "urls", "steps", "impacts", "checkpoints", "invalidations", "confidence"}
+    assert dumped["invalidations"] == [{"kind": "close_above", "symbol": "NVDA", "level": 150.0,
+                                        "by_date": "2026-10-30"}]
     assert isinstance(dumped["urls"][0], str) and dumped["checkpoints"][0]["date"] == "2026-10-20"
     assert set(dumped["impacts"][0]) == {"ticker", "direction", "horizon_days"}
     # the worst case still fits the learning layer's own limits
     Chain.model_validate({**json.loads(GrokChain.model_validate(worst_case()["chains"][0]).model_dump_json()),
                           "impacts": [{"ticker": "MU", "direction": "down", "horizon_days": 60}], "source": "grok"})
+
+
+def test_invalidations_are_optional_so_old_messages_still_parse():
+    d = grok_daily()
+    del d["chains"][0]["invalidations"]
+    msg = validate(d)
+    assert msg.chains[0].invalidations == []
+
+
+@pytest.mark.parametrize("cond", [
+    {"kind": "close_below", "symbol": "NVDA", "level": 100, "by_date": "2026-10-30"},
+    {"kind": "close_above", "symbol": "BRK-B", "level": 450.5, "by_date": "2026-10-30"},
+    {"kind": "data_not_by", "description": "Final rule text published", "by_date": "2026-10-30"},
+])
+def test_valid_invalidation_kinds(cond):
+    validate(patched("chains.0.invalidations", [cond]))
+
+
+@pytest.mark.parametrize("cond", [
+    {"kind": "close_below", "symbol": "NVDA", "level": 0, "by_date": "2026-10-30"},
+    {"kind": "close_below", "symbol": "NVDA", "level": 100},  # no due date
+    {"kind": "close_below", "level": 100, "by_date": "2026-10-30"},  # no symbol
+    {"kind": "close_below", "symbol": "NVDA", "level": 100, "by_date": "2026/10/30"},
+    {"kind": "close_between", "symbol": "NVDA", "level": 100, "by_date": "2026-10-30"},  # not in the closed set
+    {"kind": "data_not_by", "by_date": "2026-10-30"},  # no description
+    {"kind": "data_not_by", "description": "x", "by_date": "2026-10-30", "level": 1},  # extra field
+])
+def test_invalid_invalidations_rejected(cond):
+    assert rejected(patched("chains.0.invalidations", [cond]))
 
 
 def test_grok_call_is_a_valid_calls_call():
@@ -134,7 +165,7 @@ def test_full_example_and_worst_case_validate():
 
 def test_worst_case_fits_the_inbox_limit_after_base64():
     body = json.dumps(worst_case(), ensure_ascii=False, separators=(",", ":")).encode()
-    assert len(body) < 115_000
+    assert len(body) < 120_000
     assert len(base64.encodebytes(body)) + 5_000 < inbox.MAX_RAW_BYTES  # headers budget 5 KB
     assert len(json.dumps(worst_case()).encode()) < inbox.MAX_RAW_BYTES  # all-\\u escaped ASCII, sent 7bit
 
@@ -219,6 +250,7 @@ def test_required_top_level_fields(field):
 
 
 @pytest.mark.parametrize("where", ["", "events.0", "chains.0", "chains.0.impacts.0", "chains.0.checkpoints.0",
+                                   "chains.0.invalidations.0",
                                    "calls.0", "attention.0"])
 def test_extra_fields_rejected_at_every_level(where):
     d = grok_daily()
@@ -231,7 +263,8 @@ def test_extra_fields_rejected_at_every_level(where):
 
 @pytest.mark.parametrize("path,limit", [("events", 25), ("chains", 6), ("calls", 50), ("attention", 20),
                                         ("chains.0.urls", 3), ("chains.0.steps", 6), ("chains.0.impacts", 6),
-                                        ("chains.0.checkpoints", 4), ("events.0.urls", 3)])
+                                        ("chains.0.checkpoints", 4), ("chains.0.invalidations", 3),
+                                        ("events.0.urls", 3)])
 def test_list_limits(path, limit):
     base = worst_case()
     node = base

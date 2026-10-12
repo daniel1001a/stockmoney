@@ -186,6 +186,7 @@ def test_chain_after_close_uses_same_day_close(con):
 def test_chain_authority_stays_log_only_until_enough_good_samples(con):
     assert chains.authority(con)[0] == "log_only"
     for i in range(60):
+        con.execute("INSERT INTO chains (chain_id, falsifiable) VALUES (?,1)", (f"c{i}",))
         con.execute("INSERT INTO chain_scores VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                     (f"c{i}", "AAPL", 20, 1, "up", "2026-01-01", "2026-02-01", 0.01, int(i % 10 != 0), 0.7, "x"))
     assert chains.authority(con)[0] == "eligible_for_review"
@@ -386,3 +387,107 @@ def test_console_pages_render_with_empty_and_filled_state(tmp_path, monkeypatch)
         at.run()
         at.sidebar.radio[0].set_value(page).run()
         assert not at.exception, (page, [e.value for e in at.exception])
+
+
+# ------------------------------------------------------------------ author calls
+from datetime import timedelta
+
+from stockmoney.desk.learn import calls as author_calls
+
+
+def _put_calls(con, msg_id, received_at, calls, type_="CALLS"):
+    from stockmoney.desk.bridge.inbox import ensure_schema as bridge_schema
+    bridge_schema(con)
+    con.execute("INSERT INTO bridge_messages VALUES (?,?,?,?,?,?,?)",
+                (msg_id, type_, "x", received_at, received_at, "{}", json.dumps({"calls": calls})))
+
+
+def _call(url="https://x.com/a/status/1", direction="long", ticker="AAPL", author="@a"):
+    return {"author": author, "platform": "x", "ticker": ticker, "direction": direction,
+            "posted_at": "2020-01-01T00:00:00-05:00", "post_url": url}
+
+
+def test_call_received_after_close_uses_next_close_and_our_clock(con):
+    bars = make_bars()
+    d = bars.dates
+    day = d[300]
+    # 22:00 UTC is after 16:05 ET in both EST and EDT; posted_at (2020) must be ignored
+    _put_calls(con, "calls-a", datetime(day.year, day.month, day.day, 22, 0, tzinfo=timezone.utc).isoformat(),
+               [_call()])
+    _put_calls(con, "calls-b", datetime(day.year, day.month, day.day, 15, 0, tzinfo=timezone.utc).isoformat(),
+               [_call(url="https://x.com/a/status/2")])  # intraday: same-day close
+    assert author_calls.ingest(con)["added"] == 2
+    author_calls.score_due(con, bars, d[-1])
+    base = {r["post_url"]: r["base_date"] for r in con.execute(
+        "SELECT c.post_url, s.base_date FROM call_scores s JOIN author_calls c USING (call_id) WHERE s.horizon=5")}
+    assert base["https://x.com/a/status/1"] == str(d[301].date())
+    assert base["https://x.com/a/status/2"] == str(d[300].date())
+    r5 = con.execute("SELECT excess_ret FROM call_scores s JOIN author_calls c USING (call_id) "
+                     "WHERE c.post_url='https://x.com/a/status/1' AND s.horizon=5").fetchone()
+    exp = (bars.close.at[d[306], "AAPL"] / bars.close.at[d[301], "AAPL"] - 1) - \
+          (bars.close.at[d[306], MARKET] / bars.close.at[d[301], MARKET] - 1)
+    assert r5["excess_ret"] == pytest.approx(exp)
+
+
+def test_call_on_weekend_uses_next_session_close():
+    d = make_bars().dates
+    fri = next(t for t in d if t.weekday() == 4)
+    sat = datetime(fri.year, fri.month, fri.day, 15, 0, tzinfo=timezone.utc) + timedelta(days=1)
+    assert author_calls.base_session(sat.isoformat(), d) == d[d.get_loc(fri) + 1]  # Monday
+
+
+def test_duplicate_post_is_scored_once(con):
+    bars = make_bars()
+    d = bars.dates
+    t1 = datetime(d[300].year, d[300].month, d[300].day, 15, 0, tzinfo=timezone.utc)
+    _put_calls(con, "calls-1", t1.isoformat(), [_call(direction="long")])
+    _put_calls(con, "calls-2", (t1 + timedelta(days=3)).isoformat(), [_call(direction="short")])  # same url, resent
+    assert author_calls.ingest(con)["added"] == 1
+    assert author_calls.ingest(con)["added"] == 0
+    assert author_calls.score_due(con, bars, d[-1]) == 3
+    assert author_calls.score_due(con, bars, d[-1]) == 0
+    row = con.execute("SELECT direction, received_at FROM author_calls").fetchone()
+    assert row["direction"] == "long" and row["received_at"] == t1.isoformat()  # first receipt wins
+
+
+def test_bearish_call_hits_on_negative_excess_and_exit_is_skipped(con):
+    bars = make_bars()
+    d = bars.dates
+    bars.close.loc[d[305]:, "AAPL"] *= 0.5   # AAPL collapses after the baseline
+    bars.close.loc[d[305]:, "MSFT"] *= 2.0
+    t = datetime(d[300].year, d[300].month, d[300].day, 15, 0, tzinfo=timezone.utc).isoformat()
+    _put_calls(con, "calls-1", t, [_call(url="u1", direction="short", ticker="AAPL"),
+                                   _call(url="u2", direction="long", ticker="AAPL"),
+                                   _call(url="u3", direction="short", ticker="MSFT"),
+                                   _call(url="u4", direction="exit", ticker="AAPL")])
+    assert author_calls.ingest(con)["added"] == 3  # exit not stored
+    author_calls.score_due(con, bars, d[-1])
+    hit = {r["post_url"]: r["hit"] for r in con.execute(
+        "SELECT c.post_url, s.hit FROM call_scores s JOIN author_calls c USING (call_id) WHERE s.horizon=20")}
+    assert hit == {"u1": 1, "u2": 0, "u3": 0}
+
+
+def test_author_with_fewer_than_20_calls_is_insufficient_and_shrunk(con):
+    for i in range(25):
+        con.execute("INSERT INTO author_calls VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (f"big{i}", "@big", "x", "AAPL", "long", "t", "m", f"u{i}", "", None, None, ""))
+        con.execute("INSERT INTO call_scores VALUES (?,?,?,?,?,?,?)", (f"big{i}", 20, "b", "s", 0.02, 1, "x"))
+    for i in range(5):
+        con.execute("INSERT INTO author_calls VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (f"sm{i}", "@small", "x", "AAPL", "short", "t", "m", f"v{i}", "", None, None, ""))
+        con.execute("INSERT INTO call_scores VALUES (?,?,?,?,?,?,?)", (f"sm{i}", 20, "b", "s", -0.10, 1, "x"))
+    st = author_calls.author_stats(con).set_index("author")
+    assert st.at["@small", "label"] == author_calls.INSUFFICIENT and st.at["@small", "n"] == 5
+    assert st.at["@big", "label"] == "ok"
+    pool = (25 * 0.02 + 5 * 0.10) / 30
+    assert st.at["@small", "mean_signed"] == pytest.approx(0.10)
+    assert pool < st.at["@small", "shrunk_signed"] < 0.10  # pulled toward the pooled mean
+    assert st.at["@small", "shrunk_signed"] == pytest.approx(
+        (5 * 0.10 + allocator.PRIOR_N * pool) / (5 + allocator.PRIOR_N))
+
+
+def test_calls_module_is_inside_the_learn_boundary():
+    import pathlib
+    src = pathlib.Path("src/stockmoney/desk/learn/calls.py").read_text()
+    for banned in ("execution", "broker", "risk", "RiskEngine", ".submit(", "make_broker"):
+        assert banned not in src, banned
