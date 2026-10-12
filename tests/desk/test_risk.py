@@ -388,3 +388,79 @@ def test_resized_intent_is_new_object_and_original_untouched(make_engine, broker
     d = decide(make_engine(), broker, original)
     assert d.intent is not original and original.qty == 500
     assert d.intent.reason.startswith("signal: breakout") and "risk resized" in d.intent.reason
+
+
+# ------------------------------------------------- beta-adjusted exposure caps
+def _levered_book(hold, broker):
+    """TQQQ 7,500 (15% of 50k equity, counts x3 = 22,500) + AAPL 10,000 + MSFT 10,000."""
+    broker.prices["TQQQ"] = 50.0
+    broker.prices["XOM"] = 100.0
+    hold("TQQQ", "tqqq", 150, price=50.0)
+    hold("AAPL", "breakout", 100)
+    hold("MSFT", "breakout", 100)
+
+
+def test_beta_caps_default_to_none_and_change_nothing(make_engine, broker, hold):
+    _levered_book(hold, broker)
+    e = make_engine()
+    assert e.limits.max_beta_adj_exposure is None and e.limits.max_growth_group_exposure is None
+    d = decide(e, broker, buy("NVDA", qty=100))
+    assert d.allow and d.intent == buy("NVDA", qty=100) and d.reason == "ok"
+
+
+def test_beta_cap_shrinks_buy_with_reason(make_engine, broker, hold):
+    _levered_book(hold, broker)
+    e = make_engine(max_beta_adj_exposure=1.0)  # 50,000; existing 42,500 -> 7,500 room
+    d = decide(e, broker, buy("NVDA", qty=100))
+    assert d.allow and d.intent.qty == 75
+    assert "beta-adjusted exposure cap" in d.reason and "beta-adjusted exposure cap" in d.intent.reason
+
+
+def test_beta_cap_counts_leverage_of_the_new_buy(make_engine, broker, hold):
+    _levered_book(hold, broker)
+    e = make_engine(max_beta_adj_exposure=1.0)  # 7,500 adjusted room / 3 = 2,500 notional = 50 sh
+    broker.prices["SOXL"] = 50.0
+    d = decide(e, broker, buy("SOXL", qty=100), ref=50.0)
+    assert d.allow and d.intent.qty == 50 and "x3" in d.reason
+
+
+def test_beta_cap_blocks_when_no_room(make_engine, broker, hold):
+    _levered_book(hold, broker)
+    e = make_engine(max_beta_adj_exposure=0.8)  # 40,000 < existing 42,500
+    d = decide(e, broker, buy("NVDA", qty=10))
+    assert not d.allow and d.intent is None and "beta-adjusted exposure cap reached" in d.reason
+
+
+def test_beta_cap_never_blocks_or_changes_sell(make_engine, broker, hold):
+    _levered_book(hold, broker)
+    e = make_engine(max_beta_adj_exposure=0.1, max_growth_group_exposure=0.1)
+    d = decide(e, broker, sell("TQQQ", qty=150), ref=50.0)
+    assert d.allow and d.intent == sell("TQQQ", qty=150)
+    d = decide(e, broker, sell("AAPL", qty=40))
+    assert d.allow and d.intent == sell("AAPL", qty=40)
+
+
+def test_growth_group_cap_shrinks_member_only(make_engine, broker, hold):
+    _levered_book(hold, broker)
+    e = make_engine(max_growth_group_exposure=0.9)  # 45,000; group 42,500 -> 2,500 room
+    d = decide(e, broker, buy("NVDA", qty=100))
+    assert d.allow and d.intent.qty == 25 and "growth-group exposure cap" in d.reason
+    d = decide(e, broker, buy("XOM", qty=50))  # not in the group: untouched
+    assert d.allow and d.intent == buy("XOM", qty=50)
+
+
+def test_pending_buys_count_toward_beta_cap(make_engine, broker, hold):
+    _levered_book(hold, broker)
+    e = make_engine(max_beta_adj_exposure=1.0)
+    e.reserve(buy("TQQQ", qty=50), 50.0)  # +2,500 notional = +7,500 adjusted: room used up
+    d = decide(e, broker, buy("NVDA", qty=10))
+    assert not d.allow and "beta-adjusted exposure cap reached" in d.reason
+
+
+def test_unknown_ticker_leverage_is_one():
+    from stockmoney.desk.execution.risk import leverage_of
+    assert leverage_of("ZZZZ") == 1.0
+    assert leverage_of("AAPL") == 1.0
+    assert leverage_of("BTC/USD") == 1.0
+    assert leverage_of("TQQQ") == 3.0 and leverage_of("SOXL") == 3.0 and leverage_of("SOXS") == 3.0
+    assert leverage_of("TQQQ", {}) == 1.0
