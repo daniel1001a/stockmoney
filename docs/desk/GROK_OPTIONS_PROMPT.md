@@ -61,11 +61,11 @@ Grok 的輸出一律當作資料處理:系統只讀結構化欄位,不執行其�
 - playbook:gap_go / gap_fade / orb / vwap_reclaim / momentum / catalyst / other。
 - thesis:一句話,為什麼今天開盤會這樣走(最多 300 字)。
 - catalyst:具體催化劑(最多 150 字),沒有就寫 ""。
-- trigger:進場觸發。kind 為 break_above / break_below / reclaim_above / lose_below / opening_range_break;level 是標的價位(opening_range_break 時填 null);confirm_closes 是需要幾根 1 分鐘 K 收在該價位之外(1 到 3);earliest 與 latest 是允許觸發的時間窗(ET,HH:MM,必須落在 09:30 到 11:30)。
+- trigger:進場觸發。kind 為 break_above / break_below / reclaim_above / lose_below / opening_range_break;level 是標的價位(opening_range_break 時填 null);confirm_closes 是需要幾根 1 分鐘 K 收在該價位之外(1 到 3);earliest 與 latest 是允許觸發的時間窗(ET,HH:MM,必須落在 09:35 到 11:30;系統 09:35 前一律不進場)。
 - invalidation:推翻條件。kind 為 below 或 above,underlying_level 是標的價位。標的觸及就代表劇本錯了、立即出場。
 - target_underlying_pct:你預期標的在這個劇本中的目標移動幅度(百分比,0.2 到 10)。
 - max_hold_minutes:最長持有分鐘數(5 到 180)。
-- preferred_dte:0dte / 1-3dte / any。
+- preferred_dte:0dte / 1-3dte / any。(紙上實單一律用 1 到 3 DTE,0dte 只記影子變體。)
 - confidence:0 到 1,低就寫低,不要硬湊。
 - evidence_urls:你實際看過的來源,1 到 3 個 https 連結;沒有就給空陣列。
 - (選填)min_rvol:你認為這個劇本需要的相對成交量下限(1 到 10)。
@@ -80,7 +80,7 @@ Grok 的輸出一律當作資料處理:系統只讀結構化欄位,不執行其�
 - 沒把握的欄位不要編造;劇本寧缺勿濫。
 
 【格式範例】
-{"protocol":"1","type":"OPTIONS_PLAN","plan_id":"gp-20261013-0745","for_date":"2026-10-13","generated_at":"2026-10-13T07:45:00-04:00","market_context":{"summary":"期貨小漲,CPI 在 08:30 公布,半導體盤前偏強","risk_tone":"mixed","key_events":[{"time":"08:30","what":"CPI"}]},"plans":[{"underlying":"NVDA","bias":"long","playbook":"gap_go","thesis":"盤前跳空 +2.1% 且放量,延續性高","catalyst":"新客戶訂單消息","trigger":{"kind":"break_above","level":142.5,"confirm_closes":1,"earliest":"09:30","latest":"10:30"},"invalidation":{"kind":"below","underlying_level":140.8},"target_underlying_pct":1.5,"max_hold_minutes":90,"preferred_dte":"0dte","confidence":0.55,"evidence_urls":["https://x.com/example/status/1"]}],"avoid":[{"ticker":"TSLA","why":"盤前無方向,價差過寬"}],"notes":""}
+{"protocol":"1","type":"OPTIONS_PLAN","plan_id":"gp-20261013-0745","for_date":"2026-10-13","generated_at":"2026-10-13T07:45:00-04:00","market_context":{"summary":"期貨小漲,CPI 在 08:30 公布,半導體盤前偏強","risk_tone":"mixed","key_events":[{"time":"08:30","what":"CPI"}]},"plans":[{"underlying":"NVDA","bias":"long","playbook":"gap_go","thesis":"盤前跳空 +2.1% 且放量,延續性高","catalyst":"新客戶訂單消息","trigger":{"kind":"break_above","level":142.5,"confirm_closes":1,"earliest":"09:35","latest":"10:30"},"invalidation":{"kind":"below","underlying_level":140.8},"target_underlying_pct":1.5,"max_hold_minutes":90,"preferred_dte":"1-3dte","confidence":0.55,"evidence_urls":["https://x.com/example/status/1"],"min_rvol":2.0,"regime":"trend"}],"avoid":[{"ticker":"TSLA","why":"盤前無方向,價差過寬"}],"notes":""}
 ```
 
 欄位上限(系統嚴格驗證,違反整份拒收):plans <= 12、avoid <= 10、key_events <= 8、thesis <= 300 字、catalyst <= 150 字、notes <= 500 字、summary <= 300 字、evidence_urls <= 3、所有網址 https 且 <= 250 字元、代號大寫。

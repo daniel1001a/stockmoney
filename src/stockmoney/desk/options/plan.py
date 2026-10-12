@@ -56,7 +56,7 @@ HHMM = Annotated[str, StringConstraints(pattern=r"^\d{2}:\d{2}$"), AfterValidato
 PlanUrl = Annotated[HttpUrl, UrlConstraints(max_length=250, allowed_schemes=["https"])]
 Price = Annotated[float, Field(gt=0, le=1_000_000)]
 
-WINDOW_START, WINDOW_END = "09:30", "11:30"
+WINDOW_START, WINDOW_END = "09:35", "11:30"  # no entry of any kind before 09:35 ET
 
 
 class _Strict(BaseModel):
@@ -89,7 +89,7 @@ class Trigger(_Strict):
         elif self.level is None:
             raise ValueError(f"{self.kind} needs a level")
         if not (WINDOW_START <= self.earliest <= self.latest <= WINDOW_END):
-            raise ValueError("earliest <= latest, both within 09:30 to 11:30 ET")
+            raise ValueError(f"earliest <= latest, both within {WINDOW_START} to {WINDOW_END} ET")
         return self
 
 
@@ -109,8 +109,12 @@ class PlanItem(_Strict):
     target_underlying_pct: float = Field(ge=0.2, le=10)
     max_hold_minutes: int = Field(ge=5, le=180)
     preferred_dte: Literal["0dte", "1-3dte", "any"]
-    confidence: float = Field(ge=0, le=1)
+    confidence: float = Field(ge=0, le=1)  # stored for scoring only, never used for sizing
     evidence_urls: list[PlanUrl] = Field(max_length=3)
+    # optional (protocol v1 additions, 2026-10-12)
+    min_rvol: float | None = Field(default=None, ge=1, le=10)  # raises the live RVOL floor; shadow unaffected
+    regime: Literal["trend", "range", "any"] | None = None     # stored and reported only
+    daily_ref: _text(120) | None = None                       # GROK_DAILY event / attention it belongs to
 
     @model_validator(mode="after")
     def _consistent(self):

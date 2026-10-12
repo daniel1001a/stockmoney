@@ -1,10 +1,12 @@
 """Contract selection (OPTIONS_PLAN.md section 5).
 
-For one trigger the shadow book records every variant (DTE bucket x delta
-band); live trading uses exactly one. Within a variant: the nearest expiry in
-the bucket, the right matching the direction (long = call, short = put),
-contracts that pass the liquidity filters, then the |delta| closest to the
-band center (ties: tighter spread). Entry is a buy at the ask side.
+For one trigger the shadow book records every DTE bucket (0DTE, 1-3 DTE);
+live trading uses 1-3 DTE only. The delta band is one per underlying class
+(index ETFs 0.40 to 0.55, single stocks 0.45 to 0.60). Within a bucket: the
+nearest expiry in it, the right matching the direction (long = call, short
+= put), contracts that pass the liquidity filters (spread <= 8% of mid by
+default), then the |delta| closest to the band center (ties: tighter
+spread). Entry is a buy at the ask side.
 
 Delta source, in order (recorded with every choice):
   1. ``provider``  the broker's greek;

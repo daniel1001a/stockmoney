@@ -106,7 +106,8 @@ def test_report_sections(tmp_path):
         r.broker.mult = {k: 0.5 for k in r.broker.templates}
         r.run(et(10, 3))
         text = oreport.build(con, str(DAY), r.cfg)
-    for h in ("期權短打日報", "紙上實單", "依劇本", "依標的類別", "依到期", "Grok 劇本 vs 規則劇本", "被過濾掉的機會", "異常"):
+    for h in ("期權短打日報", "資料限制", "紙上實單", "主變體", "依劇本", "依標的類別", "依 RVOL", "依盤勢標記",
+              "出場變體", "到期變體", "Grok 劇本 vs 規則劇本", "同一 RVOL 條件", "被過濾掉的機會", "異常"):
         assert h in text
     assert "orb15" in text and "權利金停損" in text
 

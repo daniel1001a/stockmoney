@@ -86,6 +86,14 @@ BAD = {
     "planned and avoided": lambda d: d["avoid"].append({"ticker": "NVDA", "why": "?"}),
     "missing field": lambda d: d["plans"][0].pop("confidence"),
     "negative level": lambda d: d["plans"][0]["trigger"].update(level=-1),
+    "window at 09:30": lambda d: d["plans"][0]["trigger"].update(earliest="09:30"),
+    "window 09:34": lambda d: d["plans"][0]["trigger"].update(earliest="09:34", latest="09:40"),
+    "Z offset": lambda d: d.update(generated_at="2026-10-13T11:45:00Z"),
+    "min_rvol below 1": lambda d: d["plans"][0].update(min_rvol=0.5),
+    "min_rvol above 10": lambda d: d["plans"][0].update(min_rvol=11),
+    "min_rvol string": lambda d: d["plans"][0].update(min_rvol="2"),
+    "regime unknown": lambda d: d["plans"][0].update(regime="chop"),
+    "daily_ref 121 chars": lambda d: d["plans"][0].update(daily_ref="x" * 121),
 }
 
 
@@ -93,6 +101,19 @@ BAD = {
 def test_violation_rejects_whole_plan(name):
     with pytest.raises(ValueError):
         oplan.parse(_mut(BAD[name]))
+
+
+def test_optional_fields():
+    p = oplan.parse(dump(example()))
+    assert p.plans[0].min_rvol == 2.0 and p.plans[0].regime == "trend" and p.plans[0].daily_ref is None
+    assert p.plans[0].trigger.earliest == "09:35"
+
+    def f(d):
+        for k in ("min_rvol", "regime"):
+            d["plans"][0].pop(k, None)
+        d["plans"][0]["daily_ref"] = "event 1: CPI"
+    q = oplan.parse(_mut(f))
+    assert q.plans[0].min_rvol is None and q.plans[0].regime is None and q.plans[0].daily_ref == "event 1: CPI"
 
 
 def test_short_plan_and_orb_valid():

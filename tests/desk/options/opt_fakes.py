@@ -19,6 +19,7 @@ from stockmoney.desk.options.config import OptionsConfig
 ET = ZoneInfo("America/New_York")
 DAY = date(2026, 10, 13)  # a Tuesday, NYSE open
 PREV = date(2026, 10, 12)
+NEXT = date(2026, 10, 14)  # the 1-3 DTE expiry the live variant uses
 ONE = timedelta(minutes=1)
 
 
@@ -68,16 +69,51 @@ def day_bars(rth_closes: list[float], *, prev_close: float = 600.0, pm_close: fl
 
 
 def orb_breakout_day(level_hi: float = 601.0) -> pd.DataFrame:
-    """15 minutes inside 600..601, then a steady rally (breakout 09:45 bar,
-    volume rising), flat afterwards: orb15 long at the 09:45 bar close."""
+    """15 minutes inside 600..601, then a steady rally; the 09:50 bar is the
+    first close above the range high (600.95), on a volume spike (4x the
+    previous 5 bars): orb15 long, known at 09:51. Flat afterwards."""
     closes = [600.5 + (0.4 if i % 2 else -0.4) for i in range(15)]
     c = 600.5
     for i in range(75):
         c += 0.08
         closes.append(c)
     closes += [c] * 300
-    vol = lambda i: 100_000 if i < 15 else 150_000 + 2_000 * i
+    vol = lambda i: 400_000 if i == 20 else 100_000
     return day_bars(closes, rth_volume=vol, wick=0.05)
+
+
+def sessions_before(day: date, n: int) -> list[date]:
+    from stockmoney.desk.calendar import is_trading_day
+    out, d = [], day
+    while len(out) < n:
+        d -= timedelta(days=1)
+        if is_trading_day(d):
+            out.append(d)
+    return out
+
+
+def history_bars(day: date = DAY, sessions: int = 21, rth_volume: float = 50_000, pm_volume: float = 1_000,
+                 px: float = 600.0, rth_minutes: int = 120) -> pd.DataFrame:
+    """Previous sessions for the RVOL profile: 30 premarket bars and
+    ``rth_minutes`` regular bars from 09:30, flat at ``px`` (+-0.5)."""
+    rows = []
+    for d in sessions_before(day, sessions):
+        pm0 = datetime.combine(d, time(9, 0), ET)
+        rows += [(pm0 + i * ONE, px, px + 0.1, px - 0.1, px, pm_volume) for i in range(30)]
+        o0 = datetime.combine(d, time(9, 30), ET)
+        rows += [(o0 + i * ONE, px, px + 0.5, px - 0.5, px, rth_volume) for i in range(rth_minutes)]
+    return bars(rows)
+
+
+def with_history(day_df: pd.DataFrame, **kw) -> pd.DataFrame:
+    h = history_bars(**kw)
+    df = pd.concat([h, day_df])
+    return df[~df.index.duplicated(keep="last")].sort_index()
+
+
+def profile(**kw):
+    from stockmoney.desk.options import playbooks as pb
+    return pb.build_profile(history_bars(**kw), kw.get("day", DAY), OptionsConfig())
 
 
 def chain(underlying: str = "SPY", expiry: date = DAY, spot: float = 600.0) -> dict[str, dict]:

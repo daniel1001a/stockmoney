@@ -307,7 +307,9 @@ def run(day: date, cfg: OptionsConfig, cache_dir: Path, out_dir: Path, feed: str
 def synthetic_cache(out_dir: Path, day: date, symbol: str = "SPY") -> Path:
     """A fully synthetic, clearly fake day for offline checks: ``symbol``
     opens at 600.5, holds a 600 to 601 range for 15 minutes, then rallies to
-    606 by 11:00 on rising volume and drifts. Option contracts for the 0DTE
+    606 by 11:00 on rising volume (a 3x spike on the first close above the
+    range) and drifts. The previous 21 sessions trade 50,000 shares a minute
+    from 09:30 to 11:30 (the RVOL history). Option contracts for the 0DTE
     and next-day expiries, strikes 590 to 615, with NO option bars (so every
     quote is the Black-Scholes model at ``default_iv``)."""
     from stockmoney.desk.options._iface import occ_symbol
@@ -316,20 +318,27 @@ def synthetic_cache(out_dir: Path, day: date, symbol: str = "SPY") -> Path:
     d = out_dir / str(day)
     d.mkdir(parents=True, exist_ok=True)
     rows = []
-    prev = _prev_trading_day(day)
+    prev = h = _prev_trading_day(day)
+    for _ in range(21):
+        for m in range(120):
+            rows.append((datetime.combine(h, time(9, 30), ET) + timedelta(minutes=m), 600.0, 600.5, 599.5, 600.0,
+                         50_000))
+        h = _prev_trading_day(h)
     for m in range(10):
         t = datetime.combine(prev, time(15, 50), ET) + timedelta(minutes=m)
         rows.append((t, 600.0, 600.1, 599.9, 600.0, 50_000))
     for m in range(90):  # 08:00 to 09:29 premarket, about $20M
         t = datetime.combine(day, time(8, 0), ET) + timedelta(minutes=m)
         rows.append((t, 600.4, 600.5, 600.3, 600.4, 400))
-    px = 600.5
+    px, spiked = 600.5, False
     for m in range(390):
         t = datetime.combine(day, time(9, 30), ET) + timedelta(minutes=m)
         if m < 15:
             o, c, v = px, 600.5 + (0.4 if m % 2 else -0.4), 100_000
         elif m < 90:
             o, c, v = px, px + 0.075, 150_000 + 2_000 * (m - 15)
+            if c > 600.95 and not spiked:
+                v, spiked = 3 * v, True
         else:
             o, c, v = px, px + (0.01 if m % 2 else -0.01), 60_000
         rows.append((t, o, max(o, c) + 0.05, min(o, c) - 0.05, c, v))

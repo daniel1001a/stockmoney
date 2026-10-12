@@ -26,7 +26,7 @@ CREATE INDEX IF NOT EXISTS options_plans_date ON options_plans(for_date, status)
 CREATE TABLE IF NOT EXISTS options_setups (
   setup_id TEXT PRIMARY KEY, day TEXT, source TEXT, plan_id TEXT, plan_index INTEGER,
   underlying TEXT, uclass TEXT, state TEXT, direction TEXT, spec_json TEXT, signal_json TEXT,
-  live_eligible INTEGER, live_note TEXT, created_at TEXT, updated_at TEXT);
+  live_eligible INTEGER, live_note TEXT, created_at TEXT, updated_at TEXT, rvol REAL, regime_json TEXT);
 CREATE TABLE IF NOT EXISTS options_positions (
   position_id TEXT PRIMARY KEY, setup_id TEXT, day TEXT, mode TEXT, source TEXT, underlying TEXT,
   uclass TEXT, dte_label TEXT, band_label TEXT, occ TEXT, right TEXT, strike REAL, expiry TEXT,
@@ -34,7 +34,8 @@ CREATE TABLE IF NOT EXISTS options_positions (
   entry_ask REAL, entry_quote_json TEXT, invalidation REAL, direction TEXT, max_hold_min INTEGER,
   tp_done INTEGER DEFAULT 0, stop_price REAL, exit_time TEXT, exit_reason TEXT,
   realized_usd REAL DEFAULT 0, fees_usd REAL DEFAULT 0, spread_cost_usd REAL DEFAULT 0,
-  max_bid REAL, min_bid REAL, last_bid REAL, last_ask REAL, flags_json TEXT, note TEXT, updated_at TEXT);
+  max_bid REAL, min_bid REAL, last_bid REAL, last_ask REAL, flags_json TEXT, note TEXT, updated_at TEXT,
+  exit_variant TEXT, inv_close REAL, inv_vwap INTEGER DEFAULT 0, trail_ref REAL);
 CREATE INDEX IF NOT EXISTS options_positions_day ON options_positions(day, mode, state);
 CREATE TABLE IF NOT EXISTS options_fills (
   id INTEGER PRIMARY KEY AUTOINCREMENT, position_id TEXT, at TEXT, side TEXT, qty REAL,
@@ -54,13 +55,24 @@ CREATE TABLE IF NOT EXISTS options_notified (key TEXT PRIMARY KEY, at TEXT);
 CREATE TABLE IF NOT EXISTS options_universe (
   day TEXT, symbol TEXT, uclass TEXT, origin TEXT, prev_close REAL, pm_dollar_vol REAL,
   PRIMARY KEY (day, symbol));
+CREATE TABLE IF NOT EXISTS options_profiles (
+  day TEXT, symbol TEXT, profile_json TEXT, note TEXT, PRIMARY KEY (day, symbol));
 """
+
+# columns added after the first version of the tables: (table, column, type)
+_ADDED = (("options_setups", "rvol", "REAL"), ("options_setups", "regime_json", "TEXT"),
+          ("options_positions", "exit_variant", "TEXT"), ("options_positions", "inv_close", "REAL"),
+          ("options_positions", "inv_vwap", "INTEGER DEFAULT 0"), ("options_positions", "trail_ref", "REAL"))
 
 PENDING_SUBMIT = "pending_submit"
 
 
 def ensure_schema(con) -> None:
     con.executescript(SCHEMA)
+    for table, col, typ in _ADDED:
+        have = {r[1] for r in con.execute(f"PRAGMA table_info({table})")}
+        if col not in have:
+            con.execute(f"ALTER TABLE {table} ADD COLUMN {col} {typ}")
 
 
 def iso(t: datetime) -> str:
@@ -123,7 +135,7 @@ POSITION_COLS = (
     "right", "strike", "expiry", "qty_initial", "qty_open", "state", "entry_time", "entry_price", "entry_bid",
     "entry_ask", "entry_quote_json", "invalidation", "direction", "max_hold_min", "tp_done", "stop_price",
     "exit_time", "exit_reason", "realized_usd", "fees_usd", "spread_cost_usd", "max_bid", "min_bid", "last_bid",
-    "last_ask", "flags_json", "note", "updated_at")
+    "last_ask", "flags_json", "note", "updated_at", "exit_variant", "inv_close", "inv_vwap", "trail_ref")
 
 
 def insert_position(con, row: dict) -> bool:
@@ -203,6 +215,16 @@ def save_universe(con, day: str, rows: list[tuple[str, str, str, float | None, f
     """rows: (symbol, uclass, origin, prev_close, premarket dollar volume)."""
     con.executemany("INSERT OR IGNORE INTO options_universe VALUES (?,?,?,?,?,?)",
                     [(day, s, c, o, pc, dv) for s, c, o, pc, dv in rows])
+
+
+def save_profile(con, day: str, symbol: str, profile: dict, note: str = "") -> None:
+    con.execute("INSERT OR REPLACE INTO options_profiles VALUES (?,?,?,?)",
+                (day, symbol, json.dumps(profile), note[:500]))
+
+
+def profile(con, day: str, symbol: str) -> tuple[dict, str] | None:
+    r = con.execute("SELECT profile_json, note FROM options_profiles WHERE day=? AND symbol=?", (day, symbol)).fetchone()
+    return (json.loads(r[0]), r[1]) if r else None
 
 
 def universe(con, day: str) -> list[dict]:

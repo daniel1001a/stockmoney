@@ -12,13 +12,16 @@ Position states (one setup has several positions):
   live:   PENDING (entry order working) -> ENTERED -> EXITED, or ABANDONED
           (entry never filled).
 
-Every trigger opens a SHADOW position per contract variant (DTE bucket x
-delta band), filled at the ask by the shadow model, regardless of live
-eligibility. A setup that is live-eligible (config ``live_sources``, the
-session is live, the broker is paper unless config says otherwise, the plan
-arrived before 09:20 ET, no Grok avoid entry) additionally sends ONE real
-order for its live variant, but only if HALT is absent, Muse has no block
-flag on the underlying, the engine's own position cap is free and the
+Every trigger opens a SHADOW position per variant (DTE bucket x exit
+variant A/B; one delta band per underlying class), filled at the ask by the
+shadow model, regardless of live eligibility. A setup that is live-eligible
+(config ``live_sources``, the session is live, the broker is paper unless
+config says otherwise, the plan arrived before 09:20 ET, no Grok avoid
+entry) additionally sends ONE real order for the live variant (1-3 DTE,
+never a contract expiring today, exit A), but only if its RVOL is known
+(and, for a Grok plan, the playbook is gap_go / orb with day RVOL >= the
+live floor), no macro event is within 30 minutes, HALT is absent, Muse has
+no block flag on the underlying, the engine's own position cap is free and the
 injected risk gate (_iface.RiskGate: line A's OptionsRiskEngine in a live
 session) allows it. The risk gate may shrink an order, never grow it. After
 a submit the gate RESERVES the premium; every live fill is booked in line
@@ -26,11 +29,19 @@ A's OptionsBook (idempotent per client_order_id) and the reservation is
 RELEASED once the entry is booked or ends unfilled.
 
 Exits (OPTIONS_PLAN.md section 5, the same for shadow and live, checked in
-this order): forced flat at 15:45 ET; underlying invalidation level; time
-stop (180 min, or the plan's shorter max_hold_minutes); premium stop -35% on
-the quote mid; +40% on the mid takes half (all of a single contract) and
-moves the stop on the rest to cost. Price-based exits need a fresh quote;
-forced flat, invalidation and the time stop do not.
+this order): forced flat at 15:45 ET; underlying invalidation (a price
+level crossed by the quote, a completed 1-minute close beyond a level, or a
+close back across VWAP, depending on the playbook); time stop (180 min, or
+the plan's shorter max_hold_minutes); then by exit variant: A = premium stop
+-35% on the quote mid, +40% on the mid takes half (all of a single contract)
+and moves the stop on the rest to cost; B = premium stop -30%, +40% takes
+half, the rest trails the underlying by 0.4 x ATR(14) of its 1-minute bars.
+Premium exits need a fresh quote; the rest do not.
+
+Option prices: the account has only the "indicative" option feed and NO
+option 1-minute bars (line A, OPTIONS_PLAN.md section 10). Every option
+price here is a polled snapshot, so MFE / MAE are the best / worst BID seen
+at the poll times (every ``poll_seconds``), not intrabar extremes.
 
 Idempotency and restarts: all state lives in the options_* tables, keyed by
 deterministic ids. A tick re-reads that state, so re-running a tick or
@@ -109,6 +120,10 @@ class Engine:
         self.flags_fn = flags_fn or (lambda now: {})
         self.notifier = notifier or notify.send
         self._bars: dict[str, pd.DataFrame] = {}
+        self._profiles: dict[str, pb.VolProfile] = {}
+        self._profile_retry: dict[str, datetime] = {}
+        self._loss_days: tuple[str, int] | None = None
+        self._active = None
         self._errors = 0
         self._plan_seen: str | None = None
         ostore.ensure_schema(con)
@@ -123,6 +138,7 @@ class Engine:
         self._chains: dict[tuple, list[OptionContract]] = {}
         self._spots: dict[str, float | None] = {}
         self._flags: dict[str, str] | None = None
+        self._tick_bars: dict[str, pd.DataFrame] = {}
         self._tick_errors = 0
         self._ensure_day(now)
         halted = self.cfg.halt_file.exists()
@@ -151,7 +167,7 @@ class Engine:
     # ================================================================ day setup
     def _ensure_day(self, now: datetime) -> None:
         cfg, d = self.cfg, self._dstr
-        active = oplan.active_plan(self.con, self._day)
+        active = self._active = oplan.active_plan(self.con, self._day)
         if not ostore.universe(self.con, d):
             if _et(now) < _at(self._day, cfg.open_time) - timedelta(minutes=5):
                 return  # the scan wants premarket data up to ~09:25
@@ -213,6 +229,8 @@ class Engine:
         rows = [(m.symbol, m.uclass, m.origin, prev.get(m.symbol) or self._prev_close(m.symbol),
                  self._pm_dollar_vol(m.symbol, now)) for m in members]
         ostore.save_universe(self.con, d, rows)
+        for m in members:
+            self._profile(m.symbol, now)
         avoid = {a.ticker for a in active.plan.avoid} if active else set()
         for m in members:
             for src in RULE_PLAYBOOKS:
@@ -235,6 +253,7 @@ class Engine:
                     continue
                 ostore.save_universe(self.con, d, [(sym, self.cfg.underlying_class(sym), "plan", self._prev_close(sym),
                                                     self._pm_dollar_vol(sym, now))])
+                self._profile(sym, now)
                 have.add(sym)
             spec = {"plan_id": p.plan_id, "shadow_only": active.shadow_only, "item": item.model_dump(mode="json"),
                     "received_at": active.received_at.isoformat()}
@@ -275,7 +294,7 @@ class Engine:
             for s in waiting:
                 ostore.update_setup(self.con, s["setup_id"], state=EXPIRED)
             return
-        bars = self._refresh_bars(sym, now)
+        bars = self._bars_now(sym, now)
         done = pb.completed(bars, now)
         if et >= _at(self._day, self.cfg.open_time) + timedelta(minutes=2):
             last_close = done.index[-1] + pb.ONE_MIN if not done.empty else None
@@ -285,8 +304,11 @@ class Engine:
                     self._notify("期權軌道:資料延遲", f"{sym} 的 1 分鐘 K 過舊({last_close}),暫停該標的的新進場。",
                                  notify.WARN)
                 return
+        bench = self.cfg.benchmark(sym)
+        ctx = {"pm_dollar_vol": m.get("pm_dollar_vol"), "profile": self._profile(sym, now),
+               "bench": self._bars_now(bench, now) if bench != sym else None}
         for s in waiting:
-            sig = self._evaluate(s, done, now, m.get("prev_close"), {"pm_dollar_vol": m.get("pm_dollar_vol")})
+            sig = self._evaluate(s, done, now, m.get("prev_close"), ctx)
             if sig is not None:
                 self._on_signal(s, sig, done, now, halted)
 
@@ -311,14 +333,91 @@ class Engine:
             out["spy_vs_prev_close"] = round(last / pc - 1, 4)
         return out
 
+    # ---------------------------------------------------------------- regime tags
+    def _macro_times(self) -> list[tuple[datetime, str]]:
+        """Macro event times today: the active plan's key_events plus the
+        config list."""
+        out = []
+        if self._active is not None:
+            for ev in self._active.plan.market_context.key_events:
+                out.append((_at(self._day, pb._hm(ev.time)), ev.what))
+        for d, hm in self.cfg.macro_events:
+            if d == self._dstr:
+                out.append((_at(self._day, pb._hm(hm)), "config"))
+        return out
+
+    def _consecutive_loss_days(self) -> int:
+        """Previous sessions in a row whose closed shadow trades of the live
+        variant (live_dte, live_exit) lost money net; a day without such
+        trades ends the run. Computed once per day."""
+        if self._loss_days is None or self._loss_days[0] != self._dstr:
+            rows = self.con.execute(
+                "SELECT day, SUM(realized_usd - fees_usd) FROM options_positions WHERE day < ? AND mode='shadow' "
+                "AND state='EXITED' AND dte_label=? AND COALESCE(exit_variant, 'A')=? GROUP BY day ORDER BY day DESC",
+                (self._dstr, self.cfg.live_dte, self.cfg.live_exit)).fetchall()
+            net = {r[0]: r[1] for r in rows}
+            n, d = 0, self._day
+            while n < 60:
+                d = _prev_trading_day(d)
+                if net.get(str(d)) is None or net[str(d)] >= 0:
+                    break
+                n += 1
+            self._loss_days = (self._dstr, n)
+        return self._loss_days[1]
+
+    def _regime(self, at: datetime, now: datetime) -> dict:
+        """Tags stored per setup (not blocking, except the macro window for
+        live entries). Only data known at ``at`` is used. ``vix_prev_close``
+        has no source in this system yet and is always None (never invented)."""
+        cfg = self.cfg
+        spy = pb.completed(self._bars_now("SPY", now), at)
+        pm, rth = pb.split_session(spy, cfg) if not spy.empty and spy.index[-1].date() == self._day else (spy[:0], spy[:0])
+        first15 = None
+        if _et(at) >= _at(self._day, (9, 45)) and not rth.empty:
+            r15 = rth[rth.index < pd.Timestamp(_at(self._day, (9, 45)))]
+            if not r15.empty and float(r15["open"].iloc[0]) > 0:
+                first15 = round((float(r15["high"].max()) - float(r15["low"].min())) / float(r15["open"].iloc[0]), 5)
+        win = timedelta(minutes=cfg.macro_block_minutes)
+        near = [f"{t:%H:%M} {what}" for t, what in self._macro_times() if abs(at - t) <= win]
+        pmr = pb.premarket_rvol(pm, self._profile("SPY", now), cfg) if not pm.empty else None
+        return {"spy_premarket_rvol": None if pmr is None else round(pmr, 3), "spy_first15_range_pct": first15,
+                "vix_prev_close": None, "macro_event_within_30m": bool(near), "macro_events": near,
+                "consecutive_loss_days": self._consecutive_loss_days()}
+
+    def _live_block(self, s: dict, sig: pb.Signal, spec: dict, regime: dict) -> str:
+        """'' when this trigger may send its live order, else why not
+        (signal-level rules; the setup-level ones are in _live_note)."""
+        cfg, src, m = self.cfg, s["source"], sig.meta
+        if src == "gap_go" and m.get("rvol5") is None:
+            return "rvol_unknown"
+        if src == "orb15" and m.get("day_rvol") is None:
+            return "rvol_unknown"
+        if src == GROK:
+            item = spec["item"]
+            if item["playbook"] not in cfg.grok_live_playbooks:
+                return "grok_playbook_shadow_only"
+            floor = max(cfg.grok_min_rvol, item.get("min_rvol") or 0.0)
+            if m.get("day_rvol") is None:
+                return "rvol_unknown"
+            if m["day_rvol"] < floor:
+                return "rvol_below_live_floor"
+        if regime["macro_event_within_30m"]:
+            return "macro_event_window"
+        return ""
+
     def _on_signal(self, s: dict, sig: pb.Signal, bars: pd.DataFrame, now: datetime, halted: bool) -> None:
         cfg, d, sid, sym = self.cfg, self._dstr, s["setup_id"], s["underlying"]
+        _, rth = pb.split_session(bars, cfg)
+        rv = pb.day_rvol(rth, pd.Timestamp(sig.at).tz_convert(ET), self._profiles.get(sym), cfg)
+        sig = replace(sig, meta={**sig.meta, "day_rvol": None if rv is None else round(rv, 3)})
+        regime = self._regime(sig.at, now)
         tail = [{"t": ts.isoformat(), **{k: float(v) for k, v in r.items() if k in ("open", "high", "low", "close",
                                                                                "volume", "vwap")}}
                 for ts, r in bars.tail(5).iterrows()]
         info = {**sig.to_dict(), "bars": tail, "market": self._market_state(), "seen_at": ostore.iso(now)}
-        ostore.update_setup(self.con, sid, state=TRIGGERED, direction=sig.direction,
-                            signal_json=json.dumps(info, ensure_ascii=False))
+        ostore.update_setup(self.con, sid, state=TRIGGERED, direction=sig.direction, rvol=sig.meta["day_rvol"],
+                            regime_json=json.dumps(regime, ensure_ascii=False),
+                            signal_json=json.dumps(info, ensure_ascii=False, default=str))
         age = (now - sig.at).total_seconds()
         if age > cfg.max_signal_age_s:
             ostore.update_setup(self.con, sid, state=MISSED)
@@ -335,8 +434,9 @@ class Engine:
         spot = (q[0] + q[1]) / 2
         if (q[1] - q[0]) / spot > cfg.underlying_max_spread_pct:
             return self._skip(s, now, "underlying_spread_wide", {"bid": q[0], "ask": q[1]})
-        if (sig.direction == "long" and spot <= sig.invalidation) or (sig.direction == "short" and spot >= sig.invalidation):
-            return self._skip(s, now, "already_invalidated", {"spot": spot, "invalidation": sig.invalidation})
+        inv = sig.invalidation
+        if inv is not None and ((sig.direction == "long" and spot <= inv) or (sig.direction == "short" and spot >= inv)):
+            return self._skip(s, now, "already_invalidated", {"spot": spot, "invalidation": inv})
         max_hold = cfg.time_stop_minutes
         spec = json.loads(s["spec_json"] or "{}")
         if s["source"] == GROK:
@@ -344,7 +444,9 @@ class Engine:
         flags = self._muse_flags(now)
         ctx = {"muse_flag": flags.get(sym, ""), "halted": halted, "plan_id": s["plan_id"] or "",
                "plan_shadow_only": bool(spec.get("shadow_only", False)), "received_at": spec.get("received_at")}
-        live_dte, live_band = self._live_variant(s, spec)
+        if s["source"] == GROK and spec["item"].get("preferred_dte") == "0dte":
+            ctx["note"] = "plan prefers 0dte; live uses 1-3dte, 0dte is a shadow variant"
+        band = cfg.delta_band(sym)
         live_choice = None
         opened = 0
         for bucket in cfg.dte_buckets:
@@ -352,30 +454,28 @@ class Engine:
             if chain is None:
                 ostore.filtered(self.con, d, now, "contract", sym, "chain_error", sid, bucket.label)
                 continue
-            for band in cfg.delta_bands:
-                variant = f"{bucket.label}|{band.label}"
-                choice, why, detail = sel.choose(chain, spot, now, sig.direction, bucket, band, cfg)
-                if choice is None:
-                    ostore.filtered(self.con, d, now, "contract", sym, why, sid, variant, detail)
-                    continue
-                opened += self._open_shadow(s, sig, choice, now, max_hold, ctx)
-                if (bucket.label, band.label) == (live_dte, live_band):
-                    live_choice = choice
-        pending = self._open_live(s, sig, live_choice, now, halted, flags, max_hold, ctx) if s["live_eligible"] else False
-        if opened or pending:
-            ostore.update_setup(self.con, sid, state=ENTERED)
-        else:
-            ostore.update_setup(self.con, sid, state=SKIPPED)
+            choice, why, detail = sel.choose(chain, spot, now, sig.direction, bucket, band, cfg)
+            if choice is None:
+                ostore.filtered(self.con, d, now, "contract", sym, why, sid, bucket.label, detail)
+                continue
+            for ev in cfg.exit_variants:
+                opened += self._open_shadow(s, sig, choice, ev, now, max_hold, ctx)
+            if bucket.label == cfg.live_dte:
+                live_choice = choice
+        pending = False
+        if s["live_eligible"]:
+            why = self._live_block(s, sig, spec, regime)
+            if why:
+                ostore.filtered(self.con, d, now, "live", sym, why, sid,
+                                detail={"day_rvol": sig.meta.get("day_rvol"), "rvol5": sig.meta.get("rvol5"),
+                                        "macro": regime["macro_events"]})
+            else:
+                pending = self._open_live(s, sig, live_choice, now, halted, flags, max_hold, ctx)
+        ostore.update_setup(self.con, sid, state=ENTERED if (opened or pending) else SKIPPED)
 
     def _skip(self, s: dict, now: datetime, why: str, detail: dict | None = None) -> None:
         ostore.update_setup(self.con, s["setup_id"], state=SKIPPED)
         ostore.filtered(self.con, self._dstr, now, "entry", s["underlying"], why, s["setup_id"], detail=detail)
-
-    def _live_variant(self, s: dict, spec: dict) -> tuple[str, str]:
-        dte = self.cfg.live_dte
-        if s["source"] == GROK and spec["item"]["preferred_dte"] != "any":
-            dte = spec["item"]["preferred_dte"]
-        return dte, self.cfg.live_delta_band
 
     def _muse_flags(self, now: datetime) -> dict[str, str]:
         if self._flags is None:
@@ -387,29 +487,31 @@ class Engine:
         return self._flags
 
     # ================================================================ entries
-    def _open_shadow(self, s: dict, sig: pb.Signal, ch: sel.Choice, now: datetime, max_hold: int, ctx: dict) -> int:
+    def _open_shadow(self, s: dict, sig: pb.Signal, ch: sel.Choice, ev: str, now: datetime, max_hold: int,
+                     ctx: dict) -> int:
         cfg, c = self.cfg, ch.contract
         price = sh.buy_price(c.ask, cfg)
         qty = sh.contracts_for(price, cfg)
-        pid = f"{s['setup_id']}:shadow:{ch.dte_label}:{ch.band_label}"
+        pid = f"{s['setup_id']}:shadow:{ch.dte_label}:{ev}"
         if qty < 1:
             ostore.filtered(self.con, self._dstr, now, "contract", s["underlying"], "premium_above_cap", s["setup_id"],
-                            f"{ch.dte_label}|{ch.band_label}", {"ask": c.ask})
+                            f"{ch.dte_label}|{ev}", {"ask": c.ask})
             return 0
-        row = self._position_row(s, sig, ch, pid, "shadow", now, max_hold, ctx)
+        row = self._position_row(s, sig, ch, pid, "shadow", ev, max_hold, ctx)
         row.update(qty_initial=qty, qty_open=qty, state=ENTERED, entry_time=ostore.iso(now), entry_price=price,
                    fees_usd=cfg.fee_per_contract * qty, spread_cost_usd=sh.half_spread_cost(c.bid, c.ask, qty, cfg))
         if ostore.insert_position(self.con, row):
             ostore.add_fill(self.con, pid, now, "buy", qty, price, c.bid, c.ask, "entry")
         return 1
 
-    def _position_row(self, s, sig, ch: sel.Choice, pid, mode, now, max_hold, ctx) -> dict:
+    def _position_row(self, s, sig, ch: sel.Choice, pid, mode, ev, max_hold, ctx) -> dict:
         c = ch.contract
         return {"position_id": pid, "setup_id": s["setup_id"], "day": self._dstr, "mode": mode, "source": s["source"],
                 "underlying": s["underlying"], "uclass": s["uclass"], "dte_label": ch.dte_label,
                 "band_label": ch.band_label, "occ": c.occ, "right": c.right, "strike": c.strike,
                 "expiry": str(c.expiry), "entry_bid": c.bid, "entry_ask": c.ask,
                 "entry_quote_json": json.dumps(ch.quote_dict()), "invalidation": sig.invalidation,
+                "inv_close": sig.inv_close, "inv_vwap": int(sig.inv_vwap), "exit_variant": ev,
                 "direction": sig.direction, "max_hold_min": max_hold, "tp_done": 0, "max_bid": c.bid,
                 "min_bid": c.bid, "last_bid": c.bid, "last_ask": c.ask, "realized_usd": 0.0, "fees_usd": 0.0,
                 "spread_cost_usd": 0.0, "flags_json": json.dumps(ctx, ensure_ascii=False, default=str)}
@@ -428,6 +530,8 @@ class Engine:
             return block("muse_flag", {"flag": flags.get(sym) or flags.get("*")})
         if ch is None:
             return block("no_live_contract")
+        if ch.contract.expiry <= self._day:  # never a live order on a contract that expires today
+            return block("expires_today", {"occ": ch.contract.occ})
         n_live = self.con.execute("SELECT COUNT(*) FROM options_positions WHERE day=? AND mode='live' AND state IN (?,?)",
                                   (d, PENDING, ENTERED)).fetchone()[0]
         if n_live >= cfg.max_open_positions:
@@ -441,7 +545,7 @@ class Engine:
         qty = sh.contracts_for(limit, cfg)
         if qty < 1:
             return block("premium_above_cap", {"limit": limit})
-        pid = f"{sid}:live:{ch.dte_label}:{ch.band_label}"
+        pid = f"{sid}:live:{ch.dte_label}:{cfg.live_exit}"
         intent = OrderIntent(ostore.cid(pid, "e"), c.occ, AssetClass.OPTION, Side.BUY, qty=qty,
                              order_type=OrderType.LIMIT, tif=TIF.DAY, limit_price=limit,
                              strategy=f"options:{s['source']}", reason=sig.reason[:200])
@@ -458,7 +562,7 @@ class Engine:
                 or not 1 <= final.qty <= qty or final.order_type != OrderType.LIMIT
                 or final.limit_price is None or final.limit_price > limit):
             return block("risk_gate_bad_intent", {"reason": dec.reason})
-        row = self._position_row(s, sig, ch, pid, "live", now, max_hold, ctx)
+        row = self._position_row(s, sig, ch, pid, "live", cfg.live_exit, max_hold, ctx)
         row.update(qty_initial=final.qty, qty_open=0, state=PENDING)
         if not ostore.insert_position(self.con, row):
             return True  # already exists (re-run): the pending order is resolved by _manage_pending
@@ -588,6 +692,12 @@ class Engine:
             ostore.update_position(self.con, p["position_id"], last_bid=q.bid, last_ask=q.ask,
                                    max_bid=max(p["max_bid"] or q.bid, q.bid), min_bid=min(p["min_bid"] or q.bid, q.bid))
             p = ostore.position(self.con, p["position_id"])
+        if p["tp_done"] and p["exit_variant"] == "B":  # variant B trails the best underlying price since +40%
+            spot = self._spot(p["underlying"], now)
+            ref = p["trail_ref"]
+            if spot is not None and (ref is None or (spot > ref if p["direction"] == "long" else spot < ref)):
+                ostore.update_position(self.con, p["position_id"], trail_ref=spot)
+                p = ostore.position(self.con, p["position_id"])
         if p["mode"] == "live":
             working = [o for o in ostore.orders_for(self.con, p["position_id"])
                        if o["kind"] == "exit" and o["status"] not in _TERMINAL_ORDER]
@@ -613,25 +723,65 @@ class Engine:
         if _et(now) >= _at(self._day, cfg.force_flat):
             return "force_flat", qty
         spot = self._spot(p["underlying"], now)
-        inv = p["invalidation"]
-        if spot is not None and inv is not None:
-            if (p["direction"] == "long" and spot <= inv) or (p["direction"] == "short" and spot >= inv):
-                return "invalidation", qty
+        inv, long_ = p["invalidation"], p["direction"] == "long"
+        if spot is not None and inv is not None and (spot <= inv if long_ else spot >= inv):
+            return "invalidation", qty
+        if self._close_invalidated(p, now):
+            return "invalidation", qty
         held = (now - datetime.fromisoformat(p["entry_time"])).total_seconds() / 60
         if held >= (p["max_hold_min"] or cfg.time_stop_minutes):
             return "time_stop", qty
+        b = p["exit_variant"] == "B"
+        if b and p["tp_done"] and spot is not None and p["trail_ref"] is not None:
+            a = self._underlying_atr(p["underlying"], now)
+            if a is not None:
+                gap = cfg.trail_atr_mult * a
+                if (spot <= p["trail_ref"] - gap) if long_ else (spot >= p["trail_ref"] + gap):
+                    return "atr_trail", qty
         if q is None:
             return "", 0
         m, e = sel.mid(q), p["entry_price"]
         if not p["tp_done"]:
-            if m <= e * (1 - cfg.premium_stop_pct):
+            if m <= e * (1 - (cfg.premium_stop_pct_b if b else cfg.premium_stop_pct)):
                 return "premium_stop", qty
             if m >= e * (1 + cfg.take_profit_pct):
                 part = floor(qty * cfg.take_profit_fraction) if qty >= 2 else qty
                 return "take_profit", part
-        elif m <= (p["stop_price"] or e):
+        elif not b and m <= (p["stop_price"] or e):
             return "breakeven_stop", qty
         return "", 0
+
+    def _rth_now(self, sym: str, now: datetime) -> pd.DataFrame | None:
+        """Today's completed regular-session bars, or None when the last one
+        is older than max_bar_age_s (stale data decides nothing)."""
+        done = pb.completed(self._bars_now(sym, now), now)
+        if done.empty or done.index[-1].date() != self._day:
+            return None
+        _, rth = pb.split_session(done, self.cfg)
+        if rth.empty or (now - (rth.index[-1] + pb.ONE_MIN).to_pydatetime()).total_seconds() > self.cfg.max_bar_age_s:
+            return None
+        return rth
+
+    def _close_invalidated(self, p: dict, now: datetime) -> bool:
+        """Close-based invalidation: the last completed 1-minute close (after
+        the entry) beyond ``inv_close``, or back across session VWAP."""
+        if p["inv_close"] is None and not p["inv_vwap"]:
+            return False
+        rth = self._rth_now(p["underlying"], now)
+        if rth is None or (rth.index[-1] + pb.ONE_MIN).to_pydatetime() <= datetime.fromisoformat(p["entry_time"]):
+            return False
+        c, long_ = float(rth["close"].iloc[-1]), p["direction"] == "long"
+        if p["inv_close"] is not None and (c < p["inv_close"] if long_ else c > p["inv_close"]):
+            return True
+        if p["inv_vwap"]:
+            v = float(pb.session_vwap(rth).iloc[-1])
+            if v == v and (c < v if long_ else c > v):  # v == v: not NaN
+                return True
+        return False
+
+    def _underlying_atr(self, sym: str, now: datetime) -> float | None:
+        rth = self._rth_now(sym, now)
+        return None if rth is None else pb.atr(rth, self.cfg.atr_period)
 
     def _spot(self, sym: str, now: datetime) -> float | None:
         if sym not in self._spots:
@@ -660,7 +810,7 @@ class Engine:
                   "fees_usd": (p["fees_usd"] or 0) + cfg.fee_per_contract * qty,
                   "spread_cost_usd": (p["spread_cost_usd"] or 0) + sh.half_spread_cost(bid, ask, qty, cfg)}
         if reason == "take_profit" and left > 0:
-            fields.update(tp_done=1, stop_price=p["entry_price"])
+            fields.update(tp_done=1, stop_price=p["entry_price"], trail_ref=self._spot(p["underlying"], now))
         if left <= 1e-9:
             fields.update(state=EXITED, exit_time=ostore.iso(now), exit_reason=reason)
         if note:
@@ -760,6 +910,43 @@ class Engine:
         self.con.commit()
 
     # ================================================================ plumbing
+    def _bars_now(self, sym: str, now: datetime) -> pd.DataFrame:
+        """The symbol's bars, refreshed at most once per tick."""
+        if sym not in self._tick_bars:
+            self._tick_bars[sym] = self._refresh_bars(sym, now)
+        return self._tick_bars[sym]
+
+    def _profile(self, sym: str, now: datetime) -> pb.VolProfile | None:
+        """Volume profile of the previous sessions (same feed), built once a
+        day and stored (options_profiles). A failed fetch is retried at most
+        every 5 minutes; until then RVOL is unknown (shadow-only)."""
+        if sym in self._profiles:
+            return self._profiles[sym]
+        got = ostore.profile(self.con, self._dstr, sym)
+        if got is not None:
+            self._profiles[sym] = pb.VolProfile.from_json(got[0])
+            return self._profiles[sym]
+        retry = self._profile_retry.get(sym)
+        if retry is not None and now < retry:
+            return None
+        days, d = [], self._day
+        while len(days) < self.cfg.rvol_lookback + 1:
+            d = _prev_trading_day(d)
+            days.append(d)
+        try:
+            hist = self.broker.minute_bars(sym, _at(days[-1], (4, 0)), _at(days[0], (16, 0)))
+        except Exception as e:
+            self._error("profile", f"{sym}: {type(e).__name__}: {e}")
+            self._profile_retry[sym] = now + timedelta(minutes=5)
+            return None
+        prof = pb.build_profile(hist, self._day, self.cfg)
+        note = "" if prof.sessions >= self.cfg.rvol_min_sessions else f"only {prof.sessions} sessions: RVOL unknown"
+        ostore.save_profile(self.con, self._dstr, sym, prof.to_json(), note)
+        if note:
+            ostore.event(self.con, self._dstr, now, "warn", "profile", f"{sym}: {note}")
+        self._profiles[sym] = prof
+        return prof
+
     def _refresh_bars(self, sym: str, now: datetime) -> pd.DataFrame:
         have = self._bars.get(sym)
         day_start = _at(self._day, (4, 0))

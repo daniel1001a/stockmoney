@@ -18,6 +18,9 @@ HIGH_VOL = ("COIN", "SMCI")
 
 RULE_PLAYBOOKS = ("gap_go", "gap_fade", "orb15", "vwap_reclaim")
 GROK = "grok_plan"
+# orb15 benchmark: QQQ for tech / growth names, SPY for everything else
+TECH_GROWTH = ("QQQ", "TQQQ", "NVDA", "TSLA", "AMD", "AAPL", "MSFT", "META", "AMZN", "GOOGL", "AVGO", "PLTR", "MU",
+               "NFLX", "COIN", "SMCI")
 
 
 @dataclass(frozen=True)
@@ -57,15 +60,26 @@ class OptionsConfig:
     session_end: tuple[int, int] = (16, 0)
     plan_cutoff: tuple[int, int] = (9, 20)    # plans received after this are shadow-only
     open_time: tuple[int, int] = (9, 30)
-    entry_window_start: tuple[int, int] = (9, 30)
+    entry_window_start: tuple[int, int] = (9, 35)   # no entry of any kind before 09:35 ET (owner, 2026-10-12)
     entry_window_end: tuple[int, int] = (11, 30)
     force_flat: tuple[int, int] = (15, 45)
     poll_seconds: float = 20.0               # section 8: 15 to 30 s
 
-    # --- exits (section 5, fixed, not tuned yet)
-    premium_stop_pct: float = 0.35
+    # --- exits (section 5, fixed, not tuned yet). Every entry is recorded
+    # once per exit variant; live uses ``live_exit``. Variants are reported
+    # separately and never mixed.
+    #   A: premium stop -35%; +40% sells half, the rest stops at cost
+    #   B: premium stop -30%; +40% sells half, the rest trails the underlying
+    #      by trail_atr_mult x ATR(atr_period) of its 1-minute bars
+    # Both: underlying invalidation, time stop, flat by force_flat.
+    exit_variants: tuple[str, ...] = ("A", "B")
+    live_exit: str = "A"
+    premium_stop_pct: float = 0.35           # variant A
+    premium_stop_pct_b: float = 0.30         # variant B
     take_profit_pct: float = 0.40
     take_profit_fraction: float = 0.5
+    trail_atr_mult: float = 0.4              # variant B
+    atr_period: int = 14                     # variant B, 1-minute underlying bars
     time_stop_minutes: int = 180
 
     # --- orders
@@ -90,37 +104,68 @@ class OptionsConfig:
     daily_universe_cap: int = 25
     underlying_max_spread_pct: float = 0.002  # stock bid/ask spread / mid
 
-    # --- contract liquidity (section 3)
-    max_spread_pct: float = 0.10             # option (ask - bid) / mid
+    # --- contract liquidity (section 3); also passed to line A's OptionsLimits
+    max_spread_pct: float = 0.08             # option (ask - bid) / mid
     min_mid: float = 0.20
     min_open_interest: int = 100             # checked only when the provider reports OI
     min_volume: int = 10                     # contract day volume so far
 
-    # --- contract variants (section 5): shadow records all, live uses one
+    # --- contract variants (section 5): shadow records every DTE bucket x
+    # exit variant; live uses live_dte x live_exit. Live never uses a
+    # contract that expires today (Alpaca refuses opening orders on it from
+    # 15:30 ET, and an ITM option held to expiry is exercised into stock,
+    # which would break the stock reconcile). 0DTE is a shadow variant only.
     dte_buckets: tuple[DteBucket, ...] = (DteBucket("0dte", 0, 0), DteBucket("1-3dte", 1, 3))
-    delta_bands: tuple[DeltaBand, ...] = (DeltaBand(0.30, 0.40), DeltaBand(0.40, 0.50), DeltaBand(0.50, 0.60))
-    live_dte: str = "0dte"                   # Grok's preferred_dte overrides when not "any"
-    live_delta_band: str = "d40-50"
+    live_dte: str = "1-3dte"                 # nearest expiry 1 to 3 trading days out
+    delta_band_index: DeltaBand = DeltaBand(0.40, 0.55)
+    delta_band_stock: DeltaBand = DeltaBand(0.45, 0.60)
     default_iv: float = 0.40                 # only for the synthetic replay model
 
-    # --- playbooks (section 5)
-    gap_min_pct_index: float = 0.004
-    gap_min_pct_stock: float = 0.010
-    premarket_min_dollar_vol: float = 5_000_000.0  # proxy for "premarket volume"
+    # --- playbooks (section 5, filtered versions, owner 2026-10-12). Volume
+    # rules are RATIOS on one feed (the live feed is IEX, a fraction of the
+    # tape): never compare an absolute volume.
+    # RVOL = volume since the open / mean volume over the same minutes of the
+    # previous rvol_lookback sessions (same feed). Fewer than
+    # rvol_min_sessions usable sessions = unknown (None): the setup is then
+    # shadow-only, never live.
+    rvol_lookback: int = 20
+    rvol_min_sessions: int = 10
+    gap_min_pct_index: float = 0.005
+    gap_min_pct_stock: float = 0.015
+    gap_go_min_rvol: float = 2.0             # first 5 minutes
     gap_go_range_minutes: int = 5
+    gap_go_window: tuple[tuple[int, int], tuple[int, int]] = ((9, 35), (10, 15))
     orb_minutes: int = 15
     orb_volume_lookback: int = 5
-    vwap_extension_pct_index: float = 0.003
-    vwap_extension_pct_stock: float = 0.008
-    vwap_move_window_minutes: int = 30
+    orb_break_volume_mult: float = 1.5       # break bar volume > this x mean of the previous 5 bars
+    orb_min_day_rvol: float = 1.5
+    orb_window: tuple[tuple[int, int], tuple[int, int]] = ((9, 45), (11, 0))
+    orb_risk_atr: tuple[float, float] = (0.5, 0.75)  # initial risk reference, x daily ATR(14): recorded only
     vwap_hold_bars: int = 2
+    vwap_slope_bars: int = 15
+    vwap_slope_min: float = 0.0005           # |VWAP change over vwap_slope_bars| / VWAP; unfitted starting value
+    vwap_window: tuple[tuple[int, int], tuple[int, int]] = ((9, 45), (11, 30))
+    gap_fade_window: tuple[tuple[int, int], tuple[int, int]] = ((9, 35), (11, 30))
+
+    # --- Grok plans: live only for these playbooks and with day RVOL at the
+    # trigger >= max(grok_min_rvol, the plan's own min_rvol); else shadow only
+    grok_live_playbooks: tuple[str, ...] = ("gap_go", "orb")
+    grok_min_rvol: float = 1.5
+
+    # --- regime: live entries are blocked within macro_block_minutes before
+    # or after a macro event (the plan's market_context.key_events times plus
+    # macro_events: ("YYYY-MM-DD", "HH:MM" ET)). Other regime tags are stored
+    # per setup, not blocking.
+    macro_block_minutes: int = 30
+    macro_events: tuple[tuple[str, str], ...] = ()
 
     # --- shadow fill model
     shadow_slippage_pct: float = 0.0         # extra, on top of buying the ask / selling the bid
     fee_per_contract: float = 0.03           # regulatory fees; Alpaca charges no commission
 
-    # --- live eligibility: only these sources may send a (paper) order
-    live_sources: tuple[str, ...] = RULE_PLAYBOOKS + (GROK,)
+    # --- live eligibility: only these sources may send a (paper) order;
+    # vwap_reclaim and gap_fade are shadow only
+    live_sources: tuple[str, ...] = ("gap_go", "orb15", GROK)
     paper_only: bool = True
 
     # --- paths
@@ -145,8 +190,11 @@ class OptionsConfig:
     def gap_min(self, symbol: str) -> float:
         return self.gap_min_pct_index if symbol in self.index else self.gap_min_pct_stock
 
-    def vwap_extension(self, symbol: str) -> float:
-        return self.vwap_extension_pct_index if symbol in self.index else self.vwap_extension_pct_stock
+    def delta_band(self, symbol: str) -> DeltaBand:
+        return self.delta_band_index if symbol in self.index else self.delta_band_stock
+
+    def benchmark(self, symbol: str) -> str:
+        return "QQQ" if symbol in TECH_GROWTH else "SPY"
 
     def starting_universe(self) -> list[str]:
         return list(self.index) + list(self.mega_cap) + list(self.high_vol)
