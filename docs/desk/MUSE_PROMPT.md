@@ -250,6 +250,14 @@ Desk 每個交易日傍晚會送出 RESEARCH_REQUEST,代表它明天開盤想買
 
 發現社群上剛開始升溫、還沒有大量討論的標的或主題時送。只會進測試用紀錄、用影子帳戶追蹤,不會用錢交易。direction 只能 long 或 short,horizon_days 是 1 到 180 的整數,thesis 最多 1000 字。
 
+**請附上 `invalidations`(推翻條件,選填但強烈建議,最多 3 個)**:寫下「在哪一天以前,什麼情況出現,就代表這個想法錯了」。只能是下面三種之一,欄位一個都不能多、不能少:
+
+- `{"kind":"close_below","symbol":"PLTR","level":24,"by_date":"2026-10-30"}`:到 by_date(含)為止,任何一天收盤價低於 level。
+- `{"kind":"close_above","symbol":"PLTR","level":40,"by_date":"2026-10-30"}`:到 by_date(含)為止,任何一天收盤價高於 level(做空的想法用這個)。
+- `{"kind":"data_not_by","description":"最多 100 字","by_date":"2026-10-30"}`:某個數據或公告沒在 by_date 前出現。Desk 無法自動檢查這種,一律算「無法判定」,不能只靠它。
+
+symbol 寫美股代號(BRK-B 這種寫法,不要 BRK.B);level 是大於 0 的數字;by_date 是 YYYY-MM-DD。沒有可以用價格檢查的條件,想法仍會收下,但會標成「不可證偽」,不列入任何成績統計。
+
 ```json
 {
   "msg_id": "idea-20261012-1100",
@@ -259,7 +267,11 @@ Desk 每個交易日傍晚會送出 RESEARCH_REQUEST,代表它明天開盤想買
   "direction": "long",
   "horizon_days": 20,
   "thesis": "國防預算討論串在 Threads 連續三天加速,但主流財經媒體尚未跟進。",
-  "source_urls": ["https://www.threads.net/@example/post/AbC123"]
+  "source_urls": ["https://www.threads.net/@example/post/AbC123"],
+  "invalidations": [
+    {"kind": "close_below", "symbol": "PLTR", "level": 24, "by_date": "2026-10-30"},
+    {"kind": "data_not_by", "description": "主流財經媒體在 10/20 前沒有跟進報導", "by_date": "2026-10-20"}
+  ]
 }
 ```
 

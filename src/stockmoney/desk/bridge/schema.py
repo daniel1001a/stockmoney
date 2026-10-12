@@ -105,6 +105,8 @@ class Idea(_Msg):
     horizon_days: int = Field(ge=1, le=180)
     thesis: Annotated[str, StringConstraints(max_length=1000)]
     source_urls: list[HttpUrl] = Field(default_factory=list, max_length=10)
+    # same closed set as GrokChain.invalidations (defined below); optional, stored with the idea
+    invalidations: list["GrokInvalidation"] = Field(default_factory=list, max_length=3)
 
 
 class Call(BaseModel):
@@ -131,8 +133,8 @@ class Calls(_Msg):
 
 # ---------------------------------------------------------------- GROK_DAILY (Grok -> desk)
 # Same sender, token and subject as Muse (docs/desk/GROK_PROMPT.md). Store-only:
-# no policy effect. Limits keep a full message under ~111 KB of compact UTF-8
-# (~154 KiB after base64 + headers) against the 200 KiB inbox cap; the
+# no policy effect. Limits keep a full message under ~117 KB of compact UTF-8
+# (~159 KiB after base64 + headers) against the 200 KiB inbox cap; the
 # worst case is computed in tests/desk/test_grok_daily.py.
 
 _ET = ZoneInfo("America/New_York")
@@ -184,14 +186,40 @@ class GrokCheckpoint(BaseModel):
     date: _dt.date  # "YYYY-MM-DD" only
 
 
+class GrokPriceInvalidation(BaseModel):
+    """Mechanically checkable: any daily close on or before ``by_date`` that is
+    below (close_below) or above (close_above) ``level`` invalidates the chain."""
+    model_config = ConfigDict(extra="forbid")
+    kind: Literal["close_below", "close_above"]
+    symbol: GrokTicker
+    level: float = Field(gt=0, le=1_000_000)
+    by_date: _dt.date  # "YYYY-MM-DD" only
+
+
+class GrokDataInvalidation(BaseModel):
+    """Free-text expectation that must show up by ``by_date``. Code cannot check
+    it, so the desk judges it "no_data" and never counts it as a falsification."""
+    model_config = ConfigDict(extra="forbid")
+    kind: Literal["data_not_by"]
+    description: _text(100)
+    by_date: _dt.date
+
+
+GrokInvalidation = Annotated[Union[GrokPriceInvalidation, GrokDataInvalidation], Field(discriminator="kind")]
+Idea.model_rebuild()  # resolves Idea.invalidations now that the condition models exist
+
+
 class GrokChain(BaseModel):
-    """Field names and types are read by learn/chains.py ingest_grok(); keep them in sync."""
+    """Field names and types are read by learn/chains.py ingest_grok(); keep them in sync.
+    ``invalidations`` is optional (older messages omit it); a chain without a
+    price condition is stored but marked unfalsifiable and kept out of evidence counts."""
     model_config = ConfigDict(extra="forbid")
     trigger: _text(200)
     urls: list[GrokUrl] = Field(min_length=1, max_length=3)
     steps: list[_text(120)] = Field(min_length=1, max_length=6)
     impacts: list[GrokImpact] = Field(min_length=1, max_length=6)
     checkpoints: list[GrokCheckpoint] = Field(max_length=4)
+    invalidations: list[GrokInvalidation] = Field(default_factory=list, max_length=3)
     confidence: float = Field(ge=0, le=1)
 
 
