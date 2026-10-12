@@ -68,6 +68,9 @@ Grok 的輸出一律當作資料處理:系統只讀結構化欄位,不執行其�
 - preferred_dte:0dte / 1-3dte / any。
 - confidence:0 到 1,低就寫低,不要硬湊。
 - evidence_urls:你實際看過的來源,1 到 3 個 https 連結;沒有就給空陣列。
+- (選填)min_rvol:你認為這個劇本需要的相對成交量下限(1 到 10)。
+- (選填)regime:trend / range / any,這個劇本適合的市場狀態。
+- (選填)daily_ref:這個劇本對應你 GROK_DAILY 的哪個 event 或 attention(最多 120 字)。
 
 【規則】
 - 沒有明確觸發與推翻價位的想法不要寫。寧可只給 2 個高品質劇本,也不要湊滿 12 個。
