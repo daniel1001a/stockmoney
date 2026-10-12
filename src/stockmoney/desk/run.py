@@ -28,6 +28,11 @@ owner lifts it. Fills are booked as they arrive, partial fills included.
 Postopen, postclose and recover end by cancelling any sell stop for a symbol
 the ledger does not hold.
 
+Options isolation: the intraday options sleeve trades in the same broker
+account. Every job and the stop helpers wrap the broker in
+execution.isolation.stock_only, so option positions and orders are invisible
+here: never reconciled, counted as exposure, adopted, swept or cancelled.
+
 Crash safety: an order is written to ``submitted`` as ``pending_submit`` and
 committed before broker.submit is called (sync_fills resolves such rows by
 client_order_id), and a cancel is committed right after it happens, so neither
@@ -59,6 +64,7 @@ import pandas as pd
 from stockmoney.desk import data, engine, notify, store
 from stockmoney.desk.calendar import is_trading_day
 from stockmoney.desk.execution.broker import Broker
+from stockmoney.desk.execution.isolation import stock_only
 from stockmoney.desk.execution.ledger import Ledger, norm
 from stockmoney.desk.execution.reconcile import mismatches
 from stockmoney.desk.execution.risk import Limits, RiskEngine
@@ -470,6 +476,7 @@ def ensure_stops(con, broker: Broker, ledger: Ledger, risk: RiskEngine, snap: Ac
     ``skip``: normalized symbols that failed reconciliation or are being
     exited, left alone here. One symbol's failure is reported and the rest
     continue."""
+    broker = stock_only(broker)
     events = []
     open_orders = broker.open_orders()
     for sym, pos in ledger.positions().items():
@@ -577,6 +584,7 @@ def sweep_orphan_stops(con, broker: Broker, ledger: Ledger, day: str) -> list[st
     account it could open a short when it triggers. A symbol the broker still
     holds is a reconcile mismatch and is left for a human. One order's
     failure is reported and the rest are still swept."""
+    broker = stock_only(broker)
     events: list[str] = []
     try:
         held = {norm(s) for s in ledger.positions()}
@@ -618,6 +626,7 @@ def sweep_orphan_stops(con, broker: Broker, ledger: Ledger, day: str) -> list[st
 
 def postclose(con, broker: Broker, now: datetime, bars: data.Bars | None = None, limits: Limits | None = None) -> str:
     ensure_schema(con)
+    broker = stock_only(broker)
     today = _today(now)
     limits = limits or Limits()
     risk = RiskEngine(limits, con)
@@ -850,6 +859,7 @@ def premarket(con, broker: Broker, now: datetime, limits: Limits | None = None, 
     sell runs whenever its position is still held. A failed exit re-places its
     stop at once and stays planned for a rerun (MAX_EXIT_ATTEMPTS per day)."""
     ensure_schema(con)
+    broker = stock_only(broker)
     st = _Run()
     today = _today(now)
     if not broker.is_equity_market_open() and not _opens_today(broker, now):
@@ -1155,6 +1165,7 @@ def postopen(con, broker: Broker, now: datetime, limits: Limits | None = None) -
     a DAY market sell while the market is open, then the stop pass and the
     orphan sweep."""
     ensure_schema(con)
+    broker = stock_only(broker)
     st = _Run(job="postopen", late=True)
     today = _today(now)
     risk = RiskEngine(limits or Limits(), con)
@@ -1197,6 +1208,7 @@ def recover(con, broker: Broker, now: datetime, limits: Limits | None = None) ->
     resolves pending_submit rows), reconciles, restores protective stops and
     sweeps orphan stops. It never plans, buys or sends exits."""
     ensure_schema(con)
+    broker = stock_only(broker)
     st = _Run(job="recover")
     today = _today(now)
     risk = RiskEngine(limits or Limits(), con)
@@ -1214,6 +1226,7 @@ def recover(con, broker: Broker, now: datetime, limits: Limits | None = None) ->
 
 def crypto(con, broker: Broker, now: datetime) -> str:
     ensure_schema(con)
+    broker = stock_only(broker)
     events = sync_fills(con, broker, Ledger(con), _today(now))
     return "加密貨幣策略於第 1 階段上線。" + ("\n" + "\n".join(events) if events else "")
 

@@ -113,3 +113,14 @@
 - Alpaca 紙上帳戶的期權成交模型(是否按 NBBO)與真實成交的差距。
 - 同一帳戶內期權與股票的隔離是否完全(第 8 節隔離測試)。建議第一週穩定後,另開一個純期權紙上帳戶。
 - 價差與開盤 IV 回落是否吃掉所有 edge。這就是第一個月要回答的問題。
+
+### A 線實作紀錄(2026-10-12,`scripts/options_data_check.py` 在紙上帳戶實測,未下任何單)
+
+- **期權資料 feed**:此帳戶拿到的是 `indicative`。明確要求 `opra` 回 `OPRA agreement is not signed`。不指定 feed 時 Alpaca 自動給 indicative(Alpaca 文件:indicative 的成交是延遲的、報價是經修改的)。影子成交模型目前只能以 indicative 報價計算。
+- **期權 1 分鐘 K 拿不到**:`/v1beta1/options/bars` 沒有 feed 參數,此帳戶查詢回 `OPRA agreement is not signed`(HTTP 403)。`minute_bars(occ, ...)` 因此回傳空表並記錄警告。B 線的 MFE/MAE 與重播若需要期權 K 線,只能改用輪詢快照,或由使用者簽署 OPRA 協議後再驗證(是否需付費未驗證)。
+- **快照內容**:報價(bid/ask)齊全;IV 與 delta 只有部分合約有(SPY 10-13 到期 302 檔中 117 檔,NVDA 10-14 到期 106 檔中 36 檔,深價內外多半沒有)。當日成交量取自快照的 dailyBar(日期不是今天就記為 0);未平倉量取自交易 API 的 contracts 端點(每日更新一次,約七到八成合約有值)。
+- **股票資料**:IEX 即時可用(成交量只是 IEX 的份額,不是全市場量);近期 SIP 回 `subscription does not permit querying recent SIP data`。
+- **帳戶期權權限**:options_approved_level=3、options_trading_level=3。
+- **與第 8 節的差異**:`OptionsRiskEngine.check` 的簽名改為 `check(intent, contract, snapshot, now, *, open_orders=None, marks=None, blocked=None)`(收整張 `OrderIntent` 而不是 `intent_premium_usd`,以便依口數縮單並檢查限價)。`OrderIntent` 未新增欄位:期權單的 `side` 買即 buy_to_open、賣即 sell_to_close,由 adapter 帶上 `position_intent`。`BrokerOrder` 新增可選欄位 `asset_class`。
+- **隔離做法**:所有股票任務(premarket、postopen、postclose、recover、crypto)與 `ensure_stops`、`sweep_orphan_stops` 一律透過 `execution/isolation.stock_only` 包裝券商,期權部位與委託對股票帳本不可見,且股票任務無法取消期權委託;`reconcile` 與股票 `RiskEngine` 另外再過濾一次,股票 `RiskEngine` 直接拒絕期權單。期權軌道用自己的 `options_*` 資料表與 `options_mismatches` 對帳。
+- **仍存在的風險**:期權若持有到到期且價內,會被自動履約成股票部位,股票對帳會因此判定不一致並暫停新進場(保守、正確的反應,但會影響股票帳本);15:45 強制平倉是唯一的防線。`AlpacaBroker.cancel_all` 本身仍會取消整個帳戶的委託(股票任務不使用它)。
