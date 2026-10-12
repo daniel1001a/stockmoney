@@ -141,3 +141,62 @@
 - Grok 引用的 X 帳號績效沒有可驗證依據,不採用。
 - 出場參數(-30%、ATR 追蹤)只當影子變體,不直接取代預設。理由:單一來源的經驗判斷,不是證據;一次只改一個東西。
 - 信心分數只記錄、不用於部位大小,等校準後再說。
+
+## 12. 操作手冊(2026-10-12 整合後,給 10-13 第一個交易日)
+
+以下指令都在**主程式目錄**執行(`cd ~/Projects/stockmoney`),前提是 `opt/engine` 已合併進主線。先載入環境變數:`set -a; source .env; set +a`(推播與 Alpaca 金鑰都靠它)。
+
+**1. 盤前劇本(07:30 到 09:20 ET 之間)**
+
+```
+.venv/bin/python -m stockmoney.desk.options.run ingest-plan ~/Downloads/plan.json
+```
+
+- 印出 `ACCEPTED <plan_id> for <日期>` 代表收下;09:20 ET 後才收到會加註「當天只進影子帳戶」。
+- 印出 `REJECTED ...: <原因>` 代表整份拒收(並推播),例如時間窗早於 09:35、偏移不是 -04:00、代號小寫、超過 12 個劇本、多出欄位、bias 不是 long/short。改好再餵一次即可;同一份內容重送會顯示 `DUPLICATE`。
+- 沒有劇本也沒關係,規則劇本照跑。
+
+**2. 啟動盤中 session(09:20 到 16:00 ET)**
+
+- 自動(使用者決定後才做):`.venv/bin/python scripts/desk_schedule.py --jobs options --install`,只安裝 options 這一個 launchd 工作,每個交易日 09:00 啟動,09:20 開始迴圈。不加 `--install` 只會把 plist 寫到 `data/desk/launchd/`。
+- 手動:`nohup scripts/desk_job.sh options >/dev/null 2>&1 &`(輸出寫進 `data/desk/logs/<日期>.log`)。
+- 只想跑影子、不下紙上單:啟動前 `export DESK_OPTIONS_ORDERS=off`。
+
+**3. 確認 session 還活著**
+
+- 09:20 會收到推播「期權軌道啟動」(含模式 paper/shadow、劇本狀態、HALT 狀態)。
+- `pgrep -fl "options.run session"` 有一行;`lsof data/desk/options.lock` 顯示該程序持有鎖。
+- `tail -f data/desk/logs/$(date +%F).log`:每輪約 20 秒;錯誤會以 `options <類別>: <訊息>` 出現。
+- 資料庫:`sqlite3 data/desk/desk.sqlite "select max(updated_at) from options_setups where day=date('now','localtime')"`,時間應該在一兩分鐘內。新進場、出場、資料延遲、連續錯誤、收盤未平倉都會推播。
+
+**4. 緊急煞車**
+
+- `touch data/desk/HALT`:新進場全擋(影子照記),出場照常。注意這個檔案**股票主帳本也共用**,會一起擋股票新進場。解除:`rm data/desk/HALT`。
+- 只擋期權新進場:`sqlite3 data/desk/desk.sqlite "insert into settings values('options_halt_new_entries','1') on conflict(key) do update set value='1'"`,解除把值改回 `0`。股票帳本若自動設了 `halt_new_entries=1`(對帳不一致),期權新進場也會被擋。
+- 15:45 ET 一律強制平倉;session 結束時檢查券商期權部位,未平會推播 CRITICAL,請到 Alpaca 手動確認。
+
+**5. 盤後報告與重播**
+
+```
+.venv/bin/python -m stockmoney.desk.options.run report 2026-10-13
+.venv/bin/python -m stockmoney.desk.options.run replay 2026-10-13 --feed iex
+```
+
+- session 收盤時已自動寫 `data/desk/options/reports/<日期>.md`;`report` 可以重寫並印出。內容(中文):資料限制說明、總覽、紙上實單逐筆、影子主變體(1-3dte、出場 A)依劇本 / 標的類別 / RVOL 分組(< 1.5、1.5 到 2、> 2)/ 盤勢標記、出場變體 A 對 B(DTE 固定)、DTE 變體 0dte 對 1-3dte(出場固定)、Grok 對規則(含同一 RVOL 條件)、被過濾掉的機會、異常。
+- `replay` 要在收盤後 16 分鐘以上執行(SIP 延遲限制),第一次會下載快取到 `data/desk/options/replay_cache/<日期>/`;報告寫到 `replay_<日期>_iex.md`,開頭會寫明期權價格是合成模型。
+
+**6. 10-12 重播結果(真實 IEX 1 分鐘 K、合成期權報價、A 線正式風控)**
+
+- 正式參數:17 檔標的的 RVOL 都低於 1.5(SPY 開盤 5 分鐘 RVOL 0.49,已用原始資料手算核對),gap_go 與 orb15 一次都沒觸發(MU 跳空 -2.7% 但 RVOL5 只有 1.38),只有僅影子的 vwap_reclaim 觸發 12 次、進場 4 次(主變體合計 -486 美元,全部是推翻出場)。沒有紙上單,這是過濾設計的預期結果。
+- 機制測試(把 RVOL 門檻降到 0.3,只為了讓下單路徑跑起來):3 筆模擬紙上單經過 A 線風控、入帳、出場、帳本歸零,沒有任何 client_order_id 重送。這次重播抓到並修正一個問題:同一輪第二筆進場曾因前一筆成交尚未入帳而被風控誤擋。
+- session 端到端演練(模擬時鐘、模擬券商):09:20 開始、中途強殺後重啟不重送單、15:45 強制平倉、HALT 下出場照常、單一標的資料延遲時停止該標的進場、第二個 session 被檔案鎖拒絕,20 項檢查全過。
+
+**7. 已知限制(第一天要有心理準備)**
+
+- 期權報價只有 indicative feed(非 OPRA),影子成交按快照的買賣價計算;MFE/MAE 是每 20 秒輪詢的快照極值,不是盤中真實極值。
+- 更正第 10 節的 A 線紀錄:期權 1 分鐘成交 K **歷史**查得到(10-12 收盤後實測整天 391 根),但查詢區間碰到最近 30 分鐘就回 HTTP 403(OPRA 未簽);盤中延遲 15 分鐘的查詢是否可用未驗證。系統盤中完全不依賴期權 K 線。
+- 股票 1 分鐘 K 是 IEX,成交量只是 IEX 份額,所以所有量能條件都用同一資料源的比率;RVOL 需要前 20 個交易日(至少 10 個)的同一資料源歷史,抓不到就當作未知,該劇本只進影子。
+- 合約過濾很可能常擋住實單:未平倉量 < 100(週三到期的個股合約常見)、價差 > 8%、單筆權利金上限 1,000 美元(MU 這類高價股買不起 0.45 到 0.60 delta)、週一時只有週五到期的標的沒有 1 到 3 DTE 合約。這些都會記在「被過濾掉的機會」。A 線風控在未平倉量未知時也會擋實單。
+- VIX 前收沒有資料來源,一律記為無;宏觀事件只看劇本的 key_events 與設定檔清單。
+- indicative 報價在盤中的時間戳新鮮度尚未在開盤時段實測;報價超過 30 秒視為過期,不會進場。
+- 第一天的目標是確認流程與紀錄完整,不是看損益。
