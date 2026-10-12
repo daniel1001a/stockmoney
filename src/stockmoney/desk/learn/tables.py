@@ -24,6 +24,7 @@ CREATE TABLE IF NOT EXISTS learn_reports (
 
 
 def ensure_schema(con) -> None:
-    from stockmoney.desk.learn import earnings
+    from stockmoney.desk.learn import calls, earnings
     con.executescript(SCHEMA)
     earnings.ensure_schema(con)
+    calls.ensure_schema(con)

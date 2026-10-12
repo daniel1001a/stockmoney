@@ -8,6 +8,7 @@ Steps (each isolated, a failure in one does not stop the others):
   1. post-mortem cards for closed trades
   2. advance shadow books
   3. score due event chains
+  3b. score author calls (informational only)
   4. allocator recommendation (Fridays or when none logged this week)
   5. report -> data/desk/learn/<date>.md and learn_reports; Friday push summary
 """
@@ -24,7 +25,7 @@ import pandas as pd
 
 from stockmoney.desk import data, notify, store
 from stockmoney.desk.indicators import compute
-from stockmoney.desk.learn import allocator, chains, earnings, postmortem, shadow, tables
+from stockmoney.desk.learn import allocator, calls, chains, earnings, postmortem, shadow, tables
 
 log = logging.getLogger(__name__)
 ET = ZoneInfo("America/New_York")
@@ -102,6 +103,12 @@ def run(con, now: datetime, bars: data.Bars | None = None, shadow_start: str | N
     con.commit()
     if sc:
         parts.append(f"事件鏈新評分 {sc} 筆。")
+    ci = guarded("calls_ingest", lambda: calls.ingest(con))
+    con.commit()
+    cs = guarded("calls_score", lambda: calls.score_due(con, bars, through))
+    con.commit()
+    if (ci and ci["added"]) or cs:
+        parts.append(f"喊單:新增 {ci['added'] if ci else 0},新評分 {cs or 0} 筆。")
 
     friday = through.weekday() == 4
     do_alloc = friday if with_allocator is None else with_allocator
@@ -121,7 +128,8 @@ def run(con, now: datetime, bars: data.Bars | None = None, shadow_start: str | N
     if watch:
         parts += ["", watch]
     parts += ["", rep, "", guarded("shadow_report", lambda: shadow.report(con)) or "", "",
-              guarded("chain_report", lambda: chains.report(con)) or ""]
+              guarded("chain_report", lambda: chains.report(con)) or "", "",
+              guarded("calls_report", lambda: calls.report(con)) or ""]
     if alloc_text:
         parts += ["", alloc_text]
     if problems:
