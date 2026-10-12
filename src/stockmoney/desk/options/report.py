@@ -9,7 +9,7 @@ Definitions used in every table (closed positions only):
 - 價差佔比 = 價差成本 / |以中價計的毛損益| summed over the group (how much of
   the gross move the spread ate) and 價差/權利金 = 價差成本 / 進場權利金;
 - MFE / MAE = best / worst bid seen while open, relative to the entry price.
-  The account has no option 1-minute bars (indicative feed only), so these
+  The account has no real-time option 1-minute bars (indicative feed), so these
   are the extremes of the POLLED snapshots (every poll_seconds), not intrabar
   extremes; in a replay they come from the synthetic quote model.
 Shadow records every DTE bucket x exit variant per trigger. Variants are
@@ -32,7 +32,7 @@ REASON_LABEL = {"premium_stop": "權利金停損", "take_profit": "停利(先出
                 "invalidation": "推翻價位", "time_stop": "時間停損", "force_flat": "15:45 強制平倉",
                 "session_end": "收盤補記", "entry_unfilled": "進場未成交", "entry_not_sent": "未送出",
                 "atr_trail": "ATR 追蹤停損"}
-DATA_NOTE = ("> 資料限制:期權報價是 Alpaca indicative feed 的輪詢快照(非 OPRA,約每 20 秒一次),沒有期權 1 分鐘 K,"
+DATA_NOTE = ("> 資料限制:期權報價是 Alpaca indicative feed 的輪詢快照(非 OPRA,約每 20 秒一次),盤中拿不到期權 1 分鐘 K,"
              "所以 MFE/MAE 是輪詢到的最佳/最差買價,不是盤中極值。標的 1 分鐘 K 來自 IEX,成交量只是 IEX 的份額,"
              "所有量能條件(RVOL、突破量)都是同一資料源的比率,不是全市場絕對量。")
 

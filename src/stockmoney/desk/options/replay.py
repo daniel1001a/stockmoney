@@ -4,15 +4,23 @@ session, with a simulated clock and a simulated broker built from cached
 
 What is real and what is modelled (stated in every replay report):
 - underlying 1-minute bars: REAL (Alpaca historical, IEX by default to match
-  the live session's feed; SIP optional);
-- option prices: SEMI-SYNTHETIC. Alpaca has no historical option bid/ask, only
-  trade-based 1-minute bars. The model takes the last trade bar's close as the
-  mid when that contract traded within ``BAR_MAX_AGE``; otherwise it prices the
-  contract with Black-Scholes at the current spot, using the IV implied by
-  that contract's own last trade (or the nearest traded strike of the same
-  expiry and right, or ``cfg.default_iv``). Bid/ask is then mid -/+ a modelled
-  half spread (``half_spread``). Greeks are not supplied, so delta comes from
-  select.py's documented fallback (IV from the mid).
+  the live session's feed; SIP optional), including the previous sessions
+  the RVOL profile needs;
+- option prices: SYNTHETIC QUOTE MODEL. There is no historical option
+  bid/ask at all. Option 1-minute TRADE bars can be read for a past session
+  (verified 2026-10-12 after the close), but not in real time (a window
+  touching the last 30 minutes answers HTTP 403 "OPRA agreement is not
+  signed"), so the live session never uses them. In a replay the mid is
+  the contract's last trade bar close when it traded within
+  ``BAR_MAX_AGE`` (source "trade_bar"); otherwise Black-Scholes at the
+  current underlying bar close with an IV taken, in order, from: the IV
+  implied by the contract's last trade bar, its IV in the indicative
+  snapshot taken when the cache was fetched (AFTER the day: a mild
+  look-ahead in the IV level only), the nearest strike's IV of the same
+  expiry and right, else ``cfg.default_iv``. Bid/ask is ALWAYS mid -/+ a
+  modelled half spread (``half_spread``), never a real quote. Volume is 0
+  (unknown), so the contract volume filter is off in a replay. The source
+  of every quote is counted and printed in the report header.
 - the underlying quote is the last bar close -/+ 1 bp (synthetic);
 - order fills: a buy limit fills at the modelled ask once the limit reaches
   it, a sell limit at the modelled bid; market orders fill immediately;
@@ -82,9 +90,11 @@ class ReplayMarket:
                       for s, g in st.groupby("symbol")}
         c = pd.read_parquet(cache_dir / "contracts.parquet")
         self.contracts = {r.occ: r for r in c.itertuples()}
-        ob = pd.read_parquet(cache_dir / "option_bars.parquet")
-        self.obars = {k: bars_frame(g.to_dict("records")) for k, g in ob.groupby("occ")}
+        obp = cache_dir / "option_bars.parquet"
+        ob = pd.read_parquet(obp) if obp.exists() else pd.DataFrame()
+        self.obars = {k: bars_frame(g.to_dict("records")) for k, g in ob.groupby("occ")} if "occ" in ob else {}
         self.meta = json.loads((cache_dir / "meta.json").read_text())
+        self._iv_cache: dict[str, tuple[float, str]] = {}
         sip = cache_dir / "stock_sip.parquet"
         self.sip = {}
         if sip.exists():
@@ -120,7 +130,36 @@ class ReplayMarket:
         return sel.implied_vol(float(lb[1]["close"]), s, r.strike, sel.years_to_expiry(date.fromisoformat(r.expiry),
                                                                                        t_bar), r.right)
 
+    def _snap_iv(self, occ: str) -> float | None:
+        r = self.contracts[occ]
+        v = getattr(r, "iv_snapshot", None)
+        return float(v) if v is not None and not pd.isna(v) and v > 0 else None
+
+    def _model_iv(self, occ: str, now: datetime) -> tuple[float, str]:
+        if not self.obars:  # no trade bars at all: the answer does not depend on the time
+            if occ not in self._iv_cache:
+                self._iv_cache[occ] = self._model_iv_at(occ, now)
+            return self._iv_cache[occ]
+        return self._model_iv_at(occ, now)
+
+    def _model_iv_at(self, occ: str, now: datetime) -> tuple[float, str]:
+        r = self.contracts[occ]
+        iv = self._iv_from_bar(occ, now)
+        if iv:
+            return iv, "bs_trade_iv"
+        iv = self._snap_iv(occ)
+        if iv:
+            return iv, "bs_snapshot_iv"
+        peers = sorted((c for c in self.contracts.values() if c.underlying == r.underlying and c.expiry == r.expiry
+                        and c.right == r.right and c.occ != occ), key=lambda c: abs(c.strike - r.strike))
+        for c in peers[:6]:
+            iv = self._snap_iv(c.occ) or self._iv_from_bar(c.occ, now)
+            if iv:
+                return iv, "bs_peer_iv"
+        return self.cfg.default_iv, "bs_default_iv"
+
     def quote(self, occ: str, now: datetime) -> tuple[OptionContract | None, str]:
+        """(synthetic quote, source label). See the module docstring."""
         r = self.contracts.get(occ)
         if r is None:
             return None, "unknown"
@@ -131,28 +170,18 @@ class ReplayMarket:
         if datetime.combine(expiry, time(16, 0), ET) <= now:
             return None, "expired"
         lb = self._last_bar(occ, now)
-        vol = int(lb[2]) if lb else 0
         if lb is not None and (pd.Timestamp(now) - (lb[0] + ONE_MIN)) <= BAR_MAX_AGE:
-            mid, src = float(lb[1]["close"]), "bar"
+            mid, src = float(lb[1]["close"]), "trade_bar"
         else:
-            iv = self._iv_from_bar(occ, now)
-            if iv is None:  # nearest traded strike, same expiry and right
-                peers = sorted((c for c in self.contracts.values() if c.underlying == r.underlying
-                                and c.expiry == r.expiry and c.right == r.right and c.occ != occ),
-                               key=lambda c: abs(c.strike - r.strike))
-                for c in peers[:6]:
-                    iv = self._iv_from_bar(c.occ, now)
-                    if iv:
-                        break
-            mid = sel.bs_price(spot, r.strike, sel.years_to_expiry(expiry, now), iv or self.cfg.default_iv, r.right)
-            src = "synthetic_bs"
+            iv, src = self._model_iv(occ, now)
+            mid = sel.bs_price(spot, r.strike, sel.years_to_expiry(expiry, now), iv, r.right)
         if not math.isfinite(mid) or mid <= 0:
             return None, src
         h = half_spread(mid, r.underlying, self.cfg)
         bid = max(round(mid - h, 2), 0.0)
         ask = max(round(mid + h, 2), bid + 0.01)
         oi = None if pd.isna(r.open_interest) else int(r.open_interest)
-        return OptionContract(occ, r.underlying, r.right, float(r.strike), expiry, bid, ask, mid, vol, oi, None,
+        return OptionContract(occ, r.underlying, r.right, float(r.strike), expiry, bid, ask, mid, 0, oi, None,
                               None, now - timedelta(seconds=1)), src
 
 
@@ -277,7 +306,8 @@ def run(day: date, cfg: OptionsConfig, cache_dir: Path, out_dir: Path, feed: str
     out_dir.mkdir(parents=True, exist_ok=True)
     db = out_dir / f"replay_{day}_{feed}.sqlite"
     db.unlink(missing_ok=True)
-    cfg = replace(cfg, halt_file=out_dir / "NO_HALT_IN_REPLAY")
+    # synthetic quotes carry no traded volume: the contract volume filter is off (stated in the header)
+    cfg = replace(cfg, halt_file=out_dir / "NO_HALT_IN_REPLAY", min_volume=0)
     market = ReplayMarket(cache_dir / str(day), feed, cfg)
     clock = SimClock(datetime.combine(day, time(*cfg.session_start), ET).astimezone(timezone.utc))
     broker = ReplayBroker(market, clock)
@@ -288,15 +318,18 @@ def run(day: date, cfg: OptionsConfig, cache_dir: Path, out_dir: Path, feed: str
             rec = plan_received_at or datetime.combine(day, time(8, 0), ET)
             res = oplan.ingest(con, plan_file.read_text(encoding="utf-8"), rec, cfg)
             ostore.event(con, str(day), clock.now, "info", "plan", f"replay plan ingest: {res}")
-        gate = _iface.make_risk_gate(con, broker, replace(cfg, min_volume=0))
+        gate = _iface.make_risk_gate(con, broker, cfg)
         eng = Engine(con, broker, cfg, clock=clock, risk_gate=gate, live=True, notifier=lambda *a: sent.append(a))
         end = datetime.combine(day, time(*cfg.session_end), ET)
         while clock.now <= end:
             eng.tick()
             clock.advance(step_s)
         eng.finish()
-        header = (f"> 重播模式:{day},標的 K 線為真實資料(Alpaca {feed.upper()}),期權價格為半合成模型"
-                  f"(有成交的合約用最近 1 分鐘成交價當中價,否則用 Black-Scholes;買賣價差為模型假設,非實測)。"
+        header = (f"> 重播模式:{day},標的 K 線為真實資料(Alpaca {feed.upper()})。期權報價是**合成模型**:沒有歷史買賣價;"
+                  f"中價優先用該合約 10 分鐘內最近一根歷史 1 分鐘成交價(trade_bar,盤後才查得到,盤中即時查不到),"
+                  f"否則用 Black-Scholes(標的當下價格,IV 依序取自該合約成交價反推、抓取快取時的 indicative 快照、鄰近履約價、"
+                  f"預設值;快照 IV 屬盤後資料,IV 水準有輕微 look-ahead)。買賣價差一律是模型假設,成交量未知(重播中關閉成交量門檻)。"
+                  f"影子損益只能檢查引擎機制與觸發邏輯,不能當作期望值證據。"
                   f"風控為 A 線正式風控(OptionsRiskEngine),但合成報價沒有成交量,成交量門檻在重播中關閉。報價來源次數:{json.dumps(broker.sources)}")
         rep = oreport.build(con, str(day), cfg, header=header)
     return ReplayResult(db, rep, dict(broker.sources), sent)

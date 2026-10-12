@@ -38,10 +38,10 @@ and moves the stop on the rest to cost; B = premium stop -30%, +40% takes
 half, the rest trails the underlying by 0.4 x ATR(14) of its 1-minute bars.
 Premium exits need a fresh quote; the rest do not.
 
-Option prices: the account has only the "indicative" option feed and NO
-option 1-minute bars (line A, OPTIONS_PLAN.md section 10). Every option
-price here is a polled snapshot, so MFE / MAE are the best / worst BID seen
-at the poll times (every ``poll_seconds``), not intrabar extremes.
+Option prices: the account has only the "indicative" option feed and no
+real-time option 1-minute bars (OPTIONS_PLAN.md sections 10 and 12). Every
+option price here is a polled snapshot, so MFE / MAE are the best / worst
+BID seen at the poll times (every ``poll_seconds``), not intrabar extremes.
 
 Idempotency and restarts: all state lives in the options_* tables, keyed by
 deterministic ids. A tick re-reads that state, so re-running a tick or

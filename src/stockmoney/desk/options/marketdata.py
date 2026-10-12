@@ -1,7 +1,7 @@
-"""Read-only Alpaca market data for the options sleeve, plus the replay
-cache fetcher. NO order methods exist here: this class implements only the
-section 8 data surface (option_chain, option_quote, minute_bars,
-stock_quote), so a session built on it is shadow-only by construction.
+"""Read-only Alpaca market data for the replay cache fetcher. NO order
+methods exist here. The live session does not use this module: it reads and
+trades through line A's AlpacaBroker (execution/alpaca.py), which implements
+the same section 8 data surface.
 
 Verified 2026-10-12 against this account (read-only calls):
 - recent SIP stock data is not permitted ("subscription does not permit
@@ -184,39 +184,49 @@ class AlpacaOptionsData:
 # ------------------------------------------------------------------ replay cache
 
 def fetch_replay_cache(day: date, symbols: list[str], out_dir: Path, buckets: list[tuple[int, int]],
-                       data: AlpacaOptionsData | None = None) -> Path:
-    """Download one day's 1-minute stock bars (SIP and IEX, premarket included,
-    plus the previous session's last minutes), the option contracts near the
-    money for each expiry bucket, and their 1-minute bars. Writes parquet +
-    meta.json under ``out_dir/<day>/``. Read-only API calls only."""
+                       data: AlpacaOptionsData | None = None, history_sessions: int = 21) -> Path:
+    """Download what a replay of ``day`` needs, read-only API calls only:
+    1-minute stock bars (IEX and SIP, premarket included) for ``day`` and the
+    ``history_sessions`` sessions before it (the RVOL profile and the
+    previous close); the option contracts near the money for each expiry
+    bucket with their open interest (contracts endpoint) and their IV in the
+    current indicative snapshot (taken NOW, i.e. after the day: the replay's
+    synthetic quote model uses it as the IV level); and option 1-minute bars
+    when the account may read them (this account may not: HTTP 403, logged
+    and left empty). Writes parquet + meta.json under ``out_dir/<day>/``."""
     from stockmoney.desk.options.engine import _prev_trading_day
     from stockmoney.desk.options.select import trading_day_offset
     data = data or AlpacaOptionsData()
     d = out_dir / str(day)
     d.mkdir(parents=True, exist_ok=True)
-    start = datetime.combine(day, time(4, 0), ET)
+    first = day
+    for _ in range(history_sessions):
+        first = _prev_trading_day(first)
+    start = datetime.combine(first, time(4, 0), ET)
     # recent SIP data is not permitted without a subscription: stay 16 minutes behind real time
     end = min(datetime.combine(day, time(20, 0), ET), datetime.now(timezone.utc) - timedelta(minutes=16))
-    prev = _prev_trading_day(day)
-    pstart, pend = datetime.combine(prev, time(15, 50), ET), datetime.combine(prev, time(16, 0), ET)
     stock_rows = {"sip": [], "iex": []}
     for feed in ("sip", "iex"):
         data.stock_feed = feed
         for s in symbols:
-            for a, b in ((pstart, pend), (start, end)):
-                df = data.minute_bars(s, a, b)
-                if not df.empty:
-                    stock_rows[feed].append(df.assign(symbol=s))
+            try:
+                df = data.minute_bars(s, start, end)
+            except Exception as e:
+                log.warning("stock bars %s %s: %s", s, feed, e)
+                continue
+            if not df.empty:
+                stock_rows[feed].append(df.assign(symbol=s))
     for feed, parts in stock_rows.items():
         if parts:
             df = pd.concat(parts)
             df.index.name = "t"
             df.reset_index().to_parquet(d / f"stock_{feed}.parquet", index=False)
-    sip = pd.read_parquet(d / "stock_sip.parquet")
-    sip["t"] = pd.to_datetime(sip["t"], utc=True).dt.tz_convert(ET)
+    ref = pd.read_parquet(d / ("stock_iex.parquet" if stock_rows["iex"] else "stock_sip.parquet"))
+    ref["t"] = pd.to_datetime(ref["t"], utc=True).dt.tz_convert(ET)
     contracts: list[dict] = []
+    snap_iv: dict[str, float] = {}
     for s in symbols:
-        b = sip[(sip.symbol == s) & (sip.t.dt.date == day)]
+        b = ref[(ref.symbol == s) & (ref.t.dt.date == day)]
         b = b[(b.t.dt.time >= time(9, 30)) & (b.t.dt.time < time(11, 31))]
         if b.empty:
             continue
@@ -238,6 +248,13 @@ def fetch_replay_cache(day: date, symbols: list[str], out_dir: Path, buckets: li
             for right in ("call", "put"):
                 rr = sorted((r for r in rows if r["type"] == right), key=lambda r: abs(float(r["strike_price"]) - open_px))
                 contracts += rr[:24]
+            try:
+                exp = date.fromisoformat(nearest)
+                for c in data.option_chain(s, exp, exp):
+                    if c.iv:
+                        snap_iv[c.occ] = float(c.iv)
+            except Exception as e:
+                log.warning("snapshot IV %s %s: %s", s, nearest, e)
     seen = set()
     crow = []
     for c in contracts:
@@ -247,15 +264,23 @@ def fetch_replay_cache(day: date, symbols: list[str], out_dir: Path, buckets: li
         crow.append({"occ": c["symbol"], "underlying": c["underlying_symbol"], "right": "C" if c["type"] == "call" else "P",
                      "strike": float(c["strike_price"]), "expiry": c["expiration_date"],
                      "open_interest": int(c["open_interest"]) if c.get("open_interest") not in (None, "") else None,
-                     "open_interest_date": c.get("open_interest_date")})
+                     "open_interest_date": c.get("open_interest_date"), "iv_snapshot": snap_iv.get(c["symbol"])})
     pd.DataFrame(crow).to_parquet(d / "contracts.parquet", index=False)
-    bars = data.option_bars([c["occ"] for c in crow], start, end)
+    try:
+        bars = data.option_bars([c["occ"] for c in crow], datetime.combine(day, time(4, 0), ET), end)
+        bars_note = ""
+    except Exception as e:  # this account: 403 "OPRA agreement is not signed"
+        log.warning("option bars unavailable: %s", e)
+        bars, bars_note = {}, f"option bars unavailable: {type(e).__name__}: {str(e)[:200]}"
     orows = [{"occ": k, **b} for k, v in bars.items() for b in v]
-    pd.DataFrame(orows).to_parquet(d / "option_bars.parquet", index=False)
+    pd.DataFrame(orows, columns=["occ", "t", "o", "h", "l", "c", "v", "vw"] if not orows else None).to_parquet(
+        d / "option_bars.parquet", index=False)
     (d / "meta.json").write_text(json.dumps({
         "day": str(day), "fetched_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-        "symbols": symbols, "contracts": len(crow), "option_bar_rows": len(orows),
+        "symbols": symbols, "history_from": str(first), "contracts": len(crow), "option_bar_rows": len(orows),
+        "snapshot_iv": len([c for c in crow if c["iv_snapshot"]]), "option_bars_note": bars_note,
         "stock_feeds": [f for f, p in stock_rows.items() if p],
-        "note": "stock bars: Alpaca SIP and IEX historical; option bars: Alpaca historical trades-based 1-minute "
-                "bars (no bid/ask history); OI: contracts endpoint value as of open_interest_date"}, indent=1))
+        "note": "stock bars: Alpaca SIP and IEX historical; option prices: none historical on this account "
+                "(indicative feed only): the replay uses a synthetic Black-Scholes quote model; OI: contracts "
+                "endpoint as of open_interest_date; iv_snapshot: indicative snapshot IV at fetched_at"}, indent=1))
     return d
