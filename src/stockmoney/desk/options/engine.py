@@ -570,6 +570,13 @@ class Engine:
         # reserved even when the submit outcome is unknown: counting a buy
         # that never reached the broker only blocks entries, never adds risk
         self.risk_gate.reserve(final, final.limit_price)
+        # resolve at once: a marketable limit usually fills on arrival, and an
+        # unbooked fill would make the gate see a book / broker mismatch and
+        # refuse the next entry in this same tick
+        try:
+            self._resolve_entry(ostore.position(self.con, pid), now)
+        except Exception as e:
+            self._error("entry_order", f"{pid}: {type(e).__name__}: {e}")
         return True
 
     def _live_marks(self) -> dict[str, float]:

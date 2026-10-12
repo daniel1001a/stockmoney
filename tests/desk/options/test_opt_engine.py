@@ -523,3 +523,18 @@ def test_consecutive_loss_days_counts_losing_live_variant_days(tmp_path, con):
     con.execute("DELETE FROM options_positions WHERE day='2026-10-09'")  # a session without trades ends the run
     r.eng._loss_days = None
     assert r.eng._consecutive_loss_days() == 1
+
+
+def test_two_live_entries_in_one_tick_pass_the_real_gate(tmp_path, con):
+    """The first entry's fill is booked right after its submit, so line A's
+    book / broker check does not refuse the second entry of the same tick."""
+    from stockmoney.desk.options import _iface
+    r = Rig(tmp_path, con, index=("SPY", "QQQ"))
+    r.broker.bars["QQQ"] = r.broker.bars["SPY"]
+    r.broker.templates.update({**chain("QQQ"), **chain("QQQ", expiry=NEXT)})
+    r.gate = _iface.make_risk_gate(con, r.broker, r.cfg)
+    r.eng = r.new_engine()
+    r.run(et(9, 52))
+    live = [p for p in ostore.positions(con, str(DAY), "live")]
+    assert {p["underlying"] for p in live} == {"SPY", "QQQ"} and all(p["state"] == "ENTERED" for p in live)
+    assert _filtered(con, "risk_gate") == 0
