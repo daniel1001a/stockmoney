@@ -60,23 +60,23 @@ from stockmoney.desk.execution.types import (
 log = logging.getLogger(__name__)
 ET = ZoneInfo("America/New_York")
 QTY_EPS = 1e-9
-HALT_KEY = "halted"            # options_state: reason of a latched drawdown halt ('' = not halted)
-PEAK_KEY = "peak_equity"       # options_state: persisted sleeve equity peak
+HALT_KEY = "halted"            # options_book_state: reason of a latched drawdown halt ('' = not halted)
+PEAK_KEY = "peak_equity"       # options_book_state: persisted sleeve equity peak
 PEAK_BUDGET_KEY = "peak_budget"  # the sleeve budget the stored peak was measured against
 OPTIONS_HALT_SETTING = "options_halt_new_entries"
 _LIVE = (OrderStatus.NEW, OrderStatus.PARTIALLY_FILLED, OrderStatus.PENDING, OrderStatus.PENDING_CANCEL)
 
 OPTIONS_SCHEMA = """
-CREATE TABLE IF NOT EXISTS options_positions (
+CREATE TABLE IF NOT EXISTS options_book_positions (
   occ TEXT PRIMARY KEY, underlying TEXT NOT NULL, strategy TEXT NOT NULL, qty REAL NOT NULL,
   avg_price REAL NOT NULL, multiplier INTEGER NOT NULL DEFAULT 100, opened_at TEXT);
-CREATE TABLE IF NOT EXISTS options_fills (
+CREATE TABLE IF NOT EXISTS options_book_fills (
   id INTEGER PRIMARY KEY AUTOINCREMENT, client_order_id TEXT UNIQUE, occ TEXT NOT NULL, underlying TEXT NOT NULL,
   strategy TEXT NOT NULL, side TEXT NOT NULL, qty REAL NOT NULL, price REAL NOT NULL,
   multiplier INTEGER NOT NULL DEFAULT 100, fee REAL NOT NULL DEFAULT 0, filled_at TEXT NOT NULL,
   realized_pnl REAL NOT NULL DEFAULT 0, recorded_at TEXT);
-CREATE INDEX IF NOT EXISTS options_fills_filled_at ON options_fills(filled_at);
-CREATE TABLE IF NOT EXISTS options_state (key TEXT PRIMARY KEY, value TEXT);
+CREATE INDEX IF NOT EXISTS options_book_fills_filled_at ON options_book_fills(filled_at);
+CREATE TABLE IF NOT EXISTS options_book_state (key TEXT PRIMARY KEY, value TEXT);
 """
 
 
@@ -136,7 +136,7 @@ class OptionsBook:
 
     def positions(self) -> dict[str, OptionPosition]:
         rows = self.con.execute("SELECT occ, underlying, strategy, qty, avg_price, multiplier, opened_at "
-                                "FROM options_positions ORDER BY occ").fetchall()
+                                "FROM options_book_positions ORDER BY occ").fetchall()
         return {r[0]: OptionPosition(*tuple(r)) for r in rows}
 
     def position(self, occ: str) -> OptionPosition | None:
@@ -146,7 +146,7 @@ class OptionsBook:
         """(qty, qty * price) already booked for one broker order (plain row
         plus every ``<id>#<cumulative qty>`` partial-fill row)."""
         r = self.con.execute(
-            "SELECT COALESCE(SUM(qty),0), COALESCE(SUM(qty*price),0) FROM options_fills "
+            "SELECT COALESCE(SUM(qty),0), COALESCE(SUM(qty*price),0) FROM options_book_fills "
             "WHERE client_order_id=? OR substr(client_order_id, 1, ?)=?",
             (client_order_id, len(client_order_id) + 1, client_order_id + "#")).fetchone()
         return float(r[0]), float(r[1])
@@ -185,7 +185,7 @@ class OptionsBook:
                 price = px if math.isfinite(px) and px > 0 else price
                 client_order_id = f"{client_order_id}#{qty!r}"
             qty = delta
-        if self.con.execute("SELECT 1 FROM options_fills WHERE client_order_id=?", (client_order_id,)).fetchone():
+        if self.con.execute("SELECT 1 FROM options_book_fills WHERE client_order_id=?", (client_order_id,)).fetchone():
             return False
         pos = self.position(occ)
         at = _utc_iso(filled_at)
@@ -196,7 +196,7 @@ class OptionsBook:
                     if not strategy:
                         raise OptionsBookError(f"opening {occ} needs a strategy")
                     self.con.execute(
-                        "INSERT INTO options_positions (occ, underlying, strategy, qty, avg_price, multiplier, opened_at) "
+                        "INSERT INTO options_book_positions (occ, underlying, strategy, qty, avg_price, multiplier, opened_at) "
                         "VALUES (?,?,?,?,?,?,?)", (occ, parts.root, strategy, qty, price, multiplier, at))
                 else:
                     if strategy and pos.strategy != strategy:
@@ -204,7 +204,7 @@ class OptionsBook:
                     if pos.multiplier != multiplier:
                         raise OptionsBookError(f"{occ} multiplier {multiplier} differs from booked {pos.multiplier}")
                     n = pos.qty + qty
-                    self.con.execute("UPDATE options_positions SET qty=?, avg_price=? WHERE occ=?",
+                    self.con.execute("UPDATE options_book_positions SET qty=?, avg_price=? WHERE occ=?",
                                      (n, (pos.avg_price * pos.qty + price * qty) / n, occ))
                 owner = pos.strategy if pos else strategy
             elif side == Side.SELL:
@@ -216,14 +216,14 @@ class OptionsBook:
                 realized = (price - pos.avg_price) * qty * multiplier - fee
                 left = pos.qty - qty
                 if left <= QTY_EPS:
-                    self.con.execute("DELETE FROM options_positions WHERE occ=?", (occ,))
+                    self.con.execute("DELETE FROM options_book_positions WHERE occ=?", (occ,))
                 else:
-                    self.con.execute("UPDATE options_positions SET qty=? WHERE occ=?", (left, occ))
+                    self.con.execute("UPDATE options_book_positions SET qty=? WHERE occ=?", (left, occ))
                 owner = pos.strategy
             else:
                 raise OptionsBookError(f"unknown side {side!r}")
             self.con.execute(
-                "INSERT INTO options_fills (client_order_id, occ, underlying, strategy, side, qty, price, multiplier, "
+                "INSERT INTO options_book_fills (client_order_id, occ, underlying, strategy, side, qty, price, multiplier, "
                 "fee, filled_at, realized_pnl, recorded_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
                 (client_order_id, occ, parts.root, owner, side.value, qty, price, multiplier, fee, at, realized,
                  _utc_iso(None)))
@@ -231,7 +231,7 @@ class OptionsBook:
 
     def realized(self, start: str | None = None, end: str | None = None) -> float:
         """Realized P&L (fees included) of fills with start <= filled_at < end."""
-        q, args = "SELECT COALESCE(SUM(realized_pnl),0) FROM options_fills WHERE 1=1", []
+        q, args = "SELECT COALESCE(SUM(realized_pnl),0) FROM options_book_fills WHERE 1=1", []
         if start is not None:
             q, args = q + " AND filled_at >= ?", args + [start]
         if end is not None:
@@ -239,12 +239,12 @@ class OptionsBook:
         return float(self.con.execute(q, args).fetchone()[0])
 
     def get_state(self, key: str) -> str | None:
-        r = self.con.execute("SELECT value FROM options_state WHERE key=?", (key,)).fetchone()
+        r = self.con.execute("SELECT value FROM options_book_state WHERE key=?", (key,)).fetchone()
         return r[0] if r else None
 
     def set_state(self, key: str, value: str) -> None:
         with self.con:
-            self.con.execute("INSERT INTO options_state VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            self.con.execute("INSERT INTO options_book_state VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                              (key, value))
 
 

@@ -492,7 +492,7 @@ def test_book_rejects_bad_fills(con, kw):
     base.update(kw)
     with pytest.raises(OptionsBookError):
         OptionsBook(con).apply_fill(**base)
-    assert con.execute("SELECT COUNT(*) FROM options_fills").fetchone()[0] == 0
+    assert con.execute("SELECT COUNT(*) FROM options_book_fills").fetchone()[0] == 0
 
 
 def test_book_rules(con):
@@ -558,3 +558,16 @@ def test_engine_with_fake_broker_round_trip(eng):
                       qty=o.filled_qty, price=o.filled_avg_price, filled_at=later)
     assert e.book.realized() == pytest.approx((2.00 - 2.10) * 4 * 100)  # the spread is the cost
     assert b.account().positions == []
+
+
+def test_book_tables_coexist_with_the_sleeve_engine_tables(tmp_path):
+    """The sleeve engine (desk/options/store.py) and this book share one
+    database file; their tables must not collide."""
+    from stockmoney.desk.options import store as ostore
+    with store.connect(tmp_path / "desk.sqlite") as con:
+        ostore.ensure_schema(con)
+        book = OptionsBook(con)
+        assert book.apply_fill(client_order_id="c1", occ=OCC, strategy="options:orb15", side=Side.BUY, qty=1,
+                               price=2.0, filled_at=NOW)
+        assert book.position(OCC).qty == 1
+        assert con.execute("SELECT COUNT(*) FROM options_positions").fetchone()[0] == 0
