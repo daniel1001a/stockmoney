@@ -17,7 +17,7 @@ Design rules:
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from stockmoney.desk import store
@@ -26,6 +26,24 @@ from stockmoney.desk.execution.ledger import (
 )
 from stockmoney.desk.execution.types import (
     AccountSnapshot, AssetClass, OrderIntent, RiskDecision, Side,
+)
+from stockmoney.desk.universe import STOCKS
+
+# Leverage multiple per ticker, used only by the beta-adjusted caps below.
+# Only leveraged ETFs that already appear in this repo (data/watchlist.py,
+# desk/muse_ops.py, docs/desk/PHASE1_RESEARCH.md) are listed. Inverse funds
+# are counted by absolute leverage (gross). Unknown tickers count as 1.0.
+DEFAULT_LEVERAGE: dict[str, float] = {"TQQQ": 3.0, "SOXL": 3.0, "SOXS": 3.0}
+
+# "US large-cap growth" group for max_growth_group_exposure: the universe's
+# tech / semiconductor / communication names (XLK, SMH, XLC), AMZN and TSLA
+# (large-cap growth filed under XLY), and the broad growth ETFs. PHASE1_RESEARCH
+# 6.3: the desk and TQQQ are the same risk factor at two leverages (monthly
+# correlation 0.71), so the group is measured beta-adjusted. Inverse funds
+# (SOXS) are not members: they hedge this factor, they do not add to it.
+GROWTH_GROUP: frozenset[str] = frozenset(
+    {sym for sym, sec in STOCKS.items() if sec in ("XLK", "SMH", "XLC")}
+    | {"AMZN", "TSLA", "QQQ", "TQQQ", "SOXL", "XLK", "SMH", "XLC"}
 )
 
 MIN_ORDER_NOTIONAL = 1.0  # a buy resized below this is blocked instead
@@ -51,10 +69,26 @@ class Limits:
     # Additions beyond the spec (defaults keep the spec'd constructor valid):
     sleeve_dd_halt: float = 0.08        # a strategy whose P&L falls this fraction of capital_budget below its peak is disabled for new entries
     halt_file: Path = Path("data/desk/HALT")  # existence = kill switch
+    # Beta-adjusted caps (fractions of system equity; each position counts at
+    # value * leverage). None = disabled, behavior identical to before.
+    # OWNER DECISION REQUIRED: the numeric values are deliberately left None.
+    # Set them (from the PHASE1_RESEARCH bootstrap results) BEFORE enabling a
+    # TQQQ-style strategy live. See docs/desk/OPERATING_PLAN.md.
+    max_beta_adj_exposure: float | None = None
+    max_growth_group_exposure: float | None = None
+    leverage: dict[str, float] = field(default_factory=lambda: dict(DEFAULT_LEVERAGE))
 
 
 def _is_num(x: float | None) -> bool:
     return x is not None and math.isfinite(x)
+
+
+def leverage_of(symbol: str, table: dict[str, float] | None = None) -> float:
+    """Leverage multiple of a ticker (absolute value); unknown tickers 1.0.
+    ``table`` keys must already be normalized with ``norm``."""
+    t = {norm(k): v for k, v in DEFAULT_LEVERAGE.items()} if table is None else table
+    v = t.get(norm(symbol))
+    return abs(v) if _is_num(v) and v != 0 else 1.0
 
 
 class RiskEngine:
@@ -282,6 +316,23 @@ class RiskEngine:
         if intent.asset_class == AssetClass.CRYPTO:
             caps.append(("crypto exposure", l.max_crypto_exposure_pct * equity - crypto_exp,
                          f"{l.max_crypto_exposure_pct:.0%} of equity less existing crypto {crypto_exp:,.0f}"))
+        if l.max_beta_adj_exposure is not None or l.max_growth_group_exposure is not None:
+            # Beta-adjusted caps. The cap is in leveraged units, so room in
+            # order notional is (cap - existing) / leverage. These only add
+            # entries to the cap list: a buy can shrink or block, never grow.
+            lev = {norm(k): v for k, v in l.leverage.items()}
+            lv = leverage_of(intent.symbol, lev)
+            if l.max_beta_adj_exposure is not None:
+                adj = sum(v * leverage_of(k, lev) for k, v in values.items())
+                caps.append(("beta-adjusted exposure", (l.max_beta_adj_exposure * equity - adj) / lv,
+                             f"{l.max_beta_adj_exposure:.0%} of equity less existing beta-adjusted {adj:,.0f}, "
+                             f"{intent.symbol} counts x{lv:g}"))
+            members = {norm(g) for g in GROWTH_GROUP}
+            if l.max_growth_group_exposure is not None and norm(intent.symbol) in members:
+                gadj = sum(v * leverage_of(k, lev) for k, v in values.items() if k in members)
+                caps.append(("growth-group exposure", (l.max_growth_group_exposure * equity - gadj) / lv,
+                             f"{l.max_growth_group_exposure:.0%} of equity less existing growth-group "
+                             f"beta-adjusted {gadj:,.0f}, {intent.symbol} counts x{lv:g}"))
         for label, room, desc in caps:
             if room < MIN_ORDER_NOTIONAL:
                 return self._block(f"buy blocked: {label} cap reached ({desc}; room {max(room, 0):,.0f})")
