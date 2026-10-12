@@ -20,6 +20,9 @@ CREATE TABLE IF NOT EXISTS alloc_log (
   date TEXT PRIMARY KEY, cell TEXT, weights_json TEXT, detail_json TEXT, created_at TEXT);
 CREATE TABLE IF NOT EXISTS learn_reports (
   date TEXT PRIMARY KEY, body TEXT, created_at TEXT);
+CREATE TABLE IF NOT EXISTS link_checks (
+  url TEXT PRIMARY KEY, msg_id TEXT, agent TEXT, domain TEXT, status TEXT, http_code INTEGER,
+  detail TEXT, checked_day TEXT, checked_at TEXT);
 """
 
 
