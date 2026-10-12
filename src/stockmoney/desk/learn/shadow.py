@@ -173,3 +173,69 @@ def report(con) -> str:
         beat = float((ret[rnd_t] < ret["shadow:combined"]).mean())
         lines += ["", f"現行規則贏過 {beat:.0%} 的隨機組(樣本只有 {len(rnd_t)} 條路徑、期間很短,只當方向參考)。"]
     return "\n".join(lines)
+
+
+def _live_equity(con) -> pd.Series:
+    """The live (paper) book's system equity by date; empty when never recorded."""
+    if con.execute("SELECT 1 FROM sqlite_master WHERE name='equity_history'").fetchone() is None:
+        return pd.Series(dtype=float)
+    rows = con.execute("SELECT date, system_equity FROM equity_history WHERE system_equity > 0 ORDER BY date").fetchall()
+    return pd.Series({r["date"]: float(r["system_equity"]) for r in rows}, dtype=float)
+
+
+def period_returns(con, end: str, days: int = 7) -> dict:
+    """Live (paper) book vs SPY vs the median of the random-entry (trend) paths
+    over the same dates, read from the same stored curves the shadow report
+    uses (``equity_history`` and ``shadow_equity``); nothing is re-simulated.
+
+    All series are measured from one common start: the latest, over series, of
+    that series' last observation on or before ``end - days`` (its first
+    observation when it began later). A series with no usable pair of dates is
+    None, never an estimate. Returns {"start", "end", "live", "spy", "random"}.
+    """
+    eq = equity_table(con)
+    paths: dict[str, pd.Series] = {}
+    live = _live_equity(con)
+    if len(live):
+        paths["live"] = live
+    if not eq.empty:
+        for c in eq.columns:
+            if c == "bench:spy" or c.startswith("shadow:random_trend_"):
+                paths[c] = eq[c].dropna()
+    paths = {k: v[v.index <= end] for k, v in paths.items()}
+    paths = {k: v for k, v in paths.items() if len(v)}
+    out: dict = {"start": None, "end": end, "live": None, "spy": None, "random": None}
+    if not paths:
+        return out
+    target = str((pd.Timestamp(end) - pd.Timedelta(days=days)).date())
+
+    def base_date(s: pd.Series) -> str:
+        before = s.index[s.index <= target]
+        return before[-1] if len(before) else s.index[0]
+
+    start = max(base_date(s) for s in paths.values())
+    out["start"] = start
+
+    def ret(s: pd.Series) -> float | None:
+        base = s[s.index <= start]
+        if not len(base) or base.iloc[-1] <= 0 or s.index[-1] <= start:
+            return None
+        return float(s.iloc[-1] / base.iloc[-1] - 1)
+
+    if "live" in paths:
+        out["live"] = ret(paths["live"])
+    if "bench:spy" in paths:
+        out["spy"] = ret(paths["bench:spy"])
+    rr = [r for k, s in paths.items() if k.startswith("shadow:random_trend_") and (r := ret(s)) is not None]
+    out["random"] = float(np.median(rr)) if rr else None
+    return out
+
+
+def weekly_line(con, end: str, days: int = 7) -> str:
+    """One line for the Friday push: live vs SPY vs median random control."""
+    p = period_returns(con, end, days)
+
+    def f(v):
+        return "no data" if v is None else f"{v:+.2%}"
+    span = f"{p['start']} 到 {p['end']}" if p["start"] else f"近 {days} 天"
+    return f"本期({span})實盤(紙上) {f(p['live'])} / SPY {f(p['spy'])} / 隨機對照中位數 {f(p['random'])}"
