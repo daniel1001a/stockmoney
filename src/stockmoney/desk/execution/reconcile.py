@@ -1,10 +1,13 @@
 """Ledger vs broker reconciliation. The broker is the source of truth; any
 mismatch means the orchestrator must halt new entries and notify a human.
-Exits and protective stops keep running for every symbol that reconciles."""
+Exits and protective stops keep running for every symbol that reconciles.
+Option positions belong to the options sleeve, which reconciles its own book
+(execution.options_risk), and are ignored here."""
 from __future__ import annotations
 
 import sqlite3
 
+from stockmoney.desk.execution.isolation import without_options
 from stockmoney.desk.execution.ledger import Ledger, is_crypto_symbol, norm
 from stockmoney.desk.execution.types import AccountSnapshot, AssetClass
 
@@ -19,7 +22,7 @@ def mismatches(ledger: Ledger | sqlite3.Connection, snapshot: AccountSnapshot) -
     if not isinstance(ledger, Ledger):
         ledger = Ledger(ledger)
     mine = {norm(s): p for s, p in ledger.positions().items()}
-    theirs = {norm(p.symbol): p for p in snapshot.positions if abs(p.qty) > 0}
+    theirs = {norm(p.symbol): p for p in without_options(snapshot).positions if abs(p.qty) > 0}
     out: dict[str, str] = {}
     for key in sorted(set(mine) | set(theirs)):
         led, brk = mine.get(key), theirs.get(key)
