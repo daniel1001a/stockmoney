@@ -53,6 +53,8 @@ Grok 是第二個情報員(看 X),說明與完整格式在 `docs/desk/GROK_PROMP
 - 時間:每天美東 07:30(最晚 08:10 寄出)和 20:00 各一封,週末也寄,由 Pika 從 dnial1001a@gmail.com 寄出。只有早上那封計分、做漏交檢查:08:30 前要收到,只算 NYSE 交易日,而且 `collected_at` 要是當天(美東)中午以前;晚上那封照收照存,不計分、不檢查漏交。用 `scripts/muse_check.py grok on|off` 單獨開關,`stage N` 不會影響它。
 - 儲存:存進 `bridge_messages`,和 Muse 的訊息放在一起;`learn/chains.py` 的 `ingest_grok()` 讀出事件鏈並評分。時間一律以 Desk 的 `received_at` 為準,Grok 自己寫的時間只用來稽核。
 - 權限:v1 只存資料,`policy.active_flags` 不會讀它。要接進風控,得等 Grok 有自己的密鑰(v1.1)之後另外決定。
+- 可證偽:事件鏈可附 `invalidations`(最多 3 個,`close_below` / `close_above` / `data_not_by`,每個都要有 `by_date`),`IDEA` 也可附同一組。沒有價格條件的鏈照收,但標為不可證偽,不列入命中率與 Brier。學習層在 `by_date` 當天或之後,只用已存的日收盤價判定 held / invalidated / no_data;`data_not_by` 永遠是 no_data。
+- 獨立性:Muse 的 ALERT / RESEARCH_REPLY / IDEA 與 Grok 的事件或事件鏈打到同一標的(前後 3 天)時,學習層比對來源連結(網域加路徑)與作者帳號。有任何重疊就標為 not independent,只算一次確認,不算 Muse 與 Grok 兩次。
 - 範圍:清單(universe 加上 QQQ、TQQQ、BTC/USD)以外的標的,一封超過 5 檔只通知你一次,不拒絕。
 - 格式錯誤:FEEDBACK 會寄到 `MUSE_ADDRESS`,`problem` 開頭是「【給 Grok】」;Muse 的提示詞要它忽略這種 FEEDBACK。修正信每 24 小時最多 10 封,Muse 和 Grok 共用這個上限。
 

@@ -51,7 +51,9 @@ def main() -> int:
             if a.action == "add":
                 obj = json.loads(Path(a.file).read_text())
                 obj.setdefault("source", a.source)
-                print(chains.add_chain(con, chains.Chain.model_validate(obj)))
+                chain = chains.Chain.model_validate(obj)
+                print(chains.add_chain(con, chain) + ("" if chain.falsifiable else
+                      "  (unfalsifiable: no close_below/close_above invalidation; excluded from evidence counts)"))
             elif a.action == "list":
                 for x in con.execute("SELECT chain_id, created_at, source, trigger_text, confidence FROM chains "
                                      "ORDER BY created_at DESC LIMIT 30"):

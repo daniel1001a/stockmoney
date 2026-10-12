@@ -7,7 +7,8 @@ here is logged and never touches an order or the trading lock.
 Steps (each isolated, a failure in one does not stop the others):
   1. post-mortem cards for closed trades
   2. advance shadow books
-  3. score due event chains
+  3. score due event chains, judge due invalidation conditions, label
+     Muse/Grok source independence
   3b. score author calls (informational only)
   3c. sample source URLs and record whether they resolve (network failure is non-fatal)
   4. allocator recommendation (Fridays or when none logged this week)
@@ -26,7 +27,8 @@ import pandas as pd
 
 from stockmoney.desk import data, notify, store
 from stockmoney.desk.indicators import compute
-from stockmoney.desk.learn import allocator, calls, chains, earnings, links, postmortem, shadow, tables
+from stockmoney.desk.learn import (allocator, calls, chains, corroboration, earnings, invalidation, links,
+                                   postmortem, shadow, tables)
 
 log = logging.getLogger(__name__)
 ET = ZoneInfo("America/New_York")
@@ -116,6 +118,14 @@ def run(con, now: datetime, bars: data.Bars | None = None, shadow_start: str | N
     con.commit()
     if sc:
         parts.append(f"事件鏈新評分 {sc} 筆。")
+    iv = guarded("invalidation", lambda: invalidation.judge_due(con, bars, through))
+    con.commit()
+    if iv:
+        parts.append(f"事件鏈推翻條件新判定 {iv} 筆。")
+    co = guarded("corroboration", lambda: corroboration.refresh(con))
+    con.commit()
+    if co and co["added"]:
+        parts.append(f"Muse 與 Grok 同標的新增 {co['added']} 組來源比對。")
     ci = guarded("calls_ingest", lambda: calls.ingest(con))
     con.commit()
     cs = guarded("calls_score", lambda: calls.score_due(con, bars, through))

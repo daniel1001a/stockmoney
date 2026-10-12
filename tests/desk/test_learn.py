@@ -186,6 +186,7 @@ def test_chain_after_close_uses_same_day_close(con):
 def test_chain_authority_stays_log_only_until_enough_good_samples(con):
     assert chains.authority(con)[0] == "log_only"
     for i in range(60):
+        con.execute("INSERT INTO chains (chain_id, falsifiable) VALUES (?,1)", (f"c{i}",))
         con.execute("INSERT INTO chain_scores VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                     (f"c{i}", "AAPL", 20, 1, "up", "2026-01-01", "2026-02-01", 0.01, int(i % 10 != 0), 0.7, "x"))
     assert chains.authority(con)[0] == "eligible_for_review"
