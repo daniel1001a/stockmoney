@@ -462,7 +462,8 @@ def test_account_missing_equity_raises():
 def test_unsupported_position_class_raises():
     b, c, _ = make_broker()
     c.account_obj = account_obj()
-    c.positions = [position("AAPL250117C00200000", "us_option", 1, 1.0, 1.0, 100.0)]
+    # us_option is supported since the options sleeve (test_options_alpaca.py); crypto_perp is not
+    c.positions = [position("BTCUSD-PERP", "crypto_perp", 1, 1.0, 1.0, 100.0)]
     with pytest.raises(BrokerError):
         b.account()
 
