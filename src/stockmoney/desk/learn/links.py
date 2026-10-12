@@ -36,7 +36,7 @@ from stockmoney.desk.learn import views
 OK, DEAD, UNVERIFIABLE = "ok", "dead", "unverifiable"
 THRESHOLD = 0.90
 DEAD_CODES = frozenset({404, 410})
-BOT_BLOCKING_DOMAINS = ("threads.net", "x.com", "twitter.com", "instagram.com", "facebook.com")
+BOT_BLOCKING_DOMAINS = ("threads.net", "threads.com", "x.com", "twitter.com", "instagram.com", "facebook.com")
 DEFAULT_SAMPLE = 20
 TIMEOUT = 8.0
 
