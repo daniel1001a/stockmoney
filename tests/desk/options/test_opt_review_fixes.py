@@ -253,7 +253,7 @@ def test_n4_session_loop_stops_at_an_early_close(tmp_path, monkeypatch):
         eng = Engine(con, FakeOptionsBroker(clk, {}), cfg, clock=clk, risk_gate=allow_gate(), live=True,
                      notifier=lambda *a: None)
         real = eng.tick
-        eng.tick = lambda: (seen.append(clk.now), real())[1]
+        eng.tick = lambda fast=False: (seen.append(clk.now), real(fast=fast))[1]
         return eng, "paper"
     assert orun.session(spy_cfg(tmp_path), tmp_path / "d.sqlite", clock=clock, engine_factory=make,
                         sleep=lambda s: clock.advance(max(s, 60))) == 0

@@ -137,12 +137,21 @@ def session(cfg: OptionsConfig | None = None, db_path: Path = store.DEFAULT_PATH
             halt = "HALT 生效中" if cfg.halt_file.exists() else "HALT 未設"
             close = "" if end >= _at(day, cfg.session_end) else f";提早收盤 {end:%H:%M} ET"
             notify.send("期權軌道啟動", f"{day} 模式 {mode};{plan_txt};{halt}{close}。", notify.INFO)
+            b = eng.broker
+            log.info("options session: data budget %d calls/min for low-priority work (Alpaca Basic plan: 200/min "
+                     "stocks, 200/min options); stock feed %s; option feed %s", cfg.max_data_calls_per_min,
+                     getattr(b, "stock_feed", "unknown"),
+                     getattr(b, "option_feed", None) or "Alpaca default (indicative without an OPRA subscription)")
             con.commit()
             failures = 0
+            last_full = None
+            fast = False
             try:
                 while clock() <= end:
                     try:
-                        eng.tick()
+                        if not fast:
+                            last_full = clock()
+                        eng.tick(fast=fast)
                         failures = 0
                     except Exception as e:  # the loop must survive; exits retry next tick
                         failures += 1
@@ -157,7 +166,12 @@ def session(cfg: OptionsConfig | None = None, db_path: Path = store.DEFAULT_PATH
                     exiting = con.execute("SELECT COUNT(*) FROM options_orders WHERE kind='exit' AND status IN "
                                           "('pending_submit','submitted','new','partially_filled','pending',"
                                           "'pending_cancel')").fetchone()[0]
-                    sleep(FAST_POLL_S if (working or exiting) else cfg.poll_seconds)
+                    # 2-second polls only resolve live orders / positions; a full tick (scans,
+                    # shadow) still runs at least every poll_seconds
+                    busy = bool(working or exiting)
+                    fast = busy and last_full is not None and \
+                        (clock() + timedelta(seconds=FAST_POLL_S) - last_full).total_seconds() < cfg.poll_seconds
+                    sleep(FAST_POLL_S if busy else cfg.poll_seconds)
             finally:
                 flat = _finish(eng, cfg, con, day)
         return 0 if flat else 1

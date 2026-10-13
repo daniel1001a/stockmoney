@@ -100,6 +100,16 @@ class OptionsConfig:
     max_signal_age_s: float = 120.0          # a trigger seen later than this (e.g. after a restart) is missed, not chased
     max_consecutive_errors: int = 5          # then notify (exits keep being retried)
 
+    # --- request budget (market data). Alpaca's Basic plan (this paper
+    # account: IEX stocks, indicative options) allows 200 historical data
+    # calls / min for stocks and 200 for options (docs, read 2026-10-12).
+    # Low-priority work (scans, shadow quotes) is skipped once this many
+    # data calls were made in the last 60 s; live position quotes and every
+    # order / exit call are never skipped.
+    max_data_calls_per_min: int = 110
+    shadow_quote_every_s: float = 30.0       # a shadow-only contract / underlying is re-quoted at most this often
+    rate_limit_backoff_s: tuple[float, float] = (10.0, 30.0)  # after an HTTP 429: skip low-priority work, jittered
+
     # --- universe (section 4)
     index: tuple[str, ...] = INDEX
     mega_cap: tuple[str, ...] = MEGA_CAP

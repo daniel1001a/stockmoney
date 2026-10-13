@@ -79,6 +79,8 @@ from __future__ import annotations
 
 import json
 import logging
+import random
+from collections import deque
 from dataclasses import replace
 from datetime import date, datetime, time, timedelta, timezone
 from math import floor
@@ -112,6 +114,8 @@ UNRESOLVED = "unresolved"
 _TERMINAL_ORDER = {OrderStatus.FILLED.value, OrderStatus.CANCELED.value, OrderStatus.EXPIRED.value,
                    OrderStatus.REJECTED.value, "not_sent", UNRESOLVED}
 NOT_SENT_AFTER_S = 30.0  # a pending_submit row the broker still does not know after this was never sent
+# data-call priorities (lower = more important); order / exit calls are trading calls, never budgeted
+PRIO_LIVE, PRIO_SCAN, PRIO_SHADOW = 2, 3, 4
 
 
 def _et(now: datetime) -> datetime:
@@ -190,6 +194,15 @@ class Engine:
         self._cancel_paged: dict[str, datetime] = {}  # exit client_order_id -> last "cannot cancel" page
         self._status_fail: dict[str, int] = {}  # exit client_order_id -> failed get_order reads in a row
         self._obook: OptionsBook | None = None
+        # request budget (OPTIONS_PLAN.md section 12): data calls of the last 60 s, low-priority
+        # work skipped when it is spent or while backing off after an HTTP 429
+        self._calls: deque[datetime] = deque()
+        self._prio = PRIO_SCAN
+        self._backoff_until: datetime | None = None
+        self._quote_at: dict[str, tuple[datetime, OptionContract | None]] = {}
+        self._spot_at: dict[str, tuple[datetime, float | None]] = {}
+        self._bars_at: dict[str, datetime] = {}
+        self._rng = random.Random()
         ostore.ensure_schema(con)
 
     # ================================================================ tick
@@ -204,7 +217,11 @@ class Engine:
         self._tick_bars: dict[str, pd.DataFrame] = {}
         self._tick_errors = 0
 
-    def tick(self) -> dict:
+    def tick(self, fast: bool = False) -> dict:
+        """One pass. ``fast`` (the session's 2-second polls while a live order
+        works): only live orders are resolved (entries, working exits; no
+        market data); scans, exit decisions and shadow positions wait for the
+        next full tick, which the session runs at least every poll_seconds."""
         now = self.clock()
         self._begin(now)
         et, day = _et(now), self._day
@@ -216,8 +233,8 @@ class Engine:
         # resolve working orders and exits before any new entry, so the risk
         # gate sees a book that already includes this tick's fills
         self._manage_pending(now)
-        self._manage_open(now)
-        if et >= _at(day, self.cfg.open_time):
+        self._manage_open(now, fast)
+        if not fast and et >= _at(day, self.cfg.open_time):
             for m in ostore.universe(self.con, self._dstr):
                 try:
                     self._scan_symbol(m, now, halted)
@@ -301,6 +318,7 @@ class Engine:
         pd_ = _prev_trading_day(self._day)
         try:
             self._io()
+            self._spend(force=True)  # day setup: never skipped, counted
             b = self.broker.minute_bars(sym, _at(pd_, (15, 50)), _at(pd_, (16, 0)))
         except Exception as e:
             self._error("prev_close", f"{sym}: {e}")
@@ -316,6 +334,7 @@ class Engine:
         no premarket prints) is preferred; else the broker's own minute bars."""
         try:
             self._io()
+            self._spend(force=True)  # day setup: never skipped, counted
             fn = getattr(self.broker, "premarket_dollar_volume", None)
             if callable(fn):
                 return fn(sym, self._day, now)
@@ -335,6 +354,7 @@ class Engine:
             prev[s] = self._prev_close(s)
             try:
                 self._io()
+                self._spend(force=True)  # day setup: never skipped, counted
                 b = pb.completed(self.broker.minute_bars(s, _at(self._day, (4, 0)), now), now)
             except Exception as e:
                 self._error("scan", f"{s}: {e}")
@@ -564,6 +584,7 @@ class Engine:
             ostore.filtered(self.con, d, now, "entry", sym, "outside_window", sid)
             return
         self._io()
+        self._spend(force=True)
         q = self.broker.stock_quote(sym)
         if not q or q[0] <= 0 or q[1] < q[0]:
             return self._skip(s, now, "no_underlying_quote")
@@ -924,23 +945,50 @@ class Engine:
             self._cancel(ecid, "entry timeout")
 
     # ================================================================ exits
-    def _manage_open(self, now: datetime) -> None:
+    def _manage_open(self, now: datetime, fast: bool = False) -> None:
         rows = ostore.leftovers(self.con, self._dstr, "live", (ENTERED,)) + ostore.positions(self.con, self._dstr, None,
                                                                                                (ENTERED,))
-        for p in rows:
+        # live first: if the data budget runs short, shadow bookkeeping is what waits
+        for p in sorted(rows, key=lambda r: r["mode"] != "live"):
+            if fast:  # orders only: resolve a working exit (trading calls, no market data)
+                if p["mode"] == "live":
+                    working = [o for o in ostore.orders_for(self.con, p["position_id"])
+                               if o["kind"] == "exit" and o["status"] not in _TERMINAL_ORDER]
+                    if working:
+                        try:
+                            self._resolve_exit(p, working[-1], now)
+                        except Exception as e:
+                            self._error("exit", f"{p['position_id']}: {type(e).__name__}: {e}")
+                continue
+            self._prio = PRIO_LIVE if p["mode"] == "live" else PRIO_SHADOW
             try:
                 self._manage_one(p, now)
             except Exception as e:
                 self._error("exit", f"{p['position_id']}: {type(e).__name__}: {e}")
+            finally:
+                self._prio = PRIO_SCAN
 
     def _quote(self, occ: str) -> OptionContract | None:
-        if occ not in self._quotes:
-            try:
-                self._io()
-                self._quotes[occ] = self.broker.option_quote(occ)
-            except Exception as e:
-                self._error("quote", f"{occ}: {e}")
-                self._quotes[occ] = None
+        """This tick's quote of ``occ``. A shadow-only contract is re-quoted at
+        most every shadow_quote_every_s (else its last quote, which may be
+        stale and then decides nothing premium-based) and only within the
+        data budget; a live one every tick."""
+        if occ in self._quotes:
+            return self._quotes[occ]
+        last = self._quote_at.get(occ)
+        if self._prio >= PRIO_SHADOW and last is not None and \
+                (self._now - last[0]).total_seconds() < self.cfg.shadow_quote_every_s:
+            return last[1]
+        if not self._spend():
+            return last[1] if last is not None else None
+        try:
+            self._io()
+            self._quotes[occ] = self.broker.option_quote(occ)
+        except Exception as e:
+            self._rate_limited(e)
+            self._error("quote", f"{occ}: {e}")
+            self._quotes[occ] = None
+        self._quote_at[occ] = (self._now, self._quotes[occ])
         return self._quotes[occ]
 
     def _fresh(self, q: OptionContract | None, now: datetime) -> bool:
@@ -1056,19 +1104,26 @@ class Engine:
 
     def _spot(self, sym: str, now: datetime) -> float | None:
         if sym not in self._spots:
+            last = self._spot_at.get(sym)
+            if self._prio >= PRIO_SHADOW and last is not None and \
+                    (now - last[0]).total_seconds() < self.cfg.shadow_quote_every_s:
+                return last[1]  # shadow-only underlying: re-quoted at most every shadow_quote_every_s
             v = None
             try:
-                self._io()
-                q = self.broker.stock_quote(sym)
-                if q and q[0] > 0 and q[1] >= q[0]:
-                    v = (q[0] + q[1]) / 2
+                if self._spend():
+                    self._io()
+                    q = self.broker.stock_quote(sym)
+                    if q and q[0] > 0 and q[1] >= q[0]:
+                        v = (q[0] + q[1]) / 2
             except Exception as e:
+                self._rate_limited(e)
                 self._error("stock_quote", f"{sym}: {e}")
             if v is None:  # fall back to a fresh completed bar
                 b = pb.completed(self._bars.get(sym), now)
                 if not b.empty and (now - (b.index[-1] + pb.ONE_MIN).to_pydatetime()).total_seconds() <= self.cfg.max_bar_age_s:
                     v = float(b["close"].iloc[-1])
             self._spots[sym] = v
+            self._spot_at[sym] = (now, v)
         return self._spots[sym]
 
     def _book_exit(self, p: dict, qty: float, price: float, bid, ask, reason: str, now: datetime,
@@ -1607,10 +1662,59 @@ class Engine:
             self.con.commit()
 
     def _bars_now(self, sym: str, now: datetime) -> pd.DataFrame:
-        """The symbol's bars, refreshed at most once per tick."""
+        """The symbol's 1-minute bars. A completed bar cannot change within its
+        minute, so they are fetched again only when a new minute has started
+        since the last fetch (or, if the expected latest bar was still missing,
+        15 s later), and only within the data budget; else the bars in hand."""
         if sym not in self._tick_bars:
-            self._tick_bars[sym] = self._refresh_bars(sym, now)
+            have = self._bars.get(sym)
+            last = self._bars_at.get(sym)
+            if have is not None and not have.empty and have.index[-1].date() == self._day and last is not None:
+                minute = now.replace(second=0, microsecond=0)
+                expect = pd.Timestamp(minute - pb.ONE_MIN).tz_convert(ET)  # start of the newest completed bar
+                same_minute = last >= minute
+                if (same_minute and (have.index[-1] >= expect or (now - last).total_seconds() < 15)) \
+                        or not self._spend():
+                    self._tick_bars[sym] = have
+                    return have
+            elif not self._spend(force=last is None):
+                self._tick_bars[sym] = have if have is not None else pd.DataFrame()
+                return self._tick_bars[sym]
+            try:
+                self._tick_bars[sym] = self._refresh_bars(sym, now)
+            except Exception as e:
+                self._rate_limited(e)
+                raise
+            self._bars_at[sym] = now
         return self._tick_bars[sym]
+
+    def _spend(self, force: bool = False) -> bool:
+        """Count one market-data call. False (do not make it) for low-priority
+        work (scans, shadow quotes) when the last 60 s already used
+        max_data_calls_per_min, or while backing off after an HTTP 429. Live
+        work (and ``force``) is always allowed and still counted."""
+        now = self._now
+        while self._calls and (now - self._calls[0]).total_seconds() >= 60:
+            self._calls.popleft()
+        if not force and self._prio >= PRIO_SCAN:
+            if self._backoff_until is not None and now < self._backoff_until:
+                return False
+            if len(self._calls) >= self.cfg.max_data_calls_per_min:
+                return False
+        self._calls.append(now)
+        return True
+
+    def data_calls_last_minute(self) -> int:
+        return len(self._calls)
+
+    def _rate_limited(self, e: Exception) -> None:
+        """An HTTP 429 (the broker's own retries already gave up): skip
+        low-priority data work for a jittered while. Live work goes on."""
+        msg = str(e).lower()
+        if "429" in msg or "too many requests" in msg or "rate limit" in msg:
+            lo, hi = self.cfg.rate_limit_backoff_s
+            self._backoff_until = self._now + timedelta(seconds=self._rng.uniform(lo, hi))
+            log.warning("options: rate limited, low-priority data work paused until %s", self._backoff_until)
 
     def _profile(self, sym: str, now: datetime) -> pb.VolProfile | None:
         """Volume profile of the previous sessions (same feed), built once a
@@ -1631,6 +1735,7 @@ class Engine:
             days.append(d)
         try:
             self._io()
+            self._spend(force=True)  # day setup: never skipped, counted
             hist = self.broker.minute_bars(sym, _at(days[-1], (4, 0)), _at(days[0], (16, 0)))
         except Exception as e:
             self._error("profile", f"{sym}: {type(e).__name__}: {e}")
@@ -1671,9 +1776,11 @@ class Engine:
         if key not in self._chains:
             lo, hi = sel.bucket_range(self._day, bucket)
             try:
+                self._spend(force=True)  # a trigger just fired: never skipped, but counted
                 self._io()
                 self._chains[key] = list(self.broker.option_chain(sym, lo, hi))
             except Exception as e:
+                self._rate_limited(e)
                 self._error("chain", f"{sym} {bucket.label}: {e}")
                 self._chains[key] = None
         return self._chains[key]
