@@ -359,8 +359,12 @@ class Engine:
                      + ",".join(m.symbol for m in members))
 
     def _add_plan(self, active, now: datetime) -> None:
-        """Create grok_plan setups for the plan in force; WAITING setups of an
-        older plan for the same day are superseded (never doubled)."""
+        """Create grok_plan setups for the plan in force (items WITH a
+        trigger); WAITING setups of an older plan for the same day are
+        superseded (never doubled). An item WITHOUT a trigger (schema v1.1
+        directional prior) creates no setup of its own: its underlying joins
+        the day's universe (cap permitting) with the rule setups on it, and
+        those setups are tagged with grok_stance when they trigger."""
         d, p = self._dstr, active.plan
         self.con.execute("UPDATE options_setups SET state=?, live_note=? WHERE day=? AND source=? AND plan_id<>? "
                          "AND state=?", (SUPERSEDED, f"superseded by {p.plan_id}", d, GROK, p.plan_id, WAITING))
@@ -371,10 +375,17 @@ class Engine:
                 if len(have) >= self.cfg.daily_universe_cap:
                     ostore.filtered(self.con, d, now, "universe", sym, "daily_cap", setup_id=f"{d}:grok:{p.plan_id}:{i}")
                     continue
-                ostore.save_universe(self.con, d, [(sym, self.cfg.underlying_class(sym), "plan", self._prev_close(sym),
+                origin = "plan_prior" if item.directional else "plan"
+                ostore.save_universe(self.con, d, [(sym, self.cfg.underlying_class(sym), origin, self._prev_close(sym),
                                                     self._pm_dollar_vol(sym, now))])
                 self._profile(sym, now)
                 have.add(sym)
+                if item.directional:  # rule setups on a name that joined after the universe was built
+                    avoid = {a.ticker for a in p.avoid}
+                    for src in RULE_PLAYBOOKS:
+                        self._new_setup(f"{d}:{src}:{sym}", src, sym, self.cfg.underlying_class(sym), now, avoid=avoid)
+            if item.directional:
+                continue
             spec = {"plan_id": p.plan_id, "shadow_only": active.shadow_only, "item": item.model_dump(mode="json"),
                     "received_at": active.received_at.isoformat()}
             self._new_setup(f"{d}:grok:{p.plan_id}:{i}", GROK, sym, self.cfg.underlying_class(sym), now,
@@ -535,9 +546,11 @@ class Engine:
                                                                                "volume", "vwap")}}
                 for ts, r in bars.tail(5).iterrows()]
         info = {**sig.to_dict(), "bars": tail, "market": self._market_state(), "seen_at": ostore.iso(now)}
+        stance, late = self._grok_stance(s, sig.direction)
         ostore.update_setup(self.con, sid, state=TRIGGERED, direction=sig.direction, rvol=sig.meta["day_rvol"],
                             regime_json=json.dumps(regime, ensure_ascii=False),
-                            signal_json=json.dumps(info, ensure_ascii=False, default=str))
+                            signal_json=json.dumps(info, ensure_ascii=False, default=str),
+                            grok_stance=stance, grok_stance_late=late)
         age = (now - sig.at).total_seconds()
         if age > cfg.max_signal_age_s:
             ostore.update_setup(self.con, sid, state=MISSED)
@@ -560,7 +573,7 @@ class Engine:
             return self._skip(s, now, "already_invalidated", {"spot": spot, "invalidation": inv})
         max_hold = cfg.time_stop_minutes
         spec = json.loads(s["spec_json"] or "{}")
-        if s["source"] == GROK:
+        if s["source"] == GROK and spec["item"].get("max_hold_minutes"):
             max_hold = min(max_hold, int(spec["item"]["max_hold_minutes"]))
         # the time stop never runs past the day's forced flat (earlier on a half day)
         max_hold = max(min(max_hold, int((self._flat() - now).total_seconds() // 60)), 1)
@@ -595,6 +608,22 @@ class Engine:
             else:
                 pending = self._open_live(s, sig, live_choice, now, halted, flags, max_hold, ctx)
         ostore.update_setup(self.con, sid, state=ENTERED if (opened or pending) else SKIPPED)
+
+    def _grok_stance(self, s: dict, direction: str) -> tuple[str | None, int]:
+        """(stance, late) of a RULE setup at its trigger, from the directional
+        priors (items without a trigger) of the plan in force: 'agree' (same
+        bias), 'disagree' (opposite), 'none' (no prior on the name, or priors
+        that contradict each other). Recorded and reported only; it never
+        changes live eligibility. Grok's own setups: (None, 0)."""
+        if s["source"] == GROK:
+            return None, 0
+        a = self._active
+        if a is None:
+            return "none", 0
+        biases = {i.bias for i in a.plan.plans if i.directional and i.underlying == s["underlying"]}
+        if len(biases) != 1:
+            return "none", int(a.shadow_only)
+        return ("agree" if biases == {direction} else "disagree"), int(a.shadow_only)
 
     def _skip(self, s: dict, now: datetime, why: str, detail: dict | None = None) -> None:
         ostore.update_setup(self.con, s["setup_id"], state=SKIPPED)

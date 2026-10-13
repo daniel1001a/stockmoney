@@ -62,7 +62,10 @@ CREATE TABLE IF NOT EXISTS options_profiles (
 # columns added after the first version of the tables: (table, column, type)
 _ADDED = (("options_setups", "rvol", "REAL"), ("options_setups", "regime_json", "TEXT"),
           ("options_positions", "exit_variant", "TEXT"), ("options_positions", "inv_close", "REAL"),
-          ("options_positions", "inv_vwap", "INTEGER DEFAULT 0"), ("options_positions", "trail_ref", "REAL"))
+          ("options_positions", "inv_vwap", "INTEGER DEFAULT 0"), ("options_positions", "trail_ref", "REAL"),
+          # schema v1.1: Grok's directional prior on a rule setup, tagged at its trigger
+          # (agree | disagree | none; NULL = not triggered), late = plan received after 09:20 ET
+          ("options_setups", "grok_stance", "TEXT"), ("options_setups", "grok_stance_late", "INTEGER DEFAULT 0"))
 
 PENDING_SUBMIT = "pending_submit"
 
