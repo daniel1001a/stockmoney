@@ -229,23 +229,27 @@ class OptionsBook:
                  _utc_iso(None)))
         return True
 
-    def reconcile_flat(self, occ: str, reason: str, at: datetime | str | None = None) -> bool:
-        """Remove a book position the broker no longer holds (closed by hand,
-        expired or exercised while nothing was watching). Writes an explicit
-        ``side='reconcile'`` row (qty = what the book held, price = its cost,
-        realized_pnl 0: the true P&L is unknown) so the removal is auditable.
-        Never touches the broker. False when the book holds nothing."""
+    def reconcile_flat(self, occ: str, reason: str, at: datetime | str | None = None, keep: float = 0.0) -> bool:
+        """Bring a book position down to ``keep`` contracts (0: remove it)
+        because the broker holds fewer (closed by hand, assigned, expired or
+        exercised while nothing was watching). Writes an explicit
+        ``side='reconcile'`` row (qty = the contracts removed, price = their
+        cost, realized_pnl 0: the true P&L is unknown) so the change is
+        auditable. Never touches the broker. False when nothing changes."""
         pos = self.position(occ)
-        if pos is None:
+        if pos is None or keep >= pos.qty - QTY_EPS or keep < 0:
             return False
         at_s = _utc_iso(at)
         with self.con:
-            self.con.execute("DELETE FROM options_book_positions WHERE occ=?", (occ,))
+            if keep <= QTY_EPS:
+                self.con.execute("DELETE FROM options_book_positions WHERE occ=?", (occ,))
+            else:
+                self.con.execute("UPDATE options_book_positions SET qty=? WHERE occ=?", (float(keep), occ))
             self.con.execute(
                 "INSERT INTO options_book_fills (client_order_id, occ, underlying, strategy, side, qty, price, multiplier, "
                 "fee, filled_at, realized_pnl, recorded_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-                (f"reconcile:{occ}:{at_s}:{reason}"[:200], occ, pos.underlying, pos.strategy, "reconcile", pos.qty,
-                 pos.avg_price, pos.multiplier, 0.0, at_s, 0.0, _utc_iso(None)))
+                (f"reconcile:{occ}:{at_s}:{reason}"[:200], occ, pos.underlying, pos.strategy, "reconcile",
+                 pos.qty - keep, pos.avg_price, pos.multiplier, 0.0, at_s, 0.0, _utc_iso(None)))
         return True
 
     def realized(self, start: str | None = None, end: str | None = None) -> float:
