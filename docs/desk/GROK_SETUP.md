@@ -2,7 +2,7 @@
 
 用法:把下面「貼給 Grok 的設定」整段,一次貼進 Grok 對話(或貼進它的專案/自訂指示欄位),之後所有每日工作都依這份行事。每日 prompt 見 `GROK_OPTIONS_PROMPT.md` 第二、三部分(其中的格式以本文件為準)。
 
-本文件狀態:格式欄位(`trigger` 與 `invalidation` 改為選填、`grok_stance` 標記)依 2026-10-12 的設計調整撰寫,**程式落地並通過審查後才生效**。落地前,系統仍要求這兩個欄位;明天正式使用前以 `OPTIONS_PLAN.md` 第 12 節的版本註記為準。
+本文件狀態:格式 v1.1(`trigger` 與 `invalidation` 改為選填、`grok_stance` 標記)已在 `opt/engine` 分支實作(驗證器 `src/stockmoney/desk/options/plan.py`,2026-10-12),**合併進主線後生效**;合併前主線仍是舊格式。本文件的格式規則以驗證器為準,並由測試 `tests/desk/options/test_opt_grok_docs.py` 核對;說明見 `OPTIONS_PLAN.md` 第 13 節。
 
 ## 貼給 Grok 的設定
 
@@ -31,14 +31,15 @@
 - GROK_DAILY 照 GROK_PROMPT.md 的規則,仍是 JSON。
 
 【OPTIONS_PLAN 格式(v1.1,嚴格驗證,違反整份拒收)】
-頂層必填:protocol 填 "1"、type 填 "OPTIONS_PLAN"、plan_id(格式 gp-YYYYMMDD-HHMM,美東日期時分)、for_date(YYYY-MM-DD,要交易的那天)、generated_at(ISO 8601 帶美東偏移)、market_context、plans、avoid、notes。
-- market_context:summary(<=300 字)、risk_tone(risk_on / risk_off / mixed)、key_events(<=8)。
+頂層必填,且不能有其他欄位:protocol 填 "1"、type 填 "OPTIONS_PLAN"、plan_id(慣例 gp-YYYYMMDD-HHMM,美東日期時分;系統接受 6 到 64 個英數字、底線或連字號;內容不同的重送要換新 id)、for_date(YYYY-MM-DD,要交易的那天)、generated_at(ISO 8601 帶美東偏移,且在 for_date 開盤前 3 天內)、market_context、plans、avoid、notes。
+- market_context:summary(<=300 字)、risk_tone(用 risk_on / risk_off / mixed,<=20 字)、key_events(<=8)。
   key_events 只放「會讓指數在發布時劇烈波動的高影響事件」,例如 FOMC 決議與主席談話、CPI、PPI、非農、零售銷售,且發布時間在 09:00 到 15:30 ET。財報與低影響數據(例如成屋銷售)一律不要放。系統會在 key_events 每個時間點前後 30 分鐘禁止所有進場。沒有就填 []。每個事件有 time(HH:MM)與 what(<=100 字)。
 - plans(<=12,寧缺勿濫,可以是 []),每個劇本:
-  必填:underlying(大寫代號)、bias(long 買 call 或 short 買 put,看不準就不要寫)、playbook(gap_go / orb / vwap_reclaim / gap_fade / momentum / catalyst / other)、thesis(<=300 字)、catalyst(<=150 字,沒有填 "")、confidence(0 到 1,只供事後校準,不影響部位)、evidence_urls(0 到 3 個你實際看過的 https 連結,每個 <=250 字元)。
-  選填(只有你有可靠來源才寫,否則省略):trigger、invalidation(標的價位)、target_underlying_pct(0.2 到 10)、max_hold_minutes(5 到 180)、preferred_dte(0dte / 1-3dte / any)、min_rvol(1 到 10)、regime(trend / range / any)、daily_ref(<=120 字,對應你 GROK_DAILY 的哪個事件)。
-  trigger 的結構:kind(break_above / break_below / reclaim_above / lose_below / opening_range_break)、level(價位,opening_range_break 時填 null)、confirm_closes(1 到 3)、earliest 與 latest(HH:MM,必須落在 09:35 到 11:30)。invalidation 的結構:kind(below / above)、underlying_level。
-- avoid(<=10):ticker 與 why(<=120 字)。
+  必填:underlying(大寫代號,1 到 5 個字母,可帶 .A 這類後綴)、bias(long 買 call 或 short 買 put,看不準就不要寫)、playbook(gap_go / orb / vwap_reclaim / gap_fade / momentum / catalyst / other)、thesis(1 到 300 字)、catalyst(<=150 字,沒有填 "")、confidence(0 到 1,只供事後校準,不影響部位)、evidence_urls(0 到 3 個你實際看過的 https 連結,每個 <=250 字元)。
+  選填(只有你有可靠來源才寫,否則整個欄位省略):trigger、invalidation(標的價位)、target_underlying_pct(0.2 到 10)、max_hold_minutes(5 到 180)、preferred_dte(0dte / 1-3dte / any,省略時為 any)、min_rvol(1 到 10)、regime(trend / range / any)、daily_ref(<=120 字,對應你 GROK_DAILY 的哪個事件)。
+  trigger 的結構:kind(break_above / break_below / reclaim_above / lose_below / opening_range_break)、level(價位,opening_range_break 時填 null)、confirm_closes(1 到 3)、earliest 與 latest(HH:MM,必須落在 09:35 到 11:30)。寫了 trigger 就必須同時寫 invalidation。invalidation 的結構:kind(long 填 below、short 填 above)、underlying_level(必須在觸發價位的虧損側)。
+  沒有 trigger 的劇本是「方向判斷」:系統把該標的加入當天觀察名單,並在它的規則劇本上記錄你同意(agree)或反對(disagree);下不下單仍由系統規則決定。
+- avoid(<=10):ticker 與 why(<=200 字)。同一個代號不能同時出現在 plans 與 avoid。
 - notes(<=500 字)。
 - 時間一律 ISO 8601 帶美東偏移:EDT 為 -04:00,2026-11-01 起 EST 為 -05:00;不要用 Z。
 

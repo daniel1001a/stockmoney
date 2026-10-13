@@ -215,3 +215,13 @@
 - VIX 前收沒有資料來源,一律記為無;宏觀事件只看劇本的 key_events 與設定檔清單。
 - indicative 報價在盤中的時間戳新鮮度尚未在開盤時段實測;報價超過 30 秒視為過期,不會進場。
 - 第一天的目標是確認流程與紀錄完整,不是看損益。
+
+## 13. 劇本格式 v1.1 與 grok_stance(2026-10-12 使用者與 Grok 諮詢後的調整)
+
+背景:Grok 表示拿不到盤前成交價與盤前成交量,所以改成由 Grok 提供方向與催化劑,gap、RVOL 與觸發由系統自己算。格式規則的唯一依據是驗證器 `src/stockmoney/desk/options/plan.py`;`GROK_SETUP.md` 與 `GROK_OPTIONS_PROMPT.md` 第二部分由測試 `tests/desk/options/test_opt_grok_docs.py` 核對(三個範例:有觸發、空劇本、只有方向判斷)。協定欄位仍是 `"1"`。
+
+- 每個劇本必填:underlying、bias、playbook、thesis、catalyst、confidence、evidence_urls。選填:trigger、invalidation、target_underlying_pct、max_hold_minutes(省略時用 180 分鐘時間停損)、preferred_dte(省略為 any)、min_rvol、regime、daily_ref。寫了 trigger 就必須寫 invalidation。其餘限制不變,任何未知欄位仍整份拒收。
+- key_events 的時間必須是 HH:MM(只接受 ASCII 數字)且在 09:00 到 15:30 ET 之間,否則整份拒收(盤前公布的低影響數據不能拿來擋進場)。
+- **有 trigger 的劇本**:和以前一樣建立 grok_plan 劇本(自己的觸發、推翻價位、紙上資格規則不變)。
+- **沒有 trigger 的劇本 = 方向判斷**:不建立自己的觸發。該標的加入當天觀察名單(照常經過流動性與 RVOL 過濾,每天上限 25 檔;盤中才收到時會補建該標的的規則劇本),該標的的每個規則劇本(gap_go、orb15、vwap_reclaim、gap_fade)在觸發當下記錄 `grok_stance`:方向相同為 `agree`、相反為 `disagree`、沒有方向判斷或判斷互相矛盾為 `none`;09:20 ET 後才收到的劇本照樣標記,另記 `grok_stance_late=1`(劇本本身只進影子)。
+- `grok_stance` **只記錄、不影響**紙上資格與下單,下單仍完全由規則決定。日報新增「Grok 方向判斷 vs 規則劇本」一節:紙上實單、影子主變體與每個影子變體,依立場分組列出筆數、勝率、期望值與價差成本;任何一組少於 30 筆都會加上樣本數警告。判斷 Grok 有沒有加值,要看跨很多天累積的 agree 對 none 的差異,不看單日。
