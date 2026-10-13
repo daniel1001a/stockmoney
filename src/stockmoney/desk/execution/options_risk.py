@@ -559,8 +559,8 @@ class OptionsRiskEngine:
         if k.multiplier != OPTION_MULTIPLIER or parts.root != k.underlying.upper():
             return self._block(f"buy blocked: non-standard contract (root {parts.root}, underlying {k.underlying}, "
                                f"multiplier {k.multiplier})")
-        if k.expiry < et.date():
-            return self._block(f"buy blocked: contract expired {k.expiry}")
+        if k.expiry <= et.date():  # 0DTE too: an ITM option held into the close is exercised into stock
+            return self._block(f"buy blocked: contract expires {k.expiry} (today or earlier; no 0DTE live buy)")
         if (k.expiry - et.date()).days > l.max_dte_days:
             return self._block(f"buy blocked: expiry {k.expiry} is more than {l.max_dte_days} days out")
         muse = blocked if blocked is not None else muse_blocked(self.con, now)

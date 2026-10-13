@@ -21,13 +21,13 @@ from stockmoney.desk.execution.types import (
 
 ET = ZoneInfo("America/New_York")
 NOW = datetime(2026, 10, 13, 10, 0, tzinfo=ET)  # a Tuesday, inside the entry window
-OCC = "SPY261013C00580000"
-OCC2 = "SPY261013P00570000"
-OCC3 = "QQQ261013C00500000"
-OCC4 = "NVDA261013C00230000"
+OCC = "SPY261014C00580000"
+OCC2 = "SPY261014P00570000"
+OCC3 = "QQQ261014C00500000"
+OCC4 = "NVDA261014C00230000"
 
 
-def k(occ=OCC, bid=2.00, ask=2.10, oi=1000, vol=500, age_s=5.0, expiry=date(2026, 10, 13), mult=100,
+def k(occ=OCC, bid=2.00, ask=2.10, oi=1000, vol=500, age_s=5.0, expiry=date(2026, 10, 14), mult=100,
       underlying=None, **kw) -> OptionContract:
     from stockmoney.desk.execution.symbols import parse_occ
     p = parse_occ(occ)
@@ -111,7 +111,7 @@ def test_market_entry_priced_at_ask(eng):
 @pytest.mark.parametrize("intent", [
     OrderIntent("x", OCC, AssetClass.EQUITY, Side.BUY, qty=1),
     OrderIntent("x", "SPY", AssetClass.OPTION, Side.BUY, qty=1),
-    OrderIntent("x", "SPY   261013C00580000", AssetClass.OPTION, Side.BUY, qty=1),
+    OrderIntent("x", "SPY   261014C00580000", AssetClass.OPTION, Side.BUY, qty=1),
     OrderIntent("x", OCC, AssetClass.OPTION, Side.BUY, notional=100.0),
     OrderIntent("x", OCC, AssetClass.OPTION, Side.BUY, qty=1.5),
     OrderIntent("x", OCC, AssetClass.OPTION, Side.BUY, qty=0),
@@ -199,7 +199,10 @@ def test_exits_allowed_outside_window_and_after_flat(eng):
 
 def test_expired_and_far_dated_contracts(eng):
     e = eng()
-    assert "expired" in chk(e, contract=k(expiry=date(2026, 10, 12))).reason
+    assert "expires" in chk(e, contract=k(expiry=date(2026, 10, 12))).reason
+    # 0DTE: the gate itself refuses a buy of a contract expiring today
+    assert "no 0DTE live buy" in chk(e, intent=buy(occ="SPY261013C00580000"),
+                                     contract=k(occ="SPY261013C00580000", expiry=date(2026, 10, 13))).reason
     assert "days out" in chk(e, contract=k(expiry=date(2026, 10, 21))).reason
     assert chk(e, contract=k(expiry=date(2026, 10, 16))).allow
 
@@ -207,7 +210,7 @@ def test_expired_and_far_dated_contracts(eng):
 def test_non_standard_contract_blocked(eng):
     e = eng()
     assert "non-standard" in chk(e, contract=k(mult=50)).reason
-    adj = "SPY1261013C00580000"
+    adj = "SPY1261014C00580000"
     assert "non-standard" in chk(e, buy(occ=adj), contract=k(occ=adj, underlying="SPY")).reason
 
 
@@ -358,7 +361,7 @@ def test_per_trade_premium_resizes_in_whole_contracts(eng):
 
 
 def test_one_contract_over_the_cap_is_blocked(eng):
-    occ = "SPY261013C00500000"
+    occ = "SPY261014C00500000"
     d = chk(eng(), buy(occ=occ, limit_price=10.5), contract=k(occ=occ, bid=10.0, ask=10.5))
     assert not d.allow and "per-trade premium" in d.reason
 
