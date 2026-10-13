@@ -189,29 +189,36 @@ class OptionsBook:
             return False
         pos = self.position(occ)
         at = _utc_iso(filled_at)
+        # every rule is checked BEFORE the transaction: the connection is shared with the
+        # options engine, and an exception inside `with self.con:` would roll back the
+        # caller's own uncommitted writes too
+        if side == Side.BUY:
+            if pos is None and not strategy:
+                raise OptionsBookError(f"opening {occ} needs a strategy")
+            if pos is not None and strategy and pos.strategy != strategy:
+                raise OptionsBookError(f"{occ} is held by '{pos.strategy}'; cannot open it under '{strategy}'")
+            if pos is not None and pos.multiplier != multiplier:
+                raise OptionsBookError(f"{occ} multiplier {multiplier} differs from booked {pos.multiplier}")
+        elif side == Side.SELL:
+            if pos is None:
+                raise OptionsBookError(f"sell of {occ} but the book holds none (no sell to open)")
+            if qty > pos.qty + QTY_EPS:
+                raise OptionsBookError(f"sell {qty:g} of {occ} exceeds held {pos.qty:g} (no sell to open)")
+        else:
+            raise OptionsBookError(f"unknown side {side!r}")
         with self.con:
             if side == Side.BUY:
                 realized = -fee
                 if pos is None:
-                    if not strategy:
-                        raise OptionsBookError(f"opening {occ} needs a strategy")
                     self.con.execute(
                         "INSERT INTO options_book_positions (occ, underlying, strategy, qty, avg_price, multiplier, opened_at) "
                         "VALUES (?,?,?,?,?,?,?)", (occ, parts.root, strategy, qty, price, multiplier, at))
                 else:
-                    if strategy and pos.strategy != strategy:
-                        raise OptionsBookError(f"{occ} is held by '{pos.strategy}'; cannot open it under '{strategy}'")
-                    if pos.multiplier != multiplier:
-                        raise OptionsBookError(f"{occ} multiplier {multiplier} differs from booked {pos.multiplier}")
                     n = pos.qty + qty
                     self.con.execute("UPDATE options_book_positions SET qty=?, avg_price=? WHERE occ=?",
                                      (n, (pos.avg_price * pos.qty + price * qty) / n, occ))
                 owner = pos.strategy if pos else strategy
-            elif side == Side.SELL:
-                if pos is None:
-                    raise OptionsBookError(f"sell of {occ} but the book holds none (no sell to open)")
-                if qty > pos.qty + QTY_EPS:
-                    raise OptionsBookError(f"sell {qty:g} of {occ} exceeds held {pos.qty:g} (no sell to open)")
+            else:  # Side.SELL (checked above)
                 multiplier = pos.multiplier
                 realized = (price - pos.avg_price) * qty * multiplier - fee
                 left = pos.qty - qty
@@ -220,8 +227,6 @@ class OptionsBook:
                 else:
                     self.con.execute("UPDATE options_book_positions SET qty=? WHERE occ=?", (left, occ))
                 owner = pos.strategy
-            else:
-                raise OptionsBookError(f"unknown side {side!r}")
             self.con.execute(
                 "INSERT INTO options_book_fills (client_order_id, occ, underlying, strategy, side, qty, price, multiplier, "
                 "fee, filled_at, realized_pnl, recorded_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",

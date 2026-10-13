@@ -71,9 +71,10 @@ class RiskGate(Protocol):
     def reserve(self, intent: OrderIntent, price: float) -> None: ...
     def release(self, occ: str) -> None: ...
     def book_fill(self, *, client_order_id: str, occ: str, strategy: str, side: Side, qty: float, price: float,
-                  filled_at: datetime | None) -> None:
+                  filled_at: datetime | None) -> bool | None:
         """Book a live fill; ``qty`` / ``price`` are the order's CUMULATIVE
-        filled qty and average price (idempotent per client_order_id)."""
+        filled qty and average price (idempotent per client_order_id).
+        False = the book refused it (the caller keeps the order polled)."""
 
 
 class DenyAllGate:
@@ -147,14 +148,17 @@ class LineAGate:
     def release(self, occ) -> None:
         self.engine.release(occ)
 
-    def book_fill(self, *, client_order_id, occ, strategy, side, qty, price, filled_at) -> None:
-        """A book error is reported, never raised: the book then disagrees
-        with the broker and the risk engine blocks entries (exits go on)."""
+    def book_fill(self, *, client_order_id, occ, strategy, side, qty, price, filled_at) -> bool:
+        """A book error is reported, never raised, and returned as False: the
+        book then disagrees with the broker and the risk engine blocks entries
+        (exits go on). True when booked or already booked."""
         try:
             self.engine.book.apply_fill(client_order_id=client_order_id, occ=occ, strategy=strategy, side=side,
                                         qty=qty, price=price, filled_at=filled_at, cumulative=True)
         except OptionsBookError as e:
             self.on_error("options_book", f"{client_order_id} {occ}: {e}")
+            return False
+        return True
 
 
 class ShadowGate(LineAGate):
