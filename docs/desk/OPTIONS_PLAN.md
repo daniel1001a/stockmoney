@@ -176,6 +176,13 @@
 - 15:45 ET 一律強制平倉;收盤前 10 分鐘(15:50 ET)若仍有期權部位未平會先推播 CRITICAL,session 結束時再檢查一次券商期權部位,未平再推播 CRITICAL,請到 Alpaca 手動確認。
 - 每一張賣單(出場)也經過 A 線風控:最多只能賣券商實際持有的口數(永遠不會變成賣出開倉);限價賣單若被價格帶擋下,改送市價賣單。風控擋下出場時不送單、每輪重試,並推播 CRITICAL 一次。
 
+**4.0 請求量預算(2026-10-12 依 Alpaca 文件核對)**
+
+- 依 Alpaca「About Market Data API」文件(2026-10-12 以唯讀工具讀取):本帳戶是 Basic 方案(紙上帳戶預設),股票即時只有 IEX、期權只有 indicative feed;歷史資料 API 呼叫上限股票 200 次/分、期權 200 次/分(Algo Trader Plus 為各 10,000 次/分)。下單、帳戶、委託查詢這類 Trading API 的每分鐘上限在 Alpaca 文件中**沒有找到**,未核實。
+- 系統把市場資料呼叫控制在預算內(設定 `max_data_calls_per_min`,預設 110):1 分鐘 K 每個標的每分鐘最多抓一次(已完成的 K 不會在一分鐘內改變);只在影子帳戶用到的合約與標的報價最多每 30 秒更新一次;預算用完時先跳過掃描與影子報價,紙上實單部位的報價、觸發後的合約查詢與所有下單 / 出場呼叫永不跳過。收到 HTTP 429(券商層重試用完)時,暫停低優先工作 10 到 30 秒(隨機)。有委託在途時每 2 秒的快速輪詢只查委託(不打市場資料),完整一輪至少每 20 秒一次。17 檔標的的完整情境實測約每分鐘 99 次市場資料呼叫。
+- session 啟動時日誌會印一行:預算、股票資料源(iex)、期權資料源(未訂 OPRA 時為 indicative)。
+- 紙上帳戶的成交模擬:可成交時約 10% 機率只部分成交(Alpaca 文件),所以「部分成交」的處理路徑第一天就可能用到。
+
 **4.1 提早收盤日(半天市)**
 
 - 收盤時間優先讀 Alpaca 市場日曆,讀不到時用 `desk/calendar.py` 的 `EARLY_CLOSES`(已對 Alpaca 日曆核對:2026-11-27、2026-12-24、2027-11-26,皆 13:00 ET;兩者取較早)。
@@ -185,6 +192,7 @@
 
 - 若 session 中途死掉(當機、休眠、斷電)沒在強制平倉前出場,隔天 session 的第一輪會推播 CRITICAL「前一日部位未平」,並在 09:30 ET 起以**市價**賣出平倉(進場單只成交一部分、剩下一直撤不掉的也一樣:到了強制平倉時間、時間停損到期或屬於前一日遺留時,先撤單,再賣出已成交的部分;撤單連續失敗會立刻推播)。前一日遺留的影子部位以最後已知買價補記出場。
 - 選用的 launchd 工作 `options-recover`(開機 / 登入時執行一次,**不在預設工作內,不會自動安裝**):`.venv/bin/python scripts/desk_schedule.py --jobs options-recover --install`;手動:`scripts/desk_job.sh options-recover` 或 `.venv/bin/python -m stockmoney.desk.options.run recover`。它只做遺留部位清理:有 session 在跑(持有 options.lock)就直接結束;否則處理所有仍在 PENDING / ENTERED 的紙上實單(前一日的,以及當天沒有 session 在跑時的當天部位),市場開盤中就以市價賣出並最多輪詢 3 分鐘確認成交;非交易時段只推播,留給下個 session 09:30 處理。
+- 期權帳本(A 線)拒收某筆成交時,該委託不會被標成已結束而會持續重查、該部位註記「reconcile needed」並推播一次;本軌道自己的出場單若還沒完全確認,不會把券商少掉的口數當成「被別人動過」去對帳。
 - 只跑影子(`DESK_OPTIONS_ORDERS=off`)時,session 與復原工作用 ShadowGate:新進場一律拒絕,但遺留部位的賣單仍經 A 線風控(不會賣超過券商持有)並寫入期權帳本。
 - **資料庫說持有、券商卻是 0**(手動平掉、到期或被履約時 Mac 沒開):遺留部位的賣單被風控擋下,且券商該合約持倉為 0、沒有任何掛單時,系統把這筆標記為已出場(`broker_flat_unreconciled`,日報顯示「損益未知」且不計入統計),在期權帳本寫一筆 `reconcile` 紀錄移除該部位,推播一次;這條路徑**絕不送單**。其他情況(例如當天的部位)可手動結案:先確認 Alpaca 上該合約已無持倉與掛單,再執行 `.venv/bin/python -m stockmoney.desk.options.run resolve <position_id>`(券商仍持有、仍有掛單或讀不到券商時一律拒絕;position_id 可從 `select position_id, occ, state from options_positions where mode='live' and state in ('PENDING','ENTERED')` 查)。
 - **不要手動持有本軌道正在交易的同一個合約(同一個 OCC 代號)**:券商端無法分辨哪幾口是你的、哪幾口是本軌道的,本軌道的出場可能賣到你的口數,對帳也會混在一起。
