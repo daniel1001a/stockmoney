@@ -355,8 +355,13 @@ def test_m1_real_gate_refuses_a_sell_to_open(tmp_path, con):
     del r.broker.positions[C601N]  # the broker no longer holds it (closed by hand)
     r.clock.set(et(15, 45))
     r.run(et(15, 46), step=5)
-    assert not exits(con, lp["position_id"]) and C601N not in r.broker.positions
-    assert any("出場被風控擋下" in t for t in titles(r))
+    assert not exits(con, lp["position_id"]) and C601N not in r.broker.positions  # never a sell to open
+    from stockmoney.desk.options._iface import OrderIntent as OI
+    sell = OI("s-test", C601N, AssetClass.OPTION, Side.SELL, qty=1, order_type=OrderType.MARKET, tif=TIF.DAY)
+    assert not r.gate.check_exit(sell, None, r.clock.now).allow
+    # (Grok round-3 H2) the missing contracts are written off as a loss, not left open
+    p = ostore.position(con, lp["position_id"])
+    assert p["state"] == "EXITED" and p["exit_reason"] == "broker_shortfall"
 
 
 def test_m1_real_gate_normal_day_round_trip(tmp_path, con):

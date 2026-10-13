@@ -169,20 +169,29 @@ def test_g1_terminal_on_the_last_tick_replaced_in_the_same_tick(tmp_path, con, e
 
 
 # ------------------------------------------------------------------ G2 exit qty vs broker position
-def test_g2_broker_holds_fewer_sell_what_is_held_and_reconcile(tmp_path, con):
+def test_g2_broker_holds_fewer_sell_what_is_held_and_write_off_the_rest(tmp_path, con):
+    # (revised by the Grok round-3 review, H2): the missing contracts are a loss, not erased at cost
+    from stockmoney.desk import store as dstore
     r = Rig(tmp_path, con, time_stop_minutes=600)
     r.gate = _iface.make_risk_gate(con, r.broker, r.cfg)
     r.eng = r.new_engine()
     r.run(et(9, 52))
     lp = r.pos("live")[0]
-    r.broker.positions[C601N] = 4  # the owner sold 6 by hand
+    e = lp["entry_price"]
+    r.broker.positions[C601N] = 4  # the owner sold 6 by hand (at 0.20, which the sleeve cannot see)
     r.clock.set(et(15, 45))
     r.run(et(15, 46), step=2)
     assert [o.qty for o in sells(r)] == [4] and C601N not in r.broker.positions
     p = ostore.position(con, lp["position_id"])
-    assert p["state"] == "EXITED" and p["qty_open"] == 0 and "6 contracts gone" in p["note"]
-    assert any("口數與資料庫不符" in t for t in titles(r))
-    assert not _iface.OptionsBook(con).positions()  # book reconciled (6) and sold (4)
+    assert p["state"] == "EXITED" and p["qty_open"] == 0 and "written off at 0" in p["note"]
+    wo = [f for f in ostore.fills(con, lp["position_id"]) if f["reason"] == "broker_shortfall"]
+    assert [(f["qty"], f["price"]) for f in wo] == [(6, 0.0)]
+    assert any("券商口數少於資料庫" in t for t in titles(r))
+    assert dstore.get_setting(con, "options_halt_new_entries", "0") == "1"  # new buys latched off
+    assert not _iface.OptionsBook(con).positions()
+    assert r.gate.engine.book.realized() == pytest.approx(p["realized_usd"])  # the loss reaches the stop
+    sold4 = next(o for o in sells(r)).filled_avg_price
+    assert p["realized_usd"] == pytest.approx((sold4 - e) * 4 * 100 + (0.0 - e) * 6 * 100)
 
 
 def test_g2_broker_holds_more_never_sells_more_than_open(tmp_path, con):
@@ -194,13 +203,43 @@ def test_g2_broker_holds_more_never_sells_more_than_open(tmp_path, con):
     assert ostore.position(con, lp["position_id"])["state"] == "EXITED"
 
 
-def test_g2_broker_holds_zero_today_sends_nothing_and_pages(tmp_path, con):
+def test_g2_broker_holds_zero_today_sends_nothing_and_writes_off(tmp_path, con):
     r, lp = entered(tmp_path, con)
     del r.broker.positions[C601N]
     r.clock.set(et(15, 45))
     r.run(et(15, 46), step=2)
-    assert not sells(r) and ostore.position(con, lp["position_id"])["state"] == "ENTERED"
-    assert any("出場被風控擋下" in t for t in titles(r))
+    p = ostore.position(con, lp["position_id"])
+    assert not sells(r) and p["state"] == "EXITED" and p["exit_reason"] == "broker_shortfall"
+    assert p["realized_usd"] == pytest.approx(-10 * p["entry_price"] * 100)
+    assert any("券商口數少於資料庫" in t for t in titles(r))
+
+
+def test_h2_daily_stop_sees_a_hand_sale_and_reappearing_contracts_are_never_sold(tmp_path, con):
+    r = Rig(tmp_path, con, time_stop_minutes=600, capital_budget=10_000.0)  # daily stop 200
+    r.gate = _iface.make_risk_gate(con, r.broker, r.cfg)
+    r.eng = r.new_engine()
+    r.run(et(9, 52))
+    lp = r.pos("live")[0]
+    r.broker.positions[C601N] = 4  # the owner sold 6 by hand
+    r.clock.set(et(10, 0))
+    r.eng.tick()
+    p = ostore.position(con, lp["position_id"])
+    assert p["qty_open"] == 4 and p["state"] == "ENTERED"
+    st = _iface.sleeve_state(con, r.gate.engine.limits, {C601N: 0.95}, r.clock.now)
+    assert st.realized_today == pytest.approx(-6 * lp["entry_price"] * 100) and st.daily_pnl <= -200
+    k = OptionContract(C600N, "SPY", "C", 600.0, NEXT, 1.03, 1.07, None, 1000, 5000, 0.55, None, r.clock.now)
+    buy = OrderIntent("t", C600N, AssetClass.OPTION, Side.BUY, qty=1, order_type=OrderType.LIMIT, tif=TIF.DAY,
+                      limit_price=1.07)
+    assert not r.gate.check(buy, k, r.clock.now, marks={C601N: 0.95}, blocked={}).allow
+    # the 4 are sold at the flat; then 6 of the contract reappear at the broker
+    r.clock.set(et(15, 45))
+    r.run(et(15, 46), step=2)
+    assert C601N not in r.broker.positions
+    r.broker.positions[C601N] = 6
+    r.eng = r.new_engine()  # e.g. a restart: the start-of-day check runs again
+    r.run(et(15, 48), step=2)
+    assert any("未知期權部位" in t for t in titles(r))
+    assert sum(o.filled_qty for o in sells(r)) == 4 and r.broker.positions[C601N] == 6
 
 
 def test_g2_fresh_fill_is_not_mistaken_for_a_shortfall(tmp_path, con):

@@ -234,13 +234,16 @@ class OptionsBook:
                  _utc_iso(None)))
         return True
 
-    def reconcile_flat(self, occ: str, reason: str, at: datetime | str | None = None, keep: float = 0.0) -> bool:
+    def reconcile_flat(self, occ: str, reason: str, at: datetime | str | None = None, keep: float = 0.0,
+                       write_off: bool = True) -> bool:
         """Bring a book position down to ``keep`` contracts (0: remove it)
         because the broker holds fewer (closed by hand, assigned, expired or
         exercised while nothing was watching). Writes an explicit
-        ``side='reconcile'`` row (qty = the contracts removed, price = their
-        cost, realized_pnl 0: the true P&L is unknown) so the change is
-        auditable. Never touches the broker. False when nothing changes."""
+        ``side='reconcile'`` row so the change is auditable. The true P&L is
+        unknown; ``write_off`` (default) books the removed contracts at price
+        0, a total loss, so the daily stop and the drawdown latch see it
+        (never a loss hidden at cost); otherwise at cost with realized 0.
+        Never touches the broker. False when nothing changes."""
         pos = self.position(occ)
         if pos is None or keep >= pos.qty - QTY_EPS or keep < 0:
             return False
@@ -254,7 +257,8 @@ class OptionsBook:
                 "INSERT INTO options_book_fills (client_order_id, occ, underlying, strategy, side, qty, price, multiplier, "
                 "fee, filled_at, realized_pnl, recorded_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
                 (f"reconcile:{occ}:{at_s}:{reason}"[:200], occ, pos.underlying, pos.strategy, "reconcile",
-                 pos.qty - keep, pos.avg_price, pos.multiplier, 0.0, at_s, 0.0, _utc_iso(None)))
+                 pos.qty - keep, 0.0 if write_off else pos.avg_price, pos.multiplier, 0.0, at_s,
+                 -(pos.qty - keep) * pos.avg_price * pos.multiplier if write_off else 0.0, _utc_iso(None)))
         return True
 
     def realized(self, start: str | None = None, end: str | None = None) -> float:

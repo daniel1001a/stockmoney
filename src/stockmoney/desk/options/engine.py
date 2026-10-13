@@ -89,7 +89,7 @@ from zoneinfo import ZoneInfo
 
 import pandas as pd
 
-from stockmoney.desk import notify
+from stockmoney.desk import notify, store
 from stockmoney.desk.calendar import close_time, is_trading_day
 from stockmoney.desk.options import plan as oplan
 from stockmoney.desk.options import playbooks as pb
@@ -98,7 +98,7 @@ from stockmoney.desk.options import shadow as sh
 from stockmoney.desk.options import store as ostore
 from stockmoney.desk.options import universe as uni
 from stockmoney.desk.options._iface import (
-    TIF, AssetClass, OptionContract, OptionsBook, OrderIntent, OrderStatus, OrderType, RiskDecision, RiskGate, Side,
+    OPTIONS_HALT_SETTING, TIF, AssetClass, OptionContract, OptionsBook, OrderIntent, OrderStatus, OrderType, RiskDecision, RiskGate, Side,
 )
 from stockmoney.desk.options.config import GROK, RULE_PLAYBOOKS, OptionsConfig
 
@@ -191,6 +191,7 @@ class Engine:
         self._swept: str | None = None         # day the start-of-day sweep last ran
         self._cancel_fail: dict[str, int] = {}  # client_order_id -> failed cancels in a row
         self._cancel_next: dict[str, datetime] = {}   # exit client_order_id -> no cancel retry before this
+        self._shortfall_at: dict[str, datetime] = {}  # position_id -> last broker-quantity check
         self._cancel_paged: dict[str, datetime] = {}  # exit client_order_id -> last "cannot cancel" page
         self._status_fail: dict[str, int] = {}  # exit client_order_id -> failed get_order reads in a row
         self._obook: OptionsBook | None = None
@@ -1054,6 +1055,10 @@ class Engine:
             if working:
                 self._resolve_exit(p, working[-1], now)
                 return
+            if p["day"] == self._dstr and not any(o["status"] == UNRESOLVED for o in orders):
+                p = self._check_shortfall(p, now)
+                if p["state"] != ENTERED:
+                    return
         reason, qty = self._exit_decision(p, q if fresh else None, now)
         if not reason:
             return
@@ -1186,7 +1191,7 @@ class Engine:
         ostore.update_position(self.con, pid, **fields)
 
     def _send_exit(self, p: dict, qty: float, reason: str, q: OptionContract | None, now: datetime,
-                   force_market: bool = False, allow_reconcile: bool = True) -> bool:
+                   force_market: bool = False) -> bool:
         """Send one sell to close through the risk gate. A limit the gate
         refuses (price band, no sane quote) is retried as a market sell; a
         market sell the gate refuses (nothing held at the broker: it would
@@ -1207,15 +1212,8 @@ class Engine:
         # size the sell to what the broker holds minus its working sells (never more than asked)
         room = self._sell_room(p["occ"])
         sized = None
-        if room is not None:
+        if room is not None:  # sizing only; a shortfall is handled by _check_shortfall, never here
             held, working = room
-            # never while one of our own exits is unresolved or still open: its unbooked fills
-            # would look like contracts "gone at the broker"
-            own_open = any(o["kind"] == "exit" and (o["status"] == UNRESOLVED or o["status"] not in _TERMINAL_ORDER)
-                           for o in exits)
-            if (allow_reconcile and not own_open and working <= 1e-9 and 1 <= held < (p["qty_open"] or 0) - 1e-9
-                    and self._settled(p, now)):
-                p = self._reconcile_qty(p, held, now)  # someone else took contracts: store / book follow
             can = floor(min(qty, held - working, p["qty_open"] or 0) + 1e-9)
             if can < 1:
                 sized = RiskDecision(False, f"nothing to sell: broker holds {held:g}, working sells {working:g}")
@@ -1271,29 +1269,60 @@ class Engine:
         last = self.con.execute("SELECT MAX(at) FROM options_fills WHERE position_id=?", (p["position_id"],)).fetchone()[0]
         return last is None or (now - datetime.fromisoformat(last)).total_seconds() >= seconds
 
-    def _reconcile_qty(self, p: dict, held: float, now: datetime) -> dict:
-        """The broker holds fewer contracts than the store (the owner sold
-        some by hand, or one was assigned): the store row and the options
-        book come down to ``held`` (the missing contracts' P&L is unknown and
-        noted), and the owner is paged once. Never sends an order."""
-        gone = (p["qty_open"] or 0) - held
-        ostore.update_position(self.con, p["position_id"], qty_open=held,
-                               note=((p["note"] or "") + f"; {gone:g} contracts gone at the broker at "
-                                     f"{ostore.iso(now)}: their P&L is unknown").strip("; ")[:500])
+    def _check_shortfall(self, p: dict, now: datetime) -> dict:
+        """A live position of today with no exit working, whose broker
+        quantity is below the store's (the owner sold some by hand, one was
+        assigned). At most once a minute per position, and only once no fill
+        of it happened in the last 60 s (a position read can lag a fill).
+        First every sleeve order of the position is re-read and booked (it
+        may explain the gap); what is still missing is written off at price 0
+        (a total loss: realized, so the daily stop and the drawdown latch see
+        it, in the store and in line A's book), new buys are latched off
+        (setting options_halt_new_entries=1, cleared by the owner) and the
+        owner is paged. Never sends an order. Returns the re-read position."""
+        pid = p["position_id"]
+        last = self._shortfall_at.get(pid)
+        if (last is not None and (now - last).total_seconds() < 60) or not self._settled(p, now):
+            return p
+        self._shortfall_at[pid] = now
+        room = self._sell_room(p["occ"])
+        if room is None or room[1] > 1e-9 or room[0] >= (p["qty_open"] or 0) - 1e-9:
+            return p
+        for row in ostore.orders_for(self.con, pid):  # can our own orders explain it?
+            if row["kind"] != "exit":
+                continue
+            try:
+                self._io()
+                o = self.broker.get_order(row["client_order_id"])
+            except Exception as e:
+                self._error("exit_order", f"{row['client_order_id']}: {type(e).__name__}: {e}")
+                return p  # cannot tell: decide nothing this time
+            if o is not None:
+                p, _ = self._book_exit_order(p, row, o)
+        held = self._broker_held(p["occ"])
+        gone = (p["qty_open"] or 0) - (held if held is not None else 1e18)
+        if held is None or gone < 1 - 1e-9:
+            return p
+        open_before = p["qty_open"]
+        self._book_exit(p, gone, 0.0, None, None, "broker_shortfall", now,
+                        f"{gone:g} contracts gone at the broker at {ostore.iso(now)}: written off at 0 (P&L unknown)",
+                        client_order_id=f"writeoff:{ostore.iso(now)}")
         try:
             if self._obook is None:
                 self._obook = OptionsBook(self.con)
-            self._obook.reconcile_flat(p["occ"], "broker_qty_short", now, keep=held)
+            self._obook.reconcile_flat(p["occ"], "broker_shortfall", now, keep=held)
         except Exception as e:
-            self._error("options_book", f"reconcile {p['occ']}: {type(e).__name__}: {e}")
-        ostore.event(self.con, self._dstr, now, "critical", "broker_qty_short",
-                     f"{p['position_id']} {p['occ']}: store {p['qty_open']:g}, broker {held:g}")
+            self._error("options_book", f"write-off {p['occ']}: {type(e).__name__}: {e}")
+        store.set_setting(self.con, OPTIONS_HALT_SETTING, "1")
+        ostore.event(self.con, self._dstr, now, "critical", "broker_shortfall",
+                     f"{pid} {p['occ']}: store {open_before:g}, broker {held:g}; {gone:g} written off, new buys halted")
         self.con.commit()
-        if ostore.notify_once(self.con, f"broker_qty_short:{p['position_id']}"):
-            self._notify("期權軌道:券商口數與資料庫不符", f"{p['occ']} 資料庫記為 {p['qty_open']:g} 口,券商只有 {held:g} 口"
-                         "(有人手動賣出,或被指派?)。只會賣出券商實際持有的口數;少掉的口數損益未知,請到 Alpaca 核對。",
+        if ostore.notify_once(self.con, f"broker_shortfall:{pid}"):
+            self._notify("期權軌道:券商口數少於資料庫", f"{p['occ']} 資料庫記為 {open_before:g} 口,券商只有 {held:g} 口"
+                         f"(有人手動賣出,或被指派?)。少掉的 {gone:g} 口以 0 元記為全損(損益未知,保守計入停損),"
+                         "並已暫停本軌道新進場(options_halt_new_entries=1,核對後請手動改回 0)。沒有送出任何單。",
                          notify.CRITICAL)
-        return ostore.position(self.con, p["position_id"])
+        return ostore.position(self.con, pid)
 
     def _exit_gate(self, intent: OrderIntent, q: OptionContract | None, now: datetime) -> RiskDecision:
         """The risk gate's verdict on one sell. A gate error is a refusal,
@@ -1463,9 +1492,13 @@ class Engine:
         position removed by an explicit reconciliation row, owner paged once.
         This path only writes the store; it can never send an order."""
         pid = p["position_id"]
+        if (p["qty_open"] or 0) > 1e-9 and p["entry_price"]:  # P&L unknown: counted as a total loss, never hidden
+            self._book_exit(p, p["qty_open"], 0.0, None, None, reason, now,
+                            client_order_id=f"writeoff:{ostore.iso(now)}")
+            p = ostore.position(self.con, pid)
         ostore.update_position(self.con, pid, state=EXITED, qty_open=0, exit_time=ostore.iso(now), exit_reason=reason,
-                               note=((p["note"] or "") + f"; broker holds 0 at {ostore.iso(now)}: P&L of "
-                                     f"{p['qty_open'] or 0:g} contracts unknown").strip("; ")[:500])
+                               note=((p["note"] or "") + f"; broker holds 0 at {ostore.iso(now)}: P&L unknown, "
+                                     "written off at 0").strip("; ")[:500])
         try:
             if self._obook is None:
                 self._obook = OptionsBook(self.con)
@@ -1476,8 +1509,8 @@ class Engine:
         self.con.commit()
         if ostore.notify_once(self.con, f"{reason}:{pid}"):
             self._notify("期權軌道:部位已不在券商", f"{p['occ']} x{p['qty_open'] or 0:g}({p['day']})資料庫記為持有,"
-                         "但券商持倉為 0 且沒有掛單(手動平倉、到期或被履約?)。已標記為已出場、損益未知,並從期權帳本"
-                         "移除;沒有送出任何單。請到 Alpaca 核對實際損益。", notify.CRITICAL)
+                         "但券商持倉為 0 且沒有掛單(手動平倉、到期或被履約?)。已標記為已出場、損益未知(保守以 0 元"
+                         "記為全損),並從期權帳本移除;沒有送出任何單。請到 Alpaca 核對實際損益。", notify.CRITICAL)
 
     def resolve_manual(self, position_id: str) -> str:
         """run.py resolve: close one live row by hand after the owner checked

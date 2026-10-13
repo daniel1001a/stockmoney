@@ -106,7 +106,9 @@ def test_r2_phantom_leftover_reconciled_over_three_days_with_real_gate(tmp_path,
     assert not [o for o in r.broker.orders.values() if o.side == Side.SELL]  # this path never sells
     assert not _iface.OptionsBook(con).positions()
     rec = con.execute("SELECT side, qty, realized_pnl FROM options_book_fills WHERE side='reconcile'").fetchall()
-    assert [tuple(x) for x in rec] == [("reconcile", 10.0, 0.0)]
+    assert [tuple(x)[:2] for x in rec] == [("reconcile", 10.0)]
+    assert rec[0][2] == pytest.approx(-p["entry_price"] * 10 * 100)  # written off: a counted loss, not hidden
+    assert p["realized_usd"] == pytest.approx(-p["entry_price"] * 10 * 100)
     n_live = con.execute("SELECT COUNT(*) FROM options_positions WHERE mode='live' AND state IN "
                          "('PENDING','ENTERED')").fetchone()[0]
     assert n_live == 0

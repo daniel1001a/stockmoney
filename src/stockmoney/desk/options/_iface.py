@@ -35,7 +35,7 @@ from typing import Callable, Mapping, Protocol
 
 from stockmoney.desk.execution.broker import OptionsBroker  # noqa: F401
 from stockmoney.desk.execution.options_risk import (  # noqa: F401
-    OptionsBook, OptionsBookError, OptionsLimits, OptionsRiskEngine, sleeve_state,
+    OPTIONS_HALT_SETTING, OptionsBook, OptionsBookError, OptionsLimits, OptionsRiskEngine, sleeve_state,
 )
 from stockmoney.desk.execution.symbols import occ_symbol, parse_occ  # noqa: F401
 from stockmoney.desk.execution.types import (  # noqa: F401
