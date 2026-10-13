@@ -29,9 +29,9 @@ CLASS_LABEL = {"index": "指數/槓桿 ETF", "mega_cap": "大型個股", "high_v
 STATE_LABEL = {"WAITING": "等待", "TRIGGERED": "已觸發", "ENTERED": "持倉中", "EXITED": "已出場", "EXPIRED": "未觸發",
                "MISSED": "錯過", "SKIPPED": "觸發但未進場", "SUPERSEDED": "被新劇本取代"}
 REASON_LABEL = {"premium_stop": "權利金停損", "take_profit": "停利(先出一半)", "breakeven_stop": "成本價停損",
-                "invalidation": "推翻價位", "time_stop": "時間停損", "force_flat": "15:45 強制平倉",
+                "invalidation": "推翻價位", "time_stop": "時間停損", "force_flat": "強制平倉(15:45,提早收盤日為收盤前 15 分鐘)",
                 "session_end": "收盤補記", "entry_unfilled": "進場未成交", "entry_not_sent": "未送出",
-                "atr_trail": "ATR 追蹤停損"}
+                "atr_trail": "ATR 追蹤停損", "carry_over": "前一日遺留,開盤市價平倉", "recover_flat": "復原工作市價平倉"}
 DATA_NOTE = ("> 資料限制:期權報價是 Alpaca indicative feed 的輪詢快照(非 OPRA,約每 20 秒一次),盤中拿不到期權 1 分鐘 K,"
              "所以 MFE/MAE 是輪詢到的最佳/最差買價,不是盤中極值。標的 1 分鐘 K 來自 IEX,成交量只是 IEX 的份額,"
              "所有量能條件(RVOL、突破量)都是同一資料源的比率,不是全市場絕對量。")

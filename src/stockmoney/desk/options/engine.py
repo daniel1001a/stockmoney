@@ -29,14 +29,35 @@ A's OptionsBook (idempotent per client_order_id) and the reservation is
 RELEASED once the entry is booked or ends unfilled.
 
 Exits (OPTIONS_PLAN.md section 5, the same for shadow and live, checked in
-this order): forced flat at 15:45 ET; underlying invalidation (a price
+this order): forced flat at 15:45 ET (on an early close: the close minus
+15 minutes, e.g. 12:45 ET; see "Session clock" below); underlying invalidation (a price
 level crossed by the quote, a completed 1-minute close beyond a level, or a
 close back across VWAP, depending on the playbook); time stop (180 min, or
 the plan's shorter max_hold_minutes); then by exit variant: A = premium stop
 -35% on the quote mid, +40% on the mid takes half (all of a single contract)
 and moves the stop on the rest to cost; B = premium stop -30%, +40% takes
 half, the rest trails the underlying by 0.4 x ATR(14) of its 1-minute bars.
-Premium exits need a fresh quote; the rest do not.
+Premium exits need a fresh quote; the rest do not. Every live exit passes
+the risk gate (check_exit: never more than the broker holds, so never a
+sell to open); a limit sell the gate refuses falls back to a market sell.
+
+Session clock: the day's close comes from the broker's market calendar when
+it has one (Alpaca) and from desk.calendar.EARLY_CLOSES otherwise (the
+earlier of the two wins). Forced flat = min(15:45, close - 15 min); the
+risk gate's flat_by is set to the same time; the time stop of a new entry
+is capped by it; no live entry with less than 90 minutes left before it.
+The owner is paged (CRITICAL) if the book is not flat 10 minutes before the
+close (15:50 ET on a normal day), and again by finish().
+
+Leftovers: a live row of an EARLIER day still PENDING / ENTERED (the session
+died, the Mac slept) is resolved every tick and sold at market from the
+open (09:30), the first tick of the session; shadow leftovers are closed at
+their last known bid. On the first tick of a day the broker's option
+positions are compared with the store and the options book, and any
+position the store does not know is paged CRITICAL (never sold: it may be
+the owner's own trade). A partly filled entry stuck in PENDING (its cancel
+keeps failing) gets exits too: from the forced flat, when its time stop
+elapses, or when it is left over, the filled part is sold.
 
 Option prices: the account has only the "indicative" option feed and no
 real-time option 1-minute bars (OPTIONS_PLAN.md sections 10 and 12). Every
@@ -67,7 +88,7 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 
 from stockmoney.desk import notify
-from stockmoney.desk.calendar import is_trading_day
+from stockmoney.desk.calendar import close_time, is_trading_day
 from stockmoney.desk.options import plan as oplan
 from stockmoney.desk.options import playbooks as pb
 from stockmoney.desk.options import select as sel
@@ -75,7 +96,7 @@ from stockmoney.desk.options import shadow as sh
 from stockmoney.desk.options import store as ostore
 from stockmoney.desk.options import universe as uni
 from stockmoney.desk.options._iface import (
-    TIF, AssetClass, OptionContract, OrderIntent, OrderStatus, OrderType, RiskGate, Side,
+    TIF, AssetClass, OptionContract, OptionsBook, OrderIntent, OrderStatus, OrderType, RiskDecision, RiskGate, Side,
 )
 from stockmoney.desk.options.config import GROK, RULE_PLAYBOOKS, OptionsConfig
 
@@ -85,8 +106,11 @@ ET = ZoneInfo("America/New_York")
 WAITING, TRIGGERED, ENTERED, EXITED = "WAITING", "TRIGGERED", "ENTERED", "EXITED"
 EXPIRED, MISSED, SKIPPED, SUPERSEDED = "EXPIRED", "MISSED", "SKIPPED", "SUPERSEDED"
 PENDING, ABANDONED = "PENDING", "ABANDONED"
+# "unresolved": an exit whose status could not be read for a while and was
+# superseded by a fresh market sell; it is still polled to book late fills
+UNRESOLVED = "unresolved"
 _TERMINAL_ORDER = {OrderStatus.FILLED.value, OrderStatus.CANCELED.value, OrderStatus.EXPIRED.value,
-                   OrderStatus.REJECTED.value, "not_sent"}
+                   OrderStatus.REJECTED.value, "not_sent", UNRESOLVED}
 NOT_SENT_AFTER_S = 30.0  # a pending_submit row the broker still does not know after this was never sent
 
 
@@ -103,6 +127,28 @@ def _prev_trading_day(d: date) -> date:
     while not is_trading_day(d):
         d -= timedelta(days=1)
     return d
+
+
+def market_close(broker, day: date) -> tuple[int, int]:
+    """Close of ``day`` in ET (hour, minute): the earlier of the broker's
+    market calendar (Alpaca's, when the broker exposes a trading client) and
+    desk.calendar.close_time, so an early close known to either is honored.
+    A calendar error falls back to the built-in list."""
+    hm = close_time(day)
+    client = getattr(broker, "client", None)
+    if client is None or not hasattr(client, "get_calendar"):
+        return hm
+    try:
+        from alpaca.trading.requests import GetCalendarRequest
+        req = GetCalendarRequest(start=day, end=day)
+        retry = getattr(broker, "_retry", None)
+        cal = retry(lambda: client.get_calendar(req), "get_calendar") if callable(retry) else client.get_calendar(req)
+        for c in cal:
+            if c.date == day:  # open / close are naive ET wall-clock datetimes
+                hm = min(hm, (c.close.hour, c.close.minute))
+    except Exception as e:
+        log.warning("market calendar unavailable, using the built-in early-close list: %s", e)
+    return hm
 
 
 class Engine:
@@ -126,13 +172,18 @@ class Engine:
         self._active = None
         self._errors = 0
         self._plan_seen: str | None = None
+        self._closes: dict[date, tuple[int, int]] = {}
+        self._flat_day: str | None = None      # day the risk gate's flat_by was last set for
+        self._swept: str | None = None         # day the start-of-day sweep last ran
+        self._cancel_fail: dict[str, int] = {}  # client_order_id -> failed cancels in a row
+        self._status_fail: dict[str, int] = {}  # exit client_order_id -> failed get_order reads in a row
+        self._obook: OptionsBook | None = None
         ostore.ensure_schema(con)
 
     # ================================================================ tick
-    def tick(self) -> dict:
-        now = self.clock()
-        et = _et(now)
-        day = et.date()
+    def _begin(self, now: datetime) -> None:
+        """Per-tick context (also used by recover and finish)."""
+        day = _et(now).date()
         self._now, self._day, self._dstr = now, day, str(day)
         self._quotes: dict[str, OptionContract | None] = {}
         self._chains: dict[tuple, list[OptionContract]] = {}
@@ -140,10 +191,16 @@ class Engine:
         self._flags: dict[str, str] | None = None
         self._tick_bars: dict[str, pd.DataFrame] = {}
         self._tick_errors = 0
+
+    def tick(self) -> dict:
+        now = self.clock()
+        self._begin(now)
+        et, day = _et(now), self._day
         self._ensure_day(now)
         halted = self.cfg.halt_file.exists()
         if halted and ostore.notify_once(self.con, f"{self._dstr}:halt"):
             self._notify("期權軌道:HALT 生效", "data/desk/HALT 存在:新進場全擋(影子照記),出場照常。", notify.WARN)
+        self._start_of_day(now)
         # resolve working orders and exits before any new entry, so the risk
         # gate sees a book that already includes this tick's fills
         self._manage_pending(now)
@@ -155,6 +212,7 @@ class Engine:
                 except Exception as e:  # one symbol's bad data must not stop the loop
                     self._error("scan", f"{m['symbol']}: {type(e).__name__}: {e}")
         self._roll_setups()
+        self._flat_alert(now)
         self._errors = 0 if self._tick_errors == 0 else self._errors
         self.con.commit()
         return self.summary()
@@ -164,9 +222,38 @@ class Engine:
                                 (self._dstr,)).fetchall()
         return {f"{r['mode']}_{r['state'].lower()}": r["n"] for r in rows}
 
+    # ================================================================ session clock
+    def _close(self) -> datetime:
+        """Today's regular-session close (ET), early closes included."""
+        if self._day not in self._closes:
+            self._io()
+            self._closes[self._day] = market_close(self.broker, self._day)
+        return _at(self._day, self._closes[self._day])
+
+    def _flat(self) -> datetime:
+        """Today's forced-flat time: 15:45, or the close minus 15 minutes if earlier."""
+        return min(_at(self._day, self.cfg.force_flat),
+                   self._close() - timedelta(minutes=self.cfg.flat_before_close_min))
+
+    def session_end(self, now: datetime | None = None) -> datetime:
+        """When the session loop stops (the day of ``now``, else of the last
+        tick): the close, never after cfg.session_end."""
+        if now is not None:
+            self._begin(now)
+        return min(_at(self._day, self.cfg.session_end), self._close())
+
+    def _live_rows(self, states: tuple[str, ...], today: bool = True) -> list[dict]:
+        """Live rows in ``states``: those left over from earlier days first,
+        then (``today``) today's."""
+        rows = ostore.leftovers(self.con, self._dstr, "live", states)
+        return rows + (ostore.positions(self.con, self._dstr, "live", states) if today else [])
+
     # ================================================================ day setup
     def _ensure_day(self, now: datetime) -> None:
         cfg, d = self.cfg, self._dstr
+        if self._flat_day != d:  # the gate refuses buys from the same (possibly early) flat time
+            self._flat_day = d
+            self.risk_gate.set_flat_by(self._flat().time())
         active = self._active = oplan.active_plan(self.con, self._day)
         if not ostore.universe(self.con, d):
             if _et(now) < _at(self._day, cfg.open_time) - timedelta(minutes=5):
@@ -181,6 +268,7 @@ class Engine:
         the official closing auction print; within a few cents for liquid names."""
         pd_ = _prev_trading_day(self._day)
         try:
+            self._io()
             b = self.broker.minute_bars(sym, _at(pd_, (15, 50)), _at(pd_, (16, 0)))
         except Exception as e:
             self._error("prev_close", f"{sym}: {e}")
@@ -195,6 +283,7 @@ class Engine:
         ``premarket_dollar_volume`` (delayed SIP: the live IEX feed has almost
         no premarket prints) is preferred; else the broker's own minute bars."""
         try:
+            self._io()
             fn = getattr(self.broker, "premarket_dollar_volume", None)
             if callable(fn):
                 return fn(sym, self._day, now)
@@ -213,6 +302,7 @@ class Engine:
         for s in cfg.scan_candidates:
             prev[s] = self._prev_close(s)
             try:
+                self._io()
                 b = pb.completed(self.broker.minute_bars(s, _at(self._day, (4, 0)), now), now)
             except Exception as e:
                 self._error("scan", f"{s}: {e}")
@@ -428,6 +518,7 @@ class Engine:
             ostore.update_setup(self.con, sid, state=EXPIRED)
             ostore.filtered(self.con, d, now, "entry", sym, "outside_window", sid)
             return
+        self._io()
         q = self.broker.stock_quote(sym)
         if not q or q[0] <= 0 or q[1] < q[0]:
             return self._skip(s, now, "no_underlying_quote")
@@ -441,6 +532,8 @@ class Engine:
         spec = json.loads(s["spec_json"] or "{}")
         if s["source"] == GROK:
             max_hold = min(max_hold, int(spec["item"]["max_hold_minutes"]))
+        # the time stop never runs past the day's forced flat (earlier on a half day)
+        max_hold = max(min(max_hold, int((self._flat() - now).total_seconds() // 60)), 1)
         flags = self._muse_flags(now)
         ctx = {"muse_flag": flags.get(sym, ""), "halted": halted, "plan_id": s["plan_id"] or "",
                "plan_shadow_only": bool(spec.get("shadow_only", False)), "received_at": spec.get("received_at")}
@@ -532,11 +625,15 @@ class Engine:
             return block("no_live_contract")
         if ch.contract.expiry <= self._day:  # never a live order on a contract that expires today
             return block("expires_today", {"occ": ch.contract.occ})
-        n_live = self.con.execute("SELECT COUNT(*) FROM options_positions WHERE day=? AND mode='live' AND state IN (?,?)",
+        left = (self._flat() - now).total_seconds() / 60
+        if left < cfg.min_live_minutes_before_flat:  # e.g. after 11:15 ET on a 13:00 close
+            return block("too_close_to_flat", {"minutes_left": round(left), "flat": f"{self._flat():%H:%M}"})
+        # day <= today: a leftover of an earlier day still counts until it is sold
+        n_live = self.con.execute("SELECT COUNT(*) FROM options_positions WHERE day<=? AND mode='live' AND state IN (?,?)",
                                   (d, PENDING, ENTERED)).fetchone()[0]
         if n_live >= cfg.max_open_positions:
             return block("max_open_positions")
-        n_sym = self.con.execute("SELECT COUNT(*) FROM options_positions WHERE day=? AND mode='live' AND underlying=? "
+        n_sym = self.con.execute("SELECT COUNT(*) FROM options_positions WHERE day<=? AND mode='live' AND underlying=? "
                                  "AND state IN (?,?)", (d, sym, PENDING, ENTERED)).fetchone()[0]
         if n_sym >= cfg.max_live_per_underlying:
             return block("max_live_per_underlying")
@@ -550,6 +647,7 @@ class Engine:
                              order_type=OrderType.LIMIT, tif=TIF.DAY, limit_price=limit,
                              strategy=f"options:{s['source']}", reason=sig.reason[:200])
         try:
+            self._io()
             dec = self.risk_gate.check(intent, c, now, marks=self._live_marks(), blocked=flags)
         except Exception as e:  # a failing gate is a "no"
             self._error("risk_gate", str(e))
@@ -600,6 +698,7 @@ class Engine:
                                    intent.order_type.value, intent.limit_price, reason, now):
             return
         try:
+            self._io()
             o = self.broker.submit(intent)
         except Exception as e:  # unknown outcome: stays pending_submit, resolved by get_order next tick
             ostore.update_order(self.con, intent.client_order_id, note=f"submit error: {type(e).__name__}: {e}"[:500])
@@ -612,14 +711,65 @@ class Engine:
 
     # ================================================================ live order resolution
     def _manage_pending(self, now: datetime) -> None:
-        for p in ostore.positions(self.con, self._dstr, "live", (PENDING,)):
+        for p in self._live_rows((PENDING,)):
             try:
                 self._resolve_entry(p, now)
+                p = ostore.position(self.con, p["position_id"])
+                if p["state"] == PENDING:
+                    self._exit_partial(p, now)
             except Exception as e:
                 self._error("entry_order", f"{p['position_id']}: {type(e).__name__}: {e}")
 
+    def _pending_due(self, p: dict, now: datetime) -> str:
+        """Exit reason for the filled part of an entry still working, or ''."""
+        if p["day"] < self._dstr:
+            return "carry_over" if _et(now) >= _at(self._day, self.cfg.open_time) else ""
+        if now >= self._flat():
+            return "force_flat"
+        row = ostore.order(self.con, ostore.cid(p["position_id"], "e"))
+        if row is not None:
+            held = (now - datetime.fromisoformat(row["submitted_at"])).total_seconds() / 60
+            if held >= (p["max_hold_min"] or self.cfg.time_stop_minutes):
+                return "time_stop"
+        return ""
+
+    def _exit_partial(self, p: dict, now: datetime) -> None:
+        """A partly filled entry whose rest is still working (its cancel has
+        not taken effect, or keeps failing): once due, sell what filled at
+        market. The row stays PENDING until the entry order ends; later
+        fills of it are booked and sold the same way."""
+        working = [o for o in ostore.orders_for(self.con, p["position_id"])
+                   if o["kind"] == "exit" and o["status"] not in _TERMINAL_ORDER]
+        if working:
+            self._resolve_exit(p, working[-1], now)
+            return
+        if (p["qty_open"] or 0) <= 1e-9:
+            return
+        reason = self._pending_due(p, now)
+        if reason:
+            self._send_exit(p, p["qty_open"], reason, None, now)
+
+    def _cancel(self, cid: str, why: str) -> bool:
+        """Request a cancel; a failure is counted and, after
+        cancel_max_failures in a row, paged (CRITICAL) once per order."""
+        try:
+            self._io()
+            self.broker.cancel(cid)
+        except Exception as e:
+            n = self._cancel_fail[cid] = self._cancel_fail.get(cid, 0) + 1
+            self._error("cancel", f"{cid}: {type(e).__name__}: {e}")
+            if n >= self.cfg.cancel_max_failures and ostore.notify_once(self.con, f"{self._dstr}:cancel_failed:{cid}"):
+                ostore.event(self.con, self._dstr, self._now, "critical", "cancel_failed", f"{cid} x{n}: {e}")
+                self._notify("期權軌道:撤單一直失敗", f"{cid} 已連續 {n} 次撤單失敗({type(e).__name__}: {e})。"
+                             "已成交的部分會照常賣出;仍在掛的單請到 Alpaca 手動撤銷。", notify.CRITICAL)
+            return False
+        self._cancel_fail.pop(cid, None)
+        ostore.update_order(self.con, cid, note=f"cancel requested ({why})")
+        return True
+
     def _broker_order(self, row: dict, now: datetime):
         """(order or None, gone). ``gone`` = the broker never received it."""
+        self._io()
         o = self.broker.get_order(row["client_order_id"])
         if o is None and row["status"] == ostore.PENDING_SUBMIT:
             age = (now - datetime.fromisoformat(row["submitted_at"])).total_seconds()
@@ -657,7 +807,13 @@ class Engine:
         ostore.update_order(self.con, ecid, status=status)
         if status in _TERMINAL_ORDER:
             self.risk_gate.release(p["occ"])
-            if o.filled_qty and o.filled_qty > 0:
+            cur = ostore.position(self.con, pid)
+            if o.filled_qty and o.filled_qty > 0 and (cur["qty_open"] or 0) <= 1e-9 and cur["exit_reason"]:
+                # every filled contract was already sold while the entry was still working
+                ostore.update_position(self.con, pid, state=EXITED, qty_initial=o.filled_qty,
+                                       entry_time=ostore.iso(o.filled_at or now),
+                                       exit_time=cur["exit_time"] or ostore.iso(now))
+            elif o.filled_qty and o.filled_qty > 0:
                 ostore.update_position(self.con, pid, state=ENTERED, qty_initial=o.filled_qty,
                                        entry_time=ostore.iso(o.filled_at or now))
                 self._notify("期權紙上進場", f"{p['underlying']} {p['occ']} x{o.filled_qty:g} @ {o.filled_avg_price:.2f}"
@@ -667,13 +823,14 @@ class Engine:
                                        exit_time=ostore.iso(now))
             return
         age = (now - datetime.fromisoformat(row["submitted_at"])).total_seconds()
-        if age >= cfg.entry_timeout_s or _et(now) >= _at(self._day, cfg.force_flat):
-            self.broker.cancel(ecid)
-            ostore.update_order(self.con, ecid, note="cancel requested (entry timeout)")
+        if age >= cfg.entry_timeout_s or now >= self._flat():
+            self._cancel(ecid, "entry timeout")
 
     # ================================================================ exits
     def _manage_open(self, now: datetime) -> None:
-        for p in ostore.positions(self.con, self._dstr, None, (ENTERED,)):
+        rows = ostore.leftovers(self.con, self._dstr, "live", (ENTERED,)) + ostore.positions(self.con, self._dstr, None,
+                                                                                               (ENTERED,))
+        for p in rows:
             try:
                 self._manage_one(p, now)
             except Exception as e:
@@ -682,6 +839,7 @@ class Engine:
     def _quote(self, occ: str) -> OptionContract | None:
         if occ not in self._quotes:
             try:
+                self._io()
                 self._quotes[occ] = self.broker.option_quote(occ)
             except Exception as e:
                 self._error("quote", f"{occ}: {e}")
@@ -689,6 +847,7 @@ class Engine:
         return self._quotes[occ]
 
     def _fresh(self, q: OptionContract | None, now: datetime) -> bool:
+        """A usable quote: finite, sane two-sided (OptionContract.mid) and recent."""
         return (q is not None and sel.mid(q) is not None and q.as_of is not None
                 and (now - q.as_of).total_seconds() <= self.cfg.max_quote_age_s)
 
@@ -706,8 +865,14 @@ class Engine:
                 ostore.update_position(self.con, p["position_id"], trail_ref=spot)
                 p = ostore.position(self.con, p["position_id"])
         if p["mode"] == "live":
-            working = [o for o in ostore.orders_for(self.con, p["position_id"])
-                       if o["kind"] == "exit" and o["status"] not in _TERMINAL_ORDER]
+            orders = ostore.orders_for(self.con, p["position_id"])
+            for o in orders:
+                if o["kind"] == "exit" and o["status"] == UNRESOLVED:
+                    self._poll_unresolved(p, o, now)
+            p = ostore.position(self.con, p["position_id"])
+            if p["state"] != ENTERED:
+                return
+            working = [o for o in orders if o["kind"] == "exit" and o["status"] not in _TERMINAL_ORDER]
             if working:
                 self._resolve_exit(p, working[-1], now)
                 return
@@ -721,13 +886,15 @@ class Engine:
                 return
             self._book_exit(p, qty, sh.sell_price(bid, self.cfg), bid, ask, reason, now,
                             "" if fresh else "stale quote: last known bid")
-        else:
-            self._send_exit(p, qty, reason, q if fresh else None, now)
+        else:  # a leftover always goes out at market
+            self._send_exit(p, qty, reason, None if reason == "carry_over" else (q if fresh else None), now)
 
     def _exit_decision(self, p: dict, q: OptionContract | None, now: datetime) -> tuple[str, float]:
         cfg = self.cfg
         qty = p["qty_open"]
-        if _et(now) >= _at(self._day, cfg.force_flat):
+        if p["day"] < self._dstr:  # left over from an earlier session: out from the open, first tick
+            return ("carry_over", qty) if _et(now) >= _at(self._day, cfg.open_time) else ("", 0)
+        if now >= self._flat():
             return "force_flat", qty
         spot = self._spot(p["underlying"], now)
         inv, long_ = p["invalidation"], p["direction"] == "long"
@@ -794,6 +961,7 @@ class Engine:
         if sym not in self._spots:
             v = None
             try:
+                self._io()
                 q = self.broker.stock_quote(sym)
                 if q and q[0] > 0 and q[1] >= q[0]:
                     v = (q[0] + q[1]) / 2
@@ -819,12 +987,19 @@ class Engine:
         if reason == "take_profit" and left > 0:
             fields.update(tp_done=1, stop_price=p["entry_price"], trail_ref=self._spot(p["underlying"], now))
         if left <= 1e-9:
-            fields.update(state=EXITED, exit_time=ostore.iso(now), exit_reason=reason)
+            fields.update(exit_time=ostore.iso(now), exit_reason=reason)
+            if p["state"] != PENDING:  # a partly filled entry still working stays PENDING until it ends
+                fields["state"] = EXITED
         if note:
             fields["note"] = ((p["note"] or "") + "; " + note).strip("; ")[:500]
         ostore.update_position(self.con, pid, **fields)
 
-    def _send_exit(self, p: dict, qty: float, reason: str, q: OptionContract | None, now: datetime) -> None:
+    def _send_exit(self, p: dict, qty: float, reason: str, q: OptionContract | None, now: datetime,
+                   force_market: bool = False) -> bool:
+        """Send one sell to close through the risk gate. A limit the gate
+        refuses (price band, no sane quote) is retried as a market sell; a
+        market sell the gate refuses (nothing held at the broker: it would
+        open a short) is not sent, and the owner is paged once."""
         cfg, pid = self.cfg, p["position_id"]
         exits = [o for o in ostore.orders_for(self.con, pid) if o["kind"] == "exit"]
         streak = 0
@@ -832,23 +1007,58 @@ class Engine:
             if (o["filled_qty"] or 0) > 0:
                 break
             streak += 1
-        if q is not None and q.bid and streak < cfg.exit_max_limit_attempts:
+        if exits and now >= self._flat():  # at/after the forced flat a repeat attempt is a market sell
+            force_market = True
+        if not force_market and q is not None and q.bid and streak < cfg.exit_max_limit_attempts:
             otype, limit = OrderType.LIMIT, sh.round_tick(q.bid, sh.option_tick(p["underlying"], q.bid), up=False)
         else:
             otype, limit = OrderType.MARKET, None
         intent = OrderIntent(ostore.cid(pid, f"x{len(exits)}"), p["occ"], AssetClass.OPTION, Side.SELL, qty=qty,
                              order_type=otype, tif=TIF.DAY, limit_price=limit, strategy=f"options:{p['source']}",
                              reason=reason)
+        dec = self._exit_gate(intent, q, now)
+        if not dec.allow and intent.order_type == OrderType.LIMIT:
+            intent = replace(intent, order_type=OrderType.MARKET, limit_price=None)
+            dec = self._exit_gate(intent, q, now)
+        if not dec.allow:
+            log.warning("options exit refused by the risk gate: %s %s", pid, dec.reason)
+            if ostore.notify_once(self.con, f"{self._dstr}:exit_refused:{pid}"):
+                ostore.event(self.con, self._dstr, now, "critical", "exit_refused", f"{pid} {p['occ']}: {dec.reason}")
+                self._notify("期權軌道:出場被風控擋下", f"{p['occ']} x{qty:g}({reason})被風控拒絕:{dec.reason[:300]}。"
+                             "每輪會重試;請到 Alpaca 確認實際持倉。", notify.CRITICAL)
+            return False
         self._submit(pid, intent, "exit", reason, now)
+        return True
 
-    def _resolve_exit(self, p: dict, row: dict, now: datetime) -> None:
+    def _exit_gate(self, intent: OrderIntent, q: OptionContract | None, now: datetime) -> RiskDecision:
+        """The risk gate's verdict on one sell. A gate error is a refusal,
+        and so is an allowed intent the gate changed (exits are never resized)."""
+        try:
+            self._io()
+            dec = self.risk_gate.check_exit(intent, q, now)
+        except Exception as e:
+            self._error("risk_gate", f"exit {intent.client_order_id}: {type(e).__name__}: {e}")
+            return RiskDecision(False, f"risk gate error: {type(e).__name__}: {e}")
+        final = dec.intent or intent
+        if dec.allow and (final.client_order_id, final.symbol, final.side, final.qty, final.order_type,
+                          final.limit_price) != (intent.client_order_id, intent.symbol, Side.SELL, intent.qty,
+                                                 intent.order_type, intent.limit_price):
+            return RiskDecision(False, f"risk gate changed the exit: {dec.reason}")
+        return dec
+
+    def _book_exit_order(self, p: dict, row: dict, o) -> dict:
+        """Book the new part of an exit order's fills. The broker reports the
+        CUMULATIVE filled qty and average price; the new contracts are booked
+        at their own price, (cum_qty * cum_avg - value already booked) /
+        new qty, so a partly filled exit never re-prices earlier contracts.
+        Returns the (re-read) position."""
         cid = row["client_order_id"]
-        o, gone = self._broker_order(row, now)
-        if o is None:
-            return
-        delta = (o.filled_qty or 0) - (row["booked_qty"] or 0)
-        if delta > 0 and o.filled_avg_price is not None:
-            self._book_exit(p, delta, o.filled_avg_price, p["last_bid"], p["last_ask"], row["reason"], now,
+        booked = row["booked_qty"] or 0
+        delta = (o.filled_qty or 0) - booked
+        if delta > 1e-9 and o.filled_avg_price is not None:
+            done_value = (row["avg_price"] or 0.0) * booked
+            price = (o.filled_qty * o.filled_avg_price - done_value) / delta
+            self._book_exit(p, delta, price, p["last_bid"], p["last_ask"], row["reason"], self._now,
                             client_order_id=f"{cid}#{o.filled_qty:g}")
             ostore.update_order(self.con, cid, booked_qty=o.filled_qty, filled_qty=o.filled_qty,
                                 avg_price=o.filled_avg_price)
@@ -857,19 +1067,205 @@ class Engine:
             if p["state"] == EXITED:
                 self._notify("期權紙上出場", f"{p['underlying']} {p['occ']}:{p['exit_reason']},"
                              f"損益 {p['realized_usd'] - p['fees_usd']:+.0f} 美元", notify.INFO)
+        return p
+
+    def _resolve_exit(self, p: dict, row: dict, now: datetime) -> None:
+        cid = row["client_order_id"]
+        try:
+            o, gone = self._broker_order(row, now)
+        except Exception as e:
+            self._exit_status_failed(p, row, e, now)
+            return
+        self._status_fail.pop(cid, None)
+        if o is None:
+            return
+        p = self._book_exit_order(p, row, o)
         ostore.update_order(self.con, cid, status=o.status.value)
         if o.status.value in _TERMINAL_ORDER:
             return
         age = (now - datetime.fromisoformat(row["submitted_at"])).total_seconds()
         if age >= self.cfg.exit_timeout_s:
-            self.broker.cancel(cid)
-            ostore.update_order(self.con, cid, note="cancel requested (reprice)")
+            self._cancel(cid, "reprice")
+        elif now >= self._flat() and row["order_type"] == OrderType.LIMIT.value:
+            # at/after the forced flat a working limit is replaced at once by one market sell
+            self._cancel(cid, "forced flat: replace by a market sell")
+
+    def _exit_status_failed(self, p: dict, row: dict, err: Exception, now: datetime) -> None:
+        """get_order of a working exit failed. After order_status_max_failures
+        in a row: page once, cancel it (best effort) and, only when a fresh
+        broker read shows contracts still held, send ONE fresh market sell
+        for min(held, open qty). The risk gate counts the broker's working
+        sells, so a sell is never doubled while the old order still works.
+        The old row becomes 'unresolved' and is still polled for late fills."""
+        cid = row["client_order_id"]
+        n = self._status_fail[cid] = self._status_fail.get(cid, 0) + 1
+        self._error("exit_order", f"{cid}: get_order failed ({n}x): {type(err).__name__}: {err}")
+        if n < self.cfg.order_status_max_failures:
+            return
+        self._status_fail[cid] = 0  # the next fallback only after another full run of failures
+        if ostore.notify_once(self.con, f"{self._dstr}:exit_status:{p['position_id']}"):
+            self._notify("期權軌道:出場單狀態讀不到", f"{p['occ']} 的出場單 {cid} 連續 {n} 次查不到狀態({err})。"
+                         "會先撤舊單,再依券商持倉數量改送一張市價賣單(不會重複賣出)。", notify.CRITICAL)
+        self._cancel(cid, "status unreadable")
+        held = self._broker_held(p["occ"])
+        if held is None or held <= 1e-9:
+            return  # unknown, or nothing left at the broker: keep polling the old order
+        qty = min(float(p["qty_open"] or 0), float(held))
+        if qty < 1:
+            return
+        ostore.update_order(self.con, cid, status=UNRESOLVED, note="status unreadable; superseded by a market sell")
+        if not self._send_exit(p, qty, row["reason"], None, now, force_market=True):
+            ostore.update_order(self.con, cid, status=row["status"], note="status unreadable; fallback refused")
+
+    def _poll_unresolved(self, p: dict, row: dict, now: datetime) -> None:
+        """Book late fills of a superseded exit; a failure here is silent
+        (it was paged when the row was superseded)."""
+        try:
+            self._io()
+            o = self.broker.get_order(row["client_order_id"])
+        except Exception as e:
+            log.info("options unresolved exit %s still unreadable: %s", row["client_order_id"], e)
+            return
+        if o is None:
+            return
+        self._book_exit_order(p, row, o)
+        if o.status.value in _TERMINAL_ORDER:
+            ostore.update_order(self.con, row["client_order_id"], note=f"late status {o.status.value}")
+        else:
+            self._cancel(row["client_order_id"], "superseded exit still working")
+
+    def _broker_held(self, occ: str) -> float | None:
+        """Contracts of ``occ`` the broker holds now, or None when unreadable."""
+        try:
+            self._io()
+            snap = self.broker.account()
+        except Exception as e:
+            self._error("broker_positions", f"{type(e).__name__}: {e}")
+            return None
+        return sum(bp.qty for bp in snap.positions if bp.symbol == occ and bp.asset_class == AssetClass.OPTION)
+
+    # ================================================================ leftovers and flatness
+    def _start_of_day(self, now: datetime) -> None:
+        """Once per day (first tick, or recover): close shadow leftovers of
+        earlier days at their last known bid, page live leftovers (they are
+        sold at market from the open by _manage_pending / _manage_open), and
+        compare the broker's option positions with the store."""
+        if self._swept == self._dstr:
+            return
+        self._swept = self._dstr
+        for p in ostore.leftovers(self.con, self._dstr, "shadow", (ENTERED,)):
+            self._book_exit(p, p["qty_open"], sh.sell_price(p["last_bid"] or 0.0, self.cfg), p["last_bid"],
+                            p["last_ask"], "carry_over", now, "its session ended before the forced flat: last known bid")
+        left = ostore.leftovers(self.con, self._dstr, "live", (PENDING, ENTERED))
+        if left and ostore.notify_once(self.con, f"{self._dstr}:leftovers"):
+            what = "; ".join(f"{p['occ']} x{p['qty_open'] or 0:g} ({p['state']}, {p['day']})" for p in left)
+            ostore.event(self.con, self._dstr, now, "critical", "leftovers", what)
+            self._notify("期權軌道:前一日部位未平", f"發現前一交易日未平倉的紙上期權部位:{what[:1200]}。"
+                         f"{self.cfg.open_time[0]:02d}:{self.cfg.open_time[1]:02d} ET 起以市價賣出平倉。",
+                         notify.CRITICAL)
+        self._check_broker(now)
+        self.con.commit()
+
+    def _book_positions(self) -> set[str]:
+        try:
+            if self._obook is None:
+                self._obook = OptionsBook(self.con)
+            return set(self._obook.positions())
+        except Exception as e:
+            self._error("options_book", f"{type(e).__name__}: {e}")
+            return set()
+
+    def _check_broker(self, now: datetime) -> list[str]:
+        """Broker option positions the store does not know (no live PENDING /
+        ENTERED row on that contract): paged CRITICAL once per day and set,
+        never sold (it may be the owner's own trade). The risk gate then
+        refuses every entry (book / broker mismatch) until it is resolved."""
+        if not hasattr(self.broker, "account"):
+            return []
+        try:
+            self._io()
+            snap = self.broker.account()
+        except Exception as e:
+            self._error("broker_positions", f"{type(e).__name__}: {e}")
+            return []
+        known = {r[0] for r in self.con.execute("SELECT DISTINCT occ FROM options_positions WHERE mode='live' "
+                                                "AND state IN (?,?)", (PENDING, ENTERED))}
+        book = self._book_positions()
+        out = [f"{bp.symbol} x{bp.qty:g}" + (" (in the options book, not in the sleeve store)" if bp.symbol in book
+                                             else " (unknown to the sleeve store and the options book)")
+               for bp in snap.positions
+               if bp.asset_class == AssetClass.OPTION and abs(bp.qty) > 1e-9 and bp.symbol not in known]
+        if out and ostore.notify_once(self.con, f"{self._dstr}:unknown_broker:{'|'.join(sorted(out))}"[:400]):
+            ostore.event(self.con, self._dstr, now, "critical", "unknown_broker_positions", "; ".join(out))
+            self._notify("期權軌道:券商有未知期權部位", "券商持有本軌道不知道的期權部位(手動下單?):" + "; ".join(out)[:1200]
+                         + "。本軌道不會自動賣出;帳本與券商不一致時當天新進場會被風控擋。請手動處理。", notify.CRITICAL)
+        return out
+
+    def _flat_problems(self) -> list[str]:
+        """Live rows still PENDING / ENTERED (any day) and every option
+        position the broker holds; empty when flat."""
+        problems = [f"{p['occ']} ({p['state']}, {p['day']})" for p in self._live_rows((PENDING, ENTERED))]
+        if hasattr(self.broker, "account"):
+            try:
+                self._io()
+                snap = self.broker.account()
+                problems += [f"broker {bp.symbol} x{bp.qty:g}" for bp in snap.positions
+                             if bp.asset_class == AssetClass.OPTION and abs(bp.qty) > 1e-9]
+            except Exception as e:
+                problems.append(f"cannot read broker positions: {e}")
+        return problems
+
+    def _flat_alert(self, now: datetime) -> None:
+        """Once a day, not_flat_alert_min before the close (15:50 ET, 12:50 on
+        a 13:00 close): page CRITICAL if anything is still open, while there
+        is still time to act by hand."""
+        if now < self._close() - timedelta(minutes=self.cfg.not_flat_alert_min):
+            return
+        if not ostore.notify_once(self.con, f"{self._dstr}:flat_check"):
+            return
+        problems = self._flat_problems()
+        if problems:
+            ostore.event(self.con, self._dstr, now, "critical", "not_flat_before_close", "; ".join(problems))
+            self._notify("期權軌道收盤前未平倉", f"距收盤 {self.cfg.not_flat_alert_min} 分鐘仍有期權部位未平:"
+                         + "; ".join(problems)[:1500] + "。請立即到 Alpaca 確認。", notify.CRITICAL)
+
+    # ================================================================ recover (run.py recover)
+    def recover(self) -> dict:
+        """Standalone leftover cleanup, no session: resolve every live row
+        still PENDING / ENTERED (earlier days, and today's when no session
+        is running: the caller holds the session lock), and while the market
+        is open sell them at market through the risk gate. Pages unknown
+        broker positions. Returns {"open": n rows still open, "market_open": bool}."""
+        now = self.clock()
+        self._begin(now)
+        self._start_of_day(now)
+        et = _et(now)
+        market_open = is_trading_day(self._day) and _at(self._day, self.cfg.open_time) <= et < self._close()
+        for p in self._live_rows((PENDING, ENTERED)):
+            try:
+                if p["state"] == PENDING:
+                    self._resolve_entry(p, now)
+                    p = ostore.position(self.con, p["position_id"])
+                    if p["state"] not in (PENDING, ENTERED):
+                        continue
+                orders = ostore.orders_for(self.con, p["position_id"])
+                working = [o for o in orders if o["kind"] == "exit" and o["status"] not in _TERMINAL_ORDER]
+                if working:
+                    self._resolve_exit(p, working[-1], now)
+                elif market_open and (p["qty_open"] or 0) > 1e-9:
+                    self._send_exit(p, p["qty_open"], "carry_over" if p["day"] < self._dstr else "recover_flat",
+                                    None, now)
+            except Exception as e:
+                self._error("recover", f"{p['position_id']}: {type(e).__name__}: {e}")
+        self._roll_setups()
+        self.con.commit()
+        return {"open": len(self._live_rows((PENDING, ENTERED))), "market_open": market_open}
 
     # ================================================================ wrap-up
     def _roll_setups(self) -> None:
-        for s in ostore.setups(self.con, self._dstr):
-            if s["state"] != ENTERED:
-                continue
+        # day <= today: a leftover's setup is closed once the leftover is sold
+        for s in [dict(r) for r in self.con.execute("SELECT setup_id FROM options_setups WHERE state=? AND day<=?",
+                                                    (ENTERED, self._dstr))]:
             open_ = self.con.execute("SELECT COUNT(*) FROM options_positions WHERE setup_id=? AND state IN (?,?)",
                                      (s["setup_id"], PENDING, ENTERED)).fetchone()[0]
             if open_ == 0:
@@ -877,22 +1273,15 @@ class Engine:
 
     def finish(self) -> bool:
         """End of session: close any shadow position still open at its last
-        known bid, then verify the live book is flat (store AND broker).
-        Returns True when flat; pages the owner otherwise."""
+        known bid, then verify the live book is flat (store AND broker, any
+        day). Returns True when flat; pages the owner otherwise."""
         now = self.clock()
-        self._now, self._day, self._dstr = now, _et(now).date(), str(_et(now).date())
+        self._begin(now)
         for p in ostore.positions(self.con, self._dstr, "shadow", (ENTERED,)):
             self._book_exit(p, p["qty_open"], sh.sell_price(p["last_bid"] or 0.0, self.cfg), p["last_bid"],
                             p["last_ask"], "session_end", now, "closed at last known bid")
         self._roll_setups()
-        problems = [f"{p['occ']} ({p['state']})" for p in ostore.positions(self.con, self._dstr, "live", (PENDING, ENTERED))]
-        if hasattr(self.broker, "account"):
-            try:
-                snap = self.broker.account()
-                problems += [f"broker {bp.symbol} x{bp.qty:g}" for bp in snap.positions
-                             if bp.asset_class == AssetClass.OPTION and abs(bp.qty) > 1e-9]
-            except Exception as e:
-                problems.append(f"cannot read broker positions: {e}")
+        problems = self._flat_problems()
         self.con.commit()
         if problems:
             ostore.event(self.con, self._dstr, now, "critical", "not_flat", "; ".join(problems))
@@ -902,21 +1291,41 @@ class Engine:
         return True
 
     def flatten_now(self, reason: str = "force_flat") -> None:
-        """Emergency path: treat every open position as due for the forced exit."""
+        """Emergency path: treat every open position as due for the forced
+        exit. A live position whose exit is still working is resolved, not
+        sold a second time."""
         now = self.clock()
-        for p in ostore.positions(self.con, self._dstr, None, (ENTERED,)):
-            q = self._quote(p["occ"])
-            fresh = self._fresh(q, now)
-            if p["mode"] == "shadow":
-                bid = q.bid if fresh else p["last_bid"]
-                if bid is not None:
-                    self._book_exit(p, p["qty_open"], sh.sell_price(bid, self.cfg), bid,
-                                    q.ask if fresh else p["last_ask"], reason, now)
-            else:
-                self._send_exit(p, p["qty_open"], reason, q if fresh else None, now)
+        self._begin(now)
+        rows = self._live_rows((ENTERED,)) + ostore.positions(self.con, self._dstr, "shadow", (ENTERED,))
+        for p in rows:
+            try:
+                q = self._quote(p["occ"])
+                fresh = self._fresh(q, now)
+                if p["mode"] == "shadow":
+                    bid = q.bid if fresh else p["last_bid"]
+                    if bid is not None:
+                        self._book_exit(p, p["qty_open"], sh.sell_price(bid, self.cfg), bid,
+                                        q.ask if fresh else p["last_ask"], reason, now)
+                    continue
+                working = [o for o in ostore.orders_for(self.con, p["position_id"])
+                           if o["kind"] == "exit" and o["status"] not in _TERMINAL_ORDER]
+                if working:
+                    self._resolve_exit(p, working[-1], now)
+                else:
+                    self._send_exit(p, p["qty_open"], reason, q if fresh else None, now)
+            except Exception as e:
+                self._error("flatten", f"{p['position_id']}: {type(e).__name__}: {e}")
         self.con.commit()
 
     # ================================================================ plumbing
+    def _io(self) -> None:
+        """Commit before every broker / network call (and notification), so
+        the write lock on the shared desk.sqlite is never held across I/O:
+        the stock jobs wait at most 30 s for it (store.connect). Every write
+        here is idempotent per deterministic id, so a commit mid-tick is safe."""
+        if self.con.in_transaction:
+            self.con.commit()
+
     def _bars_now(self, sym: str, now: datetime) -> pd.DataFrame:
         """The symbol's bars, refreshed at most once per tick."""
         if sym not in self._tick_bars:
@@ -941,6 +1350,7 @@ class Engine:
             d = _prev_trading_day(d)
             days.append(d)
         try:
+            self._io()
             hist = self.broker.minute_bars(sym, _at(days[-1], (4, 0)), _at(days[0], (16, 0)))
         except Exception as e:
             self._error("profile", f"{sym}: {type(e).__name__}: {e}")
@@ -961,6 +1371,7 @@ class Engine:
             start, have = day_start, None
         else:
             start = (have.index[-1] - pd.Timedelta(minutes=3)).to_pydatetime()
+        self._io()
         new = self.broker.minute_bars(sym, start, now)
         if new is not None and not new.empty:
             new = new.copy()
@@ -980,6 +1391,7 @@ class Engine:
         if key not in self._chains:
             lo, hi = sel.bucket_range(self._day, bucket)
             try:
+                self._io()
                 self._chains[key] = list(self.broker.option_chain(sym, lo, hi))
             except Exception as e:
                 self._error("chain", f"{sym} {bucket.label}: {e}")
@@ -1000,6 +1412,7 @@ class Engine:
 
     def _notify(self, title: str, msg: str, priority: int) -> None:
         try:
+            self._io()
             self.notifier(title, msg, priority)
         except Exception as e:  # a notification failure never breaks the loop
             log.warning("notify failed: %s", e)

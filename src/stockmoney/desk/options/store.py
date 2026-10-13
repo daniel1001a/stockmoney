@@ -163,6 +163,14 @@ def positions(con, day: str, mode: str | None = None, states: tuple[str, ...] | 
     return [dict(r) for r in con.execute(q + " ORDER BY position_id", args)]
 
 
+def leftovers(con, before_day: str, mode: str, states: tuple[str, ...]) -> list[dict]:
+    """Rows of an EARLIER day still in ``states`` (a session that died before
+    its forced flat, or a half day nobody flattened)."""
+    q = (f"SELECT * FROM options_positions WHERE day < ? AND mode=? AND state IN ({','.join('?' * len(states))}) "
+         "ORDER BY day, position_id")
+    return [dict(r) for r in con.execute(q, (before_day, mode, *states))]
+
+
 def position(con, position_id: str) -> dict | None:
     r = con.execute("SELECT * FROM options_positions WHERE position_id=?", (position_id,)).fetchone()
     return dict(r) if r else None

@@ -320,7 +320,7 @@ def run(day: date, cfg: OptionsConfig, cache_dir: Path, out_dir: Path, feed: str
             ostore.event(con, str(day), clock.now, "info", "plan", f"replay plan ingest: {res}")
         gate = _iface.make_risk_gate(con, broker, cfg)
         eng = Engine(con, broker, cfg, clock=clock, risk_gate=gate, live=True, notifier=lambda *a: sent.append(a))
-        end = datetime.combine(day, time(*cfg.session_end), ET)
+        end = eng.session_end(clock.now)  # the close (early-close aware)
         while clock.now <= end:
             eng.tick()
             clock.advance(step_s)

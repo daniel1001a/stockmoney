@@ -6,17 +6,22 @@ broker types, the OptionsBroker surface and the risk gate from HERE ONLY.
 What lives here:
   - re-exports of line A's real types (AssetClass.OPTION, OptionContract,
     OrderIntent, RiskDecision, occ_symbol / parse_occ, OptionsBroker);
-  - ``RiskGate``: what the engine calls for every live entry, plus the
-    book keeping around it (reserve after submit, release when the order
-    is booked or ends unfilled, book every live fill);
+  - ``RiskGate``: what the engine calls for every live entry and every
+    live exit, plus the book keeping around it (reserve after submit,
+    release when the order is booked or ends unfilled, book every live
+    fill) and the day's forced-flat time;
   - ``LineAGate``: that protocol over line A's OptionsRiskEngine and
     OptionsBook, with limits built from options/config.py;
-  - ``DenyAllGate``: shadow-only sessions (no order is ever allowed);
+  - ``DenyAllGate``: shadow-only sessions (no entry is ever allowed; a sell
+    to close is, so a position left over from a paper session still exits);
   - ``make_trading_broker``: line A's AlpacaBroker (paper unless the owner
     set the live flags; AlpacaBroker refuses live endpoints otherwise).
 
-Exits never go through the gate: a sell to close is always allowed (and
-Alpaca enforces sell_to_close through position_intent).
+Exits go through the gate too (CLAUDE.md section 0: every order passes the
+risk layer): line A allows a sell up to the broker's held quantity, so a
+sell can never open a short, and refuses a limit far below mid (fat finger);
+the engine then falls back to a market sell. Alpaca also enforces
+sell_to_close through position_intent.
 """
 from __future__ import annotations
 
@@ -54,6 +59,11 @@ class RiskGate(Protocol):
               marks: Mapping[str, float] | None = None, blocked: Mapping[str, str] | None = None) -> RiskDecision:
         """Decide one live ENTRY. ``contract`` is the quote the order is
         priced on, with its own ``as_of`` (stale quotes are refused)."""
+    def check_exit(self, intent: OrderIntent, contract: OptionContract | None, now: datetime) -> RiskDecision:
+        """Decide one live SELL to close. ``contract`` may be None (a market
+        sell needs no quote). Never resizes; refuses a sell beyond what is held."""
+    def set_flat_by(self, t: time) -> None:
+        """The day's forced-flat time (earlier on a half day); no buy at/after it."""
     def reserve(self, intent: OrderIntent, price: float) -> None: ...
     def release(self, occ: str) -> None: ...
     def book_fill(self, *, client_order_id: str, occ: str, strategy: str, side: Side, qty: float, price: float,
@@ -67,6 +77,14 @@ class DenyAllGate:
 
     def check(self, intent, contract, now, *, marks=None, blocked=None) -> RiskDecision:
         return RiskDecision(False, "shadow-only session: no order path")
+
+    def check_exit(self, intent, contract, now) -> RiskDecision:
+        if intent.side == Side.SELL:
+            return RiskDecision(True, "shadow-only session: a sell to close is allowed", intent)
+        return RiskDecision(False, "shadow-only session: no order path")
+
+    def set_flat_by(self, t) -> None:
+        pass
 
     def reserve(self, intent, price) -> None:
         pass
@@ -106,6 +124,19 @@ class LineAGate:
         orders = self.broker.open_orders() if hasattr(self.broker, "open_orders") else None
         return self.engine.check(intent, contract, snap, now, open_orders=orders, marks=marks,
                                  blocked=blocked if blocked is not None else {})
+
+    def check_exit(self, intent, contract, now) -> RiskDecision:
+        """Line A's exit rules (OptionsRiskEngine routes a SELL to
+        _check_exit): held quantity from a fresh broker snapshot, working
+        sells from the broker's open orders, the limit's price band."""
+        if intent.side != Side.SELL:
+            return RiskDecision(False, "check_exit takes sells only")
+        snap = self.broker.account()
+        orders = self.broker.open_orders() if hasattr(self.broker, "open_orders") else None
+        return self.engine.check(intent, contract, snap, now, open_orders=orders, blocked={})
+
+    def set_flat_by(self, t) -> None:
+        self.engine.limits.flat_by = t
 
     def reserve(self, intent, price) -> None:
         self.engine.reserve(intent, price)

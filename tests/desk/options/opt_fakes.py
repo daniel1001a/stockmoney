@@ -241,19 +241,30 @@ class FakeOptionsBroker:
 
 
 class FnGate:
-    """A RiskGate whose check is ``fn(intent, contract, now) -> RiskDecision``;
-    records every call, reservation, release and booked fill."""
+    """A RiskGate whose check is ``fn(intent, contract, now) -> RiskDecision``
+    and whose exit check is ``exit_fn`` (default: allow); records every
+    call, reservation, release, booked fill and forced-flat time."""
 
-    def __init__(self, fn, calls: list | None = None):
+    def __init__(self, fn, calls: list | None = None, exit_fn=None):
         self.fn = fn
+        self.exit_fn = exit_fn or (lambda intent, contract, now: RiskDecision(True, "exit ok", intent))
         self.calls = calls if calls is not None else []
+        self.exit_calls: list = []
         self.reserved: list = []
         self.released: list = []
         self.booked: list = []
+        self.flat_by: list = []
 
     def check(self, intent, contract, now, *, marks=None, blocked=None):
         self.calls.append((intent, contract, now))
         return self.fn(intent, contract, now)
+
+    def check_exit(self, intent, contract, now):
+        self.exit_calls.append((intent, contract, now))
+        return self.exit_fn(intent, contract, now)
+
+    def set_flat_by(self, t):
+        self.flat_by.append(t)
 
     def reserve(self, intent, price):
         self.reserved.append((intent.symbol, intent.qty, price))

@@ -62,7 +62,10 @@ class OptionsConfig:
     open_time: tuple[int, int] = (9, 30)
     entry_window_start: tuple[int, int] = (9, 35)   # no entry of any kind before 09:35 ET (owner, 2026-10-12)
     entry_window_end: tuple[int, int] = (11, 30)
-    force_flat: tuple[int, int] = (15, 45)
+    force_flat: tuple[int, int] = (15, 45)   # on an early close: close - flat_before_close_min if earlier
+    flat_before_close_min: int = 15          # forced flat is never later than the close minus this
+    not_flat_alert_min: int = 10             # page (CRITICAL) if not flat this long before the close (15:50 ET)
+    min_live_minutes_before_flat: int = 90   # no live entry with less time than this left before forced flat
     poll_seconds: float = 20.0               # section 8: 15 to 30 s
 
     # --- exits (section 5, fixed, not tuned yet). Every entry is recorded
@@ -87,6 +90,8 @@ class OptionsConfig:
     entry_timeout_s: float = 20.0            # cancel an unfilled entry after this
     exit_timeout_s: float = 20.0             # reprice an unfilled exit after this
     exit_max_limit_attempts: int = 3         # then a market sell
+    cancel_max_failures: int = 3             # failed cancels of one order before the owner is paged
+    order_status_max_failures: int = 5       # failed get_order reads of an exit before a fresh market sell
 
     # --- data safety
     max_quote_age_s: float = 30.0            # never enter on an older option quote
