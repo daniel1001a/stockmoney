@@ -173,7 +173,19 @@
 
 - `touch data/desk/HALT`:新進場全擋(影子照記),出場照常。注意這個檔案**股票主帳本也共用**,會一起擋股票新進場。解除:`rm data/desk/HALT`。
 - 只擋期權新進場:`sqlite3 data/desk/desk.sqlite "insert into settings values('options_halt_new_entries','1') on conflict(key) do update set value='1'"`,解除把值改回 `0`。股票帳本若自動設了 `halt_new_entries=1`(對帳不一致),期權新進場也會被擋。
-- 15:45 ET 一律強制平倉;session 結束時檢查券商期權部位,未平會推播 CRITICAL,請到 Alpaca 手動確認。
+- 15:45 ET 一律強制平倉;收盤前 10 分鐘(15:50 ET)若仍有期權部位未平會先推播 CRITICAL,session 結束時再檢查一次券商期權部位,未平再推播 CRITICAL,請到 Alpaca 手動確認。
+- 每一張賣單(出場)也經過 A 線風控:最多只能賣券商實際持有的口數(永遠不會變成賣出開倉);限價賣單若被價格帶擋下,改送市價賣單。風控擋下出場時不送單、每輪重試,並推播 CRITICAL 一次。
+
+**4.1 提早收盤日(半天市)**
+
+- 收盤時間優先讀 Alpaca 市場日曆,讀不到時用 `desk/calendar.py` 的 `EARLY_CLOSES`(已對 Alpaca 日曆核對:2026-11-27、2026-12-24、2027-11-26,皆 13:00 ET;兩者取較早)。
+- 當天強制平倉 = min(15:45, 收盤前 15 分鐘),例如 13:00 收盤日為 12:45;A 線風控的 flat_by 用同一個時間;新進場的 180 分鐘時間停損不會超過它;距強制平倉不到 90 分鐘就不再送紙上實單(13:00 收盤日 11:15 ET 之後);session 迴圈在收盤時結束,未平倉警報在收盤前 10 分鐘(12:50)。
+
+**4.2 前一日遺留部位與復原工作**
+
+- 若 session 中途死掉(當機、休眠、斷電)沒在強制平倉前出場,隔天 session 的第一輪會推播 CRITICAL「前一日部位未平」,並在 09:30 ET 起以**市價**賣出平倉(進場單只成交一部分、剩下一直撤不掉的也一樣:到了強制平倉時間、時間停損到期或屬於前一日遺留時,先撤單,再賣出已成交的部分;撤單連續失敗會立刻推播)。前一日遺留的影子部位以最後已知買價補記出場。
+- 選用的 launchd 工作 `options-recover`(開機 / 登入時執行一次,**不在預設工作內,不會自動安裝**):`.venv/bin/python scripts/desk_schedule.py --jobs options-recover --install`;手動:`scripts/desk_job.sh options-recover` 或 `.venv/bin/python -m stockmoney.desk.options.run recover`。它只做遺留部位清理:有 session 在跑(持有 options.lock)就直接結束;否則處理所有仍在 PENDING / ENTERED 的紙上實單(前一日的,以及當天沒有 session 在跑時的當天部位),市場開盤中就以市價賣出並最多輪詢 3 分鐘確認成交;非交易時段只推播,留給下個 session 09:30 處理。
+- **手動在同一個 Alpaca 帳戶下期權單會擋住本軌道當天的新進場**:A 線風控比對期權帳本與券商持倉,出現帳本沒有的期權部位就視為不一致,拒絕所有買進(出場照常)。每天第一輪(以及復原工作)會比對券商期權部位與本軌道資料庫,發現本軌道不知道的部位會推播 CRITICAL「券商有未知期權部位」;本軌道**不會**自動賣出這種部位,請自行處理(該部位平掉後,新進場即恢復)。
 
 **5. 盤後報告與重播**
 
