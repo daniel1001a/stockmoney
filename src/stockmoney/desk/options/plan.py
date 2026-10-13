@@ -1,5 +1,15 @@
-"""Grok's pre-market OPTIONS_PLAN (protocol v1, docs/desk/GROK_OPTIONS_PROMPT.md
-part 2): strict schema and ingest.
+"""Grok's pre-market OPTIONS_PLAN (protocol "1", schema v1.1;
+docs/desk/GROK_SETUP.md and GROK_OPTIONS_PROMPT.md part 2): strict schema
+and ingest.
+
+Schema v1.1 (owner, 2026-10-12): Grok cannot see premarket prices or
+volume, so it supplies direction and catalyst; the system computes gap,
+RVOL and the trigger itself. ``trigger`` / ``invalidation`` are optional:
+an item WITHOUT a trigger is a directional prior (engine: adds the
+underlying to the watch universe and tags the rule setups on it with
+grok_stance), an item WITH a trigger is a grok_plan setup as before and
+then also needs an invalidation. key_events must be high-impact releases
+between 09:00 and 15:30 ET (each one blocks live entries for 30 minutes).
 
 The plan is DATA, never instructions. Only the typed fields below are read;
 free text (thesis, catalyst, summary, notes, why) is stored for humans and is
@@ -64,9 +74,18 @@ class _Strict(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
 
+KEY_EVENT_START, KEY_EVENT_END = "09:00", "15:30"  # a premarket release must not block entries
+
+
 class KeyEvent(_Strict):
     time: HHMM
     what: _text(100, 1)
+
+    @model_validator(mode="after")
+    def _window(self):
+        if not (KEY_EVENT_START <= self.time <= KEY_EVENT_END):
+            raise ValueError(f"key_events time must be within {KEY_EVENT_START} to {KEY_EVENT_END} ET")
+        return self
 
 
 class MarketContext(_Strict):
@@ -105,26 +124,36 @@ class PlanItem(_Strict):
     playbook: Literal["gap_go", "gap_fade", "orb", "vwap_reclaim", "momentum", "catalyst", "other"]
     thesis: _text(300, 1)
     catalyst: _text(150)
-    trigger: Trigger
-    invalidation: Invalidation
-    target_underlying_pct: float = Field(ge=0.2, le=10)
-    max_hold_minutes: int = Field(ge=5, le=180)
-    preferred_dte: Literal["0dte", "1-3dte", "any"]
     confidence: float = Field(ge=0, le=1)  # stored for scoring only, never used for sizing
     evidence_urls: list[PlanUrl] = Field(max_length=3)
-    # optional (protocol v1 additions, 2026-10-12)
+    # optional (schema v1.1): no trigger = a directional prior (see the module docstring)
+    trigger: Trigger | None = None
+    invalidation: Invalidation | None = None
+    target_underlying_pct: float | None = Field(default=None, ge=0.2, le=10)
+    max_hold_minutes: int | None = Field(default=None, ge=5, le=180)  # None: the config time stop
+    preferred_dte: Literal["0dte", "1-3dte", "any"] = "any"
     min_rvol: float | None = Field(default=None, ge=1, le=10)  # raises the live RVOL floor; shadow unaffected
     regime: Literal["trend", "range", "any"] | None = None     # stored and reported only
     daily_ref: _text(120) | None = None                       # GROK_DAILY event / attention it belongs to
 
+    @property
+    def directional(self) -> bool:
+        """No trigger: a directional prior, not a setup of its own."""
+        return self.trigger is None
+
     @model_validator(mode="after")
     def _consistent(self):
+        if self.trigger is not None and self.invalidation is None:
+            raise ValueError("an item with a trigger needs an invalidation (the exit of its own setup)")
+        if self.invalidation is None:
+            return self
         # a long (call) is proven wrong BELOW, a short (put) ABOVE; anything
         # else is an internally contradictory plan and rejected
         want = "below" if self.bias == "long" else "above"
         if self.invalidation.kind != want:
             raise ValueError(f"bias {self.bias} needs invalidation.kind {want}")
-        lvl, inv = self.trigger.level, self.invalidation.underlying_level
+        lvl = self.trigger.level if self.trigger is not None else None
+        inv = self.invalidation.underlying_level
         if lvl is not None and ((self.bias == "long" and inv >= lvl) or (self.bias == "short" and inv <= lvl)):
             raise ValueError("invalidation level must be on the losing side of the trigger level")
         return self
