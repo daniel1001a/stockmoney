@@ -192,9 +192,12 @@
 
 - 若 session 中途死掉(當機、休眠、斷電)沒在強制平倉前出場,隔天 session 的第一輪會推播 CRITICAL「前一日部位未平」,並在 09:30 ET 起以**市價**賣出平倉(進場單只成交一部分、剩下一直撤不掉的也一樣:到了強制平倉時間、時間停損到期或屬於前一日遺留時,先撤單,再賣出已成交的部分;撤單連續失敗會立刻推播)。前一日遺留的影子部位以最後已知買價補記出場。
 - 選用的 launchd 工作 `options-recover`(開機 / 登入時執行一次,**不在預設工作內,不會自動安裝**):`.venv/bin/python scripts/desk_schedule.py --jobs options-recover --install`;手動:`scripts/desk_job.sh options-recover` 或 `.venv/bin/python -m stockmoney.desk.options.run recover`。它只做遺留部位清理:有 session 在跑(持有 options.lock)就直接結束;否則處理所有仍在 PENDING / ENTERED 的紙上實單(前一日的,以及當天沒有 session 在跑時的當天部位),市場開盤中就以市價賣出並最多輪詢 3 分鐘確認成交;非交易時段只推播,留給下個 session 09:30 處理。
+- 出場單的替換原則(2026-10-13 Grok 第三輪審查):舊出場單必須先查到狀態、確認已結束並把成交入帳,才會送替換的賣單;撤單失敗、查不到狀態或掛單清單裡「看不到」都不算確認,這時不送單,每 5 分鐘推播一次 CRITICAL,請手動到 Alpaca 撤單平倉。強制平倉時間之後撤單成功,會在同一輪最多等 7.5 秒確認並立刻補送市價單(收盤前最後一輪也不會漏)。
+- 券商口數比資料庫少、且本軌道自己的委託解釋不了時(你手動賣掉一部分、被指派):少掉的口數以 0 元記為全損(計入當日停損與回撤),並自動設定 `options_halt_new_entries=1` 暫停本軌道新進場;核對 Alpaca 後用第 4 點的 sqlite 指令把它改回 0。之後若那些口數又出現在券商,只會推播「未知期權部位」,本軌道不會賣它們。
+- 券商沒有給期權部位的現價時,不會再用成本價代替;該部位視為沒有報價,風控會擋新進場。
 - 期權帳本(A 線)拒收某筆成交時,該委託不會被標成已結束而會持續重查、該部位註記「reconcile needed」並推播一次;本軌道自己的出場單若還沒完全確認,不會把券商少掉的口數當成「被別人動過」去對帳。
 - 只跑影子(`DESK_OPTIONS_ORDERS=off`)時,session 與復原工作用 ShadowGate:新進場一律拒絕,但遺留部位的賣單仍經 A 線風控(不會賣超過券商持有)並寫入期權帳本。
-- **資料庫說持有、券商卻是 0**(手動平掉、到期或被履約時 Mac 沒開):遺留部位的賣單被風控擋下,且券商該合約持倉為 0、沒有任何掛單時,系統把這筆標記為已出場(`broker_flat_unreconciled`,日報顯示「損益未知」且不計入統計),在期權帳本寫一筆 `reconcile` 紀錄移除該部位,推播一次;這條路徑**絕不送單**。其他情況(例如當天的部位)可手動結案:先確認 Alpaca 上該合約已無持倉與掛單,再執行 `.venv/bin/python -m stockmoney.desk.options.run resolve <position_id>`(券商仍持有、仍有掛單或讀不到券商時一律拒絕;position_id 可從 `select position_id, occ, state from options_positions where mode='live' and state in ('PENDING','ENTERED')` 查)。
+- **資料庫說持有、券商卻是 0**(手動平掉、到期或被履約時 Mac 沒開):遺留部位的賣單被風控擋下,且券商該合約持倉為 0、沒有任何掛單時,系統把這筆標記為已出場(`broker_flat_unreconciled`,日報顯示「損益未知」且不計入統計表;保守以 0 元記為全損,計入停損與回撤),在期權帳本寫一筆 `reconcile` 紀錄移除該部位,推播一次;這條路徑**絕不送單**。其他情況(例如當天的部位)可手動結案:先確認 Alpaca 上該合約已無持倉與掛單,再執行 `.venv/bin/python -m stockmoney.desk.options.run resolve <position_id>`(券商仍持有、仍有掛單或讀不到券商時一律拒絕;position_id 可從 `select position_id, occ, state from options_positions where mode='live' and state in ('PENDING','ENTERED')` 查)。
 - **不要手動持有本軌道正在交易的同一個合約(同一個 OCC 代號)**:券商端無法分辨哪幾口是你的、哪幾口是本軌道的,本軌道的出場可能賣到你的口數,對帳也會混在一起。
 - **手動在同一個 Alpaca 帳戶下期權單會擋住本軌道當天的新進場**:A 線風控比對期權帳本與券商持倉,出現帳本沒有的期權部位就視為不一致,拒絕所有買進(出場照常)。每天第一輪(以及復原工作)會比對券商期權部位與本軌道資料庫,發現本軌道不知道的部位會推播 CRITICAL「券商有未知期權部位」;本軌道**不會**自動賣出這種部位,請自行處理(該部位平掉後,新進場即恢復)。
 
