@@ -91,6 +91,7 @@ class OptionsConfig:
     exit_timeout_s: float = 20.0             # reprice an unfilled exit after this
     exit_max_limit_attempts: int = 3         # then a market sell
     cancel_max_failures: int = 3             # failed cancels of one order before the owner is paged
+    cancel_page_every_min: float = 5.0       # a working exit that cannot be canceled is re-paged this often
     order_status_max_failures: int = 5       # failed get_order reads of an exit before a fresh market sell
 
     # --- data safety

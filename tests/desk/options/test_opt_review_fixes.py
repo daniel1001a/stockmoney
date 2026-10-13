@@ -333,10 +333,16 @@ def test_m1_gate_refusal_sends_nothing_and_pages(tmp_path, con):
     r.run(et(9, 54))
     assert not exits(con, lp["position_id"]) and r.broker.positions[C601N] == 10
     assert sum("出場被風控擋下" in t for t in titles(r)) == 1
-    # a gate that alters a sell is a refusal too (exits are never resized)
-    gate.exit_fn = lambda i, c, n: RiskDecision(True, "resized", replace(i, qty=1))
+    # a gate that RAISES a sell, or changes anything but lowering its qty, is a refusal too
+    gate.exit_fn = lambda i, c, n: RiskDecision(True, "bigger", replace(i, qty=i.qty + 1))
     r.run(et(9, 55))
     assert not exits(con, lp["position_id"])
+    gate.exit_fn = lambda i, c, n: RiskDecision(True, "other contract", replace(i, symbol="SPY261014C00602000"))
+    r.run(et(9, 56))
+    assert not exits(con, lp["position_id"])
+    gate.exit_fn = lambda i, c, n: RiskDecision(True, "smaller", replace(i, qty=3))  # lowering is allowed
+    r.run(et(9, 56, 30))
+    assert exits(con, lp["position_id"])[0]["qty"] == 3
 
 
 def test_m1_real_gate_refuses_a_sell_to_open(tmp_path, con):

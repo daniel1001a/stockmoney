@@ -186,6 +186,8 @@ class Engine:
         self._flat_day: tuple | None = None    # (day, flat time) last given to the risk gate
         self._swept: str | None = None         # day the start-of-day sweep last ran
         self._cancel_fail: dict[str, int] = {}  # client_order_id -> failed cancels in a row
+        self._cancel_next: dict[str, datetime] = {}   # exit client_order_id -> no cancel retry before this
+        self._cancel_paged: dict[str, datetime] = {}  # exit client_order_id -> last "cannot cancel" page
         self._status_fail: dict[str, int] = {}  # exit client_order_id -> failed get_order reads in a row
         self._obook: OptionsBook | None = None
         ostore.ensure_schema(con)
@@ -737,12 +739,16 @@ class Engine:
         return True
 
     def _live_marks(self) -> dict[str, float]:
-        """OCC -> mid of the live positions' latest quotes (the gate values
-        the open book with them)."""
+        """OCC -> mid of the live positions' quotes that were fresh on THIS
+        tick (the gate values the open book with them). A position without
+        one gets no mark here, so the gate uses the broker's current_price
+        (and refuses buys when that is missing too): a stored last bid / ask
+        from minutes ago must never hide a loss from the daily stop."""
         out = {}
-        for p in ostore.positions(self.con, self._dstr, "live", (ENTERED,)):
-            if p["last_bid"] is not None and p["last_ask"] is not None and p["last_ask"] >= p["last_bid"]:
-                out[p["occ"]] = (p["last_bid"] + p["last_ask"]) / 2
+        for p in self._live_rows((ENTERED,)):
+            q = self._quotes.get(p["occ"])
+            if self._fresh(q, self._now):
+                out[p["occ"]] = q.mid
         return out
 
     def _book(self, p: dict, cid: str, side: Side, o) -> None:
@@ -808,16 +814,18 @@ class Engine:
         if reason:
             self._send_exit(p, p["qty_open"], reason, None, now)
 
-    def _cancel(self, cid: str, why: str) -> bool:
+    def _cancel(self, cid: str, why: str, page: bool = True) -> bool:
         """Request a cancel; a failure is counted and, after
-        cancel_max_failures in a row, paged (CRITICAL) once per order."""
+        cancel_max_failures in a row, paged (CRITICAL) once per order
+        (``page=False``: the caller escalates itself, see _cancel_exit)."""
         try:
             self._io()
             self.broker.cancel(cid)
         except Exception as e:
             n = self._cancel_fail[cid] = self._cancel_fail.get(cid, 0) + 1
             self._error("cancel", f"{cid}: {type(e).__name__}: {e}")
-            if n >= self.cfg.cancel_max_failures and ostore.notify_once(self.con, f"{self._dstr}:cancel_failed:{cid}"):
+            if page and n >= self.cfg.cancel_max_failures and ostore.notify_once(self.con,
+                                                                                 f"{self._dstr}:cancel_failed:{cid}"):
                 ostore.event(self.con, self._dstr, self._now, "critical", "cancel_failed", f"{cid} x{n}: {e}")
                 self._notify("期權軌道:撤單一直失敗", f"{cid} 已連續 {n} 次撤單失敗({type(e).__name__}: {e})。"
                              "已成交的部分會照常賣出;仍在掛的單請到 Alpaca 手動撤銷。", notify.CRITICAL)
@@ -1082,13 +1090,27 @@ class Engine:
             otype, limit = OrderType.LIMIT, sh.round_tick(q.bid, sh.option_tick(p["underlying"], q.bid), up=False)
         else:
             otype, limit = OrderType.MARKET, None
-        intent = OrderIntent(ostore.cid(pid, f"x{len(exits)}"), p["occ"], AssetClass.OPTION, Side.SELL, qty=qty,
-                             order_type=otype, tif=TIF.DAY, limit_price=limit, strategy=f"options:{p['source']}",
-                             reason=reason)
-        dec = self._exit_gate(intent, q, now)
-        if not dec.allow and intent.order_type == OrderType.LIMIT:
-            intent = replace(intent, order_type=OrderType.MARKET, limit_price=None)
+        # size the sell to what the broker holds minus its working sells (never more than asked)
+        room = self._sell_room(p["occ"])
+        sized = None
+        if room is not None:
+            held, working = room
+            if (working <= 1e-9 and 1 <= held < (p["qty_open"] or 0) - 1e-9 and self._settled(p, now)):
+                p = self._reconcile_qty(p, held, now)  # someone else took contracts: store / book follow
+            can = floor(min(qty, held - working, p["qty_open"] or 0) + 1e-9)
+            if can < 1:
+                sized = RiskDecision(False, f"nothing to sell: broker holds {held:g}, working sells {working:g}")
+            qty = max(can, 0)
+        intent = OrderIntent(ostore.cid(pid, f"x{len(exits)}"), p["occ"], AssetClass.OPTION, Side.SELL,
+                             qty=max(qty, 1), order_type=otype, tif=TIF.DAY, limit_price=limit,
+                             strategy=f"options:{p['source']}", reason=reason)
+        if sized is not None:
+            dec = sized
+        else:
             dec = self._exit_gate(intent, q, now)
+            if not dec.allow and intent.order_type == OrderType.LIMIT:
+                intent = replace(intent, order_type=OrderType.MARKET, limit_price=None)
+                dec = self._exit_gate(intent, q, now)
         if not dec.allow and p["day"] < self._dstr and p["state"] == ENTERED and self._broker_flat(p["occ"]):
             # a leftover the broker no longer holds (closed by hand, expired, exercised):
             # reconcile it, never sell
@@ -1101,8 +1123,58 @@ class Engine:
                 self._notify("期權軌道:出場被風控擋下", f"{p['occ']} x{qty:g}({reason})被風控拒絕:{dec.reason[:300]}。"
                              "每輪會重試;請到 Alpaca 確認實際持倉。", notify.CRITICAL)
             return False
-        self._submit(pid, intent, "exit", reason, now)
+        self._submit(pid, dec.intent or intent, "exit", reason, now)
         return True
+
+    def _sell_room(self, occ: str) -> tuple[float, float] | None:
+        """(held, working sells) of ``occ`` from a fresh broker read; None
+        when the broker has no such calls or a read fails (the gate, which
+        reads the same, then decides)."""
+        if not hasattr(self.broker, "account"):
+            return None
+        held = self._broker_held(occ)
+        if held is None:
+            return None
+        working = 0.0
+        if hasattr(self.broker, "open_orders"):
+            self._io()
+            try:
+                working = sum((o.qty or 0) - (o.filled_qty or 0) for o in self.broker.open_orders()
+                              if o.symbol == occ and o.side == Side.SELL)
+            except Exception as e:
+                self._error("open_orders", f"{type(e).__name__}: {e}")
+                return None
+        return float(held), float(working)
+
+    def _settled(self, p: dict, now: datetime, seconds: float = 60.0) -> bool:
+        """No fill of this position in the last ``seconds``: a broker position
+        read right after a fill can lag, and must not be taken as a loss."""
+        last = self.con.execute("SELECT MAX(at) FROM options_fills WHERE position_id=?", (p["position_id"],)).fetchone()[0]
+        return last is None or (now - datetime.fromisoformat(last)).total_seconds() >= seconds
+
+    def _reconcile_qty(self, p: dict, held: float, now: datetime) -> dict:
+        """The broker holds fewer contracts than the store (the owner sold
+        some by hand, or one was assigned): the store row and the options
+        book come down to ``held`` (the missing contracts' P&L is unknown and
+        noted), and the owner is paged once. Never sends an order."""
+        gone = (p["qty_open"] or 0) - held
+        ostore.update_position(self.con, p["position_id"], qty_open=held,
+                               note=((p["note"] or "") + f"; {gone:g} contracts gone at the broker at "
+                                     f"{ostore.iso(now)}: their P&L is unknown").strip("; ")[:500])
+        try:
+            if self._obook is None:
+                self._obook = OptionsBook(self.con)
+            self._obook.reconcile_flat(p["occ"], "broker_qty_short", now, keep=held)
+        except Exception as e:
+            self._error("options_book", f"reconcile {p['occ']}: {type(e).__name__}: {e}")
+        ostore.event(self.con, self._dstr, now, "critical", "broker_qty_short",
+                     f"{p['position_id']} {p['occ']}: store {p['qty_open']:g}, broker {held:g}")
+        self.con.commit()
+        if ostore.notify_once(self.con, f"broker_qty_short:{p['position_id']}"):
+            self._notify("期權軌道:券商口數與資料庫不符", f"{p['occ']} 資料庫記為 {p['qty_open']:g} 口,券商只有 {held:g} 口"
+                         "(有人手動賣出,或被指派?)。只會賣出券商實際持有的口數;少掉的口數損益未知,請到 Alpaca 核對。",
+                         notify.CRITICAL)
+        return ostore.position(self.con, p["position_id"])
 
     def _exit_gate(self, intent: OrderIntent, q: OptionContract | None, now: datetime) -> RiskDecision:
         """The risk gate's verdict on one sell. A gate error is a refusal,
@@ -1114,11 +1186,12 @@ class Engine:
             self._error("risk_gate", f"exit {intent.client_order_id}: {type(e).__name__}: {e}")
             return RiskDecision(False, f"risk gate error: {type(e).__name__}: {e}")
         final = dec.intent or intent
-        if dec.allow and (final.client_order_id, final.symbol, final.side, final.qty, final.order_type,
-                          final.limit_price) != (intent.client_order_id, intent.symbol, Side.SELL, intent.qty,
-                                                 intent.order_type, intent.limit_price):
+        if dec.allow and ((final.client_order_id, final.symbol, final.side, final.order_type, final.limit_price)
+                          != (intent.client_order_id, intent.symbol, Side.SELL, intent.order_type, intent.limit_price)
+                          or final.qty is None or final.qty != int(final.qty) or not 1 <= final.qty <= intent.qty):
+            # a gate may only lower a sell, never raise it or change anything else
             return RiskDecision(False, f"risk gate changed the exit: {dec.reason}")
-        return dec
+        return RiskDecision(dec.allow, dec.reason, final if dec.allow else None)
 
     def _book_exit_order(self, p: dict, row: dict, o) -> dict:
         """Book the new part of an exit order's fills. The broker reports the
@@ -1156,13 +1229,64 @@ class Engine:
         p = self._book_exit_order(p, row, o)
         ostore.update_order(self.con, cid, status=o.status.value)
         if o.status.value in _TERMINAL_ORDER:
+            # at/after the forced flat the remainder goes out in this same call: the next
+            # tick may never come (last tick of the session, flatten_now)
+            if now >= self._flat() and p["state"] in (ENTERED, PENDING) and (p["qty_open"] or 0) > 1e-9:
+                self._send_exit(p, p["qty_open"], "force_flat", None, now, force_market=True)
             return
         age = (now - datetime.fromisoformat(row["submitted_at"])).total_seconds()
         if age >= self.cfg.exit_timeout_s:
-            self._cancel(cid, "reprice")
+            self._cancel_exit(p, row, now, "reprice")
         elif now >= self._flat() and row["order_type"] == OrderType.LIMIT.value:
             # at/after the forced flat a working limit is replaced at once by one market sell
-            self._cancel(cid, "forced flat: replace by a market sell")
+            self._cancel_exit(p, row, now, "forced flat: replace by a market sell")
+
+    def _cancel_exit(self, p: dict, row: dict, now: datetime, why: str) -> None:
+        """Cancel a working exit so it can be replaced. Failed cancels are
+        retried with backoff (2, 4, 8 ... 60 s). After cancel_max_failures a
+        fresh read of the broker's open orders decides: the order is gone
+        there -> its row becomes 'unresolved' (still polled for late fills)
+        and the rest is sold at market in this call; still working (or
+        unreadable) -> NO second sell (it could double the sale), the owner
+        is paged CRITICAL every cancel_page_every_min until it resolves."""
+        cid, cfg = row["client_order_id"], self.cfg
+        nxt = self._cancel_next.get(cid)
+        if nxt is not None and now < nxt:
+            return
+        if self._cancel(cid, why, page=False):
+            self._cancel_next.pop(cid, None)
+            return
+        n = self._cancel_fail.get(cid, 0)
+        self._cancel_next[cid] = now + timedelta(seconds=min(2 ** n, 60))
+        if n < cfg.cancel_max_failures:
+            return
+        working = self._broker_working(cid)
+        if working is False:
+            ostore.update_order(self.con, cid, status=UNRESOLVED, note="cancel failed, gone from the broker's open orders")
+            p = ostore.position(self.con, p["position_id"])
+            if (p["qty_open"] or 0) > 1e-9:
+                self._send_exit(p, p["qty_open"], "force_flat" if now >= self._flat() else row["reason"], None, now,
+                                force_market=True)
+            return
+        last = self._cancel_paged.get(cid)
+        if last is None or (now - last).total_seconds() >= cfg.cancel_page_every_min * 60:
+            self._cancel_paged[cid] = now
+            state = "仍在券商掛著" if working else "狀態讀不到"
+            ostore.event(self.con, self._dstr, now, "critical", "exit_cancel_failed", f"{cid} x{n}: {state}")
+            self._notify("期權軌道:出場單撤不掉", f"{p['occ']} 的出場單 {cid} 已連續 {n} 次撤單失敗,{state}。"
+                         f"為避免重複賣出不會再送第二張賣單;仍持有 {p['qty_open'] or 0:g} 口。請立即到 Alpaca "
+                         f"手動撤單並平倉。每 {cfg.cancel_page_every_min:g} 分鐘提醒一次。", notify.CRITICAL)
+
+    def _broker_working(self, cid: str) -> bool | None:
+        """Is ``cid`` among the broker's open orders? None when unreadable."""
+        if not hasattr(self.broker, "open_orders"):
+            return None
+        self._io()
+        try:
+            return any(o.client_order_id == cid for o in self.broker.open_orders())
+        except Exception as e:
+            self._error("open_orders", f"{type(e).__name__}: {e}")
+            return None
 
     def _exit_status_failed(self, p: dict, row: dict, err: Exception, now: datetime) -> None:
         """get_order of a working exit failed. After order_status_max_failures
