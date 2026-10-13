@@ -751,10 +751,29 @@ class Engine:
                 out[p["occ"]] = q.mid
         return out
 
-    def _book(self, p: dict, cid: str, side: Side, o) -> None:
-        """Book a live fill (cumulative qty / average price) in line A's book."""
-        self.risk_gate.book_fill(client_order_id=cid, occ=p["occ"], strategy=f"options:{p['source']}", side=side,
-                                 qty=o.filled_qty, price=o.filled_avg_price, filled_at=o.filled_at or self._now)
+    def _book(self, p: dict, cid: str, side: Side, o) -> bool:
+        """Book a live fill (cumulative qty / average price) in line A's book.
+        Called on every poll of a filled order (the book is idempotent per
+        client_order_id), so a refused fill is retried. The store's own
+        writes are committed first, so a book error can never discard them.
+        False when the book refuses it: the caller keeps the order polled
+        (not terminal), the position is flagged and the owner paged once."""
+        if not (o.filled_qty or 0) > 0 or o.filled_avg_price is None:
+            return True
+        self._io()
+        ok = self.risk_gate.book_fill(client_order_id=cid, occ=p["occ"], strategy=f"options:{p['source']}", side=side,
+                                      qty=o.filled_qty, price=o.filled_avg_price, filled_at=o.filled_at or self._now)
+        if ok is not False:
+            return True
+        if ostore.notify_once(self.con, f"book_refused:{cid}"):
+            ostore.update_position(self.con, p["position_id"],
+                                   note=((p["note"] or "") + f"; options book refused fill {cid}: reconcile needed")
+                                   .strip("; ")[:500])
+            ostore.event(self.con, self._dstr, self._now, "critical", "book_refused", f"{p['position_id']} {cid}")
+            self._notify("期權軌道:期權帳本拒收成交", f"{p['occ']} 的成交 {cid}({side.value} {o.filled_qty:g})被 A 線"
+                         "期權帳本拒收,帳本與券商將不一致(新進場會被擋)。該委託會持續重查;請核對 Alpaca 並修正帳本。",
+                         notify.CRITICAL)
+        return False
 
     def _submit(self, pid: str, intent: OrderIntent, kind: str, reason: str, now: datetime) -> None:
         """Commit the order row first, then submit. A second call for the same
@@ -879,7 +898,8 @@ class Engine:
                                    + sh.half_spread_cost(p["entry_bid"], p["entry_ask"], delta, cfg))
             ostore.update_order(self.con, ecid, booked_qty=o.filled_qty, filled_qty=o.filled_qty,
                                 avg_price=o.filled_avg_price)
-            self._book(p, ecid, Side.BUY, o)
+        if not self._book(p, ecid, Side.BUY, o):
+            return  # refused by the book: not terminal, polled again next tick
         status = o.status.value
         ostore.update_order(self.con, ecid, status=status)
         if status in _TERMINAL_ORDER:
@@ -1072,7 +1092,7 @@ class Engine:
         ostore.update_position(self.con, pid, **fields)
 
     def _send_exit(self, p: dict, qty: float, reason: str, q: OptionContract | None, now: datetime,
-                   force_market: bool = False) -> bool:
+                   force_market: bool = False, allow_reconcile: bool = True) -> bool:
         """Send one sell to close through the risk gate. A limit the gate
         refuses (price band, no sane quote) is retried as a market sell; a
         market sell the gate refuses (nothing held at the broker: it would
@@ -1095,7 +1115,12 @@ class Engine:
         sized = None
         if room is not None:
             held, working = room
-            if (working <= 1e-9 and 1 <= held < (p["qty_open"] or 0) - 1e-9 and self._settled(p, now)):
+            # never while one of our own exits is unresolved or still open: its unbooked fills
+            # would look like contracts "gone at the broker"
+            own_open = any(o["kind"] == "exit" and (o["status"] == UNRESOLVED or o["status"] not in _TERMINAL_ORDER)
+                           for o in exits)
+            if (allow_reconcile and not own_open and working <= 1e-9 and 1 <= held < (p["qty_open"] or 0) - 1e-9
+                    and self._settled(p, now)):
                 p = self._reconcile_qty(p, held, now)  # someone else took contracts: store / book follow
             can = floor(min(qty, held - working, p["qty_open"] or 0) + 1e-9)
             if can < 1:
@@ -1193,12 +1218,12 @@ class Engine:
             return RiskDecision(False, f"risk gate changed the exit: {dec.reason}")
         return RiskDecision(dec.allow, dec.reason, final if dec.allow else None)
 
-    def _book_exit_order(self, p: dict, row: dict, o) -> dict:
+    def _book_exit_order(self, p: dict, row: dict, o) -> tuple[dict, bool]:
         """Book the new part of an exit order's fills. The broker reports the
         CUMULATIVE filled qty and average price; the new contracts are booked
         at their own price, (cum_qty * cum_avg - value already booked) /
         new qty, so a partly filled exit never re-prices earlier contracts.
-        Returns the (re-read) position."""
+        Returns (the re-read position, whether line A's book took the fill)."""
         cid = row["client_order_id"]
         booked = row["booked_qty"] or 0
         delta = (o.filled_qty or 0) - booked
@@ -1209,12 +1234,11 @@ class Engine:
                             client_order_id=f"{cid}#{o.filled_qty:g}")
             ostore.update_order(self.con, cid, booked_qty=o.filled_qty, filled_qty=o.filled_qty,
                                 avg_price=o.filled_avg_price)
-            self._book(p, cid, Side.SELL, o)
             p = ostore.position(self.con, p["position_id"])
             if p["state"] == EXITED:
                 self._notify("期權紙上出場", f"{p['underlying']} {p['occ']}:{p['exit_reason']},"
                              f"損益 {p['realized_usd'] - p['fees_usd']:+.0f} 美元", notify.INFO)
-        return p
+        return p, self._book(p, cid, Side.SELL, o)
 
     def _resolve_exit(self, p: dict, row: dict, now: datetime) -> None:
         cid = row["client_order_id"]
@@ -1226,7 +1250,9 @@ class Engine:
         self._status_fail.pop(cid, None)
         if o is None:
             return
-        p = self._book_exit_order(p, row, o)
+        p, booked = self._book_exit_order(p, row, o)
+        if not booked:
+            return  # refused by the book: not terminal, polled again next tick
         ostore.update_order(self.con, cid, status=o.status.value)
         if o.status.value in _TERMINAL_ORDER:
             # at/after the forced flat the remainder goes out in this same call: the next
@@ -1266,7 +1292,7 @@ class Engine:
             p = ostore.position(self.con, p["position_id"])
             if (p["qty_open"] or 0) > 1e-9:
                 self._send_exit(p, p["qty_open"], "force_flat" if now >= self._flat() else row["reason"], None, now,
-                                force_market=True)
+                                force_market=True, allow_reconcile=False)
             return
         last = self._cancel_paged.get(cid)
         if last is None or (now - last).total_seconds() >= cfg.cancel_page_every_min * 60:
@@ -1312,7 +1338,7 @@ class Engine:
         if qty < 1:
             return
         ostore.update_order(self.con, cid, status=UNRESOLVED, note="status unreadable; superseded by a market sell")
-        if not self._send_exit(p, qty, row["reason"], None, now, force_market=True):
+        if not self._send_exit(p, qty, row["reason"], None, now, force_market=True, allow_reconcile=False):
             ostore.update_order(self.con, cid, status=row["status"], note="status unreadable; fallback refused")
 
     def _poll_unresolved(self, p: dict, row: dict, now: datetime) -> None:
