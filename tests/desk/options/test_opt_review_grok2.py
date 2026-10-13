@@ -333,3 +333,68 @@ def test_h3_option_without_broker_mark_is_unmarked_and_blocks_buys(tmp_path, con
                       limit_price=1.07)
     dec = r.gate.engine.check(buy, k, snap, r.clock.now, open_orders=[], marks={}, blocked={})
     assert not dec.allow and "without a usable mark" in dec.reason
+
+
+# ------------------------------------------------------------------ Grok round 3, H4: last-tick replacement
+def test_h4_market_reprice_on_the_last_tick_is_replaced_in_the_same_tick(tmp_path, con):
+    r, lp = entered(tmp_path, con)
+    r.eng._sleep = lambda s: None
+    r.broker.fill = "never"
+    r.clock.set(et(15, 59, 38))
+    r.eng.tick()  # the forced exit (a limit at the bid) ...
+    r.clock.set(et(15, 59, 40))
+    r.eng.tick()  # ... is canceled at once at the flat and replaced by a market sell
+    mk = [o for o in sells(r) if o.order_type == OrderType.MARKET]
+    assert len(mk) == 1 and mk[0].status == OrderStatus.NEW
+    r.clock.set(et(15, 59, 58))  # the session's last tick: the market sell is 18 s old ...
+    r.eng.tick()
+    r.clock.set(et(16, 0, 0))    # ... a final pass past the reprice timeout
+    r.eng.tick()
+    mk = [o for o in sells(r) if o.order_type == OrderType.MARKET]
+    assert len(mk) == 2 and mk[0].status == OrderStatus.CANCELED and mk[1].status == OrderStatus.NEW
+    assert ostore.order(con, mk[1].client_order_id)["submitted_at"] == ostore.iso(r.clock.now)
+    assert sum(o.status == OrderStatus.NEW for o in sells(r)) == 1  # never two sells working
+
+
+def test_h4_not_sent_exit_is_replaced_in_the_same_call(tmp_path, con):
+    r, lp = entered(tmp_path, con)
+    real = r.broker.submit
+
+    def lost(intent):
+        r.broker.submit_calls.append(intent.client_order_id)
+        raise ConnectionError("connection reset before the broker got it")
+    r.broker.submit = lost
+    r.clock.set(et(15, 45))
+    r.eng.tick()
+    ex = [o for o in ostore.orders_for(con, lp["position_id"]) if o["kind"] == "exit"]
+    assert len(ex) == 1 and ex[0]["status"] == "pending_submit"
+    r.broker.submit = real
+    r.clock.set(et(15, 45, 32))  # > 30 s: the broker never got it
+    r.eng.tick()
+    ex = [o for o in ostore.orders_for(con, lp["position_id"]) if o["kind"] == "exit"]
+    assert ex[0]["status"] == "not_sent" and len(ex) == 2 and ex[1]["order_type"] == "market"
+    assert C601N not in r.broker.positions
+
+
+def test_h4_flatten_now_cancels_rereads_and_replaces_in_one_call(tmp_path, con):
+    r, lp = entered(tmp_path, con)
+    r.eng._sleep = lambda s: None
+    lim = to_flat_with_unfillable_limit(r, False)
+    r.clock.advance(1)
+    r.eng.flatten_now("session_end")  # one call: cancel the limit, confirm, market sell, see it filled
+    assert lim.status == OrderStatus.CANCELED
+    p = ostore.position(con, lp["position_id"])
+    assert p["state"] == "EXITED" and C601N not in r.broker.positions
+
+
+def test_h4_unconfirmed_cancel_sends_nothing_and_pages(tmp_path, con):
+    r, lp = entered(tmp_path, con)
+    waits = []
+    r.eng._sleep = waits.append
+    lim = to_flat_with_unfillable_limit(r, False)
+    r.broker.cancel = lambda cid: None  # the cancel is accepted but the order never shows as canceled
+    r.clock.advance(1)
+    r.eng.flatten_now("session_end")
+    assert [o.order_type for o in sells(r)] == [OrderType.LIMIT]
+    assert any("出場單撤不掉" in t for t in titles(r))
+    assert sum(waits) < 10 * 3  # bounded: under 10 s per round, 3 rounds at most

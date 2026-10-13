@@ -583,7 +583,11 @@ def test_n3_flatten_now_does_not_double_sell_and_flat_replaces_limit(tmp_path, c
     assert len(ex) == 1 and ex[0]["order_type"] == "limit"
     n = len(r.broker.submit_calls)
     r.eng.flatten_now("session_end")
-    assert len(r.broker.submit_calls) == n  # the working exit is resolved, not doubled
+    # (Grok round-3 H4) the working limit is canceled, confirmed, then replaced in the same call:
+    # one replacement, never two sells working at once
+    assert len(r.broker.submit_calls) == n + 1
+    sells_ = [o for o in r.broker.orders.values() if o.side == Side.SELL]
+    assert sum(o.status == OrderStatus.NEW for o in sells_) == 1
     r.run(et(15, 45, 8), step=2)
     ex = exits(con, lp["position_id"])
     assert r.broker.orders[ex[0]["client_order_id"]].status == OrderStatus.CANCELED  # limit replaced at once

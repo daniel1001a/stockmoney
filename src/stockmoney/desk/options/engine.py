@@ -80,6 +80,7 @@ from __future__ import annotations
 import json
 import logging
 import random
+import time as time_mod
 from collections import deque
 from dataclasses import replace
 from datetime import date, datetime, time, timedelta, timezone
@@ -116,6 +117,8 @@ _TERMINAL_ORDER = {OrderStatus.FILLED.value, OrderStatus.CANCELED.value, OrderSt
 NOT_SENT_AFTER_S = 30.0  # a pending_submit row the broker still does not know after this was never sent
 # data-call priorities (lower = more important); order / exit calls are trading calls, never budgeted
 PRIO_LIVE, PRIO_SCAN, PRIO_SHADOW = 2, 3, 4
+REREAD_WAITS = (0.5, 1.0, 2.0, 4.0)  # seconds between re-reads of a canceled exit at the flat (7.5 s in all)
+FLATTEN_ROUNDS = 3
 
 
 def _et(now: datetime) -> datetime:
@@ -204,6 +207,7 @@ class Engine:
         self._spot_at: dict[str, tuple[datetime, float | None]] = {}
         self._bars_at: dict[str, datetime] = {}
         self._rng = random.Random()
+        self._sleep = time_mod.sleep  # injectable (tests): the bounded re-read after a cancel at the flat
         ostore.ensure_schema(con)
 
     # ================================================================ tick
@@ -1371,6 +1375,11 @@ class Engine:
             self._exit_status_failed(p, row, e, now)
             return
         self._status_fail.pop(cid, None)
+        if gone:  # the broker never got it (now not_sent): at/after the flat, replace it in this call
+            p = ostore.position(self.con, p["position_id"])
+            if now >= self._flat() and p["state"] in (ENTERED, PENDING) and (p["qty_open"] or 0) > 1e-9:
+                self._send_exit(p, p["qty_open"], "force_flat", None, now, force_market=True)
+            return
         if o is None:
             return
         p, booked = self._book_exit_order(p, row, o)
@@ -1384,13 +1393,43 @@ class Engine:
                 self._send_exit(p, p["qty_open"], "force_flat", None, now, force_market=True)
             return
         age = (now - datetime.fromisoformat(row["submitted_at"])).total_seconds()
+        canceled = False
         if age >= self.cfg.exit_timeout_s:
-            self._cancel_exit(p, row, now, "reprice")
+            canceled = self._cancel_exit(p, row, now, "reprice")
         elif now >= self._flat() and row["order_type"] == OrderType.LIMIT.value:
             # at/after the forced flat a working limit is replaced at once by one market sell
-            self._cancel_exit(p, row, now, "forced flat: replace by a market sell")
+            canceled = self._cancel_exit(p, row, now, "forced flat: replace by a market sell")
+        if canceled and now >= self._flat():  # the next tick may never come: confirm and replace now
+            self._reread_and_replace(p, row, now)
 
-    def _cancel_exit(self, p: dict, row: dict, now: datetime, why: str) -> None:
+    def _reread_and_replace(self, p: dict, row: dict, now: datetime) -> bool:
+        """After a successful cancel at/after the forced flat: a bounded re-read
+        of the old order (REREAD_WAITS, under 10 s in all). Terminal -> book
+        its fills, then sell what is still open at market in this call.
+        Still working or unreadable -> send nothing, page CRITICAL."""
+        cid = row["client_order_id"]
+        for wait in (0.0,) + REREAD_WAITS:
+            if wait:
+                self._sleep(wait)
+            try:
+                self._io()
+                o = self.broker.get_order(cid)
+            except Exception as e:
+                self._error("exit_order", f"{cid}: re-read after cancel: {type(e).__name__}: {e}")
+                continue
+            if o is None or o.status.value not in _TERMINAL_ORDER:
+                continue
+            p, booked = self._book_exit_order(p, ostore.order(self.con, cid), o)
+            if not booked:
+                return False
+            ostore.update_order(self.con, cid, status=o.status.value)
+            if p["state"] in (ENTERED, PENDING) and (p["qty_open"] or 0) > 1e-9:
+                self._send_exit(p, p["qty_open"], "force_flat", None, now, force_market=True)
+            return True
+        self._page_stuck_exit(p, cid, now, "撤單已送出但在收盤前確認不到結果")
+        return False
+
+    def _cancel_exit(self, p: dict, row: dict, now: datetime, why: str) -> bool:
         """Cancel a working exit so it can be replaced. Failed cancels are
         retried with backoff (2, 4, 8 ... 60 s). A replacement is NEVER sent
         from here: only after a get_order of the old order has succeeded,
@@ -1400,17 +1439,18 @@ class Engine:
         cid, cfg = row["client_order_id"], self.cfg
         nxt = self._cancel_next.get(cid)
         if nxt is not None and now < nxt:
-            return
+            return False
         if self._cancel(cid, why, page=False):
             self._cancel_next.pop(cid, None)
-            return
+            return True
         n = self._cancel_fail.get(cid, 0)
         self._cancel_next[cid] = now + timedelta(seconds=min(2 ** n, 60))
         if n < cfg.cancel_max_failures:
-            return
+            return False
         working = self._broker_working(cid)
         state = {True: "仍在券商掛著", False: "券商掛單清單已看不到(狀態未確認)", None: "狀態讀不到"}[working]
         self._page_stuck_exit(p, cid, now, f"已連續 {n} 次撤單失敗,{state}")
+        return False
 
     def _page_stuck_exit(self, p: dict, cid: str, now: datetime, what: str) -> None:
         """CRITICAL, repeated every cancel_page_every_min while an exit can be
@@ -1700,12 +1740,16 @@ class Engine:
                         self._book_exit(p, p["qty_open"], sh.sell_price(bid, self.cfg), bid,
                                         q.ask if fresh else p["last_ask"], reason, now)
                     continue
-                working = [o for o in ostore.orders_for(self.con, p["position_id"])
-                           if o["kind"] == "exit" and o["status"] not in _TERMINAL_ORDER]
-                if working:
-                    self._resolve_exit(p, working[-1], now)
-                else:
-                    self._send_exit(p, p["qty_open"], reason, q if fresh else None, now)
+                for _ in range(FLATTEN_ROUNDS):  # bounded: confirm / cancel / replace, at most 3 rounds
+                    p = ostore.position(self.con, p["position_id"])
+                    if p["state"] != ENTERED or (p["qty_open"] or 0) <= 1e-9:
+                        break
+                    working = [o for o in ostore.orders_for(self.con, p["position_id"])
+                               if o["kind"] == "exit" and o["status"] not in _TERMINAL_ORDER]
+                    if working:
+                        self._resolve_exit(p, working[-1], now)
+                    else:
+                        self._send_exit(p, p["qty_open"], reason, q if fresh else None, now)
             except Exception as e:
                 self._error("flatten", f"{p['position_id']}: {type(e).__name__}: {e}")
         self.con.commit()
