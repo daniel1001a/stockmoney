@@ -376,14 +376,18 @@ def _sync_one(con, broker: Broker, ledger: Ledger, r, day: str) -> str | None:
             ev = f"{verb} {r['symbol']} {o.filled_qty:g} @ {o.filled_avg_price:.2f}({r['strategy']})"
             if not final:
                 ev += f"(部分成交,累計 {o.filled_qty:g}/{o.qty or 0:g},委託仍在)"
-            if side == Side.BUY:
-                con.execute(
-                    "INSERT INTO position_meta (symbol, highest_close, initial_stop, entry_date) VALUES (?,?,?,?) "
-                    "ON CONFLICT(symbol) DO NOTHING",
-                    (r["symbol"], float(o.filled_avg_price), r["stop"],
-                     _today(o.filled_at or datetime.now(timezone.utc))))
-            elif ledger.position(r["symbol"]) is None:
-                con.execute("DELETE FROM position_meta WHERE symbol=?", (r["symbol"],))
+        # From the ledger state, not from ``booked``: apply_fill commits on its own, so a
+        # failure right after it (e.g. a locked database) left the fill booked without its
+        # position_meta; the retry (booked=False) restores or removes the row here.
+        held = ledger.position(r["symbol"]) is not None
+        if side == Side.BUY and held:
+            con.execute(
+                "INSERT INTO position_meta (symbol, highest_close, initial_stop, entry_date) VALUES (?,?,?,?) "
+                "ON CONFLICT(symbol) DO NOTHING",
+                (r["symbol"], float(o.filled_avg_price), r["stop"],
+                 _today(o.filled_at or datetime.now(timezone.utc))))
+        elif side == Side.SELL and not held:
+            con.execute("DELETE FROM position_meta WHERE symbol=?", (r["symbol"],))
     elif final and (o.status != OrderStatus.CANCELED or r["kind"] != "stop"):
         ev = f"未成交 {r['symbol']} {r['side']}:{o.status.value}"
     if final and r["kind"] == "exit" and o.status != OrderStatus.FILLED and ledger.position(r["symbol"]) is not None:
