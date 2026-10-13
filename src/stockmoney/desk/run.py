@@ -51,6 +51,7 @@ import json
 import logging
 import math
 import signal
+import sqlite3
 import sys
 import time
 from dataclasses import dataclass, field
@@ -317,12 +318,24 @@ def sync_fills(con, broker: Broker, ledger: Ledger, day: str | None = None) -> l
                 log.warning("fill sync stopped at %s, broker unreachable: %s", r["client_order_id"], e)
                 events.append(f"成交同步中斷(券商連線失敗),下次執行再試:{type(e).__name__}: {e}")
                 break
+            if _db_busy(e):
+                # another process (the options session) held the shared database past the
+                # timeout: nothing was booked, same as an unreachable broker, never a halt
+                log.warning("fill sync stopped at %s, database busy: %s", r["client_order_id"], e)
+                events.append(f"成交同步中斷(資料庫忙碌),下次執行再試:{type(e).__name__}: {e}")
+                break
             log.exception("could not book order %s", r["client_order_id"])
             why = f"成交入帳失敗 {r['symbol']}({r['client_order_id']}):{type(e).__name__}: {e}"
             _halt(con, why, day, "sync")
             con.commit()
             events.append(why)
     return events
+
+
+def _db_busy(e: BaseException) -> bool:
+    """SQLite could not get its lock in time (another process holds it)."""
+    msg = str(e).lower()
+    return isinstance(e, sqlite3.OperationalError) and ("locked" in msg or "busy" in msg)
 
 
 def _unreachable(e: BaseException) -> bool:
