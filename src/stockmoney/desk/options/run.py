@@ -3,6 +3,7 @@
     python -m stockmoney.desk.options.run ingest-plan <file>     # Grok's OPTIONS_PLAN JSON
     python -m stockmoney.desk.options.run session                # 09:20 to the close loop (launchd starts it 09:00)
     python -m stockmoney.desk.options.run recover                # leftover cleanup only (launchd: at load, opt-in)
+    python -m stockmoney.desk.options.run resolve <position_id>  # close a live row the broker no longer holds
     python -m stockmoney.desk.options.run replay YYYY-MM-DD [--feed iex|sip] [--plan FILE] [--step 20]
     python -m stockmoney.desk.options.run report [YYYY-MM-DD]
     python -m stockmoney.desk.options.run selftest               # offline, synthetic day, no network
@@ -14,7 +15,8 @@ Session safety:
 - real (paper) orders go through line A's AlpacaBroker and every entry
   through line A's OptionsRiskEngine (_iface.LineAGate). AlpacaBroker
   refuses the live endpoint unless the owner set the live flags.
-  ``DESK_OPTIONS_ORDERS=off`` forces a shadow-only session (DenyAllGate);
+  ``DESK_OPTIONS_ORDERS=off`` forces a shadow-only session (ShadowGate: no
+  new buy; a paper leftover is still sold through line A's exit checks);
 - every exit is forced by 15:45 ET (close - 15 min on an early close), the
   loop ends at the close, the owner is paged if the book is not flat 10
   minutes before the close and again at the end;
@@ -51,6 +53,8 @@ ET = ZoneInfo("America/New_York")
 FAST_POLL_S = 2.0         # while a live order is working (entry cancel after 20 s must be timely)
 SESSION_GRACE_S = 1800    # outer alarm: session end + this
 RECOVER_MAX_S = 180       # recover polls its exits for at most this long
+LOCK_WAIT_EXTRA_S = 30    # a session waits RECOVER_MAX_S + this for the lock before giving up
+LOCK_POLL_S = 5.0
 _sleep = time.sleep
 
 
@@ -93,7 +97,7 @@ def make_session_engine(con, cfg: OptionsConfig, clock=_now) -> tuple[Engine, st
     ``cfg.paper_only`` is set."""
     broker = _iface.make_trading_broker()
     live = os.environ.get("DESK_OPTIONS_ORDERS", "paper").strip().lower() != "off"
-    gate = _iface.make_risk_gate(con, broker, cfg) if live else _iface.DenyAllGate()
+    gate = _iface.make_risk_gate(con, broker, cfg) if live else _iface.make_shadow_gate(con, broker, cfg)
     eng = Engine(con, broker, cfg, clock=clock, risk_gate=gate, live=live, flags_fn=_muse_flags(con))
     return eng, ("paper" if eng.live else "shadow")
 
@@ -108,6 +112,12 @@ def session(cfg: OptionsConfig | None = None, db_path: Path = store.DEFAULT_PATH
         print(f"{day} is not a trading day")
         return 0
     lock = _lock(cfg.lock_path)
+    waited = 0.0
+    while lock is None and waited < RECOVER_MAX_S + LOCK_WAIT_EXTRA_S:
+        # recover (run at boot) may hold the lock for up to RECOVER_MAX_S: wait it out
+        sleep(LOCK_POLL_S)
+        waited += LOCK_POLL_S
+        lock = _lock(cfg.lock_path)
     if lock is None:
         msg = "另一個期權 session 仍在執行,本次不啟動。"
         log.error(msg)
@@ -184,6 +194,29 @@ def recover(cfg: OptionsConfig | None = None, db_path: Path = store.DEFAULT_PATH
             return 1
         print(f"recover: nothing open ({mode})")
         return 0
+    finally:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+        lock.close()
+
+
+def resolve(position_id: str, cfg: OptionsConfig | None = None, db_path: Path = store.DEFAULT_PATH, clock=_now,
+            engine_factory=make_session_engine) -> int:
+    """Manual case: mark one live row EXITED (manual_resolved, P&L unknown)
+    and reconcile the options book, only when the broker holds 0 of the
+    contract and has no working order on it. Never sends an order."""
+    cfg = cfg or OptionsConfig()
+    lock = _lock(cfg.lock_path)
+    if lock is None:
+        print("options session or recover is running; try again when it has ended")
+        return 1
+    try:
+        with store.connect(db_path) as con:
+            ostore.ensure_schema(con)
+            eng, _ = engine_factory(con, cfg, clock)
+            msg = eng.resolve_manual(position_id)
+            con.commit()
+        print(msg)
+        return 0 if msg.startswith("resolved") else 1
     finally:
         fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
         lock.close()
@@ -288,6 +321,8 @@ def main(argv: list[str]) -> int:
     p.add_argument("file", type=Path)
     sub.add_parser("session")
     sub.add_parser("recover")
+    p = sub.add_parser("resolve")
+    p.add_argument("position_id")
     p = sub.add_parser("replay")
     p.add_argument("day", type=date.fromisoformat)
     p.add_argument("--feed", choices=("iex", "sip"), default="iex")
@@ -310,6 +345,8 @@ def main(argv: list[str]) -> int:
         return 0
     if a.cmd == "selftest":
         return selftest()
+    if a.cmd == "resolve":
+        return resolve(a.position_id, cfg)
     if a.cmd == "recover":
         try:
             return recover(cfg)
