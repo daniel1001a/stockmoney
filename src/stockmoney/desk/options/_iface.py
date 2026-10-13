@@ -12,8 +12,12 @@ What lives here:
     fill) and the day's forced-flat time;
   - ``LineAGate``: that protocol over line A's OptionsRiskEngine and
     OptionsBook, with limits built from options/config.py;
-  - ``DenyAllGate``: shadow-only sessions (no entry is ever allowed; a sell
-    to close is, so a position left over from a paper session still exits);
+  - ``ShadowGate``: shadow-only sessions (DESK_OPTIONS_ORDERS=off) and
+    ``recover`` in that mode: every new buy refused, but exits, fill booking
+    and reservations are line A's real ones, so a leftover of a paper
+    session is sold only up to what the broker holds and reaches the book;
+  - ``DenyAllGate``: refuses every order (engines without a broker
+    account, e.g. tests); never used by a session;
   - ``make_trading_broker``: line A's AlpacaBroker (paper unless the owner
     set the live flags; AlpacaBroker refuses live endpoints otherwise).
 
@@ -73,15 +77,14 @@ class RiskGate(Protocol):
 
 
 class DenyAllGate:
-    """Shadow-only sessions: every live entry is refused, nothing is booked."""
+    """Refuses every order, books nothing. Not used by any session: a
+    shadow-only session uses ShadowGate, whose exits keep line A's checks."""
 
     def check(self, intent, contract, now, *, marks=None, blocked=None) -> RiskDecision:
         return RiskDecision(False, "shadow-only session: no order path")
 
     def check_exit(self, intent, contract, now) -> RiskDecision:
-        if intent.side == Side.SELL:
-            return RiskDecision(True, "shadow-only session: a sell to close is allowed", intent)
-        return RiskDecision(False, "shadow-only session: no order path")
+        return RiskDecision(False, "deny-all gate: no order path (no broker account to check a sell against)")
 
     def set_flat_by(self, t) -> None:
         pass
@@ -154,8 +157,21 @@ class LineAGate:
             self.on_error("options_book", f"{client_order_id} {occ}: {e}")
 
 
+class ShadowGate(LineAGate):
+    """Shadow-only: no new buy, ever. Sells to close (a leftover of a paper
+    session), fill booking, reservations and flat_by are LineAGate's, i.e.
+    line A's held-quantity / working-sell checks and its OptionsBook."""
+
+    def check(self, intent, contract, now, *, marks=None, blocked=None) -> RiskDecision:
+        return RiskDecision(False, "shadow-only session: no new entries")
+
+
 def make_risk_gate(con, broker, cfg, on_error=None) -> LineAGate:
     return LineAGate(OptionsRiskEngine(limits_from_config(cfg), con), broker, on_error)
+
+
+def make_shadow_gate(con, broker, cfg, on_error=None) -> ShadowGate:
+    return ShadowGate(OptionsRiskEngine(limits_from_config(cfg), con), broker, on_error)
 
 
 def make_trading_broker():

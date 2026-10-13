@@ -364,12 +364,11 @@ def test_m1_real_gate_normal_day_round_trip(tmp_path, con):
     assert r.pos("live")[0]["state"] == "EXITED" and C601N not in r.broker.positions
 
 
-def test_m1_deny_all_gate_allows_sells_only():
+def test_m1_deny_all_gate_refuses_everything():
     g = _iface.DenyAllGate()
     now = et(10, 0)
     sell = OrderIntent("s", C601N, AssetClass.OPTION, Side.SELL, qty=1, order_type=OrderType.MARKET, tif=TIF.DAY)
-    assert g.check_exit(sell, None, now).allow
-    assert not g.check_exit(replace(sell, side=Side.BUY), None, now).allow
+    assert not g.check_exit(sell, None, now).allow
     assert not g.check(replace(sell, side=Side.BUY), None, now).allow
 
 

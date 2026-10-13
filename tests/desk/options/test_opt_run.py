@@ -92,7 +92,7 @@ def test_session_engine_wires_line_a_broker_and_gate(tmp_path, monkeypatch):
         assert eng.risk_gate.engine.limits.max_spread_pct == spy_cfg(tmp_path).max_spread_pct
         monkeypatch.setenv("DESK_OPTIONS_ORDERS", "off")
         eng, mode = orun.make_session_engine(con, spy_cfg(tmp_path))
-        assert mode == "shadow" and eng.live is False and isinstance(eng.risk_gate, _iface.DenyAllGate)
+        assert mode == "shadow" and eng.live is False and isinstance(eng.risk_gate, _iface.ShadowGate)
         b.is_paper = False
         monkeypatch.delenv("DESK_OPTIONS_ORDERS")
         eng, mode = orun.make_session_engine(con, spy_cfg(tmp_path))
