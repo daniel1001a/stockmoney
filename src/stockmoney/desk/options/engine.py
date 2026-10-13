@@ -129,26 +129,34 @@ def _prev_trading_day(d: date) -> date:
     return d
 
 
-def market_close(broker, day: date) -> tuple[int, int]:
-    """Close of ``day`` in ET (hour, minute): the earlier of the broker's
-    market calendar (Alpaca's, when the broker exposes a trading client) and
-    desk.calendar.close_time, so an early close known to either is honored.
-    A calendar error falls back to the built-in list."""
-    hm = close_time(day)
+def broker_close(broker, day: date) -> tuple[int, int] | None:
+    """Close of ``day`` from the broker's market calendar (Alpaca's, when the
+    broker exposes a trading client); None when the broker has no calendar
+    or the day is not in it. Raises when the calendar cannot be read."""
     client = getattr(broker, "client", None)
     if client is None or not hasattr(client, "get_calendar"):
-        return hm
+        return None
+    from alpaca.trading.requests import GetCalendarRequest
+    req = GetCalendarRequest(start=day, end=day)
+    retry = getattr(broker, "_retry", None)
+    cal = retry(lambda: client.get_calendar(req), "get_calendar") if callable(retry) else client.get_calendar(req)
+    for c in cal:
+        if c.date == day:  # open / close are naive ET wall-clock datetimes
+            return (c.close.hour, c.close.minute)
+    return None
+
+
+def market_close(broker, day: date) -> tuple[int, int]:
+    """Close of ``day`` in ET (hour, minute): the earlier of the broker's
+    market calendar and desk.calendar.close_time, so an early close known to
+    either is honored. A calendar error falls back to the built-in list."""
+    hm = close_time(day)
     try:
-        from alpaca.trading.requests import GetCalendarRequest
-        req = GetCalendarRequest(start=day, end=day)
-        retry = getattr(broker, "_retry", None)
-        cal = retry(lambda: client.get_calendar(req), "get_calendar") if callable(retry) else client.get_calendar(req)
-        for c in cal:
-            if c.date == day:  # open / close are naive ET wall-clock datetimes
-                hm = min(hm, (c.close.hour, c.close.minute))
+        b = broker_close(broker, day)
     except Exception as e:
         log.warning("market calendar unavailable, using the built-in early-close list: %s", e)
-    return hm
+        return hm
+    return min(hm, b) if b else hm
 
 
 class Engine:
@@ -173,7 +181,9 @@ class Engine:
         self._errors = 0
         self._plan_seen: str | None = None
         self._closes: dict[date, tuple[int, int]] = {}
-        self._flat_day: str | None = None      # day the risk gate's flat_by was last set for
+        self._cal_fail: dict[date, int] = {}     # failed calendar reads per day (never cached)
+        self._cal_retry: datetime | None = None  # no calendar retry before this
+        self._flat_day: tuple | None = None    # (day, flat time) last given to the risk gate
         self._swept: str | None = None         # day the start-of-day sweep last ran
         self._cancel_fail: dict[str, int] = {}  # client_order_id -> failed cancels in a row
         self._status_fail: dict[str, int] = {}  # exit client_order_id -> failed get_order reads in a row
@@ -224,11 +234,30 @@ class Engine:
 
     # ================================================================ session clock
     def _close(self) -> datetime:
-        """Today's regular-session close (ET), early closes included."""
-        if self._day not in self._closes:
-            self._io()
-            self._closes[self._day] = market_close(self.broker, self._day)
-        return _at(self._day, self._closes[self._day])
+        """Today's regular-session close (ET), early closes included. A failed
+        calendar read is NOT cached: it is retried (at most once a minute) and
+        paged after 3 failures; meanwhile the built-in list decides (16:00, or
+        a listed early close), so the forced flat is never later than 15:45."""
+        day = self._day
+        if day in self._closes:
+            return _at(day, self._closes[day])
+        hm = close_time(day)
+        if self._cal_retry is not None and self._now < self._cal_retry:
+            return _at(day, hm)
+        self._io()
+        try:
+            b = broker_close(self.broker, day)
+        except Exception as e:
+            n = self._cal_fail[day] = self._cal_fail.get(day, 0) + 1
+            self._cal_retry = self._now + timedelta(seconds=60)
+            self._error("calendar", f"market calendar read failed ({n}x): {type(e).__name__}: {e}")
+            if n >= 3 and ostore.notify_once(self.con, f"{day}:calendar_unavailable"):
+                self._notify("期權軌道:市場日曆讀不到", f"Alpaca 市場日曆連續 {n} 次讀取失敗({e})。暫用內建提早收盤"
+                             f"清單:今天收盤視為 {hm[0]:02d}:{hm[1]:02d} ET。若今天其實提早收盤,請手動確認部位。",
+                             notify.CRITICAL)
+            return _at(day, hm)
+        self._closes[day] = min(hm, b) if b else hm
+        return _at(day, self._closes[day])
 
     def _flat(self) -> datetime:
         """Today's forced-flat time: 15:45, or the close minus 15 minutes if earlier."""
@@ -251,9 +280,10 @@ class Engine:
     # ================================================================ day setup
     def _ensure_day(self, now: datetime) -> None:
         cfg, d = self.cfg, self._dstr
-        if self._flat_day != d:  # the gate refuses buys from the same (possibly early) flat time
-            self._flat_day = d
-            self.risk_gate.set_flat_by(self._flat().time())
+        flat = (d, self._flat().time())
+        if self._flat_day != flat:  # the gate refuses buys from the same (possibly early) flat time
+            self._flat_day = flat
+            self.risk_gate.set_flat_by(flat[1])
         active = self._active = oplan.active_plan(self.con, self._day)
         if not ostore.universe(self.con, d):
             if _et(now) < _at(self._day, cfg.open_time) - timedelta(minutes=5):
@@ -793,13 +823,23 @@ class Engine:
             return
         if o is None:
             return
-        delta = (o.filled_qty or 0) - (row["booked_qty"] or 0)
+        booked = row["booked_qty"] or 0
+        delta = (o.filled_qty or 0) - booked
         if delta > 0 and o.filled_avg_price:
-            ostore.add_fill(self.con, pid, now, "buy", delta, o.filled_avg_price, p["entry_bid"], p["entry_ask"],
+            # the new contracts at their own price (the broker reports a cumulative average), and
+            # entry_price = average cost of the contracts still OPEN, so a sell after a partial
+            # entry kept filling is measured against what those contracts cost (as line A's book)
+            px = (o.filled_qty * o.filled_avg_price - (row["avg_price"] or 0.0) * booked) / delta
+            if not (px > 0):
+                px = o.filled_avg_price
+            have = p["qty_open"] or 0
+            cost = ((p["entry_price"] or 0.0) * have + px * delta) / (have + delta)
+            ostore.add_fill(self.con, pid, now, "buy", delta, px, p["entry_bid"], p["entry_ask"],
                             "entry", f"{ecid}#{o.filled_qty:g}")
-            ostore.update_position(self.con, pid, qty_open=(p["qty_open"] or 0) + delta, entry_price=o.filled_avg_price,
-                                   fees_usd=cfg.fee_per_contract * o.filled_qty,
-                                   spread_cost_usd=sh.half_spread_cost(p["entry_bid"], p["entry_ask"], o.filled_qty, cfg))
+            ostore.update_position(self.con, pid, qty_open=have + delta, entry_price=cost,
+                                   fees_usd=(p["fees_usd"] or 0) + cfg.fee_per_contract * delta,
+                                   spread_cost_usd=(p["spread_cost_usd"] or 0)
+                                   + sh.half_spread_cost(p["entry_bid"], p["entry_ask"], delta, cfg))
             ostore.update_order(self.con, ecid, booked_qty=o.filled_qty, filled_qty=o.filled_qty,
                                 avg_price=o.filled_avg_price)
             self._book(p, ecid, Side.BUY, o)
@@ -1020,6 +1060,11 @@ class Engine:
         if not dec.allow and intent.order_type == OrderType.LIMIT:
             intent = replace(intent, order_type=OrderType.MARKET, limit_price=None)
             dec = self._exit_gate(intent, q, now)
+        if not dec.allow and p["day"] < self._dstr and p["state"] == ENTERED and self._broker_flat(p["occ"]):
+            # a leftover the broker no longer holds (closed by hand, expired, exercised):
+            # reconcile it, never sell
+            self._reconcile_flat(p, "broker_flat_unreconciled", now, dec.reason)
+            return False
         if not dec.allow:
             log.warning("options exit refused by the risk gate: %s %s", pid, dec.reason)
             if ostore.notify_once(self.con, f"{self._dstr}:exit_refused:{pid}"):
@@ -1133,6 +1178,62 @@ class Engine:
             ostore.update_order(self.con, row["client_order_id"], note=f"late status {o.status.value}")
         else:
             self._cancel(row["client_order_id"], "superseded exit still working")
+
+    def _broker_flat(self, occ: str) -> bool:
+        """True only when a fresh broker read shows 0 contracts of ``occ`` AND
+        no working order on it (any read failure: False, nothing is assumed)."""
+        held = self._broker_held(occ)
+        if held is None or abs(held) > 1e-9:
+            return False
+        if hasattr(self.broker, "open_orders"):
+            self._io()
+            try:
+                if any(o.symbol == occ for o in self.broker.open_orders()):
+                    return False
+            except Exception as e:
+                self._error("open_orders", f"{type(e).__name__}: {e}")
+                return False
+        return not any(o["status"] not in _TERMINAL_ORDER
+                       for q in self.con.execute("SELECT position_id FROM options_positions WHERE occ=? AND mode='live'",
+                                                 (occ,)).fetchall()
+                       for o in ostore.orders_for(self.con, q[0]))
+
+    def _reconcile_flat(self, p: dict, reason: str, now: datetime, why: str = "") -> None:
+        """Close a live row the broker does not hold: EXITED with ``reason``
+        (its P&L is unknown and the report says so), the options book
+        position removed by an explicit reconciliation row, owner paged once.
+        This path only writes the store; it can never send an order."""
+        pid = p["position_id"]
+        ostore.update_position(self.con, pid, state=EXITED, qty_open=0, exit_time=ostore.iso(now), exit_reason=reason,
+                               note=((p["note"] or "") + f"; broker holds 0 at {ostore.iso(now)}: P&L of "
+                                     f"{p['qty_open'] or 0:g} contracts unknown").strip("; ")[:500])
+        try:
+            if self._obook is None:
+                self._obook = OptionsBook(self.con)
+            self._obook.reconcile_flat(p["occ"], reason, now)
+        except Exception as e:
+            self._error("options_book", f"reconcile {p['occ']}: {type(e).__name__}: {e}")
+        ostore.event(self.con, self._dstr, now, "critical", reason, f"{pid} {p['occ']} x{p['qty_open'] or 0:g}: {why}"[:900])
+        self.con.commit()
+        if ostore.notify_once(self.con, f"{reason}:{pid}"):
+            self._notify("期權軌道:部位已不在券商", f"{p['occ']} x{p['qty_open'] or 0:g}({p['day']})資料庫記為持有,"
+                         "但券商持倉為 0 且沒有掛單(手動平倉、到期或被履約?)。已標記為已出場、損益未知,並從期權帳本"
+                         "移除;沒有送出任何單。請到 Alpaca 核對實際損益。", notify.CRITICAL)
+
+    def resolve_manual(self, position_id: str) -> str:
+        """run.py resolve: close one live row by hand after the owner checked
+        the broker. Refused unless a fresh broker read shows 0 contracts and
+        no working order on the contract. Never sends an order."""
+        now = self.clock()
+        self._begin(now)
+        p = ostore.position(self.con, position_id)
+        if p is None or p["mode"] != "live" or p["state"] not in (PENDING, ENTERED):
+            return f"refused: {position_id} is not an open live position"
+        if not self._broker_flat(p["occ"]):
+            return (f"refused: the broker still holds {p['occ']}, has a working order on it, or cannot be read; "
+                    "close it at the broker first")
+        self._reconcile_flat(p, "manual_resolved", now, "resolved by hand (run.py resolve)")
+        return f"resolved: {position_id} {p['occ']} marked EXITED (manual_resolved), options book reconciled"
 
     def _broker_held(self, occ: str) -> float | None:
         """Contracts of ``occ`` the broker holds now, or None when unreadable."""

@@ -31,7 +31,12 @@ STATE_LABEL = {"WAITING": "等待", "TRIGGERED": "已觸發", "ENTERED": "持倉
 REASON_LABEL = {"premium_stop": "權利金停損", "take_profit": "停利(先出一半)", "breakeven_stop": "成本價停損",
                 "invalidation": "推翻價位", "time_stop": "時間停損", "force_flat": "強制平倉(15:45,提早收盤日為收盤前 15 分鐘)",
                 "session_end": "收盤補記", "entry_unfilled": "進場未成交", "entry_not_sent": "未送出",
-                "atr_trail": "ATR 追蹤停損", "carry_over": "前一日遺留,開盤市價平倉", "recover_flat": "復原工作市價平倉"}
+                "atr_trail": "ATR 追蹤停損", "carry_over": "前一日遺留,開盤市價平倉", "recover_flat": "復原工作市價平倉",
+                "broker_flat_unreconciled": "券商已無部位(損益未知)", "manual_resolved": "手動結案(損益未知)",
+                "partial_entry_exit": "部分成交進場已賣出"}
+# exits whose true P&L the sleeve never saw (the broker was already flat): shown as unknown and
+# left out of every statistic
+UNKNOWN_PNL = ("broker_flat_unreconciled", "manual_resolved")
 DATA_NOTE = ("> 資料限制:期權報價是 Alpaca indicative feed 的輪詢快照(非 OPRA,約每 20 秒一次),盤中拿不到期權 1 分鐘 K,"
              "所以 MFE/MAE 是輪詢到的最佳/最差買價,不是盤中極值。標的 1 分鐘 K 來自 IEX,成交量只是 IEX 的份額,"
              "所有量能條件(RVOL、突破量)都是同一資料源的比率,不是全市場絕對量。")
@@ -121,7 +126,8 @@ def build(con, day: str, cfg: OptionsConfig | None = None, header: str = "") -> 
     ev_of = lambda p: p["exit_variant"] or "A"
     main = [p for p in shadow_all if p["dte_label"] == live_dte and ev_of(p) == live_ev]
     live_all = [p for p in pos if p["mode"] == "live"]
-    live = [p for p in closed if p["mode"] == "live"]
+    unknown = [p for p in live_all if p["exit_reason"] in UNKNOWN_PNL]
+    live = [p for p in closed if p["mode"] == "live" and p["exit_reason"] not in UNKNOWN_PNL]
     rv = lambda p: (by_id.get(p["setup_id"]) or {}).get("rvol")
     lines = [f"# {day} 期權短打日報", ""]
     if header:
@@ -143,7 +149,9 @@ def build(con, day: str, cfg: OptionsConfig | None = None, header: str = "") -> 
               f"- 主變體(實單用的 {live_dte}・出場 {live_ev})已結算 {len(main)} 筆,"
               f"合計 {sum(p['realized_usd'] - p['fees_usd'] for p in main):+.0f} 美元",
               f"- 紙上實單 {len(live_all)} 筆,已結算 {len(live)} 筆,"
-              f"合計 {sum(p['realized_usd'] - p['fees_usd'] for p in live):+.0f} 美元", ""]
+              f"合計 {sum(p['realized_usd'] - p['fees_usd'] for p in live):+.0f} 美元"
+              + (f";另 {len(unknown)} 筆券商已無部位、損益未知(不計入任何統計,請到 Alpaca 核對)" if unknown else ""),
+              ""]
 
     # ---- live
     lines += ["## 紙上實單", ""]
@@ -154,9 +162,10 @@ def build(con, day: str, cfg: OptionsConfig | None = None, header: str = "") -> 
             ep = p["entry_price"] or 0
             mfe = f"{(p['max_bid'] or 0) / ep - 1:+.0%}" if ep else "-"
             mae = f"{(p['min_bid'] or 0) / ep - 1:+.0%}" if ep else "-"
+            net_s = "未知" if p["exit_reason"] in UNKNOWN_PNL else f"{net:+.0f}"
             lines.append(f"| {p['underlying']} | {p['source']} | {p['occ']} | {p['qty_initial'] or 0:g} | "
                          f"{ep:.2f} | {REASON_LABEL.get(p['exit_reason'] or '', p['exit_reason'] or p['state'])} | "
-                         f"{net:+.0f} | {mfe} | {mae} |")
+                         f"{net_s} | {mfe} | {mae} |")
     else:
         lines.append("今天沒有紙上實單。")
     lines.append("")
