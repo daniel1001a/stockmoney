@@ -164,3 +164,13 @@ def test_book_refusal_keeps_the_order_polled_and_pages(tmp_path, con):
     assert ex and ex[0]["status"] not in ("filled", "canceled", "expired", "rejected")  # still polled
     assert "reconcile needed" in p["note"]
     assert sum("帳本拒收" in a[0] for a in r.sent) == 1
+
+
+# ------------------------------------------------------------------ F4 ingest never raises
+@pytest.mark.parametrize("text", ["[" * 60_000, '{"plan_id": "gp-\ud800", "protocol": "1"}', "\ud800", '{"a":' * 5000],
+                         ids=["deep_list", "surrogate_in_id", "lone_surrogate", "deep_object"])
+def test_ingest_never_raises_on_hostile_text(tmp_path, con, text):
+    res = oplan.ingest(con, text, et(8, 0), spy_cfg(tmp_path))
+    assert res.status == "rejected" and res.error
+    row = con.execute("SELECT status, error FROM options_plans ORDER BY id DESC LIMIT 1").fetchone()
+    assert row["status"] == "rejected" and row["error"]

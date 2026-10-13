@@ -190,12 +190,14 @@ class OptionsPlan(_Strict):
 
 def parse(text: str) -> OptionsPlan:
     """Strict parse of one JSON object. Raises ValueError with the reason."""
-    if len(text.encode("utf-8")) > MAX_PLAN_BYTES:
-        raise ValueError(f"plan larger than {MAX_PLAN_BYTES} bytes")
     try:
+        if len(text.encode("utf-8")) > MAX_PLAN_BYTES:
+            raise ValueError(f"plan larger than {MAX_PLAN_BYTES} bytes")
         return OptionsPlan.model_validate_json(text.strip())
     except ValidationError as e:
         raise ValueError(_short(e)) from None
+    except (RecursionError, UnicodeError) as e:  # absurd nesting, a lone surrogate: a reason, never a crash
+        raise ValueError(f"unparseable plan text: {type(e).__name__}") from None
 
 
 def _short(e: ValidationError) -> str:
@@ -225,11 +227,15 @@ def ingest(con, text: str, received_at: datetime, cfg: OptionsConfig | None = No
     duplicate of the first; a DIFFERENT plan reusing a plan_id is rejected."""
     cfg = cfg or OptionsConfig()
     ostore.ensure_schema(con)
-    sha = hashlib.sha256(text.strip().encode("utf-8")).hexdigest()
+    # never raises on hostile text: a lone surrogate cannot be UTF-8 encoded (hash and store a
+    # replaced copy), absurd nesting is a rejection reason (parse)
+    safe = text.encode("utf-8", "replace").decode("utf-8")
+    sha = hashlib.sha256(safe.strip().encode("utf-8")).hexdigest()
     at = ostore.iso(received_at)
     try:
         p = parse(text)
     except ValueError as e:
+        text = safe
         con.execute("INSERT INTO options_plans (plan_id, for_date, received_at, status, shadow_only, error, sha, raw) "
                     "VALUES (?,?,?,?,?,?,?,?)", (_peek_id(text), None, at, "rejected", 1, str(e)[:2000], sha,
                                                  text[:MAX_PLAN_BYTES]))
@@ -256,8 +262,8 @@ def ingest(con, text: str, received_at: datetime, cfg: OptionsConfig | None = No
 def _peek_id(text: str) -> str:
     try:
         v = json.loads(text).get("plan_id", "")
-        return v[:64] if isinstance(v, str) else ""
-    except (ValueError, AttributeError):
+        return v[:64].encode("utf-8", "replace").decode("utf-8") if isinstance(v, str) else ""
+    except (ValueError, AttributeError, RecursionError):
         return ""
 
 
