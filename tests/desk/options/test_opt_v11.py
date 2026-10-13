@@ -143,3 +143,65 @@ def test_v3_report_breaks_down_by_stance_with_sample_warning(tmp_path, con):
     sec = rep[rep.index("## Grok 方向判斷"):]
     assert "### 紙上實單" in sec and "### 影子主變體" in sec and "影子變體 0dte" in sec
     assert "Grok 同意" in sec and "樣本數警告" in sec and "少於 30 筆" in sec
+
+
+# ------------------------------------------------------------------ round-3 F5 / F6
+PRIOR_NAMES = ("QQQ", "AAPL", "MSFT", "NVDA", "AMD", "TSLA", "META")  # none in spy_cfg's starting list
+
+
+def test_f5_prior_only_names_capped_at_five(tmp_path, con):
+    oplan.ingest(con, plan([prior(sym=s) for s in PRIOR_NAMES]), et(8, 0))
+    r = Rig(tmp_path, con)
+    r.run(et(9, 26))
+    u = {m["symbol"]: m["origin"] for m in ostore.universe(con, str(DAY))}
+    assert sorted(s for s, o in u.items() if o == "plan_prior") == sorted(PRIOR_NAMES[:5])
+    capped = {x[0] for x in con.execute("SELECT underlying FROM options_filtered WHERE reason='prior_cap'")}
+    assert capped == set(PRIOR_NAMES[5:])
+    # a later plan cannot add more prior-only names
+    oplan.ingest(con, plan([prior(sym="NFLX")], plan_id="gp-20261013-0940"), et(9, 40))
+    r.run(et(9, 41))
+    assert "NFLX" not in {m["symbol"] for m in ostore.universe(con, str(DAY))}
+    # a triggered item is not a prior: not capped
+    oplan.ingest(con, plan([prior(sym="NFLX", trigger=TRIG, invalidation=INV)], plan_id="gp-20261013-0942"), et(9, 42))
+    r.run(et(9, 43))
+    assert "NFLX" in {m["symbol"] for m in ostore.universe(con, str(DAY))}
+
+
+def test_f5_late_plan_extension_runs_after_exit_management(tmp_path, con):
+    r = Rig(tmp_path, con)
+    r.run(et(9, 52))
+    lp = r.pos("live")[0]
+    calls = []
+    for name in ("submit", "minute_bars"):
+        f = getattr(r.broker, name)
+        setattr(r.broker, name, (lambda f, name: lambda *a, **k: (calls.append(
+            (name, getattr(a[0], "symbol", a[0]))), f(*a, **k))[1])(f, name))
+    r.broker.mult[ostore.position(con, lp["position_id"])["occ"]] = 0.5  # premium stop due now
+    oplan.ingest(con, plan([prior(sym="AMD")], plan_id="gp-20261013-0952"), et(9, 52))
+    r.eng.tick()
+    exit_at = next(i for i, c in enumerate(calls) if c[0] == "submit")
+    amd_at = next(i for i, c in enumerate(calls) if c == ("minute_bars", "AMD"))
+    assert exit_at < amd_at
+
+
+def test_f6_plan_retried_when_its_tick_fails(tmp_path, con):
+    r = Rig(tmp_path, con)
+    r.run(et(9, 40))
+    oplan.ingest(con, plan([prior(trigger=TRIG, invalidation=INV)], plan_id="gp-20261013-0940"), et(9, 40))
+    real = r.eng._roll_setups  # a failure LATER in the same tick, after the plan was added
+    boom = {"n": 1}
+
+    def flaky(*a, **k):
+        if boom["n"]:
+            boom["n"] -= 1
+            raise RuntimeError("disk hiccup")
+        return real(*a, **k)
+    r.eng._roll_setups = flaky
+    r.eng._io = lambda: None  # no broker call (and so no commit) between the plan and the failure
+    with pytest.raises(RuntimeError):
+        r.eng.tick()
+    con.rollback()  # what the session loop does after a failed tick
+    r.clock.advance(20)
+    r.eng.tick()
+    assert con.execute("SELECT COUNT(*) FROM options_setups WHERE source='grok_plan' AND plan_id='gp-20261013-0940'"
+                       ).fetchone()[0] == 1

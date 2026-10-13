@@ -234,6 +234,8 @@ class Engine:
         # gate sees a book that already includes this tick's fills
         self._manage_pending(now)
         self._manage_open(now, fast)
+        if not fast:
+            self._ensure_plan(now)
         if not fast and et >= _at(day, self.cfg.open_time):
             for m in ostore.universe(self.con, self._dstr):
                 try:
@@ -308,8 +310,18 @@ class Engine:
             if _et(now) < _at(self._day, cfg.open_time) - timedelta(minutes=5):
                 return  # the scan wants premarket data up to ~09:25
             self._build_universe(now, active)
+
+    def _ensure_plan(self, now: datetime) -> None:
+        """Setups / universe additions of a plan not seen yet. Runs AFTER exit
+        management in the tick (a late plan's data fetches never delay an
+        exit), and marks the plan seen only once its writes are committed, so
+        a failure half-way is retried next tick (every write is idempotent)."""
+        active = self._active
+        if not ostore.universe(self.con, self._dstr):
+            return  # before ~09:25: the universe build adds the plan's names
         if active is not None and active.plan.plan_id != self._plan_seen:
             self._add_plan(active, now)
+            self.con.commit()
         self._plan_seen = active.plan.plan_id if active else None
 
     def _prev_close(self, sym: str) -> float | None:
@@ -345,9 +357,21 @@ class Engine:
             self._error("premarket_volume", f"{sym}: {e}")
             return None
 
+    def _prior_only(self, active, syms: list[str]) -> list[str]:
+        """Names of ``syms`` that only a directional prior brings in (not in
+        the starting list, not traded by a triggered plan item)."""
+        trig = {i.underlying for i in active.plan.plans if not i.directional} if active else set()
+        start = set(self.cfg.starting_universe())
+        return [s for s in syms if s not in start and s not in trig]
+
     def _build_universe(self, now: datetime, active) -> None:
         cfg, d = self.cfg, self._dstr
-        plan_syms = [p.underlying for p in active.plan.plans] if active else []
+        plan_syms = list(dict.fromkeys(p.underlying for p in active.plan.plans)) if active else []
+        prior_only = self._prior_only(active, plan_syms)
+        for s in prior_only[cfg.prior_symbol_cap:]:  # a prior adds at most prior_symbol_cap names a day
+            ostore.filtered(self.con, d, now, "universe", s, "prior_cap")
+            plan_syms.remove(s)
+        prior_only = prior_only[:cfg.prior_symbol_cap]
         hits = []
         prev: dict[str, float | None] = {}
         for s in cfg.scan_candidates:
@@ -371,6 +395,9 @@ class Engine:
         rows = [(m.symbol, m.uclass, m.origin, prev.get(m.symbol) or self._prev_close(m.symbol),
                  self._pm_dollar_vol(m.symbol, now)) for m in members]
         ostore.save_universe(self.con, d, rows)
+        for s in prior_only:  # counted against prior_symbol_cap by later plans
+            self.con.execute("UPDATE options_universe SET origin='plan_prior' WHERE day=? AND symbol=? AND origin='plan'",
+                             (d, s))
         for m in members:
             self._profile(m.symbol, now)
         avoid = {a.ticker for a in active.plan.avoid} if active else set()
@@ -394,6 +421,11 @@ class Engine:
         for i, item in enumerate(p.plans):
             sym = item.underlying
             if sym not in have:
+                if item.directional and self._prior_only(active, [sym]) and self.con.execute(
+                        "SELECT COUNT(*) FROM options_universe WHERE day=? AND origin='plan_prior'",
+                        (d,)).fetchone()[0] >= self.cfg.prior_symbol_cap:
+                    ostore.filtered(self.con, d, now, "universe", sym, "prior_cap", setup_id=f"{d}:grok:{p.plan_id}:{i}")
+                    continue
                 if len(have) >= self.cfg.daily_universe_cap:
                     ostore.filtered(self.con, d, now, "universe", sym, "daily_cap", setup_id=f"{d}:grok:{p.plan_id}:{i}")
                     continue

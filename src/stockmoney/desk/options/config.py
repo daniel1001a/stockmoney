@@ -118,6 +118,7 @@ class OptionsConfig:
     scan_min_gap_pct: float = 0.03
     scan_min_premarket_dollar_vol: float = 20_000_000.0
     daily_universe_cap: int = 25
+    prior_symbol_cap: int = 5                # at most this many names a day joined ONLY as a Grok directional prior
     underlying_max_spread_pct: float = 0.002  # stock bid/ask spread / mid
 
     # --- contract liquidity (section 3); also passed to line A's OptionsLimits
