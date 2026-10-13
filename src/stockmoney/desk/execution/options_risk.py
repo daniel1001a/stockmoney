@@ -229,6 +229,25 @@ class OptionsBook:
                  _utc_iso(None)))
         return True
 
+    def reconcile_flat(self, occ: str, reason: str, at: datetime | str | None = None) -> bool:
+        """Remove a book position the broker no longer holds (closed by hand,
+        expired or exercised while nothing was watching). Writes an explicit
+        ``side='reconcile'`` row (qty = what the book held, price = its cost,
+        realized_pnl 0: the true P&L is unknown) so the removal is auditable.
+        Never touches the broker. False when the book holds nothing."""
+        pos = self.position(occ)
+        if pos is None:
+            return False
+        at_s = _utc_iso(at)
+        with self.con:
+            self.con.execute("DELETE FROM options_book_positions WHERE occ=?", (occ,))
+            self.con.execute(
+                "INSERT INTO options_book_fills (client_order_id, occ, underlying, strategy, side, qty, price, multiplier, "
+                "fee, filled_at, realized_pnl, recorded_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                (f"reconcile:{occ}:{at_s}:{reason}"[:200], occ, pos.underlying, pos.strategy, "reconcile", pos.qty,
+                 pos.avg_price, pos.multiplier, 0.0, at_s, 0.0, _utc_iso(None)))
+        return True
+
     def realized(self, start: str | None = None, end: str | None = None) -> float:
         """Realized P&L (fees included) of fills with start <= filled_at < end."""
         q, args = "SELECT COALESCE(SUM(realized_pnl),0) FROM options_book_fills WHERE 1=1", []
