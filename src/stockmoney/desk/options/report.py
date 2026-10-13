@@ -75,6 +75,24 @@ def _table(groups: dict[str, list[dict]], mult: int, label: str) -> list[str]:
     return out
 
 
+STANCE_LABEL = {"agree": "Grok 同意", "disagree": "Grok 反對", "none": "Grok 無意見"}
+MIN_SAMPLE = 30  # below this a group's numbers are anecdotes, not evidence
+
+
+def _stance_section(title: str, rows: list[dict], by_id: dict, mult: int) -> list[str]:
+    """Rule setups only, grouped by the grok_stance tagged at the trigger."""
+    def key(r):
+        s = by_id.get(r["setup_id"]) or {}
+        k = STANCE_LABEL.get(s.get("grok_stance") or "none", s.get("grok_stance") or "none")
+        return k + ("(劇本晚到,只進影子)" if s.get("grok_stance_late") else "")
+    groups = _group([r for r in rows if r["source"] != GROK], key)
+    out = ["", f"### {title}", ""] + _table(groups, mult, "Grok 立場")
+    small = sorted(f"{k} {len(v)} 筆" for k, v in groups.items() if len(v) < MIN_SAMPLE)
+    if small:
+        out += ["", f"> 樣本數警告:每組少於 {MIN_SAMPLE} 筆不能當作證據({'、'.join(small)});要跨很多天累積後再看。"]
+    return out
+
+
 def _group(rows: list[dict], key) -> dict[str, list[dict]]:
     g: dict[str, list[dict]] = defaultdict(list)
     for r in rows:
@@ -215,6 +233,19 @@ def build(con, day: str, cfg: OptionsConfig | None = None, header: str = "") -> 
                          f"{spec.get('regime') or '-'} / {spec.get('daily_ref') or '-'} |")
     else:
         lines += ["", "今天沒有生效的 Grok 劇本。"]
+
+    # ---- Grok directional priors (schema v1.1): rule setups by grok_stance
+    lines += ["", "## Grok 方向判斷 vs 規則劇本(grok_stance,只看規則劇本)", "",
+              "立場在規則劇本觸發當下標記:同方向為同意、反方向為反對、該標的沒有方向判斷(或判斷互相矛盾)為無意見。"
+              "立場不影響是否下單。"]
+    lines += _stance_section("紙上實單", live, by_id, mult)
+    lines += _stance_section(f"影子主變體({live_dte}・出場 {live_ev})", main, by_id, mult)
+    for b in cfg.dte_buckets:
+        for e in cfg.exit_variants:
+            if (b.label, e) == (live_dte, live_ev):
+                continue
+            lines += _stance_section(f"影子變體 {b.label}・出場 {e}",
+                                     [p for p in shadow_all if p["dte_label"] == b.label and ev_of(p) == e], by_id, mult)
 
     # ---- shadow vs live, same setup and variant
     pairs = []
