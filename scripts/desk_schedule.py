@@ -31,11 +31,14 @@ JOBS = {
     # launchd replays a missed calendar job after sleep but not after a power-off;
     # at every load (boot, login, install) recover books fills and restores stops
     "recover": {"run_at_load": True},
+    # options leftover cleanup at every load: sells a paper option position a dead session left
+    # open (only while the market is open), pages unknown broker option positions
+    "options-recover": {"run_at_load": True},
 }
 
 
-# bridge needs the Muse mailbox configured; crypto is a Phase 1 placeholder; options is the
-# intraday options sleeve (docs/desk/OPTIONS_PLAN.md). All three are opt-in (--jobs ...).
+# bridge needs the Muse mailbox configured; crypto is a Phase 1 placeholder; options and
+# options-recover are the intraday options sleeve (docs/desk/OPTIONS_PLAN.md). All are opt-in (--jobs ...).
 DEFAULT_JOBS = ["premarket", "postopen", "postclose", "recover", "learn"]
 
 

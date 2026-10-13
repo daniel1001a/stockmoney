@@ -1,7 +1,8 @@
 """Command line of the intraday options sleeve (OPTIONS_PLAN.md section 8).
 
     python -m stockmoney.desk.options.run ingest-plan <file>     # Grok's OPTIONS_PLAN JSON
-    python -m stockmoney.desk.options.run session                # 09:20 to 16:00 ET loop (launchd starts it 09:00)
+    python -m stockmoney.desk.options.run session                # 09:20 to the close loop (launchd starts it 09:00)
+    python -m stockmoney.desk.options.run recover                # leftover cleanup only (launchd: at load, opt-in)
     python -m stockmoney.desk.options.run replay YYYY-MM-DD [--feed iex|sip] [--plan FILE] [--step 20]
     python -m stockmoney.desk.options.run report [YYYY-MM-DD]
     python -m stockmoney.desk.options.run selftest               # offline, synthetic day, no network
@@ -14,8 +15,14 @@ Session safety:
   through line A's OptionsRiskEngine (_iface.LineAGate). AlpacaBroker
   refuses the live endpoint unless the owner set the live flags.
   ``DESK_OPTIONS_ORDERS=off`` forces a shadow-only session (DenyAllGate);
-- every exit is forced by 15:45 ET and flatness is verified at the end; the
-  owner is paged when it is not.
+- every exit is forced by 15:45 ET (close - 15 min on an early close), the
+  loop ends at the close, the owner is paged if the book is not flat 10
+  minutes before the close and again at the end;
+- ``recover`` (run at boot / login by an opt-in launchd job) does only the
+  leftover cleanup: resolve live rows still open (earlier days, and today's
+  when no session holds the lock), sell them at market while the market is
+  open, page unknown broker option positions. It exits at once when a
+  session holds the lock (the session does the same cleanup every tick).
 """
 from __future__ import annotations
 
@@ -43,6 +50,7 @@ log = logging.getLogger("desk.options.run")
 ET = ZoneInfo("America/New_York")
 FAST_POLL_S = 2.0         # while a live order is working (entry cancel after 20 s must be timely)
 SESSION_GRACE_S = 1800    # outer alarm: session end + this
+RECOVER_MAX_S = 180       # recover polls its exits for at most this long
 _sleep = time.sleep
 
 
@@ -106,17 +114,19 @@ def session(cfg: OptionsConfig | None = None, db_path: Path = store.DEFAULT_PATH
         notify.send("期權軌道未啟動", msg, notify.CRITICAL)
         return 1
     try:
-        start, end = _at(day, cfg.session_start), _at(day, cfg.session_end)
+        start = _at(day, cfg.session_start)
         while clock() < start:
             sleep(min(30.0, max((start - clock()).total_seconds(), 0.5)))
         with store.connect(db_path) as con:
             ostore.ensure_schema(con)
             eng, mode = engine_factory(con, cfg, clock)
+            end = eng.session_end(clock())  # the close: 13:00 ET on an early-close day
             ap = oplan.active_plan(con, day)
             plan_txt = (f"劇本 {ap.plan.plan_id}({len(ap.plan.plans)} 個,"
                         f"{'只進影子' if ap.shadow_only else '可下紙上單'})") if ap else "沒有 Grok 劇本(規則劇本照跑)"
             halt = "HALT 生效中" if cfg.halt_file.exists() else "HALT 未設"
-            notify.send("期權軌道啟動", f"{day} 模式 {mode};{plan_txt};{halt}。", notify.INFO)
+            close = "" if end >= _at(day, cfg.session_end) else f";提早收盤 {end:%H:%M} ET"
+            notify.send("期權軌道啟動", f"{day} 模式 {mode};{plan_txt};{halt}{close}。", notify.INFO)
             con.commit()
             failures = 0
             try:
@@ -131,15 +141,49 @@ def session(cfg: OptionsConfig | None = None, db_path: Path = store.DEFAULT_PATH
                             notify.send("期權軌道異常", f"連續 {failures} 次迴圈失敗:{type(e).__name__}: {e}",
                                         notify.CRITICAL)
                         con.rollback()
-                    working = con.execute("SELECT COUNT(*) FROM options_positions WHERE day=? AND mode='live' "
+                    # any day: a leftover of an earlier day being sold also wants the fast poll
+                    working = con.execute("SELECT COUNT(*) FROM options_positions WHERE day<=? AND mode='live' "
                                           "AND state=?", (str(day), PENDING)).fetchone()[0]
                     exiting = con.execute("SELECT COUNT(*) FROM options_orders WHERE kind='exit' AND status IN "
                                           "('pending_submit','submitted','new','partially_filled','pending',"
-                                          "'pending_cancel') AND position_id LIKE ?", (f"{day}:%",)).fetchone()[0]
+                                          "'pending_cancel')").fetchone()[0]
                     sleep(FAST_POLL_S if (working or exiting) else cfg.poll_seconds)
             finally:
                 flat = _finish(eng, cfg, con, day)
         return 0 if flat else 1
+    finally:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+        lock.close()
+
+
+def recover(cfg: OptionsConfig | None = None, db_path: Path = store.DEFAULT_PATH, clock=_now,
+            engine_factory=make_session_engine, sleep=None) -> int:
+    """Leftover cleanup without a session (see the module docstring). 0 when
+    nothing live is left open, 1 otherwise (the owner was paged)."""
+    cfg = cfg or OptionsConfig()
+    sleep = sleep or _sleep
+    lock = _lock(cfg.lock_path)
+    if lock is None:
+        print("options session is running; it cleans up leftovers itself")
+        return 0
+    try:
+        with store.connect(db_path) as con:
+            ostore.ensure_schema(con)
+            eng, mode = engine_factory(con, cfg, clock)
+            t0 = clock()
+            res = eng.recover()
+            while res["open"] and res["market_open"] and (clock() - t0).total_seconds() < RECOVER_MAX_S:
+                sleep(FAST_POLL_S)
+                res = eng.recover()
+            con.commit()
+        if res["open"]:
+            if res["market_open"]:  # outside market hours the engine already paged the leftovers once today
+                notify.send("期權軌道復原:仍有部位未平", f"仍有 {res['open']} 筆紙上期權部位未平(市價單已送出但尚未全部"
+                            "確認)。請到 Alpaca 確認。", notify.CRITICAL)
+            print(f"recover: {res['open']} live option rows still open ({mode})")
+            return 1
+        print(f"recover: nothing open ({mode})")
+        return 0
     finally:
         fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
         lock.close()
@@ -243,6 +287,7 @@ def main(argv: list[str]) -> int:
     p = sub.add_parser("ingest-plan")
     p.add_argument("file", type=Path)
     sub.add_parser("session")
+    sub.add_parser("recover")
     p = sub.add_parser("replay")
     p.add_argument("day", type=date.fromisoformat)
     p.add_argument("--feed", choices=("iex", "sip"), default="iex")
@@ -265,6 +310,13 @@ def main(argv: list[str]) -> int:
         return 0
     if a.cmd == "selftest":
         return selftest()
+    if a.cmd == "recover":
+        try:
+            return recover(cfg)
+        except Exception as e:
+            log.exception("recover failed")
+            notify.send("期權軌道復原失敗", f"{type(e).__name__}: {e}。請手動確認期權部位已平倉。", notify.CRITICAL)
+            return 1
 
     def _timeout(*_):
         raise SessionTimeout("options session exceeded its outer time bound")
