@@ -52,7 +52,8 @@ def _text(n: int, min_len: int = 0):
 
 EtDatetime = Annotated[AwareDatetime, AfterValidator(_et_offset)]
 Ticker = Annotated[str, StringConstraints(pattern=r"^[A-Z]{1,5}(?:\.[A-Z])?$")]
-HHMM = Annotated[str, StringConstraints(pattern=r"^\d{2}:\d{2}$"), AfterValidator(_hhmm)]
+# [0-9], not \d: \d also matches non-ASCII digits (e.g. Arabic-Indic), which int() parses
+HHMM = Annotated[str, StringConstraints(pattern=r"^[0-9]{2}:[0-9]{2}$"), AfterValidator(_hhmm)]
 PlanUrl = Annotated[HttpUrl, UrlConstraints(max_length=250, allowed_schemes=["https"])]
 Price = Annotated[float, Field(gt=0, le=1_000_000)]
 

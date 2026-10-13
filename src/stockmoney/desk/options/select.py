@@ -77,9 +77,9 @@ def implied_vol(price: float, spot: float, strike: float, t: float, right: str) 
 
 
 def mid(c: OptionContract) -> float | None:
-    if c.bid is None or c.ask is None or c.ask <= 0 or c.bid < 0 or c.ask < c.bid:
-        return None
-    return (c.bid + c.ask) / 2
+    """OptionContract.mid: None unless bid and ask are finite, bid >= 0,
+    ask > 0 and not crossed (a NaN or inf quote is never usable)."""
+    return c.mid
 
 
 def contract_delta(c: OptionContract, spot: float, now: datetime) -> tuple[float | None, str]:
