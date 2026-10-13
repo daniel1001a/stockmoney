@@ -1165,6 +1165,12 @@ class Engine:
         if not ostore.add_fill(self.con, pid, now, "sell", qty, price, bid, ask, reason, client_order_id):
             return  # already booked (re-run)
         left = p["qty_open"] - qty
+        if left < -1e-9:  # more sold than the store held: never a negative position, page
+            if ostore.notify_once(self.con, f"oversold:{pid}"):
+                ostore.event(self.con, self._dstr, now, "critical", "oversold", f"{pid}: open {p['qty_open']:g}, sold {qty:g}")
+                self._notify("期權軌道:賣出口數超過持有", f"{p['occ']} 資料庫持有 {p['qty_open']:g} 口,卻入帳賣出 {qty:g} 口。"
+                             "可能已賣空,請立即到 Alpaca 確認。", notify.CRITICAL)
+            left = 0.0
         fields = {"qty_open": left,
                   "realized_usd": (p["realized_usd"] or 0) + (price - p["entry_price"]) * qty * cfg.contract_multiplier,
                   "fees_usd": (p["fees_usd"] or 0) + cfg.fee_per_contract * qty,
@@ -1357,12 +1363,11 @@ class Engine:
 
     def _cancel_exit(self, p: dict, row: dict, now: datetime, why: str) -> None:
         """Cancel a working exit so it can be replaced. Failed cancels are
-        retried with backoff (2, 4, 8 ... 60 s). After cancel_max_failures a
-        fresh read of the broker's open orders decides: the order is gone
-        there -> its row becomes 'unresolved' (still polled for late fills)
-        and the rest is sold at market in this call; still working (or
-        unreadable) -> NO second sell (it could double the sale), the owner
-        is paged CRITICAL every cancel_page_every_min until it resolves."""
+        retried with backoff (2, 4, 8 ... 60 s). A replacement is NEVER sent
+        from here: only after a get_order of the old order has succeeded,
+        shown it terminal and its fills are booked (_resolve_exit), so the
+        same contracts can never be sold twice. After cancel_max_failures the
+        owner is paged CRITICAL every cancel_page_every_min until it resolves."""
         cid, cfg = row["client_order_id"], self.cfg
         nxt = self._cancel_next.get(cid)
         if nxt is not None and now < nxt:
@@ -1375,21 +1380,20 @@ class Engine:
         if n < cfg.cancel_max_failures:
             return
         working = self._broker_working(cid)
-        if working is False:
-            ostore.update_order(self.con, cid, status=UNRESOLVED, note="cancel failed, gone from the broker's open orders")
-            p = ostore.position(self.con, p["position_id"])
-            if (p["qty_open"] or 0) > 1e-9:
-                self._send_exit(p, p["qty_open"], "force_flat" if now >= self._flat() else row["reason"], None, now,
-                                force_market=True, allow_reconcile=False)
-            return
+        state = {True: "仍在券商掛著", False: "券商掛單清單已看不到(狀態未確認)", None: "狀態讀不到"}[working]
+        self._page_stuck_exit(p, cid, now, f"已連續 {n} 次撤單失敗,{state}")
+
+    def _page_stuck_exit(self, p: dict, cid: str, now: datetime, what: str) -> None:
+        """CRITICAL, repeated every cancel_page_every_min while an exit can be
+        neither confirmed nor replaced (no second sell is ever sent blind)."""
+        cfg = self.cfg
         last = self._cancel_paged.get(cid)
         if last is None or (now - last).total_seconds() >= cfg.cancel_page_every_min * 60:
             self._cancel_paged[cid] = now
-            state = "仍在券商掛著" if working else "狀態讀不到"
-            ostore.event(self.con, self._dstr, now, "critical", "exit_cancel_failed", f"{cid} x{n}: {state}")
-            self._notify("期權軌道:出場單撤不掉", f"{p['occ']} 的出場單 {cid} 已連續 {n} 次撤單失敗,{state}。"
-                         f"為避免重複賣出不會再送第二張賣單;仍持有 {p['qty_open'] or 0:g} 口。請立即到 Alpaca "
-                         f"手動撤單並平倉。每 {cfg.cancel_page_every_min:g} 分鐘提醒一次。", notify.CRITICAL)
+            ostore.event(self.con, self._dstr, now, "critical", "exit_stuck", f"{cid}: {what}")
+            self._notify("期權軌道:出場單撤不掉", f"{p['occ']} 的出場單 {cid} {what}。為避免重複賣出,在確認舊單"
+                         f"狀態並入帳前不會送第二張賣單;仍持有 {p['qty_open'] or 0:g} 口。請立即到 Alpaca 手動"
+                         f"撤單並平倉。每 {cfg.cancel_page_every_min:g} 分鐘提醒一次。", notify.CRITICAL)
 
     def _broker_working(self, cid: str) -> bool | None:
         """Is ``cid`` among the broker's open orders? None when unreadable."""
@@ -1403,31 +1407,19 @@ class Engine:
             return None
 
     def _exit_status_failed(self, p: dict, row: dict, err: Exception, now: datetime) -> None:
-        """get_order of a working exit failed. After order_status_max_failures
-        in a row: page once, cancel it (best effort) and, only when a fresh
-        broker read shows contracts still held, send ONE fresh market sell
-        for min(held, open qty). The risk gate counts the broker's working
-        sells, so a sell is never doubled while the old order still works.
-        The old row becomes 'unresolved' and is still polled for late fills."""
+        """get_order of a working exit failed. Its fills cannot be booked, so
+        NO replacement is sent (a broker position read can lag a fill, and a
+        blind second sell could go short). After order_status_max_failures in
+        a row: a best-effort cancel, and a CRITICAL page repeated every
+        cancel_page_every_min. The order keeps being polled; once a read
+        succeeds, _resolve_exit books it and replaces what is left."""
         cid = row["client_order_id"]
         n = self._status_fail[cid] = self._status_fail.get(cid, 0) + 1
         self._error("exit_order", f"{cid}: get_order failed ({n}x): {type(err).__name__}: {err}")
         if n < self.cfg.order_status_max_failures:
             return
-        self._status_fail[cid] = 0  # the next fallback only after another full run of failures
-        if ostore.notify_once(self.con, f"{self._dstr}:exit_status:{p['position_id']}"):
-            self._notify("期權軌道:出場單狀態讀不到", f"{p['occ']} 的出場單 {cid} 連續 {n} 次查不到狀態({err})。"
-                         "會先撤舊單,再依券商持倉數量改送一張市價賣單(不會重複賣出)。", notify.CRITICAL)
-        self._cancel(cid, "status unreadable")
-        held = self._broker_held(p["occ"])
-        if held is None or held <= 1e-9:
-            return  # unknown, or nothing left at the broker: keep polling the old order
-        qty = min(float(p["qty_open"] or 0), float(held))
-        if qty < 1:
-            return
-        ostore.update_order(self.con, cid, status=UNRESOLVED, note="status unreadable; superseded by a market sell")
-        if not self._send_exit(p, qty, row["reason"], None, now, force_market=True, allow_reconcile=False):
-            ostore.update_order(self.con, cid, status=row["status"], note="status unreadable; fallback refused")
+        self._cancel(cid, "status unreadable", page=False)
+        self._page_stuck_exit(p, cid, now, f"連續 {n} 次查不到狀態({type(err).__name__}: {str(err)[:120]})")
 
     def _poll_unresolved(self, p: dict, row: dict, now: datetime) -> None:
         """Book late fills of a superseded exit; a failure here is silent

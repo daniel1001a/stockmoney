@@ -82,7 +82,9 @@ def to_flat_with_unfillable_limit(r, early):
 
 # ------------------------------------------------------------------ G1 exit that cannot be canceled
 @pytest.mark.parametrize("early", [False, True])
-def test_g1_cancel_fails_and_order_gone_at_broker_sells_at_market(tmp_path, con, early):
+def test_g1_cancel_fails_and_order_gone_from_open_orders_is_not_replaced_blind(tmp_path, con, early):
+    # (revised by the Grok round-3 review, H1): "absent from open_orders" is not proof the order
+    # is done; while get_order still shows it working, nothing more is sold and the owner is paged
     r, lp = entered(tmp_path, con, early_close=early)
     lim = to_flat_with_unfillable_limit(r, early)
 
@@ -92,11 +94,44 @@ def test_g1_cancel_fails_and_order_gone_at_broker_sells_at_market(tmp_path, con,
     real_open = r.broker.open_orders
     r.broker.open_orders = lambda: [o for o in real_open() if o.client_order_id != lim.client_order_id]
     hh, mm = flat_of(early)
-    r.run(et(hh, mm + 2), step=2)
-    mk = [o for o in sells(r) if o.order_type == OrderType.MARKET]
-    assert len(mk) == 1 and mk[0].filled_qty == 10 and C601N not in r.broker.positions
-    old = ostore.order(con, lim.client_order_id)
-    assert old["status"] == "unresolved"
+    r.run(et(hh, mm + 8), step=2)
+    assert [o.order_type for o in sells(r)] == [OrderType.LIMIT]
+    assert sum("出場單撤不掉" in t for t in titles(r)) >= 2
+    lim.status = OrderStatus.CANCELED  # the broker finally confirms it: replaced in the same pass
+    r.run(et(hh, mm + 9), step=2)
+    assert [o.order_type for o in sells(r)] == [OrderType.LIMIT, OrderType.MARKET] and C601N not in r.broker.positions
+
+
+def test_h1_filled_exit_with_failing_cancel_and_lagging_account_never_sells_twice(tmp_path, con):
+    r, lp = entered(tmp_path, con)
+    lim = to_flat_with_unfillable_limit(r, False)
+    # the exit fills at the broker; cancel's own get_order times out; open_orders no longer lists
+    # it; the account lags and still shows 10 contracts
+    lim.status, lim.filled_qty, lim.filled_avg_price, lim.filled_at = OrderStatus.FILLED, 10, 0.45, r.clock.now
+
+    def down(cid):
+        raise TimeoutError("read timed out")
+    real_get = r.broker.get_order
+    r.broker.get_order = down
+    r.broker.cancel = down
+    r.run(et(15, 52), step=2)
+    assert [o.order_type for o in sells(r)] == [OrderType.LIMIT]  # no second 10-lot sell
+    assert any("出場單撤不掉" in t for t in titles(r))
+    r.broker.get_order = real_get
+    del r.broker.positions[C601N]  # the account catches up
+    r.run(et(15, 53), step=2)
+    p = ostore.position(con, lp["position_id"])
+    assert p["state"] == "EXITED" and p["qty_open"] == 0 and len(sells(r)) == 1
+
+
+def test_h1_booking_more_than_held_is_clamped_and_paged(tmp_path, con):
+    r, lp = entered(tmp_path, con)
+    p = ostore.position(con, lp["position_id"])
+    r.eng._begin(r.clock.now)
+    r.eng._book_exit(p, 12, 0.5, 0.49, 0.51, "late_fill", r.clock.now, client_order_id="late#12")
+    p = ostore.position(con, lp["position_id"])
+    assert p["qty_open"] == 0 and p["state"] == "EXITED"
+    assert any("賣出口數超過持有" in t for t in titles(r))
 
 
 @pytest.mark.parametrize("early", [False, True])

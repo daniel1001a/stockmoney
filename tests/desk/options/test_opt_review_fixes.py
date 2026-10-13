@@ -410,28 +410,27 @@ def test_l1_nan_bid_is_never_fresh_and_never_priced(tmp_path, con):
 
 
 # ------------------------------------------------------------------ L2 unreadable exit status
-def test_l2_unreadable_exit_falls_back_to_one_market_sell(tmp_path, con):
+def test_l2_unreadable_exit_never_replaced_blind_and_pages_until_readable(tmp_path, con):
+    # (revised by the Grok round-3 review, H1: a replacement only after the old order is read and booked)
     r, lp = entered_rig(tmp_path, con, time_stop_minutes=600)
     r.run(et(15, 44), step=60)
     r.broker.fill = "never"
     r.run(et(15, 45, 10), step=2)
     assert exits(con, lp["position_id"])
+    n_sells = len([o for o in r.broker.orders.values() if o.side == Side.SELL])
 
     def bad(cid):
         raise ConnectionError("down")
     r.broker.get_order = bad
     r.broker.fill = "immediate"
-    r.run(et(15, 47), step=2)
-    assert any("出場單狀態讀不到" in t for t in titles(r))
-    assert C601N not in r.broker.positions  # sold, exactly once (a second sell would go negative)
-    sold = sum(o.filled_qty for o in r.broker.orders.values() if o.side == Side.SELL)
-    assert sold == 10
-    r.run(et(15, 48), step=2)  # still unreadable: a fresh broker read shows nothing held, no new sell
-    assert sum(o.filled_qty for o in r.broker.orders.values() if o.side == Side.SELL) == 10
-    del r.broker.get_order  # the broker recovers: the fills are booked
-    r.run(et(15, 49), step=2)
+    r.run(et(15, 52), step=2)
+    assert len([o for o in r.broker.orders.values() if o.side == Side.SELL]) == n_sells  # nothing sent blind
+    assert sum("出場單撤不掉" in t for t in titles(r)) >= 2  # re-paged every 5 minutes
+    del r.broker.get_order  # the broker recovers: booked, the rest replaced in the same pass
+    r.run(et(15, 53), step=2)
     p = ostore.position(con, lp["position_id"])
-    assert p["state"] == "EXITED" and p["qty_open"] == 0
+    assert p["state"] == "EXITED" and p["qty_open"] == 0 and C601N not in r.broker.positions
+    assert sum(o.filled_qty for o in r.broker.orders.values() if o.side == Side.SELL) == 10
 
 
 def test_l2_forced_flat_survives_submit_errors(tmp_path, con):
