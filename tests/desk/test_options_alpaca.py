@@ -210,6 +210,19 @@ def test_option_position_missing_price_derives_per_share_price():
     assert b._map_position(p2).market_value == pytest.approx(300.0)
 
 
+def test_option_position_without_any_mark_stays_unmarked():
+    """No current_price and no market_value: current_price stays None (never
+    the entry price, which would hide the loss from the options daily stop)."""
+    b, _, _ = _broker()
+    p = position(OCC, "us_option", 2, 1.0, 1.0, 300.0)
+    p.current_price, p.market_value = None, None
+    mapped = b._map_position(p)
+    assert mapped.current_price is None and mapped.market_value is None and mapped.avg_entry_price == 1.0
+    s = position("AAPL", "us_equity", 10, 190.0, 200.0, 2000.0)
+    s.current_price, s.market_value = None, None
+    assert b._map_position(s).current_price == 190.0  # stocks unchanged
+
+
 def test_option_order_mapping():
     b, _, _ = _broker()
     o = b._map_order(make_order("x", symbol=OCC, asset_class="us_option", otype="limit", limit_price="1.1"))

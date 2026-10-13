@@ -469,6 +469,11 @@ class AlpacaBroker:
         mv = _f(p.market_value)
         # option prices are per share; market_value is per position and already includes the multiplier
         mult = OPTION_MULTIPLIER if asset == AssetClass.OPTION else 1
+        if asset == AssetClass.OPTION and price is None and mv is None:
+            # no mark at all: leave it None (never the entry price, which would show zero
+            # unrealized loss); the options risk engine then counts the position unmarked
+            # and refuses new buys
+            return BrokerPosition(p.symbol, asset, qty, avg, None, None)
         if price is None:
             price = mv / (qty * mult) if (mv is not None and qty) else avg
         if mv is None:

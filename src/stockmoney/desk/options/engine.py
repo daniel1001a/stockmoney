@@ -794,9 +794,10 @@ class Engine:
     def _live_marks(self) -> dict[str, float]:
         """OCC -> mid of the live positions' quotes that were fresh on THIS
         tick (the gate values the open book with them). A position without
-        one gets no mark here, so the gate uses the broker's current_price
-        (and refuses buys when that is missing too): a stored last bid / ask
-        from minutes ago must never hide a loss from the daily stop."""
+        one gets no mark here, so the gate uses the broker's current_price;
+        when the broker has none either (AlpacaBroker leaves it None, never
+        the entry price) the position is unmarked and the gate refuses buys.
+        A stored last bid / ask from minutes ago must never hide a loss."""
         out = {}
         for p in self._live_rows((ENTERED,)):
             q = self._quotes.get(p["occ"])

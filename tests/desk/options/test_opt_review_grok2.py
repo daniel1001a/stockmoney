@@ -243,3 +243,19 @@ def test_grok4_partial_entry_sold_between_fills_realized_equals_book(tmp_path, c
     assert p["state"] == "EXITED" and C601N not in r.broker.positions
     assert p["realized_usd"] == pytest.approx(-200.0)
     assert r.gate.engine.book.realized() == pytest.approx(-200.0)
+
+
+# ------------------------------------------------------------------ Grok round 3, H3: no broker mark
+def test_h3_option_without_broker_mark_is_unmarked_and_blocks_buys(tmp_path, con):
+    r = Rig(tmp_path, con)
+    r.gate = _iface.make_risk_gate(con, r.broker, r.cfg)
+    r.eng = r.new_engine()
+    r.run(et(9, 52))
+    assert r.pos("live")[0]["state"] == "ENTERED"
+    snap = AccountSnapshot(0, 0, 0, [BrokerPosition(C601N, AssetClass.OPTION, 10, 0.97, None, None)], r.clock.now)
+    assert C601N not in r.gate.engine._marks(snap, None, {})
+    k = OptionContract(C600N, "SPY", "C", 600.0, NEXT, 1.03, 1.07, None, 1000, 5000, 0.55, None, r.clock.now)
+    buy = OrderIntent("t", C600N, AssetClass.OPTION, Side.BUY, qty=1, order_type=OrderType.LIMIT, tif=TIF.DAY,
+                      limit_price=1.07)
+    dec = r.gate.engine.check(buy, k, snap, r.clock.now, open_orders=[], marks={}, blocked={})
+    assert not dec.allow and "without a usable mark" in dec.reason
