@@ -124,6 +124,9 @@ SHORTFALL_CONFIRM_S = 120.0   # a shortfall is written off only when seen again 
 BROKER_CHECK_EVERY_S = 300.0  # unknown / reappearing broker option positions are checked this often
 
 
+PLAN_ALERT_AT = (9, 10)  # ET: the missing-plan push
+
+
 def _et(now: datetime) -> datetime:
     return now.astimezone(ET)
 
@@ -251,6 +254,7 @@ class Engine:
         halted = self.cfg.halt_file.exists()
         if halted and ostore.notify_once(self.con, f"{self._dstr}:halt"):
             self._notify("期權軌道:HALT 生效", "data/desk/HALT 存在:新進場全擋(影子照記),出場照常。", notify.WARN)
+        self._plan_missing_alert(now)
         self._start_of_day(now)
         if not fast and (self._broker_check_at is None
                          or (now - self._broker_check_at).total_seconds() >= BROKER_CHECK_EVERY_S):
@@ -276,6 +280,23 @@ class Engine:
         self._errors = 0 if self._tick_errors == 0 else self._errors
         self.con.commit()
         return self.summary()
+
+    def _plan_missing_alert(self, now: datetime) -> None:
+        """From 09:10 ET on a trading day: one push if no accepted plan exists for
+        today (an accepted empty plan counts). Information only; never raises."""
+        try:
+            if self._active is not None or _et(now) < _at(self._day, PLAN_ALERT_AT) or not is_trading_day(self._day):
+                return
+            if not ostore.notify_once(self.con, f"{self._dstr}:plan_missing"):
+                return
+            ostore.event(self.con, self._dstr, now, "warn", "plan_missing", "no accepted OPTIONS_PLAN for today")
+            self._notify("期權軌道:OPTIONS_PLAN 今天還沒收到",
+                         "OPTIONS_PLAN 今天還沒收到。09:20 ET 前可手動補:cd /Users/danielisgod/Projects/stockmoney "
+                         "&& pbpaste > data/desk/options_plan_today.json && .venv/bin/python -m "
+                         "stockmoney.desk.options.run ingest-plan data/desk/options_plan_today.json ;"
+                         "晚於 09:20 只進影子。規則劇本照常運作。", notify.WARN)
+        except Exception as e:  # an alert never breaks the tick
+            log.warning("plan_missing alert failed: %s", e)
 
     def summary(self) -> dict:
         rows = self.con.execute("SELECT mode, state, COUNT(*) n FROM options_positions WHERE day=? GROUP BY mode, state",
