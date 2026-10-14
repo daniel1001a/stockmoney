@@ -10,6 +10,8 @@ cd "$ROOT" || exit 1
 mkdir -p data/desk/logs
 LOG="data/desk/logs/$(date +%Y-%m-%d).log"
 if [[ -f .env ]]; then set -a; source .env; set +a; fi
+# Options jobs default to shadow-only (no paper orders) until the owner sets DESK_OPTIONS_ORDERS=paper in .env.
+if [[ "$1" == options* ]]; then export DESK_OPTIONS_ORDERS="${DESK_OPTIONS_ORDERS:-off}"; fi
 echo "=== $(date '+%F %T %Z') job=$1 ===" >> "$LOG"
 if [[ "$1" == "learn" ]]; then
   .venv/bin/python -m stockmoney.desk.learn.job >> "$LOG" 2>&1
