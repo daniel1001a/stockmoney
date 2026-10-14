@@ -5,6 +5,8 @@ sender is the allowlisted Muse address, subject is ``[SMD/<TYPE>/<msg_id>] <toke
 with the shared token (constant-time compare), size is under the limit, the
 body is exactly one JSON object that validates against the strict ``Inbound``
 schema, TYPE and msg_id in the subject equal the body's, and msg_id is new.
+OPTIONS_PLAN is the one exception to "Inbound schema": its body is the options
+sleeve's OptionsPlan, whose plan_id plays the msg_id role (see _process_plan).
 
 Accepted messages are stored; everything else goes to ``bridge_rejects`` with a
 reason. ``poll`` never raises on bad mail. Free text inside messages is stored
@@ -20,8 +22,11 @@ from datetime import datetime, timezone
 
 from pydantic import TypeAdapter, ValidationError
 
+from stockmoney.desk import notify
 from stockmoney.desk.bridge.mailbox import BridgeConfig, Mailbox, RawMail
 from stockmoney.desk.bridge.schema import Inbound
+from stockmoney.desk.options import plan as oplan
+from stockmoney.desk.options.config import OptionsConfig
 
 log = logging.getLogger(__name__)
 
@@ -87,11 +92,18 @@ def is_echo_subject(subject: str | None) -> bool:
     return bool(m) and (bool(m.group(1)) or m.group(2) in OUTBOUND_ONLY_TYPES)
 
 
-def _validation_reason(e: ValidationError) -> str:
-    # location + error type only: error text can echo attacker-controlled input
+def _validation_reason(e: ValidationError, prefix: str = "") -> str:
+    # location + error type only: error text can echo attacker-controlled input.
+    # ``prefix`` (OPTIONS_PLAN) names the model and, for our own validators'
+    # fixed "value_error" messages, appends them so the sender sees WHICH rule.
     parts = []
     for err in e.errors()[:5]:
-        part = ".".join(str(p) for p in err["loc"]) + ":" + err["type"]
+        loc = ".".join(str(p) for p in err["loc"])
+        if prefix:
+            loc = f"{prefix}.{loc or '(plan)'}"
+        part = loc + ":" + err["type"]
+        if prefix and err["type"] == "value_error":
+            part += " (" + re.sub(r"[^A-Za-z0-9 ._:,()<>=/'\\-]", "", str(err.get("msg", "")).removeprefix("Value error, "))[:140] + ")"
         if err["type"] == "json_invalid":
             # the parser message names the problem and a line/column, not the input
             detail = re.sub(r"[^A-Za-z0-9 ._:,()\\-]", "", str((err.get("ctx") or {}).get("error", "")))[:100]
@@ -181,6 +193,8 @@ def _process(con, mail: RawMail, config: BridgeConfig, received_at: datetime) ->
 
     if mail.oversized or mail.size > MAX_RAW_BYTES or len(mail.body.encode("utf-8", "replace")) > MAX_RAW_BYTES:
         return fail("oversized")
+    if subj_type == "OPTIONS_PLAN":
+        return _process_plan(con, mail, config, received_at, subj_id, fail)
     try:
         msg = _INBOUND.validate_json(repair_string_newlines(extract_json(mail.body)), strict=True)
     except ValidationError as e:
@@ -198,6 +212,48 @@ def _process(con, mail: RawMail, config: BridgeConfig, received_at: datetime) ->
         "VALUES (?,?,?,?,?,?,?)",
         (msg.msg_id, msg.type, mail.sender, _iso(msg.sent_at), _iso(received_at), mail.body, msg.model_dump_json()),
     )
+    return True
+
+
+def _process_plan(con, mail: RawMail, config: BridgeConfig, received_at: datetime, subj_id: str, fail) -> bool:
+    """OPTIONS_PLAN (docs/desk/MUSE_BRIDGE.md): the body is validated by the
+    options sleeve's own strict ``OptionsPlan`` and stored by the SAME
+    ``options.plan.ingest`` the CLI uses (received_at = our clock). Its only
+    effect is the stored plan the options engine already consumes; policy.py
+    reads no OPTIONS_PLAN rows. Returns True only for a newly stored plan; an
+    identical resend is a silent no-op."""
+    text = repair_string_newlines(extract_json(mail.body)).strip()
+    if len(text.encode("utf-8", "replace")) > oplan.MAX_PLAN_BYTES:
+        return fail("schema_invalid OPTIONS_PLAN.(plan):plan_larger_than_64000_bytes")
+    try:
+        p = oplan.OptionsPlan.model_validate_json(text)
+    except ValidationError as e:
+        return fail(_validation_reason(e, "OPTIONS_PLAN"))
+    except (ValueError, RecursionError):
+        return fail("body_not_json")
+    if p.plan_id != subj_id:
+        return fail("msg_id_mismatch")
+    if p.plan_id.lower().startswith("grok-"):
+        return fail("schema_invalid OPTIONS_PLAN.plan_id:reserved_prefix_grok-")
+    other = con.execute("SELECT type FROM bridge_messages WHERE msg_id=?", (p.plan_id,)).fetchone()
+    if other is not None and other[0] != "OPTIONS_PLAN":
+        return fail("duplicate_msg_id")
+    res = oplan.ingest(con, text, received_at, OptionsConfig())
+    if res.status == "rejected":  # parse passed above, so: the id belongs to a different accepted plan
+        return fail("plan_id_reused")
+    con.execute(
+        "INSERT OR IGNORE INTO bridge_messages (msg_id, type, sender, sent_at, received_at, raw_body, parsed_json) "
+        "VALUES (?,?,?,?,?,?,?)",
+        (p.plan_id, "OPTIONS_PLAN", mail.sender, _iso(p.generated_at), _iso(received_at), mail.body,
+         p.model_dump_json()),
+    )
+    if res.status == "duplicate":
+        return False
+    note = " (shadow_only: 09:20 ET 後收到,當天只進影子帳戶)" if res.shadow_only else ""
+    try:
+        notify.send("OPTIONS_PLAN 已收到", f"OPTIONS_PLAN 已收到: {len(p.plans)} 個劇本{note}", notify.INFO)
+    except Exception:  # a notification failure never undoes a stored plan
+        log.exception("bridge: OPTIONS_PLAN notification failed")
     return True
 
 
