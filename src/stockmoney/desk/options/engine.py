@@ -1267,6 +1267,13 @@ class Engine:
             return False
         if not dec.allow:
             log.warning("options exit refused by the risk gate: %s %s", pid, dec.reason)
+            if dec.reason.startswith("risk gate error:"):
+                # a transient broker read failure inside the gate is not a refusal: it must not
+                # consume the once-a-day refusal key (a real refusal later still pages)
+                if ostore.notify_once(self.con, f"{self._dstr}:exit_gate_error:{pid}:{int(now.timestamp() // 600)}"):
+                    self._notify("期權軌道:出場風控暫時讀取失敗", f"{p['occ']} x{qty:g}({reason}):{dec.reason[:300]}。"
+                                 "下一輪會重試。", notify.WARN)
+                return False
             if ostore.notify_once(self.con, f"{self._dstr}:exit_refused:{pid}"):
                 ostore.event(self.con, self._dstr, now, "critical", "exit_refused", f"{pid} {p['occ']}: {dec.reason}")
                 self._notify("期權軌道:出場被風控擋下", f"{p['occ']} x{qty:g}({reason})被風控拒絕:{dec.reason[:300]}。"

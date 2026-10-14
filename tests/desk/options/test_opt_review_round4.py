@@ -253,3 +253,23 @@ def test_s4_finish_pages_before_1615_when_every_call_is_slow_and_failing(tmp_pat
     assert r.live_n == 3
     assert page and page[0] < et(16, 15).astimezone(page[0].tzinfo), (loop_end, page)
     assert r.broker.max_attempts == r.cfg.flat_broker_max_attempts == 2  # fewer retries after the flat
+
+
+def test_s5_transient_gate_error_does_not_consume_the_once_a_day_refusal_page(tmp_path, con):
+    from opt_fakes import FnGate
+    from test_opt_review_fixes import entered_rig, exits
+    from stockmoney.desk.options._iface import RiskDecision
+    gate = FnGate(lambda i, c, n: RiskDecision(True, "ok", i),
+                  exit_fn=lambda i, c, n: RiskDecision(False, "risk gate error: BrokerUnavailable: read failed"))
+    r, lp = entered_rig(tmp_path, con, gate=gate)
+    r.broker.mult[C601N] = 0.6
+    r.run(et(9, 54))
+    assert not exits(con, lp["position_id"])
+    assert not any("出場被風控擋下" in t for t in titles(r))
+    assert any("出場風控暫時讀取失敗" in t for t in titles(r))
+    assert ostore.notify_once(con, f"{DAY}:exit_refused:{lp['position_id']}")  # key still free
+    con.execute("DELETE FROM options_notified WHERE key=?", (f"{DAY}:exit_refused:{lp['position_id']}",))
+    # a real refusal later the same day still pages
+    gate.exit_fn = lambda i, c, n: RiskDecision(False, "no")
+    r.run(et(9, 56))
+    assert sum("出場被風控擋下" in t for t in titles(r)) == 1
