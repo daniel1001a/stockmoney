@@ -148,6 +148,8 @@
 
 **1. 盤前劇本(07:30 到 09:20 ET 之間)**
 
+正常情況不用做任何事:Grok 以 `[SMD/OPTIONS_PLAN/<plan_id>] <token>` 寄信,`bridge` 工作(每 15 分鐘)驗證並用下面同一個函式收下,推播「OPTIONS_PLAN 已收到」(見 `MUSE_BRIDGE.md`)。以下 CLI 是手動備援(信件沒到、或要補餵檔案時):
+
 ```
 .venv/bin/python -m stockmoney.desk.options.run ingest-plan ~/Downloads/plan.json
 ```
