@@ -55,6 +55,7 @@ FIXES = {
     "type_mismatch": "主旨裡的類型要和 JSON 的 \"type\" 欄位完全相同。",
     "msg_id_mismatch": "主旨裡的訊息編號要和 JSON 的 \"msg_id\" 欄位完全相同。",
     "duplicate_msg_id": "每封信的訊息編號都要不同,建議用「類型縮寫-日期-時間」,例如 sd-20261012-0730。",
+    "plan_id_reused": "這個 plan_id 已被內容不同的劇本用過。內容不同的重送一定要換新的 plan_id,例如 gp-20261015-0830b;內容完全相同的重送會被系統安靜略過。",
     "oversized": "內容超過 200KB,請減少項目數量或拆成兩封。",
 }
 
@@ -72,7 +73,8 @@ def fields_hint(reason: str) -> str:
     model, so the sender can fix a missing or misplaced field without guessing."""
     import re
     from stockmoney.desk.bridge.schema import Alert, Calls, GrokDaily, Idea, ResearchReply, SocialDaily
-    models = {"SOCIAL_DAILY": SocialDaily, "CALLS": Calls, "ALERT": Alert,
+    from stockmoney.desk.options.plan import OptionsPlan
+    models = {"OPTIONS_PLAN": OptionsPlan, "SOCIAL_DAILY": SocialDaily, "CALLS": Calls, "ALERT": Alert,
               "RESEARCH_REPLY": ResearchReply, "IDEA": Idea, "GROK_DAILY": GrokDaily}
     m = re.match(r"schema_invalid\s+([A-Z_]+)\.", reason)
     model = models.get(m.group(1)) if m else None
@@ -94,6 +96,14 @@ GROK_RULES = (
 )
 
 
+PLAN_RULES = (
+    "OPTIONS_PLAN 規則:主旨 [SMD/OPTIONS_PLAN/<plan_id>] 的 plan_id 要等於 JSON 的 plan_id(不要寫 msg_id、sent_at);"
+    "plan_id 不能以 grok- 開頭;整份單行 JSON、不超過 64000 位元組;所有時間帶美東偏移(-04:00 / -05:00),不能用 Z;"
+    "trigger 的 earliest/latest 在 09:35 到 11:30;bias 只能是 long 或 short;plans 最多 12 個;不能有多餘欄位。"
+    "細節以 GROK_SETUP.md 的 OPTIONS_PLAN 格式為準。"
+)
+
+
 def fix_for(reason: str) -> str:
     """The correction text for a stored reject reason."""
     if "json_invalid" in reason:
@@ -101,6 +111,8 @@ def fix_for(reason: str) -> str:
     base = FIXES[reason.split(" ")[0]]
     hint = fields_hint(reason)
     text = f"{hint} {base}" if hint else base
+    if "OPTIONS_PLAN" in reason:
+        text = f"{text} {PLAN_RULES}"
     return f"{text} {GROK_RULES}" if "GROK_DAILY" in reason else text
 
 
@@ -135,6 +147,13 @@ def feedback_sent_since(con, since: datetime) -> list[str]:
         (_iso(since),)).fetchall()]
 
 
+def _is_plan_reject(con, key: str) -> bool:
+    """True when the reject came from an OPTIONS_PLAN subject (Grok's, sent from
+    the same address as Muse's mail; its plan_id has no grok- prefix)."""
+    r = con.execute("SELECT subject FROM bridge_rejects WHERE id=?", (key.removeprefix("fb:"),)).fetchone()
+    return bool(r and r[0] and r[0].lstrip().find("[SMD/OPTIONS_PLAN/") >= 0)
+
+
 def send_feedback(con, box, now: datetime) -> int:
     from stockmoney.desk.bridge import outbox
     from stockmoney.desk.bridge.schema import Feedback
@@ -144,7 +163,7 @@ def send_feedback(con, box, now: datetime) -> int:
     for key, about, reason in pending[: max(budget, 0)]:
         # Grok sends from the same address, so its corrections land in the mailbox
         # Muse reads; the tag tells Muse to leave them alone (MUSE_PROMPT.md)
-        tag = "【給 Grok】" if about.lower().startswith("grok-") else ""
+        tag = "【給 Grok】" if about.lower().startswith("grok-") or _is_plan_reject(con, key) else ""
         msg = Feedback(msg_id=outbox.new_msg_id("fb"), sent_at=now, about_msg_id=about[:64],
                        problem=f"{tag}訊息 {about} 被拒絕:{reason}"[:1000], how_to_fix=fix_for(reason))
         outbox.send(box, msg)
