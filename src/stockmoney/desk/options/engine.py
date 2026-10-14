@@ -246,6 +246,7 @@ class Engine:
         self._tick_t0 = now
         et, day = _et(now), self._day
         self._ensure_day(now)
+        self._cap_retries(now)
         self._flat_alert(self.clock())  # the time now, not the tick's start: a slow tick must not delay it
         halted = self.cfg.halt_file.exists()
         if halted and ostore.notify_once(self.con, f"{self._dstr}:halt"):
@@ -1030,6 +1031,7 @@ class Engine:
                 self._error("exit", f"{p['position_id']}: {type(e).__name__}: {e}")
             finally:
                 self._prio = PRIO_SCAN
+            self._flat_alert(self.clock())  # slow calls on several positions must not delay the page
 
     def _quote(self, occ: str) -> OptionContract | None:
         """This tick's quote of ``occ``. A shadow-only contract is re-quoted at
@@ -1764,6 +1766,7 @@ class Engine:
         day). Returns True when flat; pages the owner otherwise."""
         now = self.clock()
         self._begin(now)
+        self._cap_retries(now)
         for p in ostore.positions(self.con, self._dstr, "shadow", (ENTERED,)):
             self._book_exit(p, p["qty_open"], sh.sell_price(p["last_bid"] or 0.0, self.cfg), p["last_bid"],
                             p["last_ask"], "session_end", now, "closed at last known bid")
@@ -1780,24 +1783,44 @@ class Engine:
     def flatten_now(self, reason: str = "force_flat") -> None:
         """Emergency path: treat every open position as due for the forced
         exit. A live position whose exit is still working is resolved, not
-        sold a second time."""
-        now = self.clock()
+        sold a second time. Bounded: at most FLATTEN_ROUNDS rounds per
+        position and cfg.flatten_budget_s in all (then it stops, so the
+        caller's finish() still runs and pages before the session's outer
+        time bound)."""
+        start = now = self.clock()
         self._begin(now)
+        self._cap_retries(now)
+
+        def spent() -> bool:
+            return (self.clock() - start).total_seconds() >= self.cfg.flatten_budget_s
+
         rows = self._live_rows((ENTERED,)) + ostore.positions(self.con, self._dstr, "shadow", (ENTERED,))
         for p in rows:
+            if spent():
+                log.error("options flatten_now: %.0f s budget spent, %s and later rows left to finish()",
+                          self.cfg.flatten_budget_s, p["position_id"])
+                break
             try:
-                q = self._quote(p["occ"])
-                fresh = self._fresh(q, now)
                 if p["mode"] == "shadow":
+                    q = self._quote(p["occ"])
+                    fresh = self._fresh(q, now)
                     bid = q.bid if fresh else p["last_bid"]
                     if bid is not None:
                         self._book_exit(p, p["qty_open"], sh.sell_price(bid, self.cfg), bid,
                                         q.ask if fresh else p["last_ask"], reason, now)
                     continue
+                q = None
                 for _ in range(FLATTEN_ROUNDS):  # bounded: confirm / cancel / replace, at most 3 rounds
+                    if spent():
+                        break
+                    now = self.clock()  # each round: the cancel backoff and quote age compare against it
+                    self._now = now
                     p = ostore.position(self.con, p["position_id"])
                     if p["state"] != ENTERED or (p["qty_open"] or 0) <= 1e-9:
                         break
+                    if q is None:
+                        q = self._quote(p["occ"])
+                    fresh = self._fresh(q, now)
                     working = [o for o in ostore.orders_for(self.con, p["position_id"])
                                if o["kind"] == "exit" and o["status"] not in _TERMINAL_ORDER]
                     if working:
@@ -1807,6 +1830,17 @@ class Engine:
             except Exception as e:
                 self._error("flatten", f"{p['position_id']}: {type(e).__name__}: {e}")
         self.con.commit()
+
+    def _cap_retries(self, now: datetime) -> None:
+        """From the forced flat on, a failing broker call is retried at most
+        cfg.flat_broker_max_attempts times in all (AlpacaBroker.max_attempts),
+        so a broker outage cannot stretch the last minutes past the close."""
+        n = self.cfg.flat_broker_max_attempts
+        if n and now >= self._flat() and getattr(self.broker, "max_attempts", None) is not None \
+                and self.broker.max_attempts > n:
+            log.info("options: broker attempts per call lowered from %s to %s after the forced flat",
+                     self.broker.max_attempts, n)
+            self.broker.max_attempts = n
 
     # ================================================================ plumbing
     def _io(self) -> None:

@@ -94,6 +94,8 @@ class OptionsConfig:
     cancel_max_failures: int = 3             # failed cancels of one order before the owner is paged
     cancel_page_every_min: float = 5.0       # a working exit that cannot be canceled is re-paged this often
     order_status_max_failures: int = 5       # failed get_order reads of an exit before a fresh market sell
+    flatten_budget_s: float = 300.0          # flatten_now stops after this (wall clock) and leaves the rest to finish()
+    flat_broker_max_attempts: int = 2        # after the forced flat: attempts per broker call (AlpacaBroker retries)
 
     # --- data safety
     max_quote_age_s: float = 30.0            # never enter on an older option quote

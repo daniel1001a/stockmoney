@@ -169,10 +169,12 @@ class SlowFailBroker(FakeOptionsBroker):
     delay = 5.0
     calls = 0
 
+    max_attempts = 4  # like AlpacaBroker: a failing call costs delay x max_attempts / 4
+
     def _slow(self):
         if self.slow_from is not None and self.clock.now >= self.slow_from:
             self.calls += 1
-            self.clock.advance(self.delay)
+            self.clock.advance(self.delay * self.max_attempts / 4)
             raise ConnectionError("broker unavailable (slow failure)")
 
 
@@ -196,7 +198,7 @@ def slow_rig(tmp_path, con, delay, **kw):
     costs broker calls)."""
     r = Rig(tmp_path, con, time_stop_minutes=600, index=("SPY",) + MORE, **kw)
     b = SlowFailBroker(r.clock, {**r.broker.bars, **{s: r.broker.bars["SPY"] for s in MORE}})
-    b.templates = r.broker.templates
+    b.templates = {**r.broker.templates, **{k: v for u in MORE[:2] for k, v in {**chain(u), **chain(u, NEXT)}.items()}}
     b.delay = delay
     r.broker = b
     r.eng = r.new_engine()
@@ -205,6 +207,7 @@ def slow_rig(tmp_path, con, delay, **kw):
     r.eng._sleep = lambda s: r.clock.advance(s)
     r.run(et(9, 52))
     assert r.pos("live")[0]["state"] == "ENTERED"
+    r.live_n = len([p for p in ostore.positions(con, str(DAY), "live") if p["state"] == "ENTERED"])
     return r
 
 
@@ -227,9 +230,26 @@ def test_s3_pre_close_alert_fires_on_time_while_every_call_is_slow_and_failing(t
     alert = [t for t, title, _ in r.pages if title == "期權軌道收盤前未平倉"]
     assert alert, "no pre-close alert"
     t50 = et(15, 50).astimezone(alert[0].tzinfo)
-    # checked at the top of the tick and after position management, at the time it is then:
-    # at most one tick deadline and the alert's own broker read after 15:50
-    assert alert[0] < et(15, 51).astimezone(alert[0].tzinfo), f"alert at {alert[0]}"
-    assert (alert[0] - t50).total_seconds() <= 2 * delay + 5, f"alert at {alert[0]}"
-    if delay >= 20:
+    # checked at the top of the tick and after each live position, at the time it is then: at
+    # most one position's broker calls (about 5) and the alert's own broker read after 15:50
+    assert (alert[0] - t50).total_seconds() <= 6 * delay, f"alert at {alert[0]}"
+    if delay == 5.0:
+        assert alert[0] < et(15, 51).astimezone(alert[0].tzinfo), f"alert at {alert[0]}"
+    else:
         assert "options tick running late" in caplog.text  # scans and shadow work were skipped
+
+
+@pytest.mark.parametrize("delay", [43.0, 127.0])
+def test_s4_finish_pages_before_1615_when_every_call_is_slow_and_failing(tmp_path, con, delay):
+    r = slow_rig(tmp_path, con, delay)
+    r.clock.set(et(15, 44))
+    r.broker.slow_from = et(15, 44, 50).astimezone(r.clock.now.tzinfo)
+    session_loop(r, et(15, 59, 59))
+    loop_end = r.clock.now
+    # run._finish
+    r.eng.flatten_now("session_end")
+    assert not r.eng.finish()
+    page = [t for t, title, _ in r.pages if title == "期權軌道收盤未平倉"]
+    assert r.live_n == 3
+    assert page and page[0] < et(16, 15).astimezone(page[0].tzinfo), (loop_end, page)
+    assert r.broker.max_attempts == r.cfg.flat_broker_max_attempts == 2  # fewer retries after the flat
