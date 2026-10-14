@@ -145,3 +145,17 @@ def test_s1_reappearing_contracts_are_paged_during_the_session_without_a_restart
     assert any("未知期權部位" in t for t in titles(r))
     assert sum(o.filled_qty for o in r.broker.orders.values() if o.side == Side.SELL) == 10
     assert r.broker.positions[C601N] == 6  # never sold
+
+
+# ------------------------------------------------------------------ S2 bars outage vs premium stop
+@pytest.mark.parametrize("err", ["429 Too Many Requests", "403 subscription does not permit querying recent SIP data"])
+def test_s2_bars_outage_never_blocks_the_premium_stop(tmp_path, con, err):
+    clock, b, eng, sent = lag_rig(tmp_path, con, 0.0)
+    run_eng(eng, clock, et(9, 55))
+    lp = ostore.positions(con, str(DAY), "live")[0]
+    assert lp["state"] == "ENTERED" and lp["inv_close"] is not None
+    b.data_error = RuntimeError(err)  # minute_bars fails from now on
+    b.mult[lp["occ"]] = 0.4           # premium -60%: far past the -35% stop
+    run_eng(eng, clock, et(10, 5), step=20)
+    exits = [o for o in ostore.orders_for(con, lp["position_id"]) if o["kind"] == "exit"]
+    assert exits and exits[0]["reason"] == "premium_stop", f"no exit after 10 minutes at -60% while bars fail ({err})"

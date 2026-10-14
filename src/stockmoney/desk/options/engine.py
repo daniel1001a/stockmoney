@@ -1093,33 +1093,34 @@ class Engine:
             return ("carry_over", qty) if _et(now) >= _at(self._day, cfg.open_time) else ("", 0)
         if now >= self._flat():
             return "force_flat", qty
+        # time and premium exits first: they need no underlying data, so an
+        # outage of the underlying's quotes / bars can never hold them back
+        held = (now - datetime.fromisoformat(p["entry_time"])).total_seconds() / 60
+        if held >= (p["max_hold_min"] or cfg.time_stop_minutes):
+            return "time_stop", qty
+        b = p["exit_variant"] == "B"
+        if q is not None:
+            m, e = sel.mid(q), p["entry_price"]
+            if not p["tp_done"]:
+                if m <= e * (1 - (cfg.premium_stop_pct_b if b else cfg.premium_stop_pct)):
+                    return "premium_stop", qty
+                if m >= e * (1 + cfg.take_profit_pct):
+                    part = floor(qty * cfg.take_profit_fraction) if qty >= 2 else qty
+                    return "take_profit", part
+            elif not b and m <= (p["stop_price"] or e):
+                return "breakeven_stop", qty
         spot = self._spot(p["underlying"], now)
         inv, long_ = p["invalidation"], p["direction"] == "long"
         if spot is not None and inv is not None and (spot <= inv if long_ else spot >= inv):
             return "invalidation", qty
         if self._close_invalidated(p, now):
             return "invalidation", qty
-        held = (now - datetime.fromisoformat(p["entry_time"])).total_seconds() / 60
-        if held >= (p["max_hold_min"] or cfg.time_stop_minutes):
-            return "time_stop", qty
-        b = p["exit_variant"] == "B"
         if b and p["tp_done"] and spot is not None and p["trail_ref"] is not None:
             a = self._underlying_atr(p["underlying"], now)
             if a is not None:
                 gap = cfg.trail_atr_mult * a
                 if (spot <= p["trail_ref"] - gap) if long_ else (spot >= p["trail_ref"] + gap):
                     return "atr_trail", qty
-        if q is None:
-            return "", 0
-        m, e = sel.mid(q), p["entry_price"]
-        if not p["tp_done"]:
-            if m <= e * (1 - (cfg.premium_stop_pct_b if b else cfg.premium_stop_pct)):
-                return "premium_stop", qty
-            if m >= e * (1 + cfg.take_profit_pct):
-                part = floor(qty * cfg.take_profit_fraction) if qty >= 2 else qty
-                return "take_profit", part
-        elif not b and m <= (p["stop_price"] or e):
-            return "breakeven_stop", qty
         return "", 0
 
     def _rth_now(self, sym: str, now: datetime) -> pd.DataFrame | None:
@@ -1824,7 +1825,13 @@ class Engine:
                 self._tick_bars[sym] = self._refresh_bars(sym, now)
             except Exception as e:
                 self._rate_limited(e)
-                raise
+                if self._prio > PRIO_LIVE:
+                    raise
+                # live position work: never stop on a bars failure. The bars in hand
+                # (or none) are returned; stale ones decide nothing (_rth_now: None)
+                self._error("bars", f"{sym}: {type(e).__name__}: {e}")
+                self._tick_bars[sym] = have if have is not None else pd.DataFrame()
+                return self._tick_bars[sym]
             self._bars_at[sym] = now
         return self._tick_bars[sym]
 
