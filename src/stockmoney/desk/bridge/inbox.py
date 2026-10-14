@@ -18,7 +18,8 @@ from __future__ import annotations
 import hmac
 import logging
 import re
-from datetime import datetime, timezone
+import time
+from datetime import datetime, timedelta, timezone
 
 from pydantic import TypeAdapter, ValidationError
 
@@ -265,8 +266,12 @@ def poll(con, mailbox: Mailbox, config: BridgeConfig | None = None, now: datetim
     config = config or BridgeConfig.from_env()
     ensure_schema(con)
     accepted = 0
+    t0 = time.monotonic()
     for mail in mailbox.fetch_unseen(MAX_RAW_BYTES):
-        received_at = now or datetime.now(timezone.utc)  # set by us, never taken from the message
+        # set by us, never taken from the message. A frozen job `now` is advanced by the time
+        # actually elapsed in this poll, so a plan fetched after the 09:20 ET cutoff is not
+        # stamped with the job's earlier start time (shadow_only depends on it).
+        received_at = (now + timedelta(seconds=time.monotonic() - t0)) if now else datetime.now(timezone.utc)
         try:
             if _process(con, mail, config, received_at):
                 accepted += 1

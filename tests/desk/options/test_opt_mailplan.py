@@ -257,3 +257,31 @@ def test_plan_arriving_between_ticks_becomes_active(tmp_path, con):
     st = {s["plan_id"]: s["state"] for s in ostore.setups(con, str(DAY)) if s["source"] == "grok_plan"}
     assert st == {"gp-20261013-0700": "SUPERSEDED", "gp-20261013-0900": "WAITING"}
     assert oplan.active_plan(con, DAY).plan.plan_id == "gp-20261013-0900"
+
+
+def test_plan_stamped_with_elapsed_poll_time_not_frozen_job_now(monkeypatch):
+    """A frozen job `now` just before the 09:20 ET cutoff must not make a plan fetched after
+    it live: the stamp advances by the time elapsed while polling."""
+    from datetime import timedelta
+    from stockmoney.desk.bridge import inbox
+    seen = []
+    real = inbox._process
+    monkeypatch.setattr(inbox, "_process", lambda con, mail, config, received_at: (seen.append(received_at), True)[1])
+    ticks = iter([100.0, 100.0 + 45.0])
+    monkeypatch.setattr(inbox.time, "monotonic", lambda: next(ticks))
+
+    class _MB:
+        def fetch_unseen(self, n):
+            return [type("M", (), {"uid": "1"})()]
+        def mark_seen(self, uid):
+            pass
+
+    import sqlite3
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    con = sqlite3.connect(":memory:")
+    now = datetime(2026, 10, 15, 9, 19, 50, tzinfo=ZoneInfo("America/New_York"))
+    cfg = type("C", (), {"shared_token": "t"})()
+    inbox.poll(con, _MB(), cfg, now=now)
+    assert seen and seen[0] == now + timedelta(seconds=45)
+    assert seen[0].astimezone(ZoneInfo("America/New_York")).time() > datetime(2026, 10, 15, 9, 20).time()
