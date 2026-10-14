@@ -228,6 +228,13 @@ class Engine:
         self._flags: dict[str, str] | None = None
         self._tick_bars: dict[str, pd.DataFrame] = {}
         self._tick_errors = 0
+        self._tick_t0: datetime | None = None  # set by tick(): start of a tick with a deadline
+
+    def _late(self) -> bool:
+        """This tick ran past cfg.tick_deadline_s (slow broker calls): scans and
+        shadow work wait for the next tick; live positions are still managed."""
+        return self._tick_t0 is not None and \
+            (self.clock() - self._tick_t0).total_seconds() > self.cfg.tick_deadline_s
 
     def tick(self, fast: bool = False) -> dict:
         """One pass. ``fast`` (the session's 2-second polls while a live order
@@ -236,8 +243,10 @@ class Engine:
         next full tick, which the session runs at least every poll_seconds."""
         now = self.clock()
         self._begin(now)
+        self._tick_t0 = now
         et, day = _et(now), self._day
         self._ensure_day(now)
+        self._flat_alert(self.clock())  # the time now, not the tick's start: a slow tick must not delay it
         halted = self.cfg.halt_file.exists()
         if halted and ostore.notify_once(self.con, f"{self._dstr}:halt"):
             self._notify("期權軌道:HALT 生效", "data/desk/HALT 存在:新進場全擋(影子照記),出場照常。", notify.WARN)
@@ -249,16 +258,20 @@ class Engine:
         # gate sees a book that already includes this tick's fills
         self._manage_pending(now)
         self._manage_open(now, fast)
-        if not fast:
+        self._flat_alert(self.clock())
+        late = self._late()
+        if late and not fast:
+            log.warning("options tick running late (%.0f s > %.0f s): scans and shadow work skipped",
+                        (self.clock() - now).total_seconds(), self.cfg.tick_deadline_s)
+        if not fast and not late:
             self._ensure_plan(now)
-        if not fast and et >= _at(day, self.cfg.open_time):
+        if not fast and not late and et >= _at(day, self.cfg.open_time):
             for m in ostore.universe(self.con, self._dstr):
                 try:
                     self._scan_symbol(m, now, halted)
                 except Exception as e:  # one symbol's bad data must not stop the loop
                     self._error("scan", f"{m['symbol']}: {type(e).__name__}: {e}")
         self._roll_setups()
-        self._flat_alert(now)
         self._errors = 0 if self._tick_errors == 0 else self._errors
         self.con.commit()
         return self.summary()
@@ -1008,6 +1021,8 @@ class Engine:
                         except Exception as e:
                             self._error("exit", f"{p['position_id']}: {type(e).__name__}: {e}")
                 continue
+            if p["mode"] != "live" and self._late():
+                continue  # running late: shadow bookkeeping waits for the next tick
             self._prio = PRIO_LIVE if p["mode"] == "live" else PRIO_SHADOW
             try:
                 self._manage_one(p, now)

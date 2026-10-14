@@ -67,6 +67,7 @@ class OptionsConfig:
     not_flat_alert_min: int = 10             # page (CRITICAL) if not flat this long before the close (15:50 ET)
     min_live_minutes_before_flat: int = 90   # no live entry with less time than this left before forced flat
     poll_seconds: float = 20.0               # section 8: 15 to 30 s
+    tick_deadline_s: float = 40.0            # a tick running longer skips scans and shadow work (live first)
 
     # --- exits (section 5, fixed, not tuned yet). Every entry is recorded
     # once per exit variant; live uses ``live_exit``. Variants are reported

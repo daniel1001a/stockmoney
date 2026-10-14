@@ -159,3 +159,77 @@ def test_s2_bars_outage_never_blocks_the_premium_stop(tmp_path, con, err):
     run_eng(eng, clock, et(10, 5), step=20)
     exits = [o for o in ostore.orders_for(con, lp["position_id"]) if o["kind"] == "exit"]
     assert exits and exits[0]["reason"] == "premium_stop", f"no exit after 10 minutes at -60% while bars fail ({err})"
+
+
+# ------------------------------------------------------------------ S3 / S4 slow failing broker
+class SlowFailBroker(FakeOptionsBroker):
+    """From ``slow_from`` every broker call costs ``delay`` seconds of
+    (simulated) time and fails."""
+    slow_from = None
+    delay = 5.0
+    calls = 0
+
+    def _slow(self):
+        if self.slow_from is not None and self.clock.now >= self.slow_from:
+            self.calls += 1
+            self.clock.advance(self.delay)
+            raise ConnectionError("broker unavailable (slow failure)")
+
+
+for _name in ("minute_bars", "stock_quote", "option_quote", "option_chain", "submit", "get_order", "cancel",
+              "open_orders", "account"):
+    def _wrap(name):
+        base = getattr(FakeOptionsBroker, name)
+
+        def f(self, *a, **k):
+            self._slow()
+            return base(self, *a, **k)
+        return f
+    setattr(SlowFailBroker, _name, _wrap(_name))
+
+
+MORE = ("QQQ", "IWM", "DIA", "XLK", "XLF", "SMH", "XLE", "XLV")
+
+
+def slow_rig(tmp_path, con, delay, **kw):
+    """One live SPY position; eight more symbols in the universe (each scan
+    costs broker calls)."""
+    r = Rig(tmp_path, con, time_stop_minutes=600, index=("SPY",) + MORE, **kw)
+    b = SlowFailBroker(r.clock, {**r.broker.bars, **{s: r.broker.bars["SPY"] for s in MORE}})
+    b.templates = r.broker.templates
+    b.delay = delay
+    r.broker = b
+    r.eng = r.new_engine()
+    r.pages = []
+    r.eng.notifier = lambda t, m, p: r.pages.append((r.clock.now, t, p))
+    r.eng._sleep = lambda s: r.clock.advance(s)
+    r.run(et(9, 52))
+    assert r.pos("live")[0]["state"] == "ENTERED"
+    return r
+
+
+def session_loop(r, until, poll=20.0):
+    """run.session's loop: a full tick, then poll_seconds (2 s while an order works)."""
+    while r.clock.now <= until.astimezone(r.clock.now.tzinfo):
+        try:
+            r.eng.tick()
+        except Exception:
+            r.con.rollback()
+        r.clock.advance(poll)
+
+
+@pytest.mark.parametrize("delay", [5.0, 20.0])
+def test_s3_pre_close_alert_fires_on_time_while_every_call_is_slow_and_failing(tmp_path, con, delay, caplog):
+    r = slow_rig(tmp_path, con, delay)
+    r.clock.set(et(15, 40))
+    r.broker.slow_from = r.clock.now
+    session_loop(r, et(15, 56))
+    alert = [t for t, title, _ in r.pages if title == "期權軌道收盤前未平倉"]
+    assert alert, "no pre-close alert"
+    t50 = et(15, 50).astimezone(alert[0].tzinfo)
+    # checked at the top of the tick and after position management, at the time it is then:
+    # at most one tick deadline and the alert's own broker read after 15:50
+    assert alert[0] < et(15, 51).astimezone(alert[0].tzinfo), f"alert at {alert[0]}"
+    assert (alert[0] - t50).total_seconds() <= 2 * delay + 5, f"alert at {alert[0]}"
+    if delay >= 20:
+        assert "options tick running late" in caplog.text  # scans and shadow work were skipped
