@@ -119,6 +119,9 @@ NOT_SENT_AFTER_S = 30.0  # a pending_submit row the broker still does not know a
 PRIO_LIVE, PRIO_SCAN, PRIO_SHADOW = 2, 3, 4
 REREAD_WAITS = (0.5, 1.0, 2.0, 4.0)  # seconds between re-reads of a canceled exit at the flat (7.5 s in all)
 FLATTEN_ROUNDS = 3
+SHORTFALL_SETTLE_S = 180.0    # no shortfall observation this soon after a booked fill (position reads lag)
+SHORTFALL_CONFIRM_S = 120.0   # a shortfall is written off only when seen again at least this much later
+BROKER_CHECK_EVERY_S = 300.0  # unknown / reappearing broker option positions are checked this often
 
 
 def _et(now: datetime) -> datetime:
@@ -195,6 +198,10 @@ class Engine:
         self._cancel_fail: dict[str, int] = {}  # client_order_id -> failed cancels in a row
         self._cancel_next: dict[str, datetime] = {}   # exit client_order_id -> no cancel retry before this
         self._shortfall_at: dict[str, datetime] = {}  # position_id -> last broker-quantity check
+        # position_id -> (time, contracts missing) of the first observation of a broker shortfall,
+        # still unconfirmed (OPTIONS_PLAN.md section 12: written off only on a second one)
+        self._shortfall_seen: dict[str, tuple[datetime, float]] = {}
+        self._broker_check_at: datetime | None = None  # last unknown-broker-position check
         self._cancel_paged: dict[str, datetime] = {}  # exit client_order_id -> last "cannot cancel" page
         self._status_fail: dict[str, int] = {}  # exit client_order_id -> failed get_order reads in a row
         self._obook: OptionsBook | None = None
@@ -221,6 +228,13 @@ class Engine:
         self._flags: dict[str, str] | None = None
         self._tick_bars: dict[str, pd.DataFrame] = {}
         self._tick_errors = 0
+        self._tick_t0: datetime | None = None  # set by tick(): start of a tick with a deadline
+
+    def _late(self) -> bool:
+        """This tick ran past cfg.tick_deadline_s (slow broker calls): scans and
+        shadow work wait for the next tick; live positions are still managed."""
+        return self._tick_t0 is not None and \
+            (self.clock() - self._tick_t0).total_seconds() > self.cfg.tick_deadline_s
 
     def tick(self, fast: bool = False) -> dict:
         """One pass. ``fast`` (the session's 2-second polls while a live order
@@ -229,26 +243,36 @@ class Engine:
         next full tick, which the session runs at least every poll_seconds."""
         now = self.clock()
         self._begin(now)
+        self._tick_t0 = now
         et, day = _et(now), self._day
         self._ensure_day(now)
+        self._cap_retries(now)
+        self._flat_alert(self.clock())  # the time now, not the tick's start: a slow tick must not delay it
         halted = self.cfg.halt_file.exists()
         if halted and ostore.notify_once(self.con, f"{self._dstr}:halt"):
             self._notify("期權軌道:HALT 生效", "data/desk/HALT 存在:新進場全擋(影子照記),出場照常。", notify.WARN)
         self._start_of_day(now)
+        if not fast and (self._broker_check_at is None
+                         or (now - self._broker_check_at).total_seconds() >= BROKER_CHECK_EVERY_S):
+            self._check_broker(now)  # also during the session: contracts reappearing or bought by hand
         # resolve working orders and exits before any new entry, so the risk
         # gate sees a book that already includes this tick's fills
         self._manage_pending(now)
         self._manage_open(now, fast)
-        if not fast:
+        self._flat_alert(self.clock())
+        late = self._late()
+        if late and not fast:
+            log.warning("options tick running late (%.0f s > %.0f s): scans and shadow work skipped",
+                        (self.clock() - now).total_seconds(), self.cfg.tick_deadline_s)
+        if not fast and not late:
             self._ensure_plan(now)
-        if not fast and et >= _at(day, self.cfg.open_time):
+        if not fast and not late and et >= _at(day, self.cfg.open_time):
             for m in ostore.universe(self.con, self._dstr):
                 try:
                     self._scan_symbol(m, now, halted)
                 except Exception as e:  # one symbol's bad data must not stop the loop
                     self._error("scan", f"{m['symbol']}: {type(e).__name__}: {e}")
         self._roll_setups()
-        self._flat_alert(now)
         self._errors = 0 if self._tick_errors == 0 else self._errors
         self.con.commit()
         return self.summary()
@@ -998,6 +1022,8 @@ class Engine:
                         except Exception as e:
                             self._error("exit", f"{p['position_id']}: {type(e).__name__}: {e}")
                 continue
+            if p["mode"] != "live" and self._late():
+                continue  # running late: shadow bookkeeping waits for the next tick
             self._prio = PRIO_LIVE if p["mode"] == "live" else PRIO_SHADOW
             try:
                 self._manage_one(p, now)
@@ -1005,6 +1031,7 @@ class Engine:
                 self._error("exit", f"{p['position_id']}: {type(e).__name__}: {e}")
             finally:
                 self._prio = PRIO_SCAN
+            self._flat_alert(self.clock())  # slow calls on several positions must not delay the page
 
     def _quote(self, occ: str) -> OptionContract | None:
         """This tick's quote of ``occ``. A shadow-only contract is re-quoted at
@@ -1083,33 +1110,34 @@ class Engine:
             return ("carry_over", qty) if _et(now) >= _at(self._day, cfg.open_time) else ("", 0)
         if now >= self._flat():
             return "force_flat", qty
+        # time and premium exits first: they need no underlying data, so an
+        # outage of the underlying's quotes / bars can never hold them back
+        held = (now - datetime.fromisoformat(p["entry_time"])).total_seconds() / 60
+        if held >= (p["max_hold_min"] or cfg.time_stop_minutes):
+            return "time_stop", qty
+        b = p["exit_variant"] == "B"
+        if q is not None:
+            m, e = sel.mid(q), p["entry_price"]
+            if not p["tp_done"]:
+                if m <= e * (1 - (cfg.premium_stop_pct_b if b else cfg.premium_stop_pct)):
+                    return "premium_stop", qty
+                if m >= e * (1 + cfg.take_profit_pct):
+                    part = floor(qty * cfg.take_profit_fraction) if qty >= 2 else qty
+                    return "take_profit", part
+            elif not b and m <= (p["stop_price"] or e):
+                return "breakeven_stop", qty
         spot = self._spot(p["underlying"], now)
         inv, long_ = p["invalidation"], p["direction"] == "long"
         if spot is not None and inv is not None and (spot <= inv if long_ else spot >= inv):
             return "invalidation", qty
         if self._close_invalidated(p, now):
             return "invalidation", qty
-        held = (now - datetime.fromisoformat(p["entry_time"])).total_seconds() / 60
-        if held >= (p["max_hold_min"] or cfg.time_stop_minutes):
-            return "time_stop", qty
-        b = p["exit_variant"] == "B"
         if b and p["tp_done"] and spot is not None and p["trail_ref"] is not None:
             a = self._underlying_atr(p["underlying"], now)
             if a is not None:
                 gap = cfg.trail_atr_mult * a
                 if (spot <= p["trail_ref"] - gap) if long_ else (spot >= p["trail_ref"] + gap):
                     return "atr_trail", qty
-        if q is None:
-            return "", 0
-        m, e = sel.mid(q), p["entry_price"]
-        if not p["tp_done"]:
-            if m <= e * (1 - (cfg.premium_stop_pct_b if b else cfg.premium_stop_pct)):
-                return "premium_stop", qty
-            if m >= e * (1 + cfg.take_profit_pct):
-                part = floor(qty * cfg.take_profit_fraction) if qty >= 2 else qty
-                return "take_profit", part
-        elif not b and m <= (p["stop_price"] or e):
-            return "breakeven_stop", qty
         return "", 0
 
     def _rth_now(self, sym: str, now: datetime) -> pd.DataFrame | None:
@@ -1239,6 +1267,13 @@ class Engine:
             return False
         if not dec.allow:
             log.warning("options exit refused by the risk gate: %s %s", pid, dec.reason)
+            if dec.reason.startswith("risk gate error:"):
+                # a transient broker read failure inside the gate is not a refusal: it must not
+                # consume the once-a-day refusal key (a real refusal later still pages)
+                if ostore.notify_once(self.con, f"{self._dstr}:exit_gate_error:{pid}:{int(now.timestamp() // 600)}"):
+                    self._notify("期權軌道:出場風控暫時讀取失敗", f"{p['occ']} x{qty:g}({reason}):{dec.reason[:300]}。"
+                                 "下一輪會重試。", notify.WARN)
+                return False
             if ostore.notify_once(self.con, f"{self._dstr}:exit_refused:{pid}"):
                 ostore.event(self.con, self._dstr, now, "critical", "exit_refused", f"{pid} {p['occ']}: {dec.reason}")
                 self._notify("期權軌道:出場被風控擋下", f"{p['occ']} x{qty:g}({reason})被風控拒絕:{dec.reason[:300]}。"
@@ -1277,20 +1312,27 @@ class Engine:
         """A live position of today with no exit working, whose broker
         quantity is below the store's (the owner sold some by hand, one was
         assigned). At most once a minute per position, and only once no fill
-        of it happened in the last 60 s (a position read can lag a fill).
-        First every sleeve order of the position is re-read and booked (it
-        may explain the gap); what is still missing is written off at price 0
-        (a total loss: realized, so the daily stop and the drawdown latch see
-        it, in the store and in line A's book), new buys are latched off
-        (setting options_halt_new_entries=1, cleared by the owner) and the
-        owner is paged. Never sends an order. Returns the re-read position."""
+        of it was booked in the last SHORTFALL_SETTLE_S (a position read can
+        lag a fill). Before each observation every sleeve exit order of the
+        position is re-read and booked (it may explain the gap). A shortfall
+        is acted on only when observed twice, at least SHORTFALL_CONFIRM_S
+        apart (forgotten once the broker again holds the store's quantity):
+        then what is still missing (the smaller of the two observations) is
+        written off at price 0 (a total loss: realized, so the daily stop and
+        the drawdown latch see it, in the store and in line A's book), new
+        buys are latched off (setting options_halt_new_entries=1, cleared by
+        the owner) and the owner is paged. Never sends an order. Returns the
+        re-read position."""
         pid = p["position_id"]
         last = self._shortfall_at.get(pid)
-        if (last is not None and (now - last).total_seconds() < 60) or not self._settled(p, now):
+        if (last is not None and (now - last).total_seconds() < 60) or not self._settled(p, now, SHORTFALL_SETTLE_S):
             return p
         self._shortfall_at[pid] = now
         room = self._sell_room(p["occ"])
-        if room is None or room[1] > 1e-9 or room[0] >= (p["qty_open"] or 0) - 1e-9:
+        if room is None or room[1] > 1e-9:
+            return p
+        if room[0] >= (p["qty_open"] or 0) - 1e-9:
+            self._shortfall_seen.pop(pid, None)
             return p
         for row in ostore.orders_for(self.con, pid):  # can our own orders explain it?
             if row["kind"] != "exit":
@@ -1304,9 +1346,23 @@ class Engine:
             if o is not None:
                 p, _ = self._book_exit_order(p, row, o)
         held = self._broker_held(p["occ"])
-        gone = (p["qty_open"] or 0) - (held if held is not None else 1e18)
-        if held is None or gone < 1 - 1e-9:
+        if held is None:
             return p
+        gone = (p["qty_open"] or 0) - held
+        if gone < 1 - 1e-9:
+            self._shortfall_seen.pop(pid, None)
+            return p
+        first = self._shortfall_seen.get(pid)
+        if first is None:
+            self._shortfall_seen[pid] = (now, gone)
+            log.warning("options broker shortfall seen once (unconfirmed): %s store %s broker %s",
+                        pid, p["qty_open"], held)
+            return p
+        if (now - first[0]).total_seconds() < SHORTFALL_CONFIRM_S:
+            return p
+        self._shortfall_seen.pop(pid, None)
+        gone = float(floor(min(gone, first[1]) + 1e-9))  # the smaller of the two observations
+        keep = (p["qty_open"] or 0) - gone
         open_before = p["qty_open"]
         self._book_exit(p, gone, 0.0, None, None, "broker_shortfall", now,
                         f"{gone:g} contracts gone at the broker at {ostore.iso(now)}: written off at 0 (P&L unknown)",
@@ -1314,7 +1370,7 @@ class Engine:
         try:
             if self._obook is None:
                 self._obook = OptionsBook(self.con)
-            self._obook.reconcile_flat(p["occ"], "broker_shortfall", now, keep=held)
+            self._obook.reconcile_flat(p["occ"], "broker_shortfall", now, keep=keep)
         except Exception as e:
             self._error("options_book", f"write-off {p['occ']}: {type(e).__name__}: {e}")
         store.set_setting(self.con, OPTIONS_HALT_SETTING, "1")
@@ -1612,7 +1668,11 @@ class Engine:
         """Broker option positions the store does not know (no live PENDING /
         ENTERED row on that contract): paged CRITICAL once per day and set,
         never sold (it may be the owner's own trade). The risk gate then
-        refuses every entry (book / broker mismatch) until it is resolved."""
+        refuses every entry (book / broker mismatch) until it is resolved.
+        Runs at the start of the day and every BROKER_CHECK_EVERY_S; a
+        contract with a sleeve fill booked in the last SHORTFALL_SETTLE_S is
+        skipped (a position read can lag the fill that closed it)."""
+        self._broker_check_at = now
         if not hasattr(self.broker, "account"):
             return []
         try:
@@ -1623,6 +1683,9 @@ class Engine:
             return []
         known = {r[0] for r in self.con.execute("SELECT DISTINCT occ FROM options_positions WHERE mode='live' "
                                                 "AND state IN (?,?)", (PENDING, ENTERED))}
+        known |= {r[0] for r in self.con.execute("SELECT p.occ, MAX(f.at) FROM options_fills f JOIN options_positions p "
+                                                 "ON p.position_id=f.position_id WHERE p.mode='live' GROUP BY p.occ")
+                  if r[1] and (now - datetime.fromisoformat(r[1])).total_seconds() < SHORTFALL_SETTLE_S}
         book = self._book_positions()
         out = [f"{bp.symbol} x{bp.qty:g}" + (" (in the options book, not in the sleeve store)" if bp.symbol in book
                                              else " (unknown to the sleeve store and the options book)")
@@ -1710,6 +1773,7 @@ class Engine:
         day). Returns True when flat; pages the owner otherwise."""
         now = self.clock()
         self._begin(now)
+        self._cap_retries(now)
         for p in ostore.positions(self.con, self._dstr, "shadow", (ENTERED,)):
             self._book_exit(p, p["qty_open"], sh.sell_price(p["last_bid"] or 0.0, self.cfg), p["last_bid"],
                             p["last_ask"], "session_end", now, "closed at last known bid")
@@ -1726,24 +1790,44 @@ class Engine:
     def flatten_now(self, reason: str = "force_flat") -> None:
         """Emergency path: treat every open position as due for the forced
         exit. A live position whose exit is still working is resolved, not
-        sold a second time."""
-        now = self.clock()
+        sold a second time. Bounded: at most FLATTEN_ROUNDS rounds per
+        position and cfg.flatten_budget_s in all (then it stops, so the
+        caller's finish() still runs and pages before the session's outer
+        time bound)."""
+        start = now = self.clock()
         self._begin(now)
+        self._cap_retries(now)
+
+        def spent() -> bool:
+            return (self.clock() - start).total_seconds() >= self.cfg.flatten_budget_s
+
         rows = self._live_rows((ENTERED,)) + ostore.positions(self.con, self._dstr, "shadow", (ENTERED,))
         for p in rows:
+            if spent():
+                log.error("options flatten_now: %.0f s budget spent, %s and later rows left to finish()",
+                          self.cfg.flatten_budget_s, p["position_id"])
+                break
             try:
-                q = self._quote(p["occ"])
-                fresh = self._fresh(q, now)
                 if p["mode"] == "shadow":
+                    q = self._quote(p["occ"])
+                    fresh = self._fresh(q, now)
                     bid = q.bid if fresh else p["last_bid"]
                     if bid is not None:
                         self._book_exit(p, p["qty_open"], sh.sell_price(bid, self.cfg), bid,
                                         q.ask if fresh else p["last_ask"], reason, now)
                     continue
+                q = None
                 for _ in range(FLATTEN_ROUNDS):  # bounded: confirm / cancel / replace, at most 3 rounds
+                    if spent():
+                        break
+                    now = self.clock()  # each round: the cancel backoff and quote age compare against it
+                    self._now = now
                     p = ostore.position(self.con, p["position_id"])
                     if p["state"] != ENTERED or (p["qty_open"] or 0) <= 1e-9:
                         break
+                    if q is None:
+                        q = self._quote(p["occ"])
+                    fresh = self._fresh(q, now)
                     working = [o for o in ostore.orders_for(self.con, p["position_id"])
                                if o["kind"] == "exit" and o["status"] not in _TERMINAL_ORDER]
                     if working:
@@ -1753,6 +1837,17 @@ class Engine:
             except Exception as e:
                 self._error("flatten", f"{p['position_id']}: {type(e).__name__}: {e}")
         self.con.commit()
+
+    def _cap_retries(self, now: datetime) -> None:
+        """From the forced flat on, a failing broker call is retried at most
+        cfg.flat_broker_max_attempts times in all (AlpacaBroker.max_attempts),
+        so a broker outage cannot stretch the last minutes past the close."""
+        n = self.cfg.flat_broker_max_attempts
+        if n and now >= self._flat() and getattr(self.broker, "max_attempts", None) is not None \
+                and self.broker.max_attempts > n:
+            log.info("options: broker attempts per call lowered from %s to %s after the forced flat",
+                     self.broker.max_attempts, n)
+            self.broker.max_attempts = n
 
     # ================================================================ plumbing
     def _io(self) -> None:
@@ -1786,7 +1881,13 @@ class Engine:
                 self._tick_bars[sym] = self._refresh_bars(sym, now)
             except Exception as e:
                 self._rate_limited(e)
-                raise
+                if self._prio > PRIO_LIVE:
+                    raise
+                # live position work: never stop on a bars failure. The bars in hand
+                # (or none) are returned; stale ones decide nothing (_rth_now: None)
+                self._error("bars", f"{sym}: {type(e).__name__}: {e}")
+                self._tick_bars[sym] = have if have is not None else pd.DataFrame()
+                return self._tick_bars[sym]
             self._bars_at[sym] = now
         return self._tick_bars[sym]
 

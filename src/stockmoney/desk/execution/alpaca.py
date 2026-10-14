@@ -397,6 +397,15 @@ class AlpacaBroker:
         self._sleep = sleep
 
     @property
+    def max_attempts(self) -> int:
+        """Attempts per call on a transient error (the options sleeve lowers it after its forced flat)."""
+        return self._max_attempts
+
+    @max_attempts.setter
+    def max_attempts(self, n: int) -> None:
+        self._max_attempts = max(1, int(n))
+
+    @property
     def client(self) -> TradingClient:
         """Underlying client, exposed for read-only tooling (alpaca_check)."""
         return self._client

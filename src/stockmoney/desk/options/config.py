@@ -67,6 +67,7 @@ class OptionsConfig:
     not_flat_alert_min: int = 10             # page (CRITICAL) if not flat this long before the close (15:50 ET)
     min_live_minutes_before_flat: int = 90   # no live entry with less time than this left before forced flat
     poll_seconds: float = 20.0               # section 8: 15 to 30 s
+    tick_deadline_s: float = 40.0            # a tick running longer skips scans and shadow work (live first)
 
     # --- exits (section 5, fixed, not tuned yet). Every entry is recorded
     # once per exit variant; live uses ``live_exit``. Variants are reported
@@ -93,6 +94,8 @@ class OptionsConfig:
     cancel_max_failures: int = 3             # failed cancels of one order before the owner is paged
     cancel_page_every_min: float = 5.0       # a working exit that cannot be canceled is re-paged this often
     order_status_max_failures: int = 5       # failed get_order reads of an exit before a fresh market sell
+    flatten_budget_s: float = 300.0          # flatten_now stops after this (wall clock) and leaves the rest to finish()
+    flat_broker_max_attempts: int = 2        # after the forced flat: attempts per broker call (AlpacaBroker retries)
 
     # --- data safety
     max_quote_age_s: float = 30.0            # never enter on an older option quote

@@ -354,7 +354,7 @@ def test_m1_real_gate_refuses_a_sell_to_open(tmp_path, con):
     assert lp["state"] == "ENTERED"
     del r.broker.positions[C601N]  # the broker no longer holds it (closed by hand)
     r.clock.set(et(15, 45))
-    r.run(et(15, 46), step=5)
+    r.run(et(15, 48), step=5)  # a shortfall is confirmed on a second look 120 s later
     assert not exits(con, lp["position_id"]) and C601N not in r.broker.positions  # never a sell to open
     from stockmoney.desk.options._iface import OrderIntent as OI
     sell = OI("s-test", C601N, AssetClass.OPTION, Side.SELL, qty=1, order_type=OrderType.MARKET, tif=TIF.DAY)
