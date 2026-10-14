@@ -180,7 +180,7 @@ def test_g2_broker_holds_fewer_sell_what_is_held_and_write_off_the_rest(tmp_path
     e = lp["entry_price"]
     r.broker.positions[C601N] = 4  # the owner sold 6 by hand (at 0.20, which the sleeve cannot see)
     r.clock.set(et(15, 45))
-    r.run(et(15, 46), step=2)
+    r.run(et(15, 50), step=2)  # confirmed 180 s after the sale of the 4
     assert [o.qty for o in sells(r)] == [4] and C601N not in r.broker.positions
     p = ostore.position(con, lp["position_id"])
     assert p["state"] == "EXITED" and p["qty_open"] == 0 and "written off at 0" in p["note"]
@@ -207,7 +207,7 @@ def test_g2_broker_holds_zero_today_sends_nothing_and_writes_off(tmp_path, con):
     r, lp = entered(tmp_path, con)
     del r.broker.positions[C601N]
     r.clock.set(et(15, 45))
-    r.run(et(15, 46), step=2)
+    r.run(et(15, 48), step=2)  # confirmed on a second look 120 s later
     p = ostore.position(con, lp["position_id"])
     assert not sells(r) and p["state"] == "EXITED" and p["exit_reason"] == "broker_shortfall"
     assert p["realized_usd"] == pytest.approx(-10 * p["entry_price"] * 100)
@@ -223,6 +223,8 @@ def test_h2_daily_stop_sees_a_hand_sale_and_reappearing_contracts_are_never_sold
     r.broker.positions[C601N] = 4  # the owner sold 6 by hand
     r.clock.set(et(10, 0))
     r.eng.tick()
+    r.clock.set(et(10, 2, 30))
+    r.eng.tick()  # the shortfall is written off on its second observation
     p = ostore.position(con, lp["position_id"])
     assert p["qty_open"] == 4 and p["state"] == "ENTERED"
     st = _iface.sleeve_state(con, r.gate.engine.limits, {C601N: 0.95}, r.clock.now)
@@ -237,7 +239,8 @@ def test_h2_daily_stop_sees_a_hand_sale_and_reappearing_contracts_are_never_sold
     assert C601N not in r.broker.positions
     r.broker.positions[C601N] = 6
     r.eng = r.new_engine()  # e.g. a restart: the start-of-day check runs again
-    r.run(et(15, 48), step=2)
+    # a contract filled in the last 180 s is skipped (a read may lag the sale); the 5-minute check pages it
+    r.run(et(15, 52), step=2)
     assert any("未知期權部位" in t for t in titles(r))
     assert sum(o.filled_qty for o in sells(r)) == 4 and r.broker.positions[C601N] == 6
 

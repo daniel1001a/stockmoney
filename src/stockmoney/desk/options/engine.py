@@ -119,6 +119,9 @@ NOT_SENT_AFTER_S = 30.0  # a pending_submit row the broker still does not know a
 PRIO_LIVE, PRIO_SCAN, PRIO_SHADOW = 2, 3, 4
 REREAD_WAITS = (0.5, 1.0, 2.0, 4.0)  # seconds between re-reads of a canceled exit at the flat (7.5 s in all)
 FLATTEN_ROUNDS = 3
+SHORTFALL_SETTLE_S = 180.0    # no shortfall observation this soon after a booked fill (position reads lag)
+SHORTFALL_CONFIRM_S = 120.0   # a shortfall is written off only when seen again at least this much later
+BROKER_CHECK_EVERY_S = 300.0  # unknown / reappearing broker option positions are checked this often
 
 
 def _et(now: datetime) -> datetime:
@@ -195,6 +198,10 @@ class Engine:
         self._cancel_fail: dict[str, int] = {}  # client_order_id -> failed cancels in a row
         self._cancel_next: dict[str, datetime] = {}   # exit client_order_id -> no cancel retry before this
         self._shortfall_at: dict[str, datetime] = {}  # position_id -> last broker-quantity check
+        # position_id -> (time, contracts missing) of the first observation of a broker shortfall,
+        # still unconfirmed (OPTIONS_PLAN.md section 12: written off only on a second one)
+        self._shortfall_seen: dict[str, tuple[datetime, float]] = {}
+        self._broker_check_at: datetime | None = None  # last unknown-broker-position check
         self._cancel_paged: dict[str, datetime] = {}  # exit client_order_id -> last "cannot cancel" page
         self._status_fail: dict[str, int] = {}  # exit client_order_id -> failed get_order reads in a row
         self._obook: OptionsBook | None = None
@@ -235,6 +242,9 @@ class Engine:
         if halted and ostore.notify_once(self.con, f"{self._dstr}:halt"):
             self._notify("期權軌道:HALT 生效", "data/desk/HALT 存在:新進場全擋(影子照記),出場照常。", notify.WARN)
         self._start_of_day(now)
+        if not fast and (self._broker_check_at is None
+                         or (now - self._broker_check_at).total_seconds() >= BROKER_CHECK_EVERY_S):
+            self._check_broker(now)  # also during the session: contracts reappearing or bought by hand
         # resolve working orders and exits before any new entry, so the risk
         # gate sees a book that already includes this tick's fills
         self._manage_pending(now)
@@ -1277,20 +1287,27 @@ class Engine:
         """A live position of today with no exit working, whose broker
         quantity is below the store's (the owner sold some by hand, one was
         assigned). At most once a minute per position, and only once no fill
-        of it happened in the last 60 s (a position read can lag a fill).
-        First every sleeve order of the position is re-read and booked (it
-        may explain the gap); what is still missing is written off at price 0
-        (a total loss: realized, so the daily stop and the drawdown latch see
-        it, in the store and in line A's book), new buys are latched off
-        (setting options_halt_new_entries=1, cleared by the owner) and the
-        owner is paged. Never sends an order. Returns the re-read position."""
+        of it was booked in the last SHORTFALL_SETTLE_S (a position read can
+        lag a fill). Before each observation every sleeve exit order of the
+        position is re-read and booked (it may explain the gap). A shortfall
+        is acted on only when observed twice, at least SHORTFALL_CONFIRM_S
+        apart (forgotten once the broker again holds the store's quantity):
+        then what is still missing (the smaller of the two observations) is
+        written off at price 0 (a total loss: realized, so the daily stop and
+        the drawdown latch see it, in the store and in line A's book), new
+        buys are latched off (setting options_halt_new_entries=1, cleared by
+        the owner) and the owner is paged. Never sends an order. Returns the
+        re-read position."""
         pid = p["position_id"]
         last = self._shortfall_at.get(pid)
-        if (last is not None and (now - last).total_seconds() < 60) or not self._settled(p, now):
+        if (last is not None and (now - last).total_seconds() < 60) or not self._settled(p, now, SHORTFALL_SETTLE_S):
             return p
         self._shortfall_at[pid] = now
         room = self._sell_room(p["occ"])
-        if room is None or room[1] > 1e-9 or room[0] >= (p["qty_open"] or 0) - 1e-9:
+        if room is None or room[1] > 1e-9:
+            return p
+        if room[0] >= (p["qty_open"] or 0) - 1e-9:
+            self._shortfall_seen.pop(pid, None)
             return p
         for row in ostore.orders_for(self.con, pid):  # can our own orders explain it?
             if row["kind"] != "exit":
@@ -1304,9 +1321,23 @@ class Engine:
             if o is not None:
                 p, _ = self._book_exit_order(p, row, o)
         held = self._broker_held(p["occ"])
-        gone = (p["qty_open"] or 0) - (held if held is not None else 1e18)
-        if held is None or gone < 1 - 1e-9:
+        if held is None:
             return p
+        gone = (p["qty_open"] or 0) - held
+        if gone < 1 - 1e-9:
+            self._shortfall_seen.pop(pid, None)
+            return p
+        first = self._shortfall_seen.get(pid)
+        if first is None:
+            self._shortfall_seen[pid] = (now, gone)
+            log.warning("options broker shortfall seen once (unconfirmed): %s store %s broker %s",
+                        pid, p["qty_open"], held)
+            return p
+        if (now - first[0]).total_seconds() < SHORTFALL_CONFIRM_S:
+            return p
+        self._shortfall_seen.pop(pid, None)
+        gone = float(floor(min(gone, first[1]) + 1e-9))  # the smaller of the two observations
+        keep = (p["qty_open"] or 0) - gone
         open_before = p["qty_open"]
         self._book_exit(p, gone, 0.0, None, None, "broker_shortfall", now,
                         f"{gone:g} contracts gone at the broker at {ostore.iso(now)}: written off at 0 (P&L unknown)",
@@ -1314,7 +1345,7 @@ class Engine:
         try:
             if self._obook is None:
                 self._obook = OptionsBook(self.con)
-            self._obook.reconcile_flat(p["occ"], "broker_shortfall", now, keep=held)
+            self._obook.reconcile_flat(p["occ"], "broker_shortfall", now, keep=keep)
         except Exception as e:
             self._error("options_book", f"write-off {p['occ']}: {type(e).__name__}: {e}")
         store.set_setting(self.con, OPTIONS_HALT_SETTING, "1")
@@ -1612,7 +1643,11 @@ class Engine:
         """Broker option positions the store does not know (no live PENDING /
         ENTERED row on that contract): paged CRITICAL once per day and set,
         never sold (it may be the owner's own trade). The risk gate then
-        refuses every entry (book / broker mismatch) until it is resolved."""
+        refuses every entry (book / broker mismatch) until it is resolved.
+        Runs at the start of the day and every BROKER_CHECK_EVERY_S; a
+        contract with a sleeve fill booked in the last SHORTFALL_SETTLE_S is
+        skipped (a position read can lag the fill that closed it)."""
+        self._broker_check_at = now
         if not hasattr(self.broker, "account"):
             return []
         try:
@@ -1623,6 +1658,9 @@ class Engine:
             return []
         known = {r[0] for r in self.con.execute("SELECT DISTINCT occ FROM options_positions WHERE mode='live' "
                                                 "AND state IN (?,?)", (PENDING, ENTERED))}
+        known |= {r[0] for r in self.con.execute("SELECT p.occ, MAX(f.at) FROM options_fills f JOIN options_positions p "
+                                                 "ON p.position_id=f.position_id WHERE p.mode='live' GROUP BY p.occ")
+                  if r[1] and (now - datetime.fromisoformat(r[1])).total_seconds() < SHORTFALL_SETTLE_S}
         book = self._book_positions()
         out = [f"{bp.symbol} x{bp.qty:g}" + (" (in the options book, not in the sleeve store)" if bp.symbol in book
                                              else " (unknown to the sleeve store and the options book)")
