@@ -161,3 +161,14 @@
 
 程式碼:`src/stockmoney/desk/`(universe / data / indicators / strategies / broker / engine / backtest / live / store / run / execution / bridge)。
 狀態:`data/desk/desk.sqlite`(不進 git)。價格快取:`data/desk/ohlcv.parquet`。
+
+## 9. 掃描分類引擎(TypeSafe Jev)
+
+`scripts/classify_scan.py --engine claude|jev|shadow`(預設 claude)。Jev(釘 `jev-1.13.0`)做高頻低複雜度判斷:相關性、是否值得升級為候選、各 ticker 的情緒;ticker 由程式碼找出,Jev 只判斷不生成。不確定、候選價值高或 Jev 出錯的項目升級給 Claude CLI。原始機率先寫入 `jev_judgments`(migration 041)再依門檻路由,門檻(`jev_classify.py` 常數)為暫定值。
+
+驗證流程:
+1. 影子期 5 個交易日:`--engine shadow`,套用 Claude 結果,Jev 只記錄(需 `TYPESAFE_API_KEY`,只放伺服器端,由使用者設定)。
+2. 以 Sonnet 暫代標註建立驗證集,對照 `jev_judgments`,依資料校準門檻、檢查升級率與直接路由的準確度。
+3. 通過後才切 `--engine jev`;防注入測試涵蓋不受信任文字只進 state。
+
+目前只涵蓋 scan_classify,`news_synthesis` 尚未改。
