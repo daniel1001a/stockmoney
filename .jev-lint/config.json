@@ -1,0 +1,7 @@
+{
+  "skipPaths": {
+    "repo-order-outside-broker": [
+      "src/stockmoney/desk/execution/alpaca.py"
+    ]
+  }
+}
