@@ -383,7 +383,7 @@ def apply_result(
             item.item_id,
             item.item_type,
             datetime.now(timezone.utc),
-            model_version,
+            result.get("_model_version") or model_version,
             outcome,
             json.dumps(symbols_written) if symbols_written else None,
         ],
