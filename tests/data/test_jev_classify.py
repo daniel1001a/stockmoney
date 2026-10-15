@@ -157,3 +157,18 @@ def test_shadow_applies_primary_and_survives_jev_failure():
 
     out = jc.make_shadow_classify_fn(primary, jev)([_item()], SYMS)
     assert out == [{"item_id": "a1", "verdict": "irrelevant"}] and called == [True]
+
+
+def test_shadow_logs_jev_even_when_primary_fails():
+    called = []
+
+    def primary(items, symbols):
+        raise ValueError("cli not logged in")
+
+    def jev(items, symbols):
+        called.append(True)
+        return []
+
+    with pytest.raises(ValueError):
+        jc.make_shadow_classify_fn(primary, jev)([_item()], SYMS)
+    assert called == [True]

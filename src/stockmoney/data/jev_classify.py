@@ -253,11 +253,12 @@ def make_shadow_classify_fn(
     Claude calls."""
 
     def classify(items: list[ScanItem], symbols: list[str]) -> list[dict]:
-        results = primary_fn(items, symbols)
+        # Jev runs first so its judgments are logged even when the primary
+        # engine fails the batch (the failure still propagates unchanged).
         try:
             jev_fn(items, symbols)
         except Exception:
             pass
-        return results
+        return primary_fn(items, symbols)
 
     return classify
