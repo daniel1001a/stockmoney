@@ -44,3 +44,4 @@ block-exit sits at the P@0.5 floor (75%), watch it in the findings log.
 ## Changelog
 
 - 2026-10-15: initial 12 rules.
+- 2026-10-15: disabled built-in `py-perf-orm-write-in-loop` (fires on duckdb inserts; repo has no ORM).

@@ -3,5 +3,8 @@
     "repo-order-outside-broker": [
       "src/stockmoney/desk/execution/alpaca.py"
     ]
-  }
+  },
+  "disable": [
+    "py-perf-orm-write-in-loop"
+  ]
 }
