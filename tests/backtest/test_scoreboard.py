@@ -150,7 +150,26 @@ def test_sell_put_trades_ignore_future_closes():
 _LIVE_DB = os.environ.get("STOCKMONEY_DB", DEFAULT_DB_PATH)
 
 
-@pytest.mark.skipif(not os.path.exists(_LIVE_DB), reason=f"live DB not found at {_LIVE_DB}")
+def _live_db_has_soxl_history() -> bool:
+    """The pinned numbers below come from the research DB (stockmoney_live.duckdb)
+    which carries SOXL history. The default desk DB does not, so a file merely
+    existing is not enough to run this test."""
+    if not os.path.exists(_LIVE_DB):
+        return False
+    try:
+        conn = duckdb.connect(_LIVE_DB, read_only=True)
+        try:
+            return conn.execute("SELECT count(*) FROM ohlcv_daily WHERE symbol = 'SOXL'").fetchone()[0] > 0
+        finally:
+            conn.close()
+    except duckdb.Error:
+        return False
+
+
+@pytest.mark.skipif(
+    not _live_db_has_soxl_history(),
+    reason=f"no SOXL history in {_LIVE_DB}; point STOCKMONEY_DB at the research DB (stockmoney_live.duckdb)",
+)
 def test_scoreboard_smoke_matches_known_script_outputs():
     """Cross-checked against real runs of the scripts this harness supersedes
     (2026-07-13, on data/stockmoney_live.duckdb):
