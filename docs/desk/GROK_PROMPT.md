@@ -60,3 +60,7 @@ SPY, QQQ, TQQQ, BTC/USD, NVDA, AVGO, AMD, TSM, MU, QCOM, AMAT, LRCX, KLAC, MRVL,
 ```
 
 主旨範例:`[SMD/GROK_DAILY/grok-20261012-0730] <密鑰>`
+
+---
+
+後續處理:收到的 GROK_DAILY 文字項目(events / chains / attention)會被 Jev 預篩並標記 pass / hold / archive,細節見 `OPERATING_PLAN.md` 第 10 節。預篩只標記,不影響格式要求,也不影響 chains / calls 的評分。

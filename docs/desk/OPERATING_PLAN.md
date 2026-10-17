@@ -174,3 +174,34 @@
 3. 通過後才切 `--engine jev`;防注入測試涵蓋不受信任文字只進 state。
 
 目前只涵蓋 scan_classify,`news_synthesis` 尚未改。
+
+## 10. 情報預篩層(TypeSafe Jev)
+
+範圍:`bridge_messages` 裡的 GROK_DAILY(events / chains / attention)與 Muse 的 ALERT、RESEARCH_REPLY、IDEA、SOCIAL_DAILY 文字項目。CALLS 沒有自由文字,不預篩。程式:`src/stockmoney/desk/learn/prescreen.py`,表 `prescreen_judgments`,學習日報步驟 3d,`scripts/desk_prescreen.py`。
+
+每個項目在一次 Jev 請求(釘 `jev-1.13.0`,不受信任文字只進 state)問三題:是否與交易相關(Noul)、是否為可具體追蹤的進展而非閒聊(Noul)、下行風險等級(Score,4 級)。程式碼路由,原始機率先寫入帳本,門檻(`prescreen.py` 常數)為暫定值:
+
+| 路由 | 條件 |
+|---|---|
+| pass | 旁路(ALERT elevated/critical、有 risk_flags 的 RESEARCH_REPLY、GROK event severity critical/elevated),或 actionable >= 0.70,或風險分數 >= 2.0 且信心 >= 0.60 |
+| archive | relevant < 0.30,或其餘低訊號 |
+| hold | 介於兩者之間 |
+| error | Jev 失敗,下次重跑 |
+
+規則:
+- 只標記,不刪除、不隱藏。chains / calls 的 5/20/60 日評分照常以全部資料計算,預篩只決定誰值得付費深度分析。
+- 降低風險的訊號永不被過濾(旁路)。
+- pass 的項目才進深度分析(Claude CLI,`--tools ""`,結果存 `deep_json`:傳導、受影響標的、風險備註、待查證項目)。輸出不接任何下單路徑,也不改任何參數。
+- `DESK_PRESCREEN=off|shadow|on`,預設 off。shadow 只判斷與記錄,on 才做深度分析(每次最多 10 則,每項最多重試 3 次)。需 `TYPESAFE_API_KEY`(由使用者設定)。
+
+驗證流程:
+1. 影子期 5 個交易日:`DESK_PRESCREEN=shadow`,累積 `prescreen_judgments`。
+2. 人工抽樣標註 pass / archive 各約 30 則(含已知結果的 chains),檢查被封存項目後來是否真的有影響(漏判率),依資料調整門檻。
+3. 漏判率可接受後才切 `on`。
+
+```bash
+.venv/bin/python scripts/desk_prescreen.py items            # 列出待判斷項目(不呼叫 API)
+.venv/bin/python scripts/desk_prescreen.py run --mode shadow
+.venv/bin/python scripts/desk_prescreen.py report
+.venv/bin/python -m pytest tests/desk/test_prescreen.py -q
+```

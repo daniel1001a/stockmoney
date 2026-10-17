@@ -1,0 +1,173 @@
+{
+  "language": "python",
+  "extensions": [
+    ".py"
+  ],
+  "rules": [
+    {
+      "id": "repo-order-outside-broker",
+      "question": "Does `added_code` send an order straight to Alpaca by calling `.submit_order(`, `.replace_order_by_id(`, `.close_position(`, `.close_all_positions(`, or the MCP-style helpers `place_stock_order`, `place_crypto_order`, `place_option_order`, instead of building an `OrderIntent` and calling `broker.submit(intent)` on the `Broker` interface after `RiskEngine.check` allowed it?",
+      "true": "An order is placed or closed by calling the Alpaca SDK or an order-placing helper directly, bypassing the Broker interface and the risk layer.",
+      "false": "Orders go through `broker.submit(intent)` after a risk decision; or the code only reads (`get_account`, `get_clock`, `get_all_positions`, `get_orders`), cancels, or builds an `OrderIntent` without sending it; or the code does not touch orders at all.",
+      "fix": "Build an OrderIntent and submit it through the Broker interface after RiskEngine.check allows it (CLAUDE.md section 0, PHASE0_SPEC W1/W2).",
+      "when": [
+        "submit_order|replace_order|close_position|close_all_positions|place_(stock|crypto|option)_order"
+      ],
+      "paths": [
+        "src/**",
+        "scripts/**"
+      ]
+    },
+    {
+      "id": "repo-live-flag-bypass",
+      "question": "Does `added_code` make real-money trading reachable or weaken its guard in any of these ways: (a) a default or fallback value of `live` for `ALPACA_ENV` (for example `env.get(\"ALPACA_ENV\") or \"live\"`), (b) assigning `ALPACA_ENV` to `live` or setting `ALPACA_LIVE_ENABLED` / the `I_UNDERSTAND_REAL_MONEY` confirmation in code, including `os.environ[...] = ...`, (c) constructing a trading client with `paper=False`, (d) pointing at the live `api.alpaca.markets` trading host, or (e) removing, skipping or catching the check that raises when live is requested without the owner's confirmation?",
+      "true": "Code turns on live trading, supplies the owner's confirmation itself, or disables the live-trading guard.",
+      "false": "Code only reads `ALPACA_ENV` and keeps `paper` as the default; or it validates that live requires the confirmation and raises otherwise; or a test sets live without the confirmation in order to assert that construction is refused; or the code does not involve the live/paper switch.",
+      "fix": "Leave paper as the default and let only the account owner set ALPACA_ENV=live and ALPACA_LIVE_ENABLED in their own environment (CLAUDE.md section 0).",
+      "when": [
+        "ALPACA_ENV|ALPACA_LIVE|LIVE_CONFIRMATION|paper\\s*=\\s*False|api\\.alpaca\\.markets|I_UNDERSTAND"
+      ],
+      "paths": [
+        "src/**",
+        "scripts/**",
+        "tests/**"
+      ]
+    },
+    {
+      "id": "repo-hardcoded-secret",
+      "question": "Does `added_code` contain a literal credential written in source: an Alpaca API key or secret, a TypeSafe/Anthropic/OpenAI API key, a mail app password (`DESK_MAIL_APP_PASSWORD`), the Muse shared token (`MUSE_SHARED_TOKEN`), a bearer token, or a private ntfy topic, instead of reading it from the environment or a mode-600 key file?",
+      "true": "A real-looking secret value is written directly in the code.",
+      "false": "The value comes from `os.environ`, `os.getenv`, `dotenv` or a key file; or it is an obvious placeholder or a test fixture value such as `\"wrong-token-wrong-token\"`, `\"test\"`, `\"changeme\"`; or it is only the name of an environment variable; or there is no credential.",
+      "fix": "Read the secret from the environment or a private key file and rotate the exposed value (CLAUDE.md section 13).",
+      "when": [
+        "key|token|secret|passw|bearer|credential|ntfy|sk-|tsk_"
+      ],
+      "paths": [
+        "**/*.py"
+      ]
+    },
+    {
+      "id": "repo-bridge-raises-risk",
+      "question": "Does `added_code` use content from a Muse or Grok bridge message (`bridge_messages`, `parsed_json`, `Inbound`, `Alert`, `ResearchReply`, `active_flags`, a message field such as `conviction` or `severity`) to create or enlarge an order, raise a position size or a risk limit, remove an existing block, or change a strategy parameter, rather than only to block entries, stop adds, or send a notification?",
+      "true": "Bridge message data opens or grows risk: a buy, a bigger size, a loosened limit or a lifted block.",
+      "false": "Bridge data is only used to block entries, stop adds to a held name, send a notification, or be stored for display; or the code does not read bridge messages at all.",
+      "fix": "Muse input may only reduce risk: drop the path from messages to buys, sizes or parameters (MUSE_BRIDGE permission table).",
+      "when": [
+        "bridge|muse|grok|Alert|ResearchReply|parsed_json|active_flags|Inbound"
+      ],
+      "paths": [
+        "src/**",
+        "scripts/**"
+      ]
+    },
+    {
+      "id": "repo-lookahead-timestamp",
+      "question": "Does `added_code` build a feature, signal, join or trading decision for time T from data the system could not have had at T: filtering or ordering by `published_at`, an event time or a message's own `sent_at`/`created_at` instead of `available_at` / `received_at`, or using a negative shift or lead (`shift(-n)`, `shift(periods=-n)`, `lead(`) or a next-day value as an input column, or joining on a future date?",
+      "true": "A feature or decision uses a time or value that was not yet available at decision time.",
+      "false": "Point-in-time filters use `available_at` or `received_at`; or a forward-looking value is only built as the training label or target column and never used as a feature; or `shift(n)` with a positive n lags the data; or the code does not select data by time.",
+      "fix": "Filter and join on the time the system actually had the data (`available_at` / `received_at`), never on event or publish time (CLAUDE.md sections 2 and 12).",
+      "when": [
+        "published_at|sent_at|created_at|shift|lead\\(|next_|tomorrow|future|forward"
+      ],
+      "paths": [
+        "src/**",
+        "scripts/**"
+      ]
+    },
+    {
+      "id": "repo-block-exit",
+      "question": "Does `added_code` make a SELL order, or an order that only reduces a position, get rejected by the risk check for a reason other than its limit-price band: a halted or reduced mode, the HALT kill switch, drawdown, exposure or notional caps, or the per-run order cap? Count a block that is applied before the order's side is looked at, so that it covers sells as well as buys.",
+      "true": "A sell or risk-reducing order can be blocked by a mode, kill switch, cap or limit.",
+      "false": "Only BUY or exposure-increasing orders are blocked by those conditions; or sells are checked only for the price band; or the code does not reject orders.",
+      "fix": "Sells and risk-reducing orders must always pass except the price check, so the system can always exit (PHASE0_SPEC W2).",
+      "when": [
+        "halt|kill_switch|Side\\.|SELL|reduce|_block|allow"
+      ],
+      "paths": [
+        "src/stockmoney/desk/**"
+      ]
+    },
+    {
+      "id": "repo-retry-without-client-order-id",
+      "question": "Does `added_code` retry an order submission (a `for`/`while` retry loop, `_retry`, a tenacity/backoff decorator, or `try/except` followed by another `submit`) without looking the order up by `client_order_id` (`get_order`, `get_order_by_client_id`) before each attempt, or does it generate a new `client_order_id` (for example `uuid4`) on each retry?",
+      "true": "A retried submit can create a duplicate order because the idempotency key is not checked or is regenerated.",
+      "false": "Each attempt first looks up the order by the same `client_order_id` and returns the existing order; or the retried call is read-only (account, positions, clock); or the code does not retry order submission.",
+      "fix": "Look up the order by its existing client_order_id before every attempt, and keep the same id across retries (PHASE0_SPEC W1).",
+      "when": [
+        "retry|attempt|submit|client_order_id|uuid|backoff|tenacity"
+      ],
+      "paths": [
+        "src/**",
+        "scripts/**"
+      ]
+    },
+    {
+      "id": "repo-offladder-strike",
+      "question": "Does `added_code` compute an option strike with arithmetic (`spot * 1.05`, `round(...)`, ATM plus or minus an offset, a percent OTM) and then use it in a contract, order, position or stored row without passing it through `snap_strike` (`stockmoney.models.strike_ladder`) or choosing it from a listed chain?",
+      "true": "A computed strike that may not exist on the listed ladder is used directly.",
+      "false": "The strike goes through `snap_strike(...)`, or is picked from the listed chain strikes (`min(chain.strikes, key=...)`); or the number is not an option strike; or the code does not create strikes.",
+      "fix": "Pass computed strikes through strike_ladder.snap_strike or select from the listed chain (data-integrity-audit-2026-07-15).",
+      "when": [
+        "strike"
+      ],
+      "paths": [
+        "src/**",
+        "scripts/**"
+      ]
+    },
+    {
+      "id": "repo-untrusted-text-to-agent",
+      "question": "Does `added_code` insert scraped or inbound text (web pages, RSS entries, Reddit posts, news, email bodies, Muse/Grok free text, free-text fields of `parsed_json`) into a prompt for a model or agent that has tools or can write state, or pass such text to `eval`, `exec`, `subprocess`, `os.system`, or `shell=True`, instead of treating it as data?",
+      "true": "Untrusted text can steer a tool-enabled agent or be executed.",
+      "false": "The text is parsed against a strict schema and only stored or displayed; or it goes to a classifier call with no tools whose output is validated against a fixed label set; or the code never passes outside text to a model or an executor.",
+      "fix": "Treat scraped and inbound text as data: schema-parse it, store it, display it, and never route it into a tool-enabled prompt or executor (scanner SKILL SAFETY RULE, MUSE_BRIDGE).",
+      "when": [
+        "prompt|anthropic|messages\\.create|agent|eval\\(|exec\\(|subprocess|os\\.system|tools"
+      ],
+      "paths": [
+        "src/**",
+        "scripts/**"
+      ]
+    },
+    {
+      "id": "repo-test-cannot-fail",
+      "question": "Does `added_code` add a test (pytest `def test_...` functions or `unittest.TestCase` `test_...` methods) that could not fail if the code it is named after were broken, because it (a) has no assertion at all (`assert`, `self.assert...`, `pytest.raises`), (b) only asserts a tautology or a value the test itself just created (`assert True`, `assert x == x`, `assert Foo() is not None`), (c) only checks that a mock returns what the test configured (`mock.return_value = 3` then `assert mock() == 3`), or (d) mocks the very unit it claims to test?",
+      "true": "At least one added test has no assertion that depends on the real behaviour of the code under test.",
+      "false": "Every added test calls real code and asserts on its output, error, returned value or a side effect it causes (including calls the unit makes to a mock with arguments the unit computed). Weak but real assertions do not count. Fixtures, helpers and setup code without tests do not count, and neither does non-test code.",
+      "fix": "Make the test exercise the real code and assert on a result that would change if that code broke; delete it if it can't.",
+      "when": [
+        "def test_|class \\w+\\(.*TestCase\\)"
+      ],
+      "paths": [
+        "tests/**"
+      ]
+    },
+    {
+      "id": "repo-test-hits-live",
+      "question": "Does `added_code` in a test talk to a real external service: constructing `AlpacaBroker()` or a real `TradingClient` without injecting a fake client, reading real broker or mail keys, submitting to a non-fake broker, or calling `imaplib`/`smtplib`/`ImapSmtpMailbox`, `requests`, `httpx`, `urlopen`, `yfinance`, `praw` or `anthropic` without a monkeypatch or fake?",
+      "true": "A test would reach a real endpoint (or place an order, even on paper).",
+      "false": "The test injects `FakeBroker`, `FakeMailbox` or a fake `TradingClient`, or monkeypatches the network call; or it only builds objects with in-memory data; or it does not touch external services.",
+      "fix": "Mock or inject a fake: tests run fully offline and never place orders, paper included (PHASE0_SPEC shared rules).",
+      "when": [
+        "TradingClient|AlpacaBroker|ImapSmtpMailbox|imaplib|smtplib|requests|yfinance|praw|anthropic|httpx|urlopen|getenv|environ"
+      ],
+      "paths": [
+        "tests/**"
+      ]
+    },
+    {
+      "id": "repo-broad-except-silent",
+      "question": "Does `added_code` catch `Exception`, `BaseException`, or use a bare `except:` and then carry on (`pass`, `continue`, return `None` or a default value, a comment only) without logging the exception, recording it, notifying, or re-raising it?",
+      "true": "A broad except block hides the failure: nothing is logged, recorded or re-raised.",
+      "false": "The block logs (`log.exception`, `logger.warning(..., exc_info=True)`), re-raises, records the failure in a reject/error table, or sends a notification; or it catches a specific exception type such as `ValidationError`, `KeyError`, `ValueError`, `FileNotFoundError`; or there is no broad except.",
+      "fix": "Catch the specific exception you expect, or log/record it before continuing, because errors in execution and risk code must be visible.",
+      "when": [
+        "except"
+      ],
+      "paths": [
+        "src/**",
+        "scripts/**"
+      ]
+    }
+  ]
+}

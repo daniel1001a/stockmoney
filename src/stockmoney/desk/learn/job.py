@@ -11,6 +11,7 @@ Steps (each isolated, a failure in one does not stop the others):
      Muse/Grok source independence
   3b. score author calls (informational only)
   3c. sample source URLs and record whether they resolve (network failure is non-fatal)
+  3d. Jev prescreen of Muse/Grok text items, deep analysis of passed ones (DESK_PRESCREEN off|shadow|on)
   4. allocator recommendation (Fridays or when none logged this week)
   5. report -> data/desk/learn/<date>.md and learn_reports; Friday push summary
 """
@@ -28,7 +29,7 @@ import pandas as pd
 from stockmoney.desk import data, notify, store
 from stockmoney.desk.indicators import compute
 from stockmoney.desk.learn import (allocator, calls, chains, corroboration, earnings, invalidation, links,
-                                   postmortem, shadow, tables)
+                                   postmortem, prescreen, shadow, tables)
 
 log = logging.getLogger(__name__)
 ET = ZoneInfo("America/New_York")
@@ -136,6 +137,11 @@ def run(con, now: datetime, bars: data.Bars | None = None, shadow_start: str | N
     con.commit()
     if lk and lk["checked"]:
         parts.append(f"來源連結抽查:{lk['checked']} 筆(真實 {lk['ok']}、失效 {lk['dead']}、無法驗證 {lk['unverifiable']})。")
+    ps = guarded("prescreen", lambda: prescreen.step(con))
+    con.commit()
+    if ps and ps["mode"] != "off" and (ps["judged"] or ps["error"] or ps["deep_done"]):
+        parts.append(f"情報預篩({ps['mode']}):判斷 {ps['judged']} 則(通過 {ps['pass']}、保留 {ps['hold']}、"
+                     f"封存 {ps['archive']}),失敗 {ps['error']};深度分析完成 {ps['deep_done']}。")
 
     friday = through.weekday() == 4
     do_alloc = friday if with_allocator is None else with_allocator
@@ -157,7 +163,8 @@ def run(con, now: datetime, bars: data.Bars | None = None, shadow_start: str | N
     parts += ["", rep, "", guarded("shadow_report", lambda: shadow.report(con)) or "", "",
               guarded("chain_report", lambda: chains.report(con)) or "", "",
               guarded("calls_report", lambda: calls.report(con)) or "", "",
-              guarded("link_report", lambda: links.report(con)) or ""]
+              guarded("link_report", lambda: links.report(con)) or "", "",
+              guarded("prescreen_report", lambda: prescreen.report(con)) or ""]
     if alloc_text:
         parts += ["", alloc_text]
     if problems:

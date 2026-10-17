@@ -107,3 +107,7 @@ Grok 是第二個情報員(看 X),說明與完整格式在 `docs/desk/GROK_PROMP
 2. 產生一組密鑰(例如在終端機執行 `openssl rand -hex 24`),放進 `.env` 的 `MUSE_SHARED_TOKEN`,並私下交給 Muse
 3. 在 Muse 連結你的 Gmail,把第 5 節和 schema 交給它,請它設定每天的固定任務
 4. 確認 Muse 寄信給 Desk 信箱是否需要每次核准(見第 1 節)
+
+## 預篩層註記
+
+ALERT、RESEARCH_REPLY、IDEA、SOCIAL_DAILY 的文字項目會被 Jev 預篩並標記 pass / hold / archive(見 `OPERATING_PLAN.md` 第 10 節)。預篩只決定誰進付費深度分析,不刪除任何訊息;ALERT elevated/critical 與帶 risk_flags 的 RESEARCH_REPLY 一律旁路通過,降低風險的輸入永不被過濾。輸出不開倉、不改參數。
