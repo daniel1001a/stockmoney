@@ -457,8 +457,11 @@ def test_regime_label_map_empty_when_no_predictions():
 # --- analyst sentiment aggregation -----------------------------------------
 
 def _seed_analyst_rating(
-    conn, *, item_id, symbol, sentiment_score, published_at=datetime(2026, 7, 10, tzinfo=timezone.utc),
+    conn, *, item_id, symbol, sentiment_score, published_at=None,
 ):
+    # Queries window on wall-clock now(), so default to a recent relative time.
+    if published_at is None:
+        published_at = datetime.now(timezone.utc) - timedelta(days=2)
     conn.execute(
         """
         INSERT INTO news_items
@@ -483,9 +486,9 @@ def test_analyst_sentiment_insufficient_data_reports_none_not_zero():
 def test_analyst_sentiment_averages_once_enough_ratings():
     conn = _conn()
     _seed_analyst_rating(conn, item_id="a1", symbol="NVDA", sentiment_score=0.6,
-                          published_at=datetime(2026, 7, 8, tzinfo=timezone.utc))
+                          published_at=datetime.now(timezone.utc) - timedelta(days=4))
     _seed_analyst_rating(conn, item_id="a2", symbol="NVDA", sentiment_score=0.2,
-                          published_at=datetime(2026, 7, 10, tzinfo=timezone.utc))
+                          published_at=datetime.now(timezone.utc) - timedelta(days=2))
     result = queries.analyst_sentiment_for_symbol(conn, "NVDA")
     assert result["sufficient_data"] is True
     assert result["avg_sentiment"] == pytest.approx(0.4)
@@ -507,9 +510,9 @@ def test_market_analyst_sentiment_excludes_thin_coverage_symbols():
     conn = _conn()
     # NVDA: 2 ratings, net bullish -> counted.
     _seed_analyst_rating(conn, item_id="a1", symbol="NVDA", sentiment_score=0.5,
-                          published_at=datetime(2026, 7, 8, tzinfo=timezone.utc))
+                          published_at=datetime.now(timezone.utc) - timedelta(days=4))
     _seed_analyst_rating(conn, item_id="a2", symbol="NVDA", sentiment_score=0.3,
-                          published_at=datetime(2026, 7, 10, tzinfo=timezone.utc))
+                          published_at=datetime.now(timezone.utc) - timedelta(days=2))
     # AMD: only 1 rating -> excluded entirely, not counted as neutral.
     _seed_analyst_rating(conn, item_id="a3", symbol="AMD", sentiment_score=-0.8)
 
