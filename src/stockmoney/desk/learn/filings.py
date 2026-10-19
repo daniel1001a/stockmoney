@@ -55,7 +55,7 @@ EARNINGS_DAYS = 3
 CRITICAL_8K = {"1.03": "bankruptcy", "3.01": "delisting notice", "4.01": "auditor change",
                "4.02": "financials non-reliance"}
 ELEVATED_8K = {"1.02": "material agreement terminated", "2.04": "debt acceleration", "2.05": "exit/restructuring costs",
-               "2.06": "material impairment", "5.02": "officer/director change"}
+               "2.06": "material impairment"}  # 5.02 (officer/director change) is routine: stays info
 LATE_FORMS = ("NT 10-K", "NT 10-Q")
 SUMMARY_FORMS = ("8-K", "10-Q", "10-K")
 

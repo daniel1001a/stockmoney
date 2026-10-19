@@ -50,7 +50,8 @@ def _doc_url(acc, doc="x.xml"):
 
 def test_classify_8k_levels():
     assert filings.classify_8k("2.02,9.01") == ("info", "8-K items 2.02,9.01")
-    assert filings.classify_8k("5.02") == ("elevated", "8-K 5.02 officer/director change")
+    assert filings.classify_8k("2.05") == ("elevated", "8-K 2.05 exit/restructuring costs")
+    assert filings.classify_8k("5.02") == ("info", "8-K items 5.02")  # routine officer/director change
     assert filings.classify_8k("9.01, 4.02") == ("critical", "8-K 4.02 financials non-reliance")
     assert filings.classify_8k("")[0] == "info"
 

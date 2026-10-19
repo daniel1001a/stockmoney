@@ -93,6 +93,10 @@ def _slip_bps(side: str, ref: float, price: float) -> float:
     return ((price - ref) if side == Side.BUY.value else (ref - price)) / ref * 1e4
 
 
+_BASE_SQL = ("CASE WHEN instr(client_order_id,'#')>0 THEN substr(client_order_id,1,instr(client_order_id,'#')-1) "
+             "ELSE client_order_id END")
+
+
 def summarize(con: sqlite3.Connection, day: str, open_orders: list[BrokerOrder] | None = None) -> dict:
     """Pure read. ``open_orders`` = the broker's live orders (None: the stop check is skipped and said so)."""
     have = _tables(con)
@@ -101,27 +105,39 @@ def summarize(con: sqlite3.Connection, day: str, open_orders: list[BrokerOrder] 
     slips: list[dict] = []
     if {"fills", "submitted"} <= have:
         ref_col = "p.ref_price" if "planned_orders" in have else "NULL"
-        join = "LEFT JOIN planned_orders p ON p.client_order_id=f.client_order_id" if "planned_orders" in have else ""
+        join = "LEFT JOIN planned_orders p ON p.client_order_id=f.base" if "planned_orders" in have else ""
+        # A partial fill's later slices are stored as '<id>#<cumulative qty>': score each broker order
+        # once, on the quantity-weighted average price of its slices booked today.
+        orders: dict[str, dict] = {}
         for r in con.execute(
-                f"SELECT f.client_order_id cid, f.symbol, f.side, f.price, f.filled_at, s.kind, s.stop AS s_stop, "
-                f"{ref_col} AS ref FROM fills f LEFT JOIN submitted s ON s.client_order_id=f.client_order_id {join} "
+                f"SELECT f.base, f.symbol, f.side, f.qty, f.price, f.filled_at, s.kind, s.stop AS s_stop, "
+                f"{ref_col} AS ref FROM (SELECT *, {_BASE_SQL} AS base FROM fills) f "
+                f"LEFT JOIN submitted s ON s.client_order_id=f.base {join} "
                 f"WHERE substr(f.filled_at,1,10) IN ({marks})", near):
             if _et_day(r["filled_at"]) != day or r["kind"] not in ("entry", "exit", "stop"):
                 continue
             ref = r["s_stop"] if r["kind"] == "stop" else r["ref"]
             if not ref or ref <= 0:
                 continue
-            slips.append({"cid": r["cid"], "symbol": r["symbol"], "side": r["side"], "kind": r["kind"],
-                          "ref": float(ref), "price": float(r["price"]),
-                          "bps": _slip_bps(r["side"], float(ref), float(r["price"]))})
+            o = orders.setdefault(r["base"], {"symbol": r["symbol"], "side": r["side"], "kind": r["kind"],
+                                              "ref": float(ref), "qty": 0.0, "cost": 0.0})
+            o["qty"] += float(r["qty"])
+            o["cost"] += float(r["qty"]) * float(r["price"])
+        for cid, o in orders.items():
+            if o["qty"] <= 0:
+                continue
+            px = o["cost"] / o["qty"]
+            slips.append({"cid": cid, "symbol": o["symbol"], "side": o["side"], "kind": o["kind"],
+                          "ref": o["ref"], "price": px, "bps": _slip_bps(o["side"], o["ref"], px)})
     n_fills = 0
     missed: list[dict] = []
     partial: list[dict] = []
     n_orders = 0
     if "submitted" in have:
         if "fills" in have:
-            n_fills = sum(1 for r in con.execute(f"SELECT filled_at FROM fills WHERE substr(filled_at,1,10) IN ({marks})", near)
-                          if _et_day(r["filled_at"]) == day)
+            n_fills = len({r["base"] for r in con.execute(
+                f"SELECT {_BASE_SQL} AS base, filled_at FROM fills WHERE substr(filled_at,1,10) IN ({marks})", near)
+                if _et_day(r["filled_at"]) == day})
         for r in con.execute(
                 f"SELECT client_order_id cid, kind, symbol, side, qty, status FROM submitted "
                 f"WHERE kind IN ('entry','exit') AND substr(submitted_at,1,10) IN ({marks})", near):
@@ -129,8 +145,11 @@ def summarize(con: sqlite3.Connection, day: str, open_orders: list[BrokerOrder] 
             if _et_day(row["submitted_at"]) != day:
                 continue
             n_orders += 1
-            got = con.execute("SELECT qty FROM fills WHERE client_order_id=?", (r["cid"],)).fetchone() if "fills" in have else None
-            filled = float(got["qty"]) if got else 0.0
+            # Total booked over the plain row and its '<id>#...' slices, whichever day each slice landed.
+            got = con.execute("SELECT COALESCE(SUM(qty),0) AS q FROM fills WHERE client_order_id=? OR "
+                              "substr(client_order_id,1,?)=?", (r["cid"], len(r["cid"]) + 1, r["cid"] + "#")).fetchone() \
+                if "fills" in have else None
+            filled = float(got["q"]) if got else 0.0
             tol = float(r["qty"]) * 1e-6 + 1e-9
             item = {"cid": r["cid"], "symbol": r["symbol"], "kind": r["kind"], "side": r["side"],
                     "qty": float(r["qty"]), "filled": filled, "status": r["status"]}

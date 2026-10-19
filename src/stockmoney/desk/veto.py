@@ -146,7 +146,10 @@ def collect(con, symbol: str, now: datetime | None = None, days: int = DAYS) -> 
 
 
 def _muse_grok_independent(muse: list[dict], grok: list[dict]) -> bool:
-    return any(corroboration.compare(m["urls"], g["urls"])["independent"] for m in muse for g in grok)
+    """A Muse/Grok pair is independent only when both cite sources and share none: two unsourced
+    items prove nothing about independence, so an empty URL list never counts as distinct."""
+    return any(m["urls"] and g["urls"] and corroboration.compare(m["urls"], g["urls"])["independent"]
+               for m in muse for g in grok)
 
 
 def vote_count(items: dict[str, list[dict]]) -> int:

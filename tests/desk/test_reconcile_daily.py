@@ -134,6 +134,51 @@ def test_canceled_after_partial_fill_counts_as_partial_not_missed(con):
     assert len(s["partial"]) == 1 and s["missed"] == []
 
 
+def test_partial_fill_completed_in_later_slices_is_not_a_difference(con):
+    # ledger layout: first slice under the plain id, later slice under '<id>#<cumulative qty>'
+    _order(con, "b1", "entry", "AAPL", "buy", 10, ref=100.0)
+    _fill(con, "b1", "AAPL", "buy", 6, 100.0)
+    _fill(con, "b1#10.0", "AAPL", "buy", 4, 100.5)
+    s = reconcile.summarize(con, DAY)
+    assert s["partial"] == [] and s["zero_diff"]
+    assert s["n_orders"] == 1 and s["n_fills"] == 1
+
+
+def test_slices_are_scored_once_on_the_average_price(con):
+    _order(con, "b1", "entry", "AAPL", "buy", 10, ref=100.0)
+    _fill(con, "b1", "AAPL", "buy", 6, 100.0)
+    _fill(con, "b1#10.0", "AAPL", "buy", 4, 103.0)  # average 101.2 = 120 bps
+    s = reconcile.summarize(con, DAY)
+    assert len(s["slips"]) == 1 and s["slips"][0]["price"] == pytest.approx(101.2)
+    assert s["slips"][0]["bps"] == pytest.approx(120.0)
+    assert [x["cid"] for x in s["slip_flags"]] == ["b1"]
+
+
+def test_partial_still_short_after_a_later_slice_is_reported(con):
+    _order(con, "b1", "entry", "AAPL", "buy", 10, ref=100.0)
+    _fill(con, "b1", "AAPL", "buy", 6, 100.0)
+    _fill(con, "b1#8.0", "AAPL", "buy", 2, 100.0)
+    s = reconcile.summarize(con, DAY)
+    assert [(x["cid"], x["filled"]) for x in s["partial"]] == [("b1", 8.0)] and not s["zero_diff"]
+
+
+def test_slice_booked_on_a_later_day_still_completes_the_order(con):
+    _order(con, "b1", "entry", "AAPL", "buy", 10, ref=100.0)
+    _fill(con, "b1", "AAPL", "buy", 6, 100.0)
+    _fill(con, "b1#10.0", "AAPL", "buy", 4, 100.0, filled_at="2026-10-16T14:35:00+00:00")
+    s = reconcile.summarize(con, DAY)
+    assert s["partial"] == [] and len(s["slips"]) == 1 and s["slips"][0]["price"] == pytest.approx(100.0)
+
+
+def test_similar_order_ids_are_not_mixed(con):
+    _order(con, "b1", "entry", "AAPL", "buy", 10, ref=100.0)
+    _order(con, "b10", "entry", "MSFT", "buy", 10, ref=100.0)
+    _fill(con, "b1", "AAPL", "buy", 4, 100.0)
+    _fill(con, "b10", "MSFT", "buy", 10, 100.0)
+    s = reconcile.summarize(con, DAY)
+    assert [x["cid"] for x in s["partial"]] == ["b1"] and s["partial"][0]["filled"] == 4.0
+
+
 def test_stop_diffs_missing_price_duplicate_and_orphan(con):
     _hold(con, "AAPL", 10, 95.0)    # no broker stop
     _hold(con, "MSFT", 10, 200.0)   # stop at the wrong price

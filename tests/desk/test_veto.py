@@ -88,6 +88,21 @@ def test_muse_and_grok_sharing_a_url_count_once(db):
     assert not r.blocked and veto.vote_count(r.sources) == 1
 
 
+def test_unsourced_muse_and_grok_count_once(db):
+    _muse_alert(db, urls=())
+    _grok(db, urls=())
+    r = veto.check(db, "AAPL")
+    assert not r.blocked and veto.vote_count(r.sources) == 1
+
+
+def test_unsourced_grok_event_does_not_split_a_shared_story(db):
+    _muse_alert(db, urls=("https://same.example/story",))
+    _grok(db, urls=("https://same.example/story",))
+    _grok(db, urls=(), msg_id="g2")
+    r = veto.check(db, "AAPL")
+    assert not r.blocked and veto.vote_count(r.sources) == 1
+
+
 def test_shared_source_plus_filing_still_two_votes(db):
     _muse_alert(db, urls=("https://same.example/story",))
     _grok(db, urls=("https://same.example/story",))
