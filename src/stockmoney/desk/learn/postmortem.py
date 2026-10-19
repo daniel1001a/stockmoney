@@ -27,7 +27,7 @@ from datetime import datetime, timedelta, timezone
 
 import pandas as pd
 
-from stockmoney.desk import store
+from stockmoney.desk import store, veto
 from stockmoney.desk.data import Bars
 from stockmoney.desk.indicators import Ind, market_state, sector_ranking
 from stockmoney.desk.learn.trades import ClosedTrade, closed_trades
@@ -139,6 +139,8 @@ def build_card(con, t: ClosedTrade, bars: Bars, ind: Ind) -> dict | None:
     slip_out = abs(t.exit_px / open_out - 1) if open_out else None
 
     alerts = _alerts(con, sym, t.entry_at, t.exit_at)
+    flags_in_hold = veto.flags_between(con, sym, t.entry_at, t.exit_at)
+    vetoes_in_hold = veto.blocks_between(con, sym, t.entry_at, t.exit_at)
     from stockmoney.desk.learn import earnings as _earn
     span = (entry_day.date(), exit_day.date())
     earn_known = _earn.covered(con, *span)
@@ -173,7 +175,8 @@ def build_card(con, t: ClosedTrade, bars: Bars, ind: Ind) -> dict | None:
         "ext_atr": ext_atr, "mfe": mfe, "mae": mae, "mfe_r": mfe_r, "exit_gap_atr": exit_gap,
         "gap_events": gap_hits, "earnings_in_hold": earn_dates if earn_known else None, "back_above_entry_10d": back_above if complete else None,
         "slip_entry": slip_in, "slip_exit": slip_out, "hold_sessions": len(held) - 1,
-        "alerts": alerts, "signal_id": t.signal_id, "initial_stop": t.initial_stop,
+        "alerts": alerts, "research_flags_in_hold": flags_in_hold, "veto_blocks_in_hold": vetoes_in_hold,
+        "signal_id": t.signal_id, "initial_stop": t.initial_stop,
     }
     return {"symptoms": s, "facts": facts, "r_multiple": r_mult, "status": "final" if complete else "provisional"}
 
@@ -206,16 +209,12 @@ def update_cards(con, bars: Bars, ind: Ind) -> dict:
     return {"new": new, "updated": upd}
 
 
-def symptom_report(con, today: str, weeks: int = 4) -> tuple[str, list[str]]:
-    """Per-week symptom counts and loss totals; returns (text, hypotheses).
-    A hypothesis is proposed only when a symptom (other than S0) is in the top
-    two by loss for two consecutive weeks."""
+def week_stats(con, today: str, weeks: int = 4) -> list[dict]:
+    """One dict per trailing 7-day window ending ``today`` (newest first):
+    lo, hi (Timestamps), n, wins, loss (symptom -> summed losing pnl), cnt (symptom -> losing trades)."""
     rows = con.execute("SELECT exit_day, strategy, pnl, symptoms FROM trade_postmortem").fetchall()
-    if not rows:
-        return "尚無平倉交易,沒有驗屍卡。", []
     end = pd.Timestamp(today)
-    per_week: list[dict[str, float]] = []
-    lines = [f"## 驗屍卡週報(截至 {today})", ""]
+    out: list[dict] = []
     for w in range(weeks):
         hi = end - pd.Timedelta(days=7 * w)
         lo = hi - pd.Timedelta(days=7)
@@ -234,15 +233,36 @@ def symptom_report(con, today: str, weeks: int = 4) -> tuple[str, list[str]]:
                 if code:
                     cnt[code] += 1
                     loss[code] += r["pnl"]
-        per_week.append(dict(loss))
+        out.append({"lo": lo, "hi": hi, "n": n, "wins": wins, "loss": dict(loss), "cnt": dict(cnt)})
+    return out
+
+
+def candidate_symptoms(stats: list[dict]) -> list[str]:
+    """Non-S0 symptoms in the top two by loss in both of the two newest weeks."""
+    if len(stats) < 2:
+        return []
+    tops = [set(sorted((c for c in w["loss"] if c != "S0"), key=lambda c: w["loss"][c])[:2]) for w in stats[:2]]
+    return sorted(tops[0] & tops[1])
+
+
+def hypothesis_text(code: str) -> str:
+    return f"{code} {LABEL[code]} 連續兩週排在虧損前兩名:提出規則假設,走回測 + 影子帳戶驗證,不直接改規則。"
+
+
+def symptom_report(con, today: str, weeks: int = 4) -> tuple[str, list[str]]:
+    """Per-week symptom counts and loss totals; returns (text, hypotheses).
+    A hypothesis is proposed only when a symptom (other than S0) is in the top
+    two by loss for two consecutive weeks."""
+    if con.execute("SELECT 1 FROM trade_postmortem LIMIT 1").fetchone() is None:
+        return "尚無平倉交易,沒有驗屍卡。", []
+    stats = week_stats(con, today, weeks)
+    lines = [f"## 驗屍卡週報(截至 {today})", ""]
+    for w in stats:
+        loss, cnt = w["loss"], w["cnt"]
         top = ", ".join(f"{c} {LABEL.get(c, c)} x{cnt[c]} (${loss[c]:,.0f})"
                         for c in sorted(loss, key=lambda k: loss[k])[:4]) or "無虧損交易"
-        lines.append(f"- {lo.date()} 到 {hi.date()}:{n} 筆,勝 {wins};{top}")
-    hyp: list[str] = []
-    if len(per_week) >= 2:
-        tops = [set(sorted((c for c in w if c != "S0"), key=lambda c: w[c])[:2]) for w in per_week[:2]]
-        for c in sorted(tops[0] & tops[1]):
-            hyp.append(f"{c} {LABEL[c]} 連續兩週排在虧損前兩名:提出規則假設,走回測 + 影子帳戶驗證,不直接改規則。")
+        lines.append(f"- {w['lo'].date()} 到 {w['hi'].date()}:{w['n']} 筆,勝 {w['wins']};{top}")
+    hyp = [hypothesis_text(c) for c in candidate_symptoms(stats)]
     if hyp:
         lines += ["", "### 候選假設", *[f"- {h}" for h in hyp]]
     return "\n".join(lines), hyp

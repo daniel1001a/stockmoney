@@ -12,6 +12,9 @@ Steps (each isolated, a failure in one does not stop the others):
   3b. score author calls (informational only)
   3c. sample source URLs and record whether they resolve (network failure is non-fatal)
   3d. Jev prescreen of Muse/Grok text items, deep analysis of passed ones (DESK_PRESCREEN off|shadow|on)
+  3e. H1 / H2 shadow comparison reports; a changed verdict is logged as a DRAFT in param_changes
+  3f. research flags (earnings, SEC 8-K / Form 4) for the buy-only research veto; EDGAR needs SEC_USER_AGENT
+  3g. Fridays: weekly hypotheses recorded in weekly_hypotheses (record only, changes no parameter)
   4. allocator recommendation (Fridays or when none logged this week)
   5. report -> data/desk/learn/<date>.md and learn_reports; Friday push summary
 """
@@ -26,10 +29,10 @@ from zoneinfo import ZoneInfo
 
 import pandas as pd
 
-from stockmoney.desk import data, notify, store
+from stockmoney.desk import data, notify, store, veto
 from stockmoney.desk.indicators import compute
-from stockmoney.desk.learn import (allocator, calls, chains, corroboration, earnings, invalidation, links,
-                                   postmortem, prescreen, shadow, tables)
+from stockmoney.desk.learn import (allocator, calls, chains, corroboration, earnings, filings, h_reports, hypotheses,
+                                   invalidation, links, postmortem, prescreen, shadow, tables)
 
 log = logging.getLogger(__name__)
 ET = ZoneInfo("America/New_York")
@@ -104,6 +107,11 @@ def run(con, now: datetime, bars: data.Bars | None = None, shadow_start: str | N
     con.commit()
     if er is not None:
         parts.append(f"財報日:掃描 {er['scanned']} 天,失敗 {er['failed']} 天,略過 {er['skipped']} 天。")
+    fl = guarded("filings", lambda: filings.refresh(con, through.date()))
+    con.commit()
+    if fl is not None:
+        parts.append(f"研究旗標:財報 {fl['earnings']} 筆,SEC {fl['filings']} 筆(掃描 {fl['scanned']} 檔,失敗 {fl['failed']})"
+                     + (f";略過 EDGAR:{fl['skipped_edgar']}" if fl["skipped_edgar"] else "") + "。")
     pm = guarded("postmortem", lambda: postmortem.update_cards(con, bars, ind))
     con.commit()
     if pm is not None:
@@ -144,6 +152,8 @@ def run(con, now: datetime, bars: data.Bars | None = None, shadow_start: str | N
                      f"封存 {ps['archive']}),失敗 {ps['error']};深度分析完成 {ps['deep_done']}。")
 
     friday = through.weekday() == 4
+    hyp_text = guarded("hypotheses", lambda: hypotheses.run(con, day, include_weekly=False)) if friday else None
+    con.commit()
     do_alloc = friday if with_allocator is None else with_allocator
     if do_alloc:
         def _alloc():
@@ -160,11 +170,17 @@ def run(con, now: datetime, bars: data.Bars | None = None, shadow_start: str | N
     watch = guarded("earnings_watch", lambda: _earnings_watch(con, through.date()))
     if watch:
         parts += ["", watch]
+    if hyp_text:
+        parts += ["", hyp_text]
     parts += ["", rep, "", guarded("shadow_report", lambda: shadow.report(con)) or "", "",
               guarded("chain_report", lambda: chains.report(con)) or "", "",
               guarded("calls_report", lambda: calls.report(con)) or "", "",
               guarded("link_report", lambda: links.report(con)) or "", "",
-              guarded("prescreen_report", lambda: prescreen.report(con)) or ""]
+              guarded("prescreen_report", lambda: prescreen.report(con)) or "", "",
+              guarded("filings_report", lambda: filings.report(con)) or "", "",
+              guarded("veto_report", lambda: veto.report(con, (through - pd.Timedelta(days=7)).date().isoformat())) or "", "",
+              guarded("h_reports", lambda: h_reports.run_all(con, bars)) or ""]
+    con.commit()
     if alloc_text:
         parts += ["", alloc_text]
     if problems:

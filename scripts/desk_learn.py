@@ -5,17 +5,21 @@
     desk_learn.py lesson TRADE_ID "text"                          write your one-line lesson
     desk_learn.py chain add FILE.json [--source owner|claude]     record an event chain (JSON object)
     desk_learn.py chain list | report
+    desk_learn.py filings [--no-fetch]                            refresh SEC/earnings research flags (needs SEC_USER_AGENT), show flags and veto blocks
+    desk_learn.py hypotheses [--date YYYY-MM-DD] [--no-record] [--list]   weekly post-mortem hypotheses (record only; Fridays run in the job)
+    desk_learn.py h1-report [--no-record]                       H1 (wider trailing stop) vs combined; DRAFT in param_changes
+    desk_learn.py h2-report [--no-record]                         H2 (earnings entry block) vs combined; never auto-enabled
 """
 from __future__ import annotations
 
 import argparse
 import json
 import sys
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
-from stockmoney.desk import store
-from stockmoney.desk.learn import chains, job, tables
+from stockmoney.desk import data, store, veto
+from stockmoney.desk.learn import chains, filings, h_reports, hypotheses, job, tables
 
 
 def main() -> int:
@@ -33,6 +37,14 @@ def main() -> int:
     ch.add_argument("action", choices=["add", "list", "report"])
     ch.add_argument("file", nargs="?")
     ch.add_argument("--source", default="owner")
+    fi = sub.add_parser("filings")
+    fi.add_argument("--no-fetch", action="store_true", help="only print the stored flags and recent veto blocks")
+    hy = sub.add_parser("hypotheses")
+    hy.add_argument("--date", help="week end day, default today (UTC)")
+    hy.add_argument("--no-record", action="store_true", help="print only, write no weekly_hypotheses rows")
+    hy.add_argument("--list", action="store_true", help="show recorded hypotheses and exit")
+    for h in ("h1-report", "h2-report"):
+        sub.add_parser(h).add_argument("--no-record", action="store_true", help="print only, write no DRAFT row")
     a = ap.parse_args()
     with store.connect() as con:
         tables.ensure_schema(con)
@@ -47,6 +59,25 @@ def main() -> int:
         elif a.cmd == "lesson":
             con.execute("UPDATE trade_postmortem SET lesson=? WHERE trade_id=?", (a.text, a.trade_id))
             print("ok")
+        elif a.cmd == "filings":
+            if not a.no_fetch:
+                print(filings.refresh(con, date.today()))
+            print(filings.report(con))
+            since = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
+            print(veto.report(con, since) or "最近 7 天沒有買單被研究否決擋下。")
+        elif a.cmd == "hypotheses":
+            if a.list:
+                for h in hypotheses.history(con, 50):
+                    print(f"{h['week']} {h['symptom']} {h['label']} [{h['status']}] {h['text']}")
+            else:
+                print(hypotheses.run(con, a.date or datetime.now(timezone.utc).date().isoformat(), record_rows=not a.no_record))
+        elif a.cmd in ("h1-report", "h2-report"):
+            try:
+                bars = data.to_bars(data.load())
+            except Exception as e:  # no price cache: the report still runs, MFE/MAE shows n/a
+                print(f"(no bars, MFE/MAE skipped: {type(e).__name__})", file=sys.stderr)
+                bars = None
+            print(h_reports.run(con, a.cmd[:2].upper(), bars, record=not a.no_record))
         else:
             if a.action == "add":
                 obj = json.loads(Path(a.file).read_text())

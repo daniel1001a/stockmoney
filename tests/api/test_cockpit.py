@@ -157,7 +157,7 @@ def test_is_generic_headline_false_for_real_news(headline):
 
 def test_latest_symbol_news_skips_generic_headline_for_real_one():
     conn = _conn()
-    now = datetime(2026, 7, 13, 12, 0, tzinfo=timezone.utc)
+    now = datetime.now(timezone.utc)  # query windows on wall-clock now()
     # Generic template headline is MORE "important" but should still lose to
     # the real headline once filtered.
     _seed_symbol_news(conn, item_id="n1", symbol="AAPL", headline="AAPL Stock Quote Price and Forecast - CNN",

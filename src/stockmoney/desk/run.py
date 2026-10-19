@@ -60,6 +60,7 @@ from stockmoney.desk import data, engine, notify, store
 from stockmoney.desk.calendar import is_trading_day
 from stockmoney.desk.execution.broker import Broker
 from stockmoney.desk.execution.ledger import Ledger, norm
+from stockmoney.desk.execution.reconcile import daily as reconcile_daily
 from stockmoney.desk.execution.reconcile import mismatches
 from stockmoney.desk.execution.risk import Limits, RiskEngine
 from stockmoney.desk.execution.types import (
@@ -716,6 +717,7 @@ def postclose(con, broker: Broker, now: datetime, bars: data.Bars | None = None,
     store.set_setting(con, PLAN_THROUGH_KEY, day)
 
     report = head + _report(day, ctx, sys_eq, limits.capital_budget, mode, why, ledger, events, planned, exits)
+    report += _reconcile_summary(con, broker, day)
     con.execute(
         "INSERT INTO journal (date, auto_summary, updated_at) VALUES (?,?,?) "
         "ON CONFLICT(date) DO UPDATE SET auto_summary=excluded.auto_summary, updated_at=excluded.updated_at",
@@ -724,6 +726,27 @@ def postclose(con, broker: Broker, now: datetime, bars: data.Bars | None = None,
     _bridge_outbound(con, ledger, planned, report, now)
     notify.send(f"Desk 盤後 {day}", report[:3500], notify.INFO)
     return report
+
+
+def _reconcile_summary(con, broker: Broker, day: str) -> str:
+    """Daily broker-vs-plan comparison for the report (execution.reconcile.daily). Read-only for
+    trading and isolated: any failure here costs the section, never the run."""
+    con.commit()  # what postclose wrote so far must survive a rollback below
+    try:
+        try:
+            open_orders = broker.open_orders()
+        except Exception:
+            log.exception("reconcile summary: open orders unavailable, stop check skipped")
+            open_orders = None
+        text, alert = reconcile_daily(con, day, open_orders)
+        if alert:
+            _notify_once(con, "reconcile_daily_diff", "Desk 券商對帳連續有差異", alert[:900], notify.WARN, day)
+        con.commit()
+        return "\n\n" + text
+    except Exception as e:
+        con.rollback()
+        log.exception("reconcile summary failed")
+        return f"\n\n(券商對帳摘要失敗:{type(e).__name__}: {e})"
 
 
 def _plan(con, day, sym, side: Side, qty, strategy, stop, ref, reason, signal_id) -> str:
