@@ -38,7 +38,8 @@ def main() -> int:
         open_orders = None
         if not a.no_broker:
             from stockmoney.desk import run
-            open_orders = run.make_broker().open_orders()
+            from stockmoney.desk.execution.isolation import stock_only
+            open_orders = stock_only(run.make_broker()).open_orders()
         text, alert = reconcile.daily(con, day, open_orders, record_rows=not a.no_record)
         con.commit()
         print(text)

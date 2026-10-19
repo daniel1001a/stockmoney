@@ -21,7 +21,7 @@ from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 from stockmoney.desk import store
-from stockmoney.desk.execution.isolation import without_options
+from stockmoney.desk.execution.isolation import is_option, without_options
 from stockmoney.desk.execution.ledger import Ledger, is_crypto_symbol, norm
 from stockmoney.desk.execution.types import AccountSnapshot, AssetClass, BrokerOrder, OrderType, Side
 
@@ -166,6 +166,8 @@ def summarize(con: sqlite3.Connection, day: str, open_orders: list[BrokerOrder] 
     if open_orders is not None and "sleeve_positions" in have:
         stops_by: dict[str, list[BrokerOrder]] = defaultdict(list)
         for o in open_orders:
+            if is_option(o):
+                continue  # option orders belong to the options sleeve
             if o.side == Side.SELL and o.order_type in (OrderType.STOP, OrderType.STOP_LIMIT):
                 stops_by[norm(o.symbol)].append(o)
         for r in con.execute("SELECT symbol, qty, stop FROM sleeve_positions WHERE qty > 0"):
