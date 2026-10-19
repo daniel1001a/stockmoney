@@ -28,6 +28,11 @@ owner lifts it. Fills are booked as they arrive, partial fills included.
 Postopen, postclose and recover end by cancelling any sell stop for a symbol
 the ledger does not hold.
 
+Options isolation: the intraday options sleeve trades in the same broker
+account. Every job and the stop helpers wrap the broker in
+execution.isolation.stock_only, so option positions and orders are invisible
+here: never reconciled, counted as exposure, adopted, swept or cancelled.
+
 Crash safety: an order is written to ``submitted`` as ``pending_submit`` and
 committed before broker.submit is called (sync_fills resolves such rows by
 client_order_id), and a cancel is committed right after it happens, so neither
@@ -46,6 +51,7 @@ import json
 import logging
 import math
 import signal
+import sqlite3
 import sys
 import time
 from dataclasses import dataclass, field
@@ -59,6 +65,7 @@ import pandas as pd
 from stockmoney.desk import data, engine, notify, store
 from stockmoney.desk.calendar import is_trading_day
 from stockmoney.desk.execution.broker import Broker
+from stockmoney.desk.execution.isolation import stock_only
 from stockmoney.desk.execution.ledger import Ledger, norm
 from stockmoney.desk.execution.reconcile import daily as reconcile_daily
 from stockmoney.desk.execution.reconcile import mismatches
@@ -312,12 +319,24 @@ def sync_fills(con, broker: Broker, ledger: Ledger, day: str | None = None) -> l
                 log.warning("fill sync stopped at %s, broker unreachable: %s", r["client_order_id"], e)
                 events.append(f"成交同步中斷(券商連線失敗),下次執行再試:{type(e).__name__}: {e}")
                 break
+            if _db_busy(e):
+                # another process (the options session) held the shared database past the
+                # timeout: nothing was booked, same as an unreachable broker, never a halt
+                log.warning("fill sync stopped at %s, database busy: %s", r["client_order_id"], e)
+                events.append(f"成交同步中斷(資料庫忙碌),下次執行再試:{type(e).__name__}: {e}")
+                break
             log.exception("could not book order %s", r["client_order_id"])
             why = f"成交入帳失敗 {r['symbol']}({r['client_order_id']}):{type(e).__name__}: {e}"
             _halt(con, why, day, "sync")
             con.commit()
             events.append(why)
     return events
+
+
+def _db_busy(e: BaseException) -> bool:
+    """SQLite could not get its lock in time (another process holds it)."""
+    msg = str(e).lower()
+    return isinstance(e, sqlite3.OperationalError) and ("locked" in msg or "busy" in msg)
 
 
 def _unreachable(e: BaseException) -> bool:
@@ -358,14 +377,18 @@ def _sync_one(con, broker: Broker, ledger: Ledger, r, day: str) -> str | None:
             ev = f"{verb} {r['symbol']} {o.filled_qty:g} @ {o.filled_avg_price:.2f}({r['strategy']})"
             if not final:
                 ev += f"(部分成交,累計 {o.filled_qty:g}/{o.qty or 0:g},委託仍在)"
-            if side == Side.BUY:
-                con.execute(
-                    "INSERT INTO position_meta (symbol, highest_close, initial_stop, entry_date) VALUES (?,?,?,?) "
-                    "ON CONFLICT(symbol) DO NOTHING",
-                    (r["symbol"], float(o.filled_avg_price), r["stop"],
-                     _today(o.filled_at or datetime.now(timezone.utc))))
-            elif ledger.position(r["symbol"]) is None:
-                con.execute("DELETE FROM position_meta WHERE symbol=?", (r["symbol"],))
+        # From the ledger state, not from ``booked``: apply_fill commits on its own, so a
+        # failure right after it (e.g. a locked database) left the fill booked without its
+        # position_meta; the retry (booked=False) restores or removes the row here.
+        held = ledger.position(r["symbol"]) is not None
+        if side == Side.BUY and held:
+            con.execute(
+                "INSERT INTO position_meta (symbol, highest_close, initial_stop, entry_date) VALUES (?,?,?,?) "
+                "ON CONFLICT(symbol) DO NOTHING",
+                (r["symbol"], float(o.filled_avg_price), r["stop"],
+                 _today(o.filled_at or datetime.now(timezone.utc))))
+        elif side == Side.SELL and not held:
+            con.execute("DELETE FROM position_meta WHERE symbol=?", (r["symbol"],))
     elif final and (o.status != OrderStatus.CANCELED or r["kind"] != "stop"):
         ev = f"未成交 {r['symbol']} {r['side']}:{o.status.value}"
     if final and r["kind"] == "exit" and o.status != OrderStatus.FILLED and ledger.position(r["symbol"]) is not None:
@@ -471,6 +494,7 @@ def ensure_stops(con, broker: Broker, ledger: Ledger, risk: RiskEngine, snap: Ac
     ``skip``: normalized symbols that failed reconciliation or are being
     exited, left alone here. One symbol's failure is reported and the rest
     continue."""
+    broker = stock_only(broker)
     events = []
     open_orders = broker.open_orders()
     for sym, pos in ledger.positions().items():
@@ -578,6 +602,7 @@ def sweep_orphan_stops(con, broker: Broker, ledger: Ledger, day: str) -> list[st
     account it could open a short when it triggers. A symbol the broker still
     holds is a reconcile mismatch and is left for a human. One order's
     failure is reported and the rest are still swept."""
+    broker = stock_only(broker)
     events: list[str] = []
     try:
         held = {norm(s) for s in ledger.positions()}
@@ -619,6 +644,7 @@ def sweep_orphan_stops(con, broker: Broker, ledger: Ledger, day: str) -> list[st
 
 def postclose(con, broker: Broker, now: datetime, bars: data.Bars | None = None, limits: Limits | None = None) -> str:
     ensure_schema(con)
+    broker = stock_only(broker)
     today = _today(now)
     limits = limits or Limits()
     risk = RiskEngine(limits, con)
@@ -873,6 +899,7 @@ def premarket(con, broker: Broker, now: datetime, limits: Limits | None = None, 
     sell runs whenever its position is still held. A failed exit re-places its
     stop at once and stays planned for a rerun (MAX_EXIT_ATTEMPTS per day)."""
     ensure_schema(con)
+    broker = stock_only(broker)
     st = _Run()
     today = _today(now)
     if not broker.is_equity_market_open() and not _opens_today(broker, now):
@@ -1178,6 +1205,7 @@ def postopen(con, broker: Broker, now: datetime, limits: Limits | None = None) -
     a DAY market sell while the market is open, then the stop pass and the
     orphan sweep."""
     ensure_schema(con)
+    broker = stock_only(broker)
     st = _Run(job="postopen", late=True)
     today = _today(now)
     risk = RiskEngine(limits or Limits(), con)
@@ -1220,6 +1248,7 @@ def recover(con, broker: Broker, now: datetime, limits: Limits | None = None) ->
     resolves pending_submit rows), reconciles, restores protective stops and
     sweeps orphan stops. It never plans, buys or sends exits."""
     ensure_schema(con)
+    broker = stock_only(broker)
     st = _Run(job="recover")
     today = _today(now)
     risk = RiskEngine(limits or Limits(), con)
@@ -1237,6 +1266,7 @@ def recover(con, broker: Broker, now: datetime, limits: Limits | None = None) ->
 
 def crypto(con, broker: Broker, now: datetime) -> str:
     ensure_schema(con)
+    broker = stock_only(broker)
     events = sync_fills(con, broker, Ledger(con), _today(now))
     return "加密貨幣策略於第 1 階段上線。" + ("\n" + "\n".join(events) if events else "")
 

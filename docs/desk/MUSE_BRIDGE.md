@@ -58,6 +58,19 @@ Grok 是第二個情報員(看 X),說明與完整格式在 `docs/desk/GROK_PROMP
 - 範圍:清單(universe 加上 QQQ、TQQQ、BTC/USD)以外的標的,一封超過 5 檔只通知你一次,不拒絕。
 - 格式錯誤:FEEDBACK 會寄到 `MUSE_ADDRESS`,`problem` 開頭是「【給 Grok】」;Muse 的提示詞要它忽略這種 FEEDBACK。修正信每 24 小時最多 10 封,Muse 和 Grok 共用這個上限。
 
+### 期權劇本 `OPTIONS_PLAN`(Grok,2026-10-14 起自動收件)
+
+取代手動 `ingest-plan`。完整格式見 `docs/desk/GROK_SETUP.md`,驗證器是 `src/stockmoney/desk/options/plan.py` 的 `OptionsPlan`。
+
+- 線上格式:主旨 `[SMD/OPTIONS_PLAN/<plan_id>] <token>`,內文是單行 JSON(text/plain),就是 `OptionsPlan` 本身(`protocol`、`type`、`plan_id`、`for_date`、`generated_at`、`market_context`、`plans`、`avoid`、`notes`)。沒有 `msg_id`、`sent_at`;`plan_id` 就是訊息編號,主旨的編號必須與它相同,否則 `msg_id_mismatch`。
+- 沿用的檢查:寄件人白名單、密鑰、200KB 上限、`grok-` 前綴保留給 `GROK_DAILY`(OPTIONS_PLAN 的 `plan_id` 不能用)、與其他類型撞編號為 `duplicate_msg_id`。另外 `OptionsPlan` 自己的 64000 位元組上限。
+- 儲存:通過驗證後由和 CLI 同一個函式 `options.plan.ingest` 寫進 `options_plans`(`received_at` 是 Desk 收信時鐘,不是 Grok 的),同時在 `bridge_messages` 留一筆稽核紀錄。09:20 ET 之後收到的劇本照舊標 `shadow_only`。
+- 重複:內容完全相同的重送是安靜的 no-op;同一個 `plan_id` 內容不同,拒收為 `plan_id_reused` 並寄 FEEDBACK(重送要換新編號,與 CLI 規則相同)。
+- 權限:`policy.active_flags` 不讀 OPTIONS_PLAN,不會產生任何 blocked / no_add / notify,也不碰股票帳本。唯一效果是期權引擎本來就會讀的那份已儲存劇本,下單仍只經期權引擎自己的規則與風控。
+- 通知:收下時推播一次「OPTIONS_PLAN 已收到: N 個劇本」,晚收加註 shadow_only。
+- 格式錯誤:不寫入 `options_plans`,記入 `bridge_rejects`(`schema_invalid OPTIONS_PLAN.<欄位路徑>:<錯誤類型>`),並寄 FEEDBACK:`problem` 開頭「【給 Grok】」,`how_to_fix` 點出違規欄位與 OPTIONS_PLAN 規則。計入同一個每 24 小時 10 封的上限;帶 `Re:`/`Fwd:` 前綴的不回信。
+- 手動備援:`python -m stockmoney.desk.options.run ingest-plan <file>` 仍可用,與信件路徑共用同一個驗證與寫入函式。
+
 ## 4. 安全
 
 - 寄件人白名單 + 主旨裡的共享密鑰(至少 16 字元、隨機)。寄件人地址可以偽造,密鑰不行,所以密鑰只能私下交給 Muse,不要放進任何公開的地方。

@@ -27,13 +27,18 @@ JOBS = {
     "crypto": {"times": [(20, 0)], "weekdays": False},     # daily crypto sleeve, 7 days
     "learn": {"times": [(17, 15)], "weekdays": True},      # read-only: post-mortems, shadow books, chain scoring
     "bridge": {"interval": 900},                           # poll Muse every 15 minutes
+    "options": {"times": [(9, 0)], "weekdays": True},      # intraday options session, loops 09:20 to 16:00 ET
     # launchd replays a missed calendar job after sleep but not after a power-off;
     # at every load (boot, login, install) recover books fills and restores stops
     "recover": {"run_at_load": True},
+    # options leftover cleanup at every load: sells a paper option position a dead session left
+    # open (only while the market is open), pages unknown broker option positions
+    "options-recover": {"run_at_load": True},
 }
 
 
-# bridge needs the Muse mailbox configured; crypto is a Phase 1 placeholder. Both are opt-in.
+# bridge needs the Muse mailbox configured; crypto is a Phase 1 placeholder; options and
+# options-recover are the intraday options sleeve (docs/desk/OPTIONS_PLAN.md). All are opt-in (--jobs ...).
 DEFAULT_JOBS = ["premarket", "postopen", "postclose", "recover", "learn"]
 
 
