@@ -189,6 +189,22 @@ H1 已在 2.1(a) 登記(出場放寬,對應影子帳戶 `shadow:combined_t35`)�
 
 **情境分配器 walk-forward(2018 到 2026-10,每月只用該月以前已出場的交易)**:分配器年化 8.0% / Sharpe 0.80,三策略等權 9.6% / 0.85;Sharpe 差 -0.05,95% 區間 [-0.32, +0.23],包含 0。結論:**目前沒有證據顯示「依情境換模型」比等權好,不上線**。原因很可能是樣本太少(每格只有幾十到幾百筆)、三個策略本質都是順勢、彼此差異小。等有更多互補策略(TQQQ、BTC、均值回歸)再重測。結果存在 `research/desk_audit/results/allocator.md`。
 
+## 3.6 紙上改善施工狀態(2026-10-19)
+
+分支 `feat/desk-paper-improvements`。只建「機制與影子」,**沒有任何交易規則被自動啟用**。驗證指令一律是 `.venv/bin/python -m pytest tests/desk -q`(本分支完成時 726 個測試全過),下表另列各項的專屬測試與入口。
+
+| # | 項目 | 做了什麼 | 入口 | 專屬測試 |
+|---|---|---|---|---|
+| 1 | H1 出場驗證報告 | H1(寬停損)對現行規則的影子比較,結果寫成 `param_changes` 的 DRAFT 紀錄,不改任何設定 | `scripts/desk_learn.py h1-report [--no-record]`;學習任務每次自動附報告 | `tests/desk/test_h_reports.py` |
+| 2 | 研究否決(買單專用) | `veto.py`:Muse / Grok / 申報(8-K、10-Q)/ 內部人(Form 4)/ 財報,4 個交易日內有 2 個以上獨立來源標 elevated 或 critical 才擋**買單**;賣單與停損永遠放行;原因進 `RiskDecision`、`veto_log`、驗屍事實。這是純粹的風控層附加區塊,只能降低風險 | `scripts/desk_learn.py filings [--no-fetch]`;學習任務自動收集(EDGAR 需環境變數 `SEC_USER_AGENT`) | `tests/desk/test_veto.py`、`tests/desk/test_filings.py`(含「買單被擋、賣單不擋」) |
+| 3 | 驗屍卡到每週假設 | `postmortem.update_cards` 本來就在學習任務內執行;每週五把連續兩週排在虧損前兩名的非 S0 症狀記進 `weekly_hypotheses`(只記錄,狀態為 candidate) | `scripts/desk_learn.py hypotheses [--date] [--no-record] [--list]` | `tests/desk/test_hypotheses.py` |
+| 4 | 執行一致性與對帳 | 每日收盤報告加「券商對帳摘要」:Alpaca 紙上成交對內部計畫的滑價、漏單 / 部分成交、停損單差異(缺漏 / 重複 / 價格不符 / 孤兒);每天一列存 `reconcile_daily`;報告顯示「連續零差異 N 天」(對應第 5 節第 1 條);連續 3 天有差異時只發日報與 ntfy 警示。**唯讀:不停機、不改單**(既有 `mismatches()` 對帳停機機制不變) | `scripts/desk_reconcile.py [--date] [--no-record] [--no-broker] [--list]` | `tests/desk/test_reconcile_daily.py` |
+| 5 | H2 影子延續與報告 | H2(財報前不進場)對照現行規則,影子持續累積;少於 30 筆交易標「樣本不足」;永不自動啟用 | `scripts/desk_learn.py h2-report [--no-record]` | `tests/desk/test_h_reports.py` |
+
+**監測參數(不是交易規則)**:對帳滑價旗標 100 bps、連續差異警示 3 天、停損價容差 0.011 美元,都定義在 `execution/reconcile.py` 頂端。進場參考價是計畫當時的收盤價,所以隔夜跳空會算進滑價;加密貨幣在 16:45 收盤任務之後的成交,要重跑 `desk_reconcile.py --date` 才會進摘要。
+
+**沒有被自動啟用、等你核准的規則**:H1 寬停損、H2 財報前不進場、每週假設候選、情境分配器。流程維持:假設 → 回測 / 影子 → `param_changes` DRAFT → 你核准。研究否決只會降低風險,上線後的門檻(2 個來源、4 個交易日)同樣視為待校準參數。
+
 ## 4. 時程
 
 | 時間 | 做什麼 | 完成的標準 |
