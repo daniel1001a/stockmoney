@@ -12,6 +12,7 @@ Steps (each isolated, a failure in one does not stop the others):
   3b. score author calls (informational only)
   3c. sample source URLs and record whether they resolve (network failure is non-fatal)
   3d. Jev prescreen of Muse/Grok text items, deep analysis of passed ones (DESK_PRESCREEN off|shadow|on)
+  3e. H1 / H2 shadow comparison reports; a changed verdict is logged as a DRAFT in param_changes
   4. allocator recommendation (Fridays or when none logged this week)
   5. report -> data/desk/learn/<date>.md and learn_reports; Friday push summary
 """
@@ -28,7 +29,7 @@ import pandas as pd
 
 from stockmoney.desk import data, notify, store
 from stockmoney.desk.indicators import compute
-from stockmoney.desk.learn import (allocator, calls, chains, corroboration, earnings, invalidation, links,
+from stockmoney.desk.learn import (allocator, calls, chains, corroboration, earnings, h_reports, invalidation, links,
                                    postmortem, prescreen, shadow, tables)
 
 log = logging.getLogger(__name__)
@@ -164,7 +165,9 @@ def run(con, now: datetime, bars: data.Bars | None = None, shadow_start: str | N
               guarded("chain_report", lambda: chains.report(con)) or "", "",
               guarded("calls_report", lambda: calls.report(con)) or "", "",
               guarded("link_report", lambda: links.report(con)) or "", "",
-              guarded("prescreen_report", lambda: prescreen.report(con)) or ""]
+              guarded("prescreen_report", lambda: prescreen.report(con)) or "", "",
+              guarded("h_reports", lambda: h_reports.run_all(con, bars)) or ""]
+    con.commit()
     if alloc_text:
         parts += ["", alloc_text]
     if problems:
