@@ -6,6 +6,7 @@
     desk_learn.py chain add FILE.json [--source owner|claude]     record an event chain (JSON object)
     desk_learn.py chain list | report
     desk_learn.py filings [--no-fetch]                            refresh SEC/earnings research flags (needs SEC_USER_AGENT), show flags and veto blocks
+    desk_learn.py hypotheses [--date YYYY-MM-DD] [--no-record] [--list]   weekly post-mortem hypotheses (record only; Fridays run in the job)
     desk_learn.py h1-report [--no-record]                       H1 (wider trailing stop) vs combined; DRAFT in param_changes
     desk_learn.py h2-report [--no-record]                         H2 (earnings entry block) vs combined; never auto-enabled
 """
@@ -18,7 +19,7 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 from stockmoney.desk import data, store, veto
-from stockmoney.desk.learn import chains, filings, h_reports, job, tables
+from stockmoney.desk.learn import chains, filings, h_reports, hypotheses, job, tables
 
 
 def main() -> int:
@@ -38,6 +39,10 @@ def main() -> int:
     ch.add_argument("--source", default="owner")
     fi = sub.add_parser("filings")
     fi.add_argument("--no-fetch", action="store_true", help="only print the stored flags and recent veto blocks")
+    hy = sub.add_parser("hypotheses")
+    hy.add_argument("--date", help="week end day, default today (UTC)")
+    hy.add_argument("--no-record", action="store_true", help="print only, write no weekly_hypotheses rows")
+    hy.add_argument("--list", action="store_true", help="show recorded hypotheses and exit")
     for h in ("h1-report", "h2-report"):
         sub.add_parser(h).add_argument("--no-record", action="store_true", help="print only, write no DRAFT row")
     a = ap.parse_args()
@@ -60,6 +65,12 @@ def main() -> int:
             print(filings.report(con))
             since = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
             print(veto.report(con, since) or "最近 7 天沒有買單被研究否決擋下。")
+        elif a.cmd == "hypotheses":
+            if a.list:
+                for h in hypotheses.history(con, 50):
+                    print(f"{h['week']} {h['symptom']} {h['label']} [{h['status']}] {h['text']}")
+            else:
+                print(hypotheses.run(con, a.date or datetime.now(timezone.utc).date().isoformat(), record_rows=not a.no_record))
         elif a.cmd in ("h1-report", "h2-report"):
             try:
                 bars = data.to_bars(data.load())

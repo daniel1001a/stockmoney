@@ -14,6 +14,7 @@ Steps (each isolated, a failure in one does not stop the others):
   3d. Jev prescreen of Muse/Grok text items, deep analysis of passed ones (DESK_PRESCREEN off|shadow|on)
   3e. H1 / H2 shadow comparison reports; a changed verdict is logged as a DRAFT in param_changes
   3f. research flags (earnings, SEC 8-K / Form 4) for the buy-only research veto; EDGAR needs SEC_USER_AGENT
+  3g. Fridays: weekly hypotheses recorded in weekly_hypotheses (record only, changes no parameter)
   4. allocator recommendation (Fridays or when none logged this week)
   5. report -> data/desk/learn/<date>.md and learn_reports; Friday push summary
 """
@@ -30,8 +31,8 @@ import pandas as pd
 
 from stockmoney.desk import data, notify, store, veto
 from stockmoney.desk.indicators import compute
-from stockmoney.desk.learn import (allocator, calls, chains, corroboration, earnings, filings, h_reports, invalidation,
-                                   links, postmortem, prescreen, shadow, tables)
+from stockmoney.desk.learn import (allocator, calls, chains, corroboration, earnings, filings, h_reports, hypotheses,
+                                   invalidation, links, postmortem, prescreen, shadow, tables)
 
 log = logging.getLogger(__name__)
 ET = ZoneInfo("America/New_York")
@@ -151,6 +152,8 @@ def run(con, now: datetime, bars: data.Bars | None = None, shadow_start: str | N
                      f"封存 {ps['archive']}),失敗 {ps['error']};深度分析完成 {ps['deep_done']}。")
 
     friday = through.weekday() == 4
+    hyp_text = guarded("hypotheses", lambda: hypotheses.run(con, day, include_weekly=False)) if friday else None
+    con.commit()
     do_alloc = friday if with_allocator is None else with_allocator
     if do_alloc:
         def _alloc():
@@ -167,6 +170,8 @@ def run(con, now: datetime, bars: data.Bars | None = None, shadow_start: str | N
     watch = guarded("earnings_watch", lambda: _earnings_watch(con, through.date()))
     if watch:
         parts += ["", watch]
+    if hyp_text:
+        parts += ["", hyp_text]
     parts += ["", rep, "", guarded("shadow_report", lambda: shadow.report(con)) or "", "",
               guarded("chain_report", lambda: chains.report(con)) or "", "",
               guarded("calls_report", lambda: calls.report(con)) or "", "",
