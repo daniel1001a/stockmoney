@@ -27,7 +27,7 @@ from datetime import datetime, timedelta, timezone
 
 import pandas as pd
 
-from stockmoney.desk import store
+from stockmoney.desk import store, veto
 from stockmoney.desk.data import Bars
 from stockmoney.desk.indicators import Ind, market_state, sector_ranking
 from stockmoney.desk.learn.trades import ClosedTrade, closed_trades
@@ -139,6 +139,8 @@ def build_card(con, t: ClosedTrade, bars: Bars, ind: Ind) -> dict | None:
     slip_out = abs(t.exit_px / open_out - 1) if open_out else None
 
     alerts = _alerts(con, sym, t.entry_at, t.exit_at)
+    flags_in_hold = veto.flags_between(con, sym, t.entry_at, t.exit_at)
+    vetoes_in_hold = veto.blocks_between(con, sym, t.entry_at, t.exit_at)
     from stockmoney.desk.learn import earnings as _earn
     span = (entry_day.date(), exit_day.date())
     earn_known = _earn.covered(con, *span)
@@ -173,7 +175,8 @@ def build_card(con, t: ClosedTrade, bars: Bars, ind: Ind) -> dict | None:
         "ext_atr": ext_atr, "mfe": mfe, "mae": mae, "mfe_r": mfe_r, "exit_gap_atr": exit_gap,
         "gap_events": gap_hits, "earnings_in_hold": earn_dates if earn_known else None, "back_above_entry_10d": back_above if complete else None,
         "slip_entry": slip_in, "slip_exit": slip_out, "hold_sessions": len(held) - 1,
-        "alerts": alerts, "signal_id": t.signal_id, "initial_stop": t.initial_stop,
+        "alerts": alerts, "research_flags_in_hold": flags_in_hold, "veto_blocks_in_hold": vetoes_in_hold,
+        "signal_id": t.signal_id, "initial_stop": t.initial_stop,
     }
     return {"symptoms": s, "facts": facts, "r_multiple": r_mult, "status": "final" if complete else "provisional"}
 

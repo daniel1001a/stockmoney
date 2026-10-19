@@ -20,7 +20,7 @@ import math
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
-from stockmoney.desk import store
+from stockmoney.desk import store, veto
 from stockmoney.desk.execution.ledger import (
     Ledger, is_crypto_symbol, norm,
 )
@@ -77,6 +77,11 @@ class Limits:
     max_beta_adj_exposure: float | None = None
     max_growth_group_exposure: float | None = None
     leverage: dict[str, float] = field(default_factory=lambda: dict(DEFAULT_LEVERAGE))
+    # Research veto (desk/veto.py): a NEW BUY is blocked when this many independent
+    # research sources flagged the symbol elevated/critical within veto_days
+    # trading days. Buys only; sells and stops never consult it.
+    veto_days: int = veto.DAYS
+    veto_min_sources: int = veto.MIN_SOURCES
 
 
 def _is_num(x: float | None) -> bool:
@@ -280,6 +285,10 @@ class RiskEngine:
             tripped, why = self.sleeve_breaker(intent.strategy, snapshot)
             if tripped:
                 return self._block(f"buy blocked: {why}")
+        vt = veto.check(self.con, intent.symbol, days=l.veto_days, min_sources=l.veto_min_sources)
+        if vt.blocked:
+            veto.record(self.con, intent.symbol, vt)
+            return self._block(f"buy blocked: {vt.reason}")
         owner = self.ledger.owner(intent.symbol)
         if owner is not None and intent.strategy and owner != intent.strategy:
             return self._block(f"buy blocked: {intent.symbol} is held by strategy '{owner}', "
