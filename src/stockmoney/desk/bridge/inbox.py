@@ -289,8 +289,9 @@ def _process(con, mail: RawMail, config: BridgeConfig, received_at: datetime) ->
             # an identical resend: already received, nothing to store or correct,
             # except that a verified copy upgrades a stored grok_legacy one (the
             # first copy failed DKIM); received_at stays the first arrival and
-            # source_reason records when the verification arrived
-            if prior[2] == SOURCE_GROK_LEGACY and source == SOURCE_GROK_VERIFIED:
+            # source_reason records when the verification arrived (a NULL source
+            # from before the column existed reads as grok_legacy too)
+            if source_of(prior[2], prior[0]) == SOURCE_GROK_LEGACY and source == SOURCE_GROK_VERIFIED:
                 con.execute("UPDATE bridge_messages SET source=?, source_reason=?, sender=? WHERE msg_id=?",
                             (source, f"verified_by_resend {_iso(received_at)}", mail.sender, msg.msg_id))
                 log.info("bridge: verified resend of %s upgraded it from grok_legacy", msg.msg_id)

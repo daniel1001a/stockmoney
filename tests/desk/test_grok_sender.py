@@ -360,6 +360,18 @@ def test_identical_verified_resend_upgrades_a_legacy_row_but_never_downgrades(co
     assert rows(con)[0]["source"] == "grok_verified" and rejects(con) == []
 
 
+def test_identical_verified_resend_upgrades_a_pre_column_null_source_row(con):
+    box = FakeMailbox()
+    d = grok_daily()
+    send(box, d, auth="")
+    assert inbox.poll(con, box, CONFIG, now=NOW) == 1
+    con.execute("UPDATE bridge_messages SET source=NULL, source_reason=NULL")  # a row from before the column
+    send(box, d)
+    assert inbox.poll(con, box, CONFIG, now=NOW) == 0
+    r = rows(con)
+    assert len(r) == 1 and r[0]["source"] == "grok_verified" and rejects(con) == []
+
+
 def test_r2_suffix_msg_id_is_valid_and_accepted(con):
     assert validate(grok_daily("grok-20261021-0730-r2")).msg_id == "grok-20261021-0730-r2"
     box = FakeMailbox()
