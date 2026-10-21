@@ -65,7 +65,10 @@ _ADDED = (("options_setups", "rvol", "REAL"), ("options_setups", "regime_json", 
           ("options_positions", "inv_vwap", "INTEGER DEFAULT 0"), ("options_positions", "trail_ref", "REAL"),
           # schema v1.1: Grok's directional prior on a rule setup, tagged at its trigger
           # (agree | disagree | none; NULL = not triggered), late = plan received after 09:20 ET
-          ("options_setups", "grok_stance", "TEXT"), ("options_setups", "grok_stance_late", "INTEGER DEFAULT 0"))
+          ("options_setups", "grok_stance", "TEXT"), ("options_setups", "grok_stance_late", "INTEGER DEFAULT 0"),
+          # the quote an order was sent against (arrival price), and the quote time on each fill
+          ("options_orders", "ref_bid", "REAL"), ("options_orders", "ref_ask", "REAL"),
+          ("options_orders", "ref_quote_at", "TEXT"), ("options_fills", "quote_at", "TEXT"))
 
 PENDING_SUBMIT = "pending_submit"
 
@@ -180,10 +183,12 @@ def position(con, position_id: str) -> dict | None:
 
 
 def add_fill(con, position_id: str, at: datetime, side: str, qty: float, price: float,
-             bid: float | None, ask: float | None, reason: str, client_order_id: str = "") -> bool:
+             bid: float | None, ask: float | None, reason: str, client_order_id: str = "",
+             quote_at: str | None = None) -> bool:
     cur = con.execute(
-        "INSERT OR IGNORE INTO options_fills (position_id, at, side, qty, price, bid, ask, reason, client_order_id) "
-        "VALUES (?,?,?,?,?,?,?,?,?)", (position_id, iso(at), side, qty, price, bid, ask, reason, client_order_id))
+        "INSERT OR IGNORE INTO options_fills (position_id, at, side, qty, price, bid, ask, reason, client_order_id,"
+        " quote_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
+        (position_id, iso(at), side, qty, price, bid, ask, reason, client_order_id, quote_at))
     return cur.rowcount == 1
 
 
@@ -198,14 +203,18 @@ def order(con, client_order_id: str) -> dict | None:
 
 
 def record_order(con, client_order_id: str, position_id: str, kind: str, side: str, qty: float,
-                 order_type: str, limit_price: float | None, reason: str, at: datetime) -> bool:
+                 order_type: str, limit_price: float | None, reason: str, at: datetime,
+                 ref_bid: float | None = None, ref_ask: float | None = None,
+                 ref_quote_at: datetime | None = None) -> bool:
     """Written as pending_submit and COMMITTED before broker.submit, so a crash
-    between the two never loses the record of an order the broker may hold."""
+    between the two never loses the record of an order the broker may hold.
+    ref_* is the quote the order was sent against, so a fill's slippage is
+    measured against the price at the decision, not a later poll."""
     cur = con.execute(
         "INSERT OR IGNORE INTO options_orders (client_order_id, position_id, kind, side, qty, order_type, limit_price,"
-        " status, reason, submitted_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+        " status, reason, submitted_at, updated_at, ref_bid, ref_ask, ref_quote_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (client_order_id, position_id, kind, side, qty, order_type, limit_price, PENDING_SUBMIT, reason,
-         iso(at), store.now()))
+         iso(at), store.now(), ref_bid, ref_ask, iso(ref_quote_at) if ref_quote_at else None))
     con.commit()
     return cur.rowcount == 1
 

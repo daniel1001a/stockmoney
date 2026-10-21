@@ -828,7 +828,7 @@ class Engine:
         row.update(qty_initial=final.qty, qty_open=0, state=PENDING)
         if not ostore.insert_position(self.con, row):
             return True  # already exists (re-run): the pending order is resolved by _manage_pending
-        self._submit(pid, final, "entry", "entry", now)
+        self._submit(pid, final, "entry", "entry", now, quote=c)
         # reserved even when the submit outcome is unknown: counting a buy
         # that never reached the broker only blocks entries, never adds risk
         self.risk_gate.reserve(final, final.limit_price)
@@ -879,11 +879,15 @@ class Engine:
                          notify.CRITICAL)
         return False
 
-    def _submit(self, pid: str, intent: OrderIntent, kind: str, reason: str, now: datetime) -> None:
+    def _submit(self, pid: str, intent: OrderIntent, kind: str, reason: str, now: datetime,
+                quote: OptionContract | None = None) -> None:
         """Commit the order row first, then submit. A second call for the same
-        client_order_id never reaches the broker again."""
+        client_order_id never reaches the broker again. ``quote`` is the quote
+        the order is sent against, kept on the row as its arrival price."""
         if not ostore.record_order(self.con, intent.client_order_id, pid, kind, intent.side.value, intent.qty,
-                                   intent.order_type.value, intent.limit_price, reason, now):
+                                   intent.order_type.value, intent.limit_price, reason, now,
+                                   ref_bid=quote.bid if quote else None, ref_ask=quote.ask if quote else None,
+                                   ref_quote_at=quote.as_of if quote else None):
             return
         try:
             self._io()
@@ -994,8 +998,8 @@ class Engine:
                 px = o.filled_avg_price
             have = p["qty_open"] or 0
             cost = ((p["entry_price"] or 0.0) * have + px * delta) / (have + delta)
-            ostore.add_fill(self.con, pid, now, "buy", delta, px, p["entry_bid"], p["entry_ask"],
-                            "entry", f"{ecid}#{o.filled_qty:g}")
+            ostore.add_fill(self.con, pid, o.filled_at or now, "buy", delta, px, p["entry_bid"], p["entry_ask"],
+                            "entry", f"{ecid}#{o.filled_qty:g}", quote_at=row["ref_quote_at"])
             ostore.update_position(self.con, pid, qty_open=have + delta, entry_price=cost,
                                    fees_usd=(p["fees_usd"] or 0) + cfg.fee_per_contract * delta,
                                    spread_cost_usd=(p["spread_cost_usd"] or 0)
@@ -1218,9 +1222,10 @@ class Engine:
         return self._spots[sym]
 
     def _book_exit(self, p: dict, qty: float, price: float, bid, ask, reason: str, now: datetime,
-                   note: str = "", client_order_id: str = "") -> None:
+                   note: str = "", client_order_id: str = "", quote_at: str | None = None) -> None:
         cfg, pid = self.cfg, p["position_id"]
-        if not ostore.add_fill(self.con, pid, now, "sell", qty, price, bid, ask, reason, client_order_id):
+        if not ostore.add_fill(self.con, pid, now, "sell", qty, price, bid, ask, reason, client_order_id,
+                               quote_at=quote_at):
             return  # already booked (re-run)
         left = p["qty_open"] - qty
         if left < -1e-9:  # more sold than the store held: never a negative position, page
@@ -1300,7 +1305,7 @@ class Engine:
                 self._notify("期權軌道:出場被風控擋下", f"{p['occ']} x{qty:g}({reason})被風控拒絕:{dec.reason[:300]}。"
                              "每輪會重試;請到 Alpaca 確認實際持倉。", notify.CRITICAL)
             return False
-        self._submit(pid, dec.intent or intent, "exit", reason, now)
+        self._submit(pid, dec.intent or intent, "exit", reason, now, quote=q)
         return True
 
     def _sell_room(self, occ: str) -> tuple[float, float] | None:
@@ -1434,8 +1439,12 @@ class Engine:
         if delta > 1e-9 and o.filled_avg_price is not None:
             done_value = (row["avg_price"] or 0.0) * booked
             price = (o.filled_qty * o.filled_avg_price - done_value) / delta
-            self._book_exit(p, delta, price, p["last_bid"], p["last_ask"], row["reason"], self._now,
-                            client_order_id=f"{cid}#{o.filled_qty:g}")
+            # measured against the quote the sell was sent on (the row's ref_*), not
+            # last_bid/ask, which later polls overwrite; booked at the broker's fill time
+            sent = row["ref_bid"] is not None or row["ref_ask"] is not None
+            self._book_exit(p, delta, price, row["ref_bid"] if sent else p["last_bid"],
+                            row["ref_ask"] if sent else p["last_ask"], row["reason"], o.filled_at or self._now,
+                            client_order_id=f"{cid}#{o.filled_qty:g}", quote_at=row["ref_quote_at"])
             ostore.update_order(self.con, cid, booked_qty=o.filled_qty, filled_qty=o.filled_qty,
                                 avg_price=o.filled_avg_price)
             p = ostore.position(self.con, p["position_id"])
