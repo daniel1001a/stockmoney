@@ -1,10 +1,11 @@
 #!/bin/zsh
 # Wrapper used by launchd: loads .env, runs one desk job, appends to a dated log.
-# Usage: scripts/desk_job.sh <premarket|postopen|postclose|recover|crypto|bridge|learn|scanshadow|options|options-recover>
+# Usage: scripts/desk_job.sh <premarket|postopen|postclose|recover|crypto|bridge|learn|scanshadow|options|options-recover|intraday_shadow>
 # "scanshadow" ingests RSS/Reddit then runs classify_scan.py --engine shadow (Jev logging only).
 # "learn" is the read-only learning job (own module, own lock; never touches orders).
 # "options" is the intraday options session (own module, own lock, runs until the close).
 # "options-recover" sells options leftovers of a dead session (same lock; exits if a session runs).
+# "intraday_shadow" is a read-only shadow tick (stockmoney.desk.intraday): no order path, own timeout alarm.
 set -u
 ROOT="${0:A:h:h}"
 cd "$ROOT" || exit 1
@@ -23,6 +24,8 @@ elif [[ "$1" == "options" ]]; then
   .venv/bin/python -m stockmoney.desk.options.run session >> "$LOG" 2>&1
 elif [[ "$1" == "options-recover" ]]; then
   .venv/bin/python -m stockmoney.desk.options.run recover >> "$LOG" 2>&1
+elif [[ "$1" == "intraday_shadow" ]]; then
+  .venv/bin/python -m stockmoney.desk.intraday tick --feed sip >> "$LOG" 2>&1
 else
   .venv/bin/python -m stockmoney.desk.run "$1" >> "$LOG" 2>&1
 fi
