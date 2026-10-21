@@ -35,9 +35,8 @@ Design notes:
     market_value 1068).
   * Option market data uses OptionHistoricalDataClient with raw responses,
     because the alpaca-py OptionsSnapshot model drops the dailyBar field
-    (today's volume). The feed is left to Alpaca unless ALPACA_OPTION_FEED or
-    ``option_feed`` sets it ("opra" with a subscription, otherwise
-    "indicative"). Open interest comes from the trading API option contracts
+    (today's volume). The feed is "indicative" unless ALPACA_OPTION_FEED or
+    ``option_feed`` sets it ("opra" needs a subscription). Open interest comes from the trading API option contracts
     endpoint (published once a day). Stock bars and quotes use the IEX feed
     by default (the free plan's real-time feed; IEX volume is only IEX's
     share of the consolidated tape).
@@ -107,6 +106,7 @@ CRYPTO_ORDER_TYPES = frozenset({OrderType.MARKET, OrderType.LIMIT, OrderType.STO
 OPTION_TIFS = frozenset({TIF.DAY})
 OPTION_ORDER_TYPES = frozenset({OrderType.MARKET, OrderType.LIMIT})
 OPTION_FEEDS = ("opra", "indicative")
+DEFAULT_OPTION_FEED = "indicative"  # used when neither ALPACA_OPTION_FEED nor option_feed is set
 ET = ZoneInfo("America/New_York")
 
 _STATUS_MAP = {
@@ -388,7 +388,11 @@ class AlpacaBroker:
         feed = (option_feed if option_feed is not None else env.get("ALPACA_OPTION_FEED") or "").strip().lower()
         if feed and feed not in OPTION_FEEDS:
             raise ValueError(f"option feed must be one of {OPTION_FEEDS}, got {feed!r}")
-        self.option_feed = feed or None  # None: Alpaca picks (opra with a subscription, else indicative)
+        if not feed:
+            # No OPRA subscription on this account: say so explicitly instead of letting Alpaca pick.
+            feed = DEFAULT_OPTION_FEED
+            log.info("option feed not set (ALPACA_OPTION_FEED unset): using %s", feed)
+        self.option_feed = feed
         self.stock_feed = stock_feed
         self._now = now
         self._oi_cache: dict[tuple[str, date], _Info] = {}

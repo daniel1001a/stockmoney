@@ -132,9 +132,10 @@ class Calls(_Msg):
 
 
 # ---------------------------------------------------------------- GROK_DAILY (Grok -> desk)
-# Same sender, token and subject as Muse (docs/desk/GROK_PROMPT.md). Store-only:
-# no policy effect. Limits keep a full message under ~117 KB of compact UTF-8
-# (~159 KiB after base64 + headers) against the 200 KiB inbox cap; the
+# Sent from GROK_ADDRESS with GROK_SHARED_TOKEN (or, legacy, over the Muse
+# channel); see docs/desk/GROK_PROMPT.md. Store-only: no policy effect. Limits
+# keep a full message under ~123 KB of compact UTF-8 (~167 KiB after base64 +
+# headers) against the 200 KiB inbox cap; the
 # worst case is computed in tests/desk/test_grok_daily.py.
 
 _ET = ZoneInfo("America/New_York")
@@ -171,6 +172,8 @@ class GrokEvent(BaseModel):
     confirmed: bool
     first_seen: EtDatetime
     urls: list[GrokUrl] = Field(min_length=1, max_length=3)  # no source, no event
+    # optional (2026-10-21): "post" = a post states it, "inference" = Grok's reading
+    basis: Literal["post", "inference"] | None = None
 
 
 class GrokImpact(BaseModel):
@@ -242,6 +245,23 @@ class GrokAttention(BaseModel):
     why: _text(120)
 
 
+class GrokLinkCheck(BaseModel):
+    """Grok's own link audit for this message (counts only; the desk stores it)."""
+    model_config = ConfigDict(extra="forbid")
+    total: int = Field(ge=0, le=1000)
+    passed: int = Field(ge=0, le=1000)
+    removed: int = Field(ge=0, le=1000)
+
+
+class GrokMarketRisk(BaseModel):
+    """Market-level risk read (2026-10-21). Stored and scored against later SPY
+    moves (learn/market_risk.py); never read by veto, risk or any order path."""
+    model_config = ConfigDict(extra="forbid")
+    level: Literal["low", "elevated", "critical"]
+    summary: _text(300)
+    source_urls: list[GrokUrl] = Field(max_length=5)
+
+
 class GrokDaily(_Msg):
     """Grok's daily pre-market digest. Stored only: produces no policy flags.
     Grok's own timestamps are audit data; the desk's clock is ``received_at``."""
@@ -252,9 +272,13 @@ class GrokDaily(_Msg):
     events: list[GrokEvent] = Field(max_length=25)
     chains: list[GrokChain] = Field(max_length=6)
     calls: list[GrokCall] = Field(max_length=50)
-    attention: list[GrokAttention] = Field(max_length=20)
+    # optional since 2026-10-21: the post-count source changed scale; nothing
+    # computes from it
+    attention: list[GrokAttention] = Field(default_factory=list, max_length=20)
     tracked_accounts: list[XHandle] = Field(max_length=60)
-    notes: Annotated[str, StringConstraints(max_length=1000)] = ""
+    notes: Annotated[str, StringConstraints(max_length=2000)] = ""
+    link_check: GrokLinkCheck | None = None
+    market_risk: GrokMarketRisk | None = None
 
     @model_validator(mode="after")
     def _consistency(self):

@@ -5,7 +5,10 @@ the same symbol as elevated or critical within the last ``days`` trading days.
 Sources (one vote each, however many items they contributed):
 
   muse      ALERT with severity elevated / critical, or a RESEARCH_REPLY that lists risk_flags
-  grok      a GROK_DAILY event with severity elevated / critical
+  grok      a GROK_DAILY event with severity elevated / critical, from a
+            grok_verified message (Pika's own address and token) and citing at
+            least one URL. grok_legacy messages (Grok types that came over the
+            Muse channel) never vote.
   filings   research_flags rows (8-K items, late-filing notices) written by learn/filings.py
   insider   research_flags rows (Form 4 discretionary sell cluster)
   earnings  research_flags rows (earnings inside the next days). Beyond the four
@@ -88,7 +91,9 @@ def _bridge_items(con, sym: str, since: str) -> dict[str, list[dict]]:
     out: dict[str, list[dict]] = {"muse": [], "grok": []}
     if not _has(con, "bridge_messages"):
         return out
-    for r in con.execute("SELECT msg_id, type, received_at, parsed_json FROM bridge_messages "
+    from stockmoney.desk.bridge.inbox import SOURCE_GROK_VERIFIED, has_source_column, source_of
+    src = "source" if has_source_column(con) else "NULL"
+    for r in con.execute(f"SELECT msg_id, type, received_at, parsed_json, {src} AS source FROM bridge_messages "
                          "WHERE type IN ('ALERT','RESEARCH_REPLY','GROK_DAILY') AND received_at>=?", (since,)).fetchall():
         try:
             m = json.loads(r["parsed_json"])
@@ -97,9 +102,11 @@ def _bridge_items(con, sym: str, since: str) -> dict[str, list[dict]]:
         if not isinstance(m, dict):
             continue
         if r["type"] == "GROK_DAILY":
+            if source_of(r["source"], r["type"]) != SOURCE_GROK_VERIFIED:
+                continue
             for i, e in enumerate(m.get("events") or []):
                 try:
-                    if norm(e["ticker"]) == sym and e.get("severity") in FLAGGED:
+                    if norm(e["ticker"]) == sym and e.get("severity") in FLAGGED and e.get("urls"):
                         out["grok"].append({"ref": f"{r['msg_id']}:{i}", "type": "GROK_DAILY", "urls": [str(u) for u in e.get("urls", [])],
                                             "detail": f"{e['severity']}: {str(e.get('headline', ''))[:60]}",
                                             "at": r["received_at"]})

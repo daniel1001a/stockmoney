@@ -174,7 +174,8 @@ def test_active_flags_does_not_rescan_old_messages(con, monkeypatch):
     ensure_schema(con)
 
     def put(i, when):
-        con.execute("INSERT INTO bridge_messages VALUES (?,?,?,?,?,?,?)",
+        con.execute("INSERT INTO bridge_messages (msg_id, type, sender, sent_at, received_at, raw_body, parsed_json) "
+                "VALUES (?,?,?,?,?,?,?)",
                     (f"al-{i:06d}", "ALERT", MUSE, when.isoformat(), when.isoformat(timespec="seconds"), "",
                      json.dumps(_alert(f"al-{i:06d}", "NVDA", when))))
 

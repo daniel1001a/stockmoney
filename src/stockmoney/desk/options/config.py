@@ -18,6 +18,8 @@ HIGH_VOL = ("COIN", "SMCI")
 
 RULE_PLAYBOOKS = ("gap_go", "gap_fade", "orb15", "vwap_reclaim")
 GROK = "grok_plan"
+# printed on every options report (daily report, weekly option cards); decided by the account owner 2026-10-21
+FEED_CAVEAT = "報價為 indicative,滑價量測僅供參考"
 # orb15 benchmark: QQQ for tech / growth names, SPY for everything else
 TECH_GROWTH = ("QQQ", "TQQQ", "NVDA", "TSLA", "AMD", "AAPL", "MSFT", "META", "AMZN", "GOOGL", "AVGO", "PLTR", "MU",
                "NFLX", "COIN", "SMCI")

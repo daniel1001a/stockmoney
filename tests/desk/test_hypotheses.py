@@ -120,6 +120,28 @@ def test_non_friday_learn_job_does_not_record(con, monkeypatch, tmp_path):
     assert con.execute("SELECT COUNT(*) FROM weekly_hypotheses").fetchone()[0] == 0
 
 
+def _prescreen_row(con, recv):
+    from stockmoney.desk.learn import prescreen
+
+    it = prescreen.Item("m#idea#0", "m", "IDEA", "idea", "AAPL", "", recv)
+    prescreen._store(con, it, {"model": "m", "relevant_p": 0.9, "actionable_p": 0.9, "risk_score": 0.0,
+                               "risk_conf": 0.9}, "pass", "actionable")
+
+
+def test_friday_learn_job_carries_the_prescreen_weekly_section(con, monkeypatch, tmp_path):
+    bars, now = _friday_setup(con, monkeypatch, tmp_path, 423)
+    _prescreen_row(con, now.isoformat())
+    body = job.run(con, now, bars=bars, shadow_start=str(bars.dates[-200].date()), with_allocator=False)
+    assert "## 情報預篩週報(Jev)" in body and "升級率" in body
+
+
+def test_non_friday_learn_job_has_no_prescreen_weekly_section(con, monkeypatch, tmp_path):
+    bars, now = _friday_setup(con, monkeypatch, tmp_path, 422)
+    _prescreen_row(con, now.isoformat())
+    body = job.run(con, now, bars=bars, shadow_start=str(bars.dates[-200].date()), with_allocator=False)
+    assert "情報預篩週報" not in body
+
+
 def test_hypotheses_module_does_not_import_execution_layers():
     src = Path(hypotheses.__file__).read_text()
     for banned in ("execution.alpaca", "execution.broker", "execution.risk", "RiskEngine", ".submit(", "make_broker"):

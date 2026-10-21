@@ -1,5 +1,5 @@
 """End-to-end orchestrator cycle against FakeBroker on synthetic bars."""
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import pandas as pd
 import pytest
@@ -91,7 +91,13 @@ def test_reconcile_mismatch_halts(tmp_path):
         assert store.get_setting(con, "halt_new_entries") == "1"
 
 
-def test_muse_alert_blocks_planned_entry(tmp_path):
+@pytest.mark.parametrize("severity, filing, blocked", [
+    ("critical", False, True),   # critical blocks on Muse alone
+    ("elevated", False, False),  # Muse downgrade 2026-10-21: elevated alone passes, logged for the counterfactual
+    ("info", False, False),      # info is logged only
+    ("elevated", True, True),    # elevated plus an independent 8-K: veto.check blocks (2 sources)
+])
+def test_muse_alert_on_planned_entry(tmp_path, severity, filing, blocked):
     from stockmoney.desk.bridge import inbox
     from stockmoney.desk.bridge.mailbox import BridgeConfig, FakeMailbox
     from stockmoney.desk.bridge.outbox import build_subject
@@ -113,17 +119,33 @@ def test_muse_alert_blocks_planned_entry(tmp_path):
         cfg = BridgeConfig(desk_address="desk@example.com", muse_address="muse@example.com",
                            shared_token="t" * 32)
         box = FakeMailbox()
-        body = ('{"msg_id":"alert0001","sent_at":"%s","type":"ALERT","ticker":"%s","severity":"elevated",'
+        body = ('{"msg_id":"alert0001","sent_at":"%s","type":"ALERT","ticker":"%s","severity":"%s",'
                 '"headline":"probe","source_urls":["https://example.com/x"],"observed_at":"%s"}'
-                % (_at(nxt, 7, 0).isoformat(), target, _at(nxt, 6, 0).isoformat()))
+                % (_at(nxt, 7, 0).isoformat(), target, severity, _at(nxt, 6, 0).isoformat()))
         box.inject("muse@example.com", build_subject("ALERT", "alert0001", cfg.shared_token), body)
-        inbox.poll(con, box, cfg, now=_at(nxt, 8, 0))
+        # veto.check runs on the wall clock, so a two-source case is received "now"
+        inbox.poll(con, box, cfg, now=datetime.now(timezone.utc) if filing else _at(nxt, 8, 0))
+        if filing:
+            from stockmoney.desk import veto
+            veto.ensure_schema(con)
+            con.execute("INSERT INTO research_flags (symbol, source, kind, severity, headline, url, event_date, "
+                        "collected_at) VALUES (?, 'filings', '8-K', 'elevated', 'h', 'https://sec.example/1', ?, ?)",
+                        (target, str(nxt.date()), datetime.now(timezone.utc).isoformat(timespec="seconds")))
         broker.prices.update({s: float(v) for s, v in bars.open.loc[nxt].items()})
         out = run.premarket(con, broker, _at(nxt, 8, 45), limits)
         row = con.execute("SELECT status, note FROM planned_orders WHERE client_order_id=?",
                           (planned[0]["client_order_id"],)).fetchone()
-        assert row["status"] == "blocked", out
-        assert target not in {o.symbol for o in broker.orders.values() if o.status == OrderStatus.FILLED}
+        from stockmoney.desk.bridge.policy import legacy_rows
+        legacy = legacy_rows(con)
+        if blocked:
+            assert row["status"] == "blocked", out
+            assert target not in {o.symbol for o in broker.orders.values() if o.status == OrderStatus.FILLED}
+        else:
+            assert row["status"] == "submitted", out
+            assert [r["client_order_id"] for r in legacy] == [planned[0]["client_order_id"]]
+            assert "舊規則會擋" in out
+        if severity == "critical":
+            assert legacy == []  # really blocked, nothing to log as legacy-only
 
 
 @pytest.fixture

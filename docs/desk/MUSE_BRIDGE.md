@@ -23,7 +23,7 @@ Desk ──(寄到你的 Gmail)──> Muse 讀你的信箱 ──> 需要時用
 | 1 | **社群情緒快照** | `SOCIAL_DAILY` | 每天 07:30、20:00(美東) | 存入特徵庫。累積 2-3 個月後檢驗兩個假設:「討論量剛開始加速 = 動能起點」、「一面倒的狂熱 = 頂部附近」。通過才變成策略輸入 |
 | 2 | **網紅喊單紀錄** | `CALLS` | 每天 20:00 | 每則喊單在 5/20/60 天後自動打分數。幾個月後就知道哪些帳號真的有預測力、哪些帳號是可靠的反指標。這是別人沒有的獨家資料 |
 | 3 | **進場前查核** | `RESEARCH_REPLY` | 收到請求後,隔天 08:30 前 | 明天要買的標的,有消息面風險就取消進場 |
-| 4 | **持倉夜間守望** | `ALERT` | 隨時,24/7(含加密貨幣) | 候選標的:取消進場;持倉:3 天內不加碼並通知你。**不會自動賣出**,出場交給停損 |
+| 4 | **持倉夜間守望** | `ALERT` | 隨時,24/7(含加密貨幣) | 候選標的:critical 取消進場,elevated 需第二個獨立來源才擋(見第 3 節),info 只記錄;持倉:3 天內不加碼並通知你。**不會自動賣出**,出場交給停損 |
 | 5 | **機會發現** | `IDEA` | 隨時 | 只進孵化器,影子追蹤,不用錢交易 |
 
 另外 Desk 每天盤後會寄 `REPORT` 到你的 Gmail,請 Muse 摘要後用通知管道傳給你。
@@ -38,32 +38,50 @@ Desk ──(寄到你的 Gmail)──> Muse 讀你的信箱 ──> 需要時用
 
 | Muse 的輸入 | Desk 自動執行的動作 | 不會做的事 |
 |---|---|---|
-| `ALERT`,標的為候選 | 取消進場 3 天 | 不影響其他標的 |
+| `ALERT` critical,標的為候選 | 取消進場 3 天 | 不影響其他標的 |
+| `ALERT` elevated,標的為候選 | 只算一票;4 個交易日內另有一個獨立來源(例如 8-K、已驗證的 Grok)才經 veto 擋新買單 | 單獨不擋進場 |
+| `ALERT` info,標的為候選 | 只記錄 | 不擋進場 |
 | `ALERT` critical,標的為持倉 | 通知你;3 天不加碼 | 不會自動賣出 |
-| `RESEARCH_REPLY` 有風險旗標 | 取消這次進場 | |
+| `RESEARCH_REPLY` 有風險旗標 | 只算一票,規則同 elevated ALERT(需第二個獨立來源) | 單獨不擋進場 |
 | `SOCIAL_DAILY`、`CALLS` | 只存資料,累積後做統計檢驗 | 驗證通過前不影響任何交易 |
 | `IDEA` | 寫進孵化器 | 不交易 |
 | `GROK_DAILY`(Grok) | 只存資料;事件鏈交給學習層評分 | v1 不擋進場、不推播,驗證通過前不影響任何交易 |
+
+**2026-10-21 Muse 降權(帳戶擁有人決定)**:原規則是任何嚴重度的 `ALERT` 只要命中候選標的就取消進場 3 天,`RESEARCH_REPLY` 有風險旗標就取消進場。這是當初的政策設計,不是實作錯誤;程式與測試都照這張表做。改動後:
+
+- 只影響新買單。賣出、停損、持倉的不加碼與通知都不變。
+- 舊規則會擋、新規則放行的單,寫進 `muse_legacy_blocks`,並以 `legacy_only=1` 進入擋單結果追蹤(`blocked_counterfactual`),報告標示「舊規則會擋,新規則放行」。
+- 影子帳本 `shadow:combined_muse_strict` 用舊規則逐日重算,作為對照組。
+- 選擇權部位(options sleeve)仍採舊的嚴格規則,未隨本次降權放寬。
 
 ### Grok 日報 `GROK_DAILY`
 
 Grok 是第二個情報員(看 X),說明與完整格式在 `docs/desk/GROK_PROMPT.md`。
 
-- 通道:和 Muse 相同的寄件人(`MUSE_ADDRESS`)、相同的共享密鑰、相同的主旨格式 `[SMD/GROK_DAILY/grok-…] <token>`。`grok-` 開頭的訊息編號只保留給 `GROK_DAILY`,其他類型用了會被拒絕。
-- 時間:每天美東 07:30(最晚 08:10 寄出)和 20:00 各一封,週末也寄,由 Pika 從 dnial1001a@gmail.com 寄出。只有早上那封計分、做漏交檢查:08:30 前要收到,只算 NYSE 交易日,而且 `collected_at` 要是當天(美東)中午以前;晚上那封照收照存,不計分、不檢查漏交。用 `scripts/muse_check.py grok on|off` 單獨開關,`stage N` 不會影響它。
+- 通道(2026-10-21 起,帳號持有人決定):Grok(Pika)有自己的寄件地址與密鑰。主旨格式不變:`[SMD/<TYPE>/<msg_id>] <token>`。`grok-` 開頭的訊息編號只保留給 `GROK_DAILY`,其他類型用了會被拒絕。
+  - 環境變數:`GROK_ADDRESS`(一個 email 地址,目前是 super-pika@mail.grokbot.com;程式裡不寫死)與 `GROK_SHARED_TOKEN`(至少 16 個字元、不含空白,檢查規則與 `MUSE_SHARED_TOKEN` 相同)。兩個都設才啟用;只設一個、或與 `MUSE_ADDRESS` / `MUSE_SHARED_TOKEN` 相同,啟動時報錯。兩個都沒設時,行為和以前完全一樣。
+  - 寄件人白名單分開:`GROK_ADDRESS` 只能寄 `GROK_DAILY` 和 `OPTIONS_PLAN`,其他類型拒收為 `type_not_allowed_for_sender`。每個寄件人只比對自己的密鑰(constant-time compare),拿 Muse 的密鑰從 Grok 地址寄會是 `bad_token`。IMAP 搜尋對兩個寄件人各做一次。
+  - 來源標記:`bridge_messages.source` 是 `muse`、`grok_verified` 或 `grok_legacy`,`source_reason` 記下降級原因。`grok_verified` = 寄件人是 `GROK_ADDRESS` + 密鑰是 `GROK_SHARED_TOKEN` + DKIM 通過。從 `MUSE_ADDRESS` 寄來的 Grok 類型(舊通道)一律是 `grok_legacy`。加欄位之前的舊資料:Grok 類型視為 `grok_legacy`,其他視為 `muse`。
+  - DKIM 檢查(只在 `GROK_ADDRESS` 有設時做):只讀 Gmail 自己加的 `Authentication-Results`,也就是信件最上面那一個,而且它的 authserv-id(第一個分號前的字)必須是 `mx.google.com`;最上面那個不是 Gmail 的,就當作沒有。信件裡更下面的 `Authentication-Results` 可能是寄件人自己偽造的,一律不讀。在那一個標頭裡,要有一項 `dkim=pass`,而且它的 `header.d`,或 `header.i` 的 @ 後面,等於 `GROK_ADDRESS` 的網域或其子網域。不綁 selector(對方換金鑰不會壞)。只有 `d=amazonses.com` 這類寄送服務的簽章通過不算。沒通過或沒有標頭時,信不會被丟掉:照常驗證格式並儲存,但標成 `grok_legacy`,`source_reason` 是 `dkim_header_missing` / `dkim_no_domain` / `dkim_no_pass` / `dkim_domain_mismatch` 之一。
+  - 為什麼 DKIM 通過了還要密鑰:DKIM 只證明信是從那個網域寄出,不證明是哪一條線(哪個 agent、哪個帳號)寄的;同網域的其他寄件者也能通過 DKIM。密鑰證明是我們發給 Pika 的那一條線。兩個都要。
+  - 重寄:同一個 `msg_id`、內容完全相同(JSON 正規化後 sha256 相同)的重寄安靜略過,不拒絕、不回信。內容不同仍拒收為 `duplicate_msg_id`,FEEDBACK 會叫它換新編號,例如結尾加 `-r2`(`grok-20261021-0730-r2`)。
+- 時間:每天美東 07:30(最晚 08:10 寄出)和 20:00 各一封,週末也寄,由 Pika 寄出(專用通道從 `GROK_ADDRESS`,舊通道從 dnial1001a@gmail.com)。只有早上那封計分、做漏交檢查:08:30 前要收到,只算 NYSE 交易日,而且 `collected_at` 要是當天(美東)中午以前;晚上那封照收照存,不計分、不檢查漏交。用 `scripts/muse_check.py grok on|off` 單獨開關,`stage N` 不會影響它;預設是關的,沒開就不會有漏交通知。
+- 漏交與空白日報不同:漏交是 08:30 前沒收到早上那封(開啟檢查時推播「Grok 漏交」,並註明「沒有收到信(不是空白日報),不代表今天沒有風險」);空白日報是收到了、但 events 是空的。儀表板的 Grok 卡片用 `muse_ops.grok_today()` 分成 not_due / pending / missed / empty / delivered 五種狀態顯示。
 - 儲存:存進 `bridge_messages`,和 Muse 的訊息放在一起;`learn/chains.py` 的 `ingest_grok()` 讀出事件鏈並評分。時間一律以 Desk 的 `received_at` 為準,Grok 自己寫的時間只用來稽核。
-- 權限:v1 只存資料,`policy.active_flags` 不會讀它。要接進風控,得等 Grok 有自己的密鑰(v1.1)之後另外決定。
+- 權限:只能降低風險。`policy.active_flags` 不讀它。研究否決(`veto.py`)與學習層的 `grok_muse_independent_same_symbol` 只把 `grok_verified` 而且附連結的 events 算成 Grok 的一票;`grok_legacy` 永遠不投票(照存、照給學習層的事件鏈評分)。
+- `market_risk`(可省略):`{level: low|elevated|critical, summary, source_urls}`。只存進 `grok_market_risk` 表(`learn/market_risk.py`),在 5、20 個交易日後對照 SPY 收盤報酬與最大回撤評分。否決、風控、下單都不讀它。
+- `attention`(可省略):只顯示,不進任何計算;所有讀取的地方都容許它不存在。
 - 可證偽:事件鏈可附 `invalidations`(最多 3 個,`close_below` / `close_above` / `data_not_by`,每個都要有 `by_date`),`IDEA` 也可附同一組。沒有價格條件的鏈照收,但標為不可證偽,不列入命中率與 Brier。學習層在 `by_date` 當天或之後,只用已存的日收盤價判定 held / invalidated / no_data;`data_not_by` 永遠是 no_data。
 - 獨立性:Muse 的 ALERT / RESEARCH_REPLY / IDEA 與 Grok 的事件或事件鏈打到同一標的(前後 3 天)時,學習層比對來源連結(網域加路徑)與作者帳號。有任何重疊就標為 not independent,只算一次確認,不算 Muse 與 Grok 兩次。
 - 範圍:清單(universe 加上 QQQ、TQQQ、BTC/USD)以外的標的,一封超過 5 檔只通知你一次,不拒絕。
-- 格式錯誤:FEEDBACK 會寄到 `MUSE_ADDRESS`,`problem` 開頭是「【給 Grok】」;Muse 的提示詞要它忽略這種 FEEDBACK。修正信每 24 小時最多 10 封,Muse 和 Grok 共用這個上限。
+- 格式錯誤:FEEDBACK 會寄到 `MUSE_ADDRESS`(兩個通道都一樣,Desk 不寄信到 `GROK_ADDRESS`),`problem` 開頭是「【給 Grok】」;Muse 的提示詞要它忽略這種 FEEDBACK。修正信每 24 小時最多 10 封,Muse 和 Grok 共用這個上限。
 
 ### 期權劇本 `OPTIONS_PLAN`(Grok,2026-10-14 起自動收件)
 
 取代手動 `ingest-plan`。完整格式見 `docs/desk/GROK_SETUP.md`,驗證器是 `src/stockmoney/desk/options/plan.py` 的 `OptionsPlan`。
 
 - 線上格式:主旨 `[SMD/OPTIONS_PLAN/<plan_id>] <token>`,內文是單行 JSON(text/plain),就是 `OptionsPlan` 本身(`protocol`、`type`、`plan_id`、`for_date`、`generated_at`、`market_context`、`plans`、`avoid`、`notes`)。沒有 `msg_id`、`sent_at`;`plan_id` 就是訊息編號,主旨的編號必須與它相同,否則 `msg_id_mismatch`。
-- 沿用的檢查:寄件人白名單、密鑰、200KB 上限、`grok-` 前綴保留給 `GROK_DAILY`(OPTIONS_PLAN 的 `plan_id` 不能用)、與其他類型撞編號為 `duplicate_msg_id`。另外 `OptionsPlan` 自己的 64000 位元組上限。
+- 沿用的檢查:寄件人白名單(`MUSE_ADDRESS` 或 `GROK_ADDRESS`,後者用 `GROK_SHARED_TOKEN`;來源標記與 DKIM 規則同 GROK_DAILY)、密鑰、200KB 上限、`grok-` 前綴保留給 `GROK_DAILY`(OPTIONS_PLAN 的 `plan_id` 不能用)、與其他類型撞編號為 `duplicate_msg_id`。另外 `OptionsPlan` 自己的 64000 位元組上限。
 - 儲存:通過驗證後由和 CLI 同一個函式 `options.plan.ingest` 寫進 `options_plans`(`received_at` 是 Desk 收信時鐘,不是 Grok 的),同時在 `bridge_messages` 留一筆稽核紀錄。09:20 ET 之後收到的劇本照舊標 `shadow_only`。
 - 重複:內容完全相同的重送是安靜的 no-op;同一個 `plan_id` 內容不同,拒收為 `plan_id_reused` 並寄 FEEDBACK(重送要換新編號,與 CLI 規則相同)。
 - 權限:`policy.active_flags` 不讀 OPTIONS_PLAN,不會產生任何 blocked / no_add / notify,也不碰股票帳本。唯一效果是期權引擎本來就會讀的那份已儲存劇本,下單仍只經期權引擎自己的規則與風控。

@@ -57,6 +57,34 @@ def _guarded_book(window_days: int) -> Callable:
     return make
 
 
+def muse_legacy_fn(con) -> Callable:
+    """(symbol, t) -> True when the pre-2026-10-21 Muse rule (any ALERT or
+    research risk flag on a candidate) would have blocked an entry decided at
+    session ``t``. Flags are read as of 09:00 ET the next calendar day, i.e. the
+    premarket that would have sent the order, using only messages received by
+    then. No connection or no bridge table: never blocks."""
+    if con is None:
+        return lambda symbol, t: False
+    from stockmoney.desk.bridge import policy
+    cache: dict = {}
+
+    def blocked(symbol: str, t) -> bool:
+        day = pd.Timestamp(t).normalize()
+        if day not in cache:
+            at = (day + pd.Timedelta(days=1, hours=9)).tz_localize("America/New_York").to_pydatetime()
+            try:
+                cache[day] = set(policy.active_flags(con, at).legacy_blocked)
+            except Exception:  # noqa: BLE001 - a bad bridge table must not stop the shadow books
+                cache[day] = set()
+        return symbol.upper() in cache[day]
+    return blocked
+
+
+def _muse_strict_book(day: str, con=None) -> dict[str, Strategy]:
+    blocked = muse_legacy_fn(con)
+    return {n: EarningsGuard(REGISTRY[n](), blocked) for n in REGISTRY}
+
+
 def _single(name: str) -> Callable:
     return lambda day, con=None: {name: REGISTRY[name]()}
 
@@ -76,6 +104,8 @@ VARIANTS: dict[str, Callable] = {
     "shadow:combined_earn7": _guarded_book(7),
     # H1 in docs/desk/EDGE_PLAN.md: wider trailing stop on the two stop-driven strategies
     "shadow:combined_t35": _book(breakout={"trail_atr": 3.5}, pullback={"trail_atr": 3.5}),
+    # control for the 2026-10-21 Muse downgrade: entries filtered by the old Muse rule
+    "shadow:combined_muse_strict": _muse_strict_book,
     "shadow:breakout": _single("breakout"),
     "shadow:pullback": _single("pullback"),
     "shadow:rotation": _single("rotation"),
@@ -163,7 +193,8 @@ def report(con) -> str:
     lines = [f"## 影子帳戶({first} 到 {last},{len(eq)} 個交易日)", "",
              "| 帳戶 | 累計報酬 | 最大回撤 |", "|---|---|---|"]
     for c in [c for c in eq.columns if c.startswith("bench:") or c in
-              ("shadow:combined", "shadow:combined_t35", "shadow:combined_earn7", "shadow:breakout", "shadow:pullback", "shadow:rotation")]:
+              ("shadow:combined", "shadow:combined_t35", "shadow:combined_earn7", "shadow:combined_muse_strict",
+               "shadow:breakout", "shadow:pullback", "shadow:rotation")]:
         lines.append(f"| {c} | {ret[c]:+.2%} | {dd[c]:.2%} |")
     for label, cols in (("隨機進場(多頭排列)", rnd_t), ("隨機進場(不限)", rnd_a)):
         if cols:

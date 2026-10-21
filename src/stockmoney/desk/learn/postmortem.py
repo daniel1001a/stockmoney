@@ -17,11 +17,23 @@ Symptom rules (all computed from bars known at the time, or after exit for S2):
   S9 消息面     a Muse/Grok ALERT for the ticker arrived while held
   S0 正常虧損    a loss with none of the above (expected for a trend system)
 Winners are carded too (symptoms may be empty) so wins and losses are compared.
+
+grok_muse_independent_same_symbol (every card, stock and option): 1 when a Grok
+item (grok_verified messages with a URL only; grok_legacy never counts) and a Muse flag on the same symbol, both received in the 3 days before the
+entry, are independent by veto's rule (both sourced, no shared URL or author);
+0 when not; NULL when the inputs are unavailable. Built from bridge_messages and
+chains at their receipt times, never from the corroboration table (that table is
+rebuilt after the fact and is not point-in-time).
+
+Option cards (trade_id 'opt:...') are built by learn/options_postmortem.py with
+their own O codes and are reported in their own section, never mixed into the
+stock weekly counts or the stock hypotheses.
 """
 from __future__ import annotations
 
 import json
 import math
+import sqlite3
 from collections import Counter, defaultdict
 from datetime import datetime, timedelta, timezone
 
@@ -30,10 +42,14 @@ import pandas as pd
 from stockmoney.desk import store, veto
 from stockmoney.desk.data import Bars
 from stockmoney.desk.indicators import Ind, market_state, sector_ranking
-from stockmoney.desk.learn.trades import ClosedTrade, closed_trades
+from stockmoney.desk.learn import corroboration
+from stockmoney.desk.learn.trades import ClosedTrade, _table_exists, closed_trades
+from stockmoney.desk.options.config import FEED_CAVEAT
 from stockmoney.desk.universe import sector_of
 
 WHIPSAW_SESSIONS = 10
+GM_WINDOW_DAYS = 3  # Grok and Muse must both name the symbol within this many days before the entry
+OPTION_PREFIX = "opt:"
 FINAL_AFTER = WHIPSAW_SESSIONS  # a card is provisional until S2 can be decided
 
 LABEL = {
@@ -54,6 +70,41 @@ def _at(frame: pd.DataFrame, t: pd.Timestamp, sym: str) -> float | None:
     if sym not in frame.columns or t not in frame.index:
         return None
     return _num(frame.at[t, sym])
+
+
+def gm_inputs(con) -> tuple[list[dict], list[dict]] | None:
+    """(Grok items, Muse flags) for the independence column; None when a
+    source table is missing or unreadable (the column is then NULL)."""
+    if not (_table_exists(con, "bridge_messages") and _table_exists(con, "chains")):
+        return None
+    try:
+        return corroboration._grok_items(con, verified_only=True), corroboration._muse_flags(con)
+    except sqlite3.Error:
+        return None
+
+
+def _aware(d: datetime) -> datetime:
+    return d if d.tzinfo is not None else d.replace(tzinfo=timezone.utc)
+
+
+def grok_muse_independent(inputs: tuple[list[dict], list[dict]] | None, symbol: str, entry_at: str | None) -> int | None:
+    """1 when some Grok item and some Muse flag on ``symbol``, both received in
+    [entry - GM_WINDOW_DAYS, entry), are independent (veto._muse_grok_independent);
+    0 otherwise; None when the inputs or the entry time are unknown."""
+    if inputs is None or not entry_at:
+        return None
+    entry = corroboration._when(entry_at)
+    if entry is None:
+        return None
+    entry = _aware(entry)
+    lo = entry - timedelta(days=GM_WINDOW_DAYS)
+    tick = corroboration._tick(symbol)
+
+    def _before(items: list[dict]) -> list[dict]:
+        return [i for i in items if i["ticker"] == tick and i["at"] is not None and lo <= _aware(i["at"]) < entry]
+
+    grok, muse = _before(inputs[0]), _before(inputs[1])
+    return int(bool(grok and muse and veto._muse_grok_independent(muse, grok)))
 
 
 def _alerts(con, sym: str, entry_at: str, exit_at: str) -> list[str]:
@@ -185,6 +236,7 @@ def update_cards(con, bars: Bars, ind: Ind) -> dict:
     """Insert missing cards and refresh provisional ones. Lessons the owner
     wrote are never overwritten."""
     new = upd = 0
+    gm = gm_inputs(con)
     for t in closed_trades(con):
         old = con.execute("SELECT status FROM trade_postmortem WHERE trade_id=?", (t.trade_id,)).fetchone()
         if old is not None and old["status"] == "final":
@@ -195,13 +247,16 @@ def update_cards(con, bars: Bars, ind: Ind) -> dict:
         now = store.now()
         con.execute(
             "INSERT INTO trade_postmortem (trade_id, symbol, strategy, entry_day, exit_day, entry_px, exit_px, qty, pnl, "
-            "ret, r_multiple, exit_kind, exit_reason, symptoms, facts_json, status, created_at, updated_at) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(trade_id) DO UPDATE SET "
+            "ret, r_multiple, exit_kind, exit_reason, symptoms, facts_json, status, created_at, updated_at, "
+            "grok_muse_independent_same_symbol) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(trade_id) DO UPDATE SET "
             "symptoms=excluded.symptoms, facts_json=excluded.facts_json, status=excluded.status, "
-            "r_multiple=excluded.r_multiple, updated_at=excluded.updated_at",
+            "r_multiple=excluded.r_multiple, updated_at=excluded.updated_at, "
+            "grok_muse_independent_same_symbol=excluded.grok_muse_independent_same_symbol",
             (t.trade_id, t.symbol, t.strategy, t.entry_day, t.exit_day, t.entry_px, t.exit_px, t.qty, t.pnl, t.ret,
              card["r_multiple"], t.exit_kind, t.exit_reason, ",".join(card["symptoms"]),
-             json.dumps(card["facts"], ensure_ascii=False, default=str), card["status"], now, now))
+             json.dumps(card["facts"], ensure_ascii=False, default=str), card["status"], now, now,
+             grok_muse_independent(gm, t.symbol, t.entry_at)))
         if old is None:
             new += 1
         else:
@@ -209,10 +264,13 @@ def update_cards(con, bars: Bars, ind: Ind) -> dict:
     return {"new": new, "updated": upd}
 
 
-def week_stats(con, today: str, weeks: int = 4) -> list[dict]:
+def week_stats(con, today: str, weeks: int = 4, book: str = "stock") -> list[dict]:
     """One dict per trailing 7-day window ending ``today`` (newest first):
-    lo, hi (Timestamps), n, wins, loss (symptom -> summed losing pnl), cnt (symptom -> losing trades)."""
-    rows = con.execute("SELECT exit_day, strategy, pnl, symptoms FROM trade_postmortem").fetchall()
+    lo, hi (Timestamps), n, wins, loss (symptom -> summed losing pnl), cnt (symptom -> losing trades).
+    ``book`` 'stock' (default) excludes option cards, 'options' keeps only them."""
+    op = "NOT LIKE" if book == "stock" else "LIKE"
+    rows = con.execute(f"SELECT exit_day, strategy, pnl, symptoms FROM trade_postmortem WHERE trade_id {op} ?",
+                       (OPTION_PREFIX + "%",)).fetchall()
     end = pd.Timestamp(today)
     out: list[dict] = []
     for w in range(weeks):
@@ -238,31 +296,47 @@ def week_stats(con, today: str, weeks: int = 4) -> list[dict]:
 
 
 def candidate_symptoms(stats: list[dict]) -> list[str]:
-    """Non-S0 symptoms in the top two by loss in both of the two newest weeks."""
+    """Symptoms other than S0 / O0 in the top two by loss in both of the two newest weeks."""
     if len(stats) < 2:
         return []
-    tops = [set(sorted((c for c in w["loss"] if c != "S0"), key=lambda c: w["loss"][c])[:2]) for w in stats[:2]]
+    tops = [set(sorted((c for c in w["loss"] if c not in ("S0", "O0")), key=lambda c: w["loss"][c])[:2])
+            for w in stats[:2]]
     return sorted(tops[0] & tops[1])
 
 
+def _label(code: str) -> str:
+    from stockmoney.desk.learn.options_postmortem import LABEL as OPTION_LABEL
+    return LABEL.get(code) or OPTION_LABEL.get(code, code)
+
+
 def hypothesis_text(code: str) -> str:
-    return f"{code} {LABEL[code]} 連續兩週排在虧損前兩名:提出規則假設,走回測 + 影子帳戶驗證,不直接改規則。"
+    return f"{code} {_label(code)} 連續兩週排在虧損前兩名:提出規則假設,走回測 + 影子帳戶驗證,不直接改規則。"
+
+
+def _week_lines(stats: list[dict]) -> list[str]:
+    lines = []
+    for w in stats:
+        loss, cnt = w["loss"], w["cnt"]
+        top = ", ".join(f"{c} {_label(c)} x{cnt[c]} (${loss[c]:,.0f})"
+                        for c in sorted(loss, key=lambda k: loss[k])[:4]) or "無虧損交易"
+        lines.append(f"- {w['lo'].date()} 到 {w['hi'].date()}:{w['n']} 筆,勝 {w['wins']};{top}")
+    return lines
 
 
 def symptom_report(con, today: str, weeks: int = 4) -> tuple[str, list[str]]:
     """Per-week symptom counts and loss totals; returns (text, hypotheses).
     A hypothesis is proposed only when a symptom (other than S0) is in the top
-    two by loss for two consecutive weeks."""
+    two by loss for two consecutive weeks. Option cards get their own
+    section and their own candidates (never mixed with the stock counts)."""
     if con.execute("SELECT 1 FROM trade_postmortem LIMIT 1").fetchone() is None:
         return "尚無平倉交易,沒有驗屍卡。", []
     stats = week_stats(con, today, weeks)
-    lines = [f"## 驗屍卡週報(截至 {today})", ""]
-    for w in stats:
-        loss, cnt = w["loss"], w["cnt"]
-        top = ", ".join(f"{c} {LABEL.get(c, c)} x{cnt[c]} (${loss[c]:,.0f})"
-                        for c in sorted(loss, key=lambda k: loss[k])[:4]) or "無虧損交易"
-        lines.append(f"- {w['lo'].date()} 到 {w['hi'].date()}:{w['n']} 筆,勝 {w['wins']};{top}")
+    lines = [f"## 驗屍卡週報(截至 {today})", "", *_week_lines(stats)]
     hyp = [hypothesis_text(c) for c in candidate_symptoms(stats)]
+    if con.execute("SELECT 1 FROM trade_postmortem WHERE trade_id LIKE ? LIMIT 1", (OPTION_PREFIX + "%",)).fetchone():
+        ostats = week_stats(con, today, weeks, book="options")
+        lines += ["", "### 期權驗屍卡(實盤紙上)", f"> {FEED_CAVEAT}", *_week_lines(ostats)]
+        hyp += [hypothesis_text(c) for c in candidate_symptoms(ostats)]
     if hyp:
         lines += ["", "### 候選假設", *[f"- {h}" for h in hyp]]
     return "\n".join(lines), hyp

@@ -90,8 +90,27 @@ def _when(s: str) -> datetime | None:
         return None
 
 
-def _grok_items(con) -> list[dict]:
-    """Chains (by impact ticker) and events from stored Grok data."""
+def _grok_items(con, verified_only: bool = False) -> list[dict]:
+    """Chains (by impact ticker) and events from stored Grok data.
+
+    ``verified_only``: keep only items from grok_verified GROK_DAILY messages
+    (Grok's own address, token and DKIM) that cite at least one URL. A chain
+    row is credited to the message whose insert wrote it (chain_owners,
+    recorded by ingest_grok), so another message with the same trigger in the
+    same second cannot vouch for it.
+    grok_legacy items are dropped."""
+    from stockmoney.desk.bridge.inbox import SOURCE_GROK_VERIFIED, has_source_column, source_of
+    from stockmoney.desk.learn.chains import grok_chain_owners
+    has_bridge = con.execute("SELECT 1 FROM sqlite_master WHERE name='bridge_messages'").fetchone() is not None
+    msgs = []
+    if has_bridge:
+        src = "source" if has_source_column(con) else "NULL"
+        for r in con.execute(f"SELECT msg_id, received_at, parsed_json, {src} AS source FROM bridge_messages "
+                             "WHERE type='GROK_DAILY'").fetchall():
+            if verified_only and source_of(r["source"], "GROK_DAILY") != SOURCE_GROK_VERIFIED:
+                continue
+            msgs.append(r)
+    owners = grok_chain_owners(con) if verified_only else {}
     items = []
     for r in con.execute("SELECT chain_id, created_at, urls_json, impacts_json FROM chains "
                          "WHERE source='grok'").fetchall():
@@ -100,21 +119,26 @@ def _grok_items(con) -> list[dict]:
         except ValueError:
             continue
         at = _when(r["created_at"])
+        if verified_only:
+            owner = owners.get(r["chain_id"])
+            if not urls or owner is None or source_of(owner["source"], "GROK_DAILY") != SOURCE_GROK_VERIFIED:
+                continue
         for t in {_tick(i["ticker"]) for i in imps}:
             items.append({"ref": f"chain:{r['chain_id']}", "kind": "chain", "ticker": t, "urls": urls, "at": at})
-    if con.execute("SELECT 1 FROM sqlite_master WHERE name='bridge_messages'").fetchone():
-        for r in con.execute("SELECT msg_id, received_at, parsed_json FROM bridge_messages "
-                             "WHERE type='GROK_DAILY'").fetchall():
+    for r in msgs:
+        try:
+            events = json.loads(r["parsed_json"]).get("events", [])
+        except (ValueError, AttributeError):
+            continue
+        for i, e in enumerate(events):
             try:
-                events = json.loads(r["parsed_json"]).get("events", [])
-            except (ValueError, AttributeError):
-                continue
-            for i, e in enumerate(events):
-                try:
-                    items.append({"ref": f"event:{r['msg_id']}:{i}", "kind": "event", "ticker": _tick(e["ticker"]),
-                                  "urls": [str(u) for u in e["urls"]], "at": _when(r["received_at"])})
-                except (KeyError, TypeError):
+                urls = [str(u) for u in e["urls"]]
+                if verified_only and not urls:
                     continue
+                items.append({"ref": f"event:{r['msg_id']}:{i}", "kind": "event", "ticker": _tick(e["ticker"]),
+                              "urls": urls, "at": _when(r["received_at"])})
+            except (KeyError, TypeError):
+                continue
     return items
 
 

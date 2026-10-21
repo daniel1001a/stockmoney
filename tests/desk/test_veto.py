@@ -26,9 +26,10 @@ def _flag(con, sym, source, sev="elevated", days_ago=0.0, kind="k", url=""):
                 "VALUES (?,?,?,?,?,?,?,?)", (sym, source, kind, sev, "h", url, "2026-10-19", _iso(days_ago)))
 
 
-def _msg(con, msg_id, typ, body, days_ago=0.0):
-    con.execute("INSERT INTO bridge_messages (msg_id, type, sender, sent_at, received_at, raw_body, parsed_json) "
-                "VALUES (?,?,?,?,?,?,?)", (msg_id, typ, "x", _iso(days_ago), _iso(days_ago), "raw", json.dumps(body)))
+def _msg(con, msg_id, typ, body, days_ago=0.0, source=None):
+    con.execute("INSERT INTO bridge_messages (msg_id, type, sender, sent_at, received_at, raw_body, parsed_json, source) "
+                "VALUES (?,?,?,?,?,?,?,?)",
+                (msg_id, typ, "x", _iso(days_ago), _iso(days_ago), "raw", json.dumps(body), source))
 
 
 def _muse_alert(con, sym="AAPL", sev="elevated", urls=("https://a.example/1",), days_ago=0.0, msg_id="m1"):
@@ -36,9 +37,10 @@ def _muse_alert(con, sym="AAPL", sev="elevated", urls=("https://a.example/1",), 
                                 "observed_at": _iso(days_ago)}, days_ago)
 
 
-def _grok(con, sym="AAPL", sev="elevated", urls=("https://b.example/2",), days_ago=0.0, msg_id="g1"):
+def _grok(con, sym="AAPL", sev="elevated", urls=("https://b.example/2",), days_ago=0.0, msg_id="g1",
+          source="grok_verified"):
     _msg(con, msg_id, "GROK_DAILY", {"events": [{"ticker": sym, "headline": "x", "severity": sev, "confirmed": True,
-                                                  "first_seen": _iso(days_ago), "urls": list(urls)}]}, days_ago)
+                                                  "first_seen": _iso(days_ago), "urls": list(urls)}]}, days_ago, source)
 
 
 def test_two_independent_sources_block_buy(db, make_engine, broker):
