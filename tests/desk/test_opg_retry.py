@@ -150,3 +150,58 @@ def test_muse_flags_are_read_at_postopen_and_block_adding_to_a_held_symbol(desk,
         assert retries(b) == []
         row = plan_status(con, cid)
         assert row["status"] == "submitted" and "Muse critical ALERT" in row["note"]
+
+
+def test_a_broker_read_failure_before_sending_does_not_spend_the_retry(desk, monkeypatch):
+    """Grok review 2026-10-21: an unreachable broker used to record the one
+    attempt although nothing was sent. Now the plan stays a candidate and the
+    next run before the cutoff sends the retry."""
+    from stockmoney.desk.execution.alpaca import BrokerUnavailable
+    b = desk.broker
+    real = b.get_order
+    down = {"on": True}
+
+    def get_order(c):
+        if down["on"] and c.endswith("-rt"):
+            raise BrokerUnavailable("timed out")
+        return real(c)
+    with store.connect(desk.path) as con:
+        cid = opening_short(con, b, desk.limits, 0.4)
+        monkeypatch.setattr(b, "get_order", get_order)
+        out = run.postopen(con, b, POSTOPEN, desk.limits)
+        assert retries(b) == [] and "補單暫緩" in out
+        assert con.execute("SELECT 1 FROM plan_attempts WHERE key LIKE ?", (f"%{cid}",)).fetchone() is None
+        assert plan_status(con, cid)["status"] == "submitted"
+        down["on"] = False
+        run.postopen(con, b, POSTOPEN.replace(minute=55), desk.limits)
+        assert [(o.qty, o.tif) for o in retries(b)] == [(30, TIF.DAY)]
+
+
+def test_a_failed_send_with_an_unreadable_opening_order_does_not_abort_postopen(desk, monkeypatch):
+    """The retry was sent (write-ahead row exists) and failed, then the
+    opening order cannot be read either: the attempt is spent, the plan keeps
+    its status, and postopen still protects the filled shares."""
+    from stockmoney.desk.execution.alpaca import BrokerUnavailable
+    b = desk.broker
+    real_get, real_submit = b.get_order, b.submit
+    state = {"sent": False}
+
+    def submit(intent):
+        if intent.client_order_id.endswith("-rt"):
+            state["sent"] = True
+            raise BrokerUnavailable("submit timed out")
+        return real_submit(intent)
+
+    def get_order(c):
+        if state["sent"] and not c.endswith("-rt"):
+            raise BrokerUnavailable("timed out")
+        return real_get(c)
+    with store.connect(desk.path) as con:
+        cid = opening_short(con, b, desk.limits, 0.4)
+        monkeypatch.setattr(b, "submit", submit)
+        monkeypatch.setattr(b, "get_order", get_order)
+        out = run.postopen(con, b, POSTOPEN, desk.limits)
+        assert state["sent"] and "補單失敗" in out
+        assert con.execute("SELECT 1 FROM plan_attempts WHERE key LIKE ?", (f"%{cid}",)).fetchone() is not None
+        assert plan_status(con, cid)["status"] == "submitted"
+        assert [s.qty for s in stops(b, "AAPL")] == [20]

@@ -1242,8 +1242,20 @@ def _retry_opg_entries(con, broker: Broker, risk: RiskEngine, snap: AccountSnaps
             log.exception("opening retry %s failed", p["client_order_id"])
             con.rollback()
             why = f"開盤單補單失敗:{type(e).__name__}: {e}"
+            if con.execute("SELECT 1 FROM submitted WHERE client_order_id=?",
+                           (f"{p['client_order_id']}-rt",)).fetchone() is None:
+                # nothing was sent (a broker read failed first): the one attempt
+                # is not spent, the next run before the cutoff tries again
+                st.lines.append(f"補單暫緩 {p['symbol']}:{why},下次執行再試")
+                notify.send(f"Desk 補單暫緩 {p['symbol']}", why[:1000], notify.WARN)
+                continue
             con.execute("INSERT OR IGNORE INTO plan_attempts VALUES (?, 1)", (_opg_retry_key(today, p),))
-            _mark(con, p, "submitted" if _filled_any(broker.get_order(p["client_order_id"])) else "error", why)
+            try:
+                filled = _filled_any(broker.get_order(p["client_order_id"]))
+            except Exception:
+                log.exception("opening order %s unreadable after a failed retry", p["client_order_id"])
+                filled = True  # unknown: keep the plan 'submitted' rather than call it an error
+            _mark(con, p, "submitted" if filled else "error", why)
             con.commit()
             st.lines.append(f"補單失敗 {p['symbol']}:{why}")
             notify.send(f"Desk 補單失敗 {p['symbol']}", why[:1000], notify.CRITICAL)
