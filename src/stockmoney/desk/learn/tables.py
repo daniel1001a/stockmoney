@@ -42,6 +42,8 @@ CREATE TABLE IF NOT EXISTS blocked_counterfactual (
 # Columns added after a table first shipped; CREATE TABLE IF NOT EXISTS will not add them.
 ADDED_COLUMNS = {
     "chains": [("invalidations_json", "TEXT DEFAULT '[]'"), ("falsifiable", "INTEGER DEFAULT 0")],
+    # 1 / 0 / NULL (inputs unavailable): Grok and Muse independently named the symbol in the 3 days before entry
+    "trade_postmortem": [("grok_muse_independent_same_symbol", "INTEGER")],
 }
 
 

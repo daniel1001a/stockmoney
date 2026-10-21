@@ -5,7 +5,7 @@ learning tables and a report file. Own lock, own failure handling: a crash
 here is logged and never touches an order or the trading lock.
 
 Steps (each isolated, a failure in one does not stop the others):
-  1. post-mortem cards for closed trades
+  1. post-mortem cards for closed trades, then for closed live option positions
   1b. counterfactual outcomes of blocked stock buys (blocked_counterfactual, read-only log)
   2. advance shadow books
   3. score due event chains, judge due invalidation conditions, label
@@ -33,7 +33,8 @@ import pandas as pd
 from stockmoney.desk import data, notify, store, veto
 from stockmoney.desk.indicators import compute
 from stockmoney.desk.learn import (allocator, calls, chains, corroboration, counterfactual, earnings, filings,
-                                   h_reports, hypotheses, invalidation, links, postmortem, prescreen, shadow, tables)
+                                   h_reports, hypotheses, invalidation, links, options_postmortem, postmortem,
+                                   prescreen, shadow, tables)
 
 log = logging.getLogger(__name__)
 ET = ZoneInfo("America/New_York")
@@ -117,6 +118,10 @@ def run(con, now: datetime, bars: data.Bars | None = None, shadow_start: str | N
     con.commit()
     if pm is not None:
         parts.append(f"驗屍卡:新增 {pm['new']},更新 {pm['updated']}。")
+    opm = guarded("options_postmortem", lambda: options_postmortem.update_option_cards(con))
+    con.commit()
+    if opm is not None:
+        parts.append(f"期權驗屍卡:新增 {opm['new']},更新 {opm['updated']}。")
     cf = guarded("counterfactual", lambda: counterfactual.refresh(con, bars, through))
     con.commit()
     if cf and (cf["added"] or cf["updated"]):
