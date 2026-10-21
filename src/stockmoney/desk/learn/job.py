@@ -157,9 +157,11 @@ def run(con, now: datetime, bars: data.Bars | None = None, shadow_start: str | N
         parts.append(f"來源連結抽查:{lk['checked']} 筆(真實 {lk['ok']}、失效 {lk['dead']}、無法驗證 {lk['unverifiable']})。")
     ps = guarded("prescreen", lambda: prescreen.step(con))
     con.commit()
-    if ps and ps["mode"] != "off" and (ps["judged"] or ps["error"] or ps["deep_done"]):
+    if ps and ps["mode"] != "off" and (ps["judged"] or ps["error"] or ps["deep_done"]
+                                       or ps.get("dup") or ps.get("skipped")):
         parts.append(f"情報預篩({ps['mode']}):判斷 {ps['judged']} 則(通過 {ps['pass']}、保留 {ps['hold']}、"
-                     f"封存 {ps['archive']}),失敗 {ps['error']};深度分析完成 {ps['deep_done']}。")
+                     f"封存 {ps['archive']}),重複沿用 {ps.get('dup', 0)}、略過 {ps.get('skipped', 0)},"
+                     f"失敗 {ps['error']};深度分析完成 {ps['deep_done']}。")
 
     friday = through.weekday() == 4
     hyp_text = guarded("hypotheses", lambda: hypotheses.run(con, day, include_weekly=False)) if friday else None
@@ -182,6 +184,10 @@ def run(con, now: datetime, bars: data.Bars | None = None, shadow_start: str | N
         parts += ["", watch]
     if hyp_text:
         parts += ["", hyp_text]
+    if friday:
+        pw = guarded("prescreen_weekly", lambda: prescreen.weekly_report(con, bars, now))
+        if pw:
+            parts += ["", pw]
     parts += ["", rep, "", guarded("shadow_report", lambda: shadow.report(con)) or "", "",
               guarded("chain_report", lambda: chains.report(con)) or "", "",
               guarded("calls_report", lambda: calls.report(con)) or "", "",
