@@ -95,15 +95,16 @@ def is_echo_subject(subject: str | None) -> bool:
 
 def _validation_reason(e: ValidationError, prefix: str = "") -> str:
     # location + error type only: error text can echo attacker-controlled input.
-    # ``prefix`` (OPTIONS_PLAN) names the model and, for our own validators'
-    # fixed "value_error" messages, appends them so the sender sees WHICH rule.
+    # ``prefix`` (OPTIONS_PLAN) names the model. Our own validators' fixed
+    # "value_error" messages are appended for every type, so the sender sees
+    # WHICH rule (a GROK_DAILY consistency reject was a bare value_error).
     parts = []
     for err in e.errors()[:5]:
         loc = ".".join(str(p) for p in err["loc"])
         if prefix:
             loc = f"{prefix}.{loc or '(plan)'}"
         part = loc + ":" + err["type"]
-        if prefix and err["type"] == "value_error":
+        if err["type"] == "value_error":
             part += " (" + re.sub(r"[^A-Za-z0-9 ._:,()<>=/'\\-]", "", str(err.get("msg", "")).removeprefix("Value error, "))[:140] + ")"
         if err["type"] == "json_invalid":
             # the parser message names the problem and a line/column, not the input

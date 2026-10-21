@@ -192,6 +192,18 @@ def test_longest_grok_fix_text_fits_feedback_limit():
     assert "GROK_DAILY 規則" in muse_ops.fix_for("schema_invalid GROK_DAILY:value_error")
 
 
+def test_grok_consistency_reject_names_the_rule(con):
+    """A model-level ValueError used to be stored as a bare GROK_DAILY:value_error,
+    so neither the sender nor the review could tell which rule failed."""
+    box = FakeMailbox()
+    d = message_for(MON)
+    d["tracked_accounts"] = ["@trader_abc", "@trader_abc"]
+    deliver(box, d)
+    assert poll(con, box, CONFIG, now=at(MON, 7, 45)) == 0
+    reason = con.execute("SELECT reason FROM bridge_rejects").fetchone()[0]
+    assert "value_error (tracked_accounts has duplicates)" in reason
+    assert "GROK_DAILY 規則" in muse_ops.fix_for(reason)
+
 # ---------------------------------------------------------------- evening digest (20:00): stored, never scored
 
 def test_evening_message_same_day_does_not_count_as_the_morning_delivery(con):
