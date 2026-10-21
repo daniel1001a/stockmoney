@@ -1363,9 +1363,12 @@ def _retry_opg_one(con, broker: Broker, risk: RiskEngine, snap: AccountSnapshot,
     if (why := _retry_conflict(con, broker, sym, rcid)):
         return stop_here("blocked", why)
     px = _live_price(broker, sym)
-    qty = rest
+    allowed = p["qty"]
     if px is not None and px > p["ref_price"]:
-        qty = floor(rest * p["ref_price"] / px + 1e-9)  # the premarket scale-down, on the remainder
+        allowed = floor(allowed * p["ref_price"] / px + 1e-9)  # the premarket scale-down, on the whole plan
+    # the opening order was already scaled at premarket: cap what is held plus
+    # the retry at today's allowed size, never rescale the remainder again
+    qty = min(rest, floor(allowed - filled + 1e-9))
     if qty <= 0:
         return stop_here("blocked", f"以即時價 {px:g} 重算後股數為 0")
     intent = OrderIntent(rcid, sym, AssetClass(p["asset_class"]), Side.BUY, qty=qty,

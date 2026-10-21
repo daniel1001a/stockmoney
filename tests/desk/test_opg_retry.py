@@ -21,14 +21,15 @@ def job_clock(monkeypatch):
     monkeypatch.setattr(run, "_sleep", lambda s: None)
 
 
-def opening_short(con, b, limits, ratio, sym="AAPL", qty=50):
+def opening_short(con, b, limits, ratio, sym="AAPL", qty=50, sent=None):
     """Premarket sends the OPG buy; it fills ``ratio`` of the qty, then the
-    broker ends it (expired) with the rest unfilled."""
+    broker ends it (expired) with the rest unfilled. ``sent`` is the OPG size
+    when a live price above ref scales it down."""
     cid = plan(con, sym, qty=qty)
     b.partial_ratio = ratio
     run.premarket(con, b, WED, limits)
     o = b.get_order(cid)
-    assert o.tif == TIF.OPG and o.qty == qty
+    assert o.tif == TIF.OPG and o.qty == (sent if sent is not None else qty)
     b.expire_day_orders()
     b.partial_ratio = None
     return cid
@@ -283,3 +284,20 @@ def test_an_order_still_unreadable_is_left_for_the_next_run(desk, monkeypatch, r
         assert plan_status(con, cid)["status"] == "submitted"
         assert con.execute("SELECT 1 FROM plan_attempts WHERE key LIKE ?", (f"%{cid}",)).fetchone() is None
         assert len(run._opg_unretried(con)) == 1
+
+
+@pytest.mark.parametrize("ratio, px_open, want", [
+    (0.0, 108.0, 92),   # the 92-share OPG is resent whole, not floor(92 * 100/108) = 85
+    (0.5, 108.0, 46),   # 46 of 92 held: the other 46, not 42
+    (0.0, 109.0, 91),   # price rose again: capped at floor(100 * 100/109)
+])
+def test_the_retry_does_not_rescale_an_order_already_scaled_at_premarket(desk, ratio, px_open, want):
+    """Grok review 2026-10-21: the retry applied the ref/price scale-down a
+    second time to a remainder that premarket had already scaled."""
+    b = desk.broker
+    with store.connect(desk.path) as con:
+        b.prices["AAPL"] = 108.0
+        opening_short(con, b, desk.limits, ratio, qty=100, sent=92)
+        b.prices["AAPL"] = px_open
+        run.postopen(con, b, POSTOPEN, desk.limits)
+        assert [o.qty for o in retries(b)] == [want]
