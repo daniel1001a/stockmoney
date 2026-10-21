@@ -141,7 +141,7 @@ def session(cfg: OptionsConfig | None = None, db_path: Path = store.DEFAULT_PATH
             log.info("options session: data budget %d calls/min for low-priority work (Alpaca Basic plan: 200/min "
                      "stocks, 200/min options); stock feed %s; option feed %s", cfg.max_data_calls_per_min,
                      getattr(b, "stock_feed", "unknown"),
-                     getattr(b, "option_feed", None) or "Alpaca default (indicative without an OPRA subscription)")
+                     getattr(b, "option_feed", None) or "unknown")
             con.commit()
             failures = 0
             last_full = None

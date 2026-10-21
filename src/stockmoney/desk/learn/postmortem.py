@@ -44,6 +44,7 @@ from stockmoney.desk.data import Bars
 from stockmoney.desk.indicators import Ind, market_state, sector_ranking
 from stockmoney.desk.learn import corroboration
 from stockmoney.desk.learn.trades import ClosedTrade, _table_exists, closed_trades
+from stockmoney.desk.options.config import FEED_CAVEAT
 from stockmoney.desk.universe import sector_of
 
 WHIPSAW_SESSIONS = 10
@@ -334,7 +335,7 @@ def symptom_report(con, today: str, weeks: int = 4) -> tuple[str, list[str]]:
     hyp = [hypothesis_text(c) for c in candidate_symptoms(stats)]
     if con.execute("SELECT 1 FROM trade_postmortem WHERE trade_id LIKE ? LIMIT 1", (OPTION_PREFIX + "%",)).fetchone():
         ostats = week_stats(con, today, weeks, book="options")
-        lines += ["", "### 期權驗屍卡(實盤紙上)", *_week_lines(ostats)]
+        lines += ["", "### 期權驗屍卡(實盤紙上)", f"> {FEED_CAVEAT}", *_week_lines(ostats)]
         hyp += [hypothesis_text(c) for c in candidate_symptoms(ostats)]
     if hyp:
         lines += ["", "### 候選假設", *[f"- {h}" for h in hyp]]

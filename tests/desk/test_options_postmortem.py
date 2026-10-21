@@ -11,6 +11,7 @@ from stockmoney.desk.execution.ledger import ensure_schema as ledger_schema
 from stockmoney.desk.indicators import compute
 from stockmoney.desk.learn import earnings, options_postmortem as opm, postmortem, tables
 from stockmoney.desk.options import store as ostore
+from stockmoney.desk.options.config import FEED_CAVEAT
 from stockmoney.desk.run import ensure_schema as run_schema
 
 from test_learn import fill, make_bars
@@ -328,3 +329,37 @@ def test_symptom_report_keeps_option_codes_separate(con):
     options = postmortem.week_stats(con, "2026-10-16", 1, book="options")[0]
     assert (stock["n"], dict(stock["cnt"])) == (1, {"S2": 1})
     assert (options["n"], dict(options["cnt"])) == (1, {"O8": 1})
+
+
+def test_symptom_report_option_section_carries_feed_caveat(con):
+    con.execute("INSERT INTO trade_postmortem (trade_id, symbol, strategy, exit_day, pnl, symptoms) "
+                "VALUES ('opt:p0','NVDA','options:grok','2026-10-16',-100,'O0')")
+    text, _ = postmortem.symptom_report(con, "2026-10-16")
+    assert FEED_CAVEAT in text.split("### 期權驗屍卡(實盤紙上)")[1]
+
+
+def test_learn_job_writes_cards_for_a_closed_stock_trade_and_a_closed_option(con, monkeypatch, tmp_path):
+    """Trigger paths: job.run -> guarded("postmortem") -> postmortem.update_cards (flat-to-flat
+    round trips in fills) and guarded("options_postmortem") -> update_option_cards (live EXITED)."""
+    from stockmoney.desk.learn import job, links
+    monkeypatch.setattr(job.notify, "send", lambda *a, **k: True)
+    monkeypatch.setattr(job, "OUT_DIR", tmp_path / "out")
+    monkeypatch.setattr(job.earnings, "refresh", lambda *a, **k: None)
+    monkeypatch.setattr(job.filings, "refresh", lambda *a, **k: None)
+    monkeypatch.setattr(links, "default_fetch", lambda url, timeout=0: (_ for _ in ()).throw(OSError("offline")))
+    bars = make_bars(423)
+    d = bars.dates
+    fill(con, "b1", "AAPL", "buy", 10, 100, f"{d[-30].date()}T14:35:00+00:00")
+    fill(con, "s1", "AAPL", "sell", 10, 95, f"{d[-20].date()}T14:35:00+00:00", pnl=-50)
+    oday = d[-2]
+    oentry = datetime(oday.year, oday.month, oday.day, 14, 0, tzinfo=timezone.utc)
+    opid, ox = pos(con, day=str(oday.date()), entry=oentry)
+    fills(con, opid, ox, entry=oentry)
+    pos(con, setup="s2", mode="shadow", day=str(oday.date()), entry=oentry)  # shadow: never carded
+    now = datetime(d[-1].year, d[-1].month, d[-1].day, 21, 15, tzinfo=timezone.utc)
+    body = job.run(con, now, bars=bars, shadow_start=str(d[-200].date()), with_allocator=False)
+    ids = {r["trade_id"] for r in con.execute("SELECT trade_id FROM trade_postmortem")}
+    assert "opt:" + opid in ids and not any(i.startswith("opt:s2:") for i in ids)
+    assert len([i for i in ids if not i.startswith("opt:")]) == 1  # the AAPL round trip
+    assert "驗屍卡:新增 1" in body and "期權驗屍卡:新增 1" in body
+    assert FEED_CAVEAT in body

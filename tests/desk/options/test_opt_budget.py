@@ -142,7 +142,7 @@ def test_session_logs_budget_and_feeds(tmp_path, monkeypatch, caplog):
 
     def make(c, cfg, clk):
         b = FakeOptionsBroker(clk, {"SPY": orb_breakout_day()})
-        b.stock_feed = "iex"
+        b.stock_feed, b.option_feed = "iex", "indicative"
         return Engine(c, b, cfg, clock=clk, risk_gate=allow_gate(), live=True, notifier=lambda *a: None), "paper"
     with caplog.at_level(logging.INFO, logger="desk.options.run"):
         orun.session(spy_cfg(tmp_path), tmp_path / "d.sqlite", clock=clock, engine_factory=make,

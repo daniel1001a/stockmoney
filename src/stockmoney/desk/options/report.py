@@ -22,8 +22,9 @@ from __future__ import annotations
 import json
 from collections import defaultdict
 
+from stockmoney.desk.options import exit_shadow
 from stockmoney.desk.options import store as ostore
-from stockmoney.desk.options.config import GROK, OptionsConfig
+from stockmoney.desk.options.config import FEED_CAVEAT, GROK, OptionsConfig
 
 CLASS_LABEL = {"index": "指數/槓桿 ETF", "mega_cap": "大型個股", "high_vol": "高波動股"}
 STATE_LABEL = {"WAITING": "等待", "TRIGGERED": "已觸發", "ENTERED": "持倉中", "EXITED": "已出場", "EXPIRED": "未觸發",
@@ -150,7 +151,7 @@ def build(con, day: str, cfg: OptionsConfig | None = None, header: str = "") -> 
     lines = [f"# {day} 期權短打日報", ""]
     if header:
         lines += [header, ""]
-    lines += [DATA_NOTE, ""]
+    lines += [f"> {FEED_CAVEAT}", "", DATA_NOTE, ""]
 
     # ---- overview
     st = defaultdict(int)
@@ -260,6 +261,11 @@ def build(con, day: str, cfg: OptionsConfig | None = None, header: str = "") -> 
         for p, q in pairs:
             lines.append(f"| {p['occ']} | {p['entry_price']:.2f} | {q['entry_price']:.2f} | "
                          f"{p['realized_usd'] - p['fees_usd']:+.0f} | {q['realized_usd'] - q['fees_usd']:+.0f} |")
+
+    # ---- exit chasing: live exits vs the shadow exit rule (read only, live unchanged)
+    ex = exit_shadow.report_lines(exit_shadow.compare(con, live, cfg), FEED_CAVEAT)
+    if ex:
+        lines += ["", *ex[:-1]]
 
     # ---- filtered
     rows = con.execute("SELECT stage, reason, COUNT(*) n FROM options_filtered WHERE day=? GROUP BY stage, reason "
