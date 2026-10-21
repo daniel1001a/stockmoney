@@ -281,19 +281,26 @@ def test_an_order_still_unreadable_is_left_for_the_next_run(desk, monkeypatch):
 
 
 def test_a_missing_opening_order_pages_at_postopen_and_is_settled_after_the_cutoff(desk, monkeypatch):
-    """Grok review 2026-10-21: a 404 (get_order returns None) is a settled
-    answer. At 09:50 it is retried in-run and paged like a failed read; after
-    the cutoff the window is closed with a note, fills left to reconcile."""
+    """Grok review 2026-10-21 (sixth pass): a 404 (get_order returns None) is
+    a settled answer, not a transient read failure. At 09:50 it is paged
+    immediately, with no 20s wait and no "try again" advice, since no rerun
+    will ever send the rest; after the cutoff the window is closed with a
+    note, fills left to reconcile."""
     b = desk.broker
     sent_pages = []
+    sleeps = []
     monkeypatch.setattr(run.notify, "send", lambda subj, body, level=None: sent_pages.append((subj, body)))
+    monkeypatch.setattr(run, "_sleep", lambda s: sleeps.append(s))
     with store.connect(desk.path) as con:
         cid = opening_short(con, b, desk.limits, 0.0)
         run.sync_fills(con, b, run.Ledger(con), "2026-09-09")  # the expiry is recorded, then the order vanishes
         monkeypatch.setattr(b, "get_order", lambda c: None)
         out = run.postopen(con, b, POSTOPEN, desk.limits)
         assert "補單暫緩" in out and "404" in out and retries(b) == []
-        assert any("補單暫緩" in subj and "手動執行 postopen" in body for subj, body in sent_pages)
+        assert sleeps == []  # settled, not transient: no wait, unlike a failed read
+        assert any("查無記錄" in subj and "不會再送出" in body and "持股以對帳為準" in body
+                   for subj, body in sent_pages)
+        assert not any("手動執行 postopen" in body for subj, body in sent_pages)  # a rerun would never help
         assert plan_status(con, cid)["status"] == "submitted" and len(run._opg_unretried(con)) == 1
         lines = run._expire_unretried_opg(con, b, WED.replace(hour=16, minute=45))
         assert len(lines) == 1 and "404" in lines[0]

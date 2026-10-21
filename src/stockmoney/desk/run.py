@@ -108,6 +108,12 @@ _sleep = time.sleep
 _monotonic = time.monotonic
 
 
+class _OpeningOrderGone(Exception):
+    """The opening order is a settled 404, not a transient read failure: no
+    rerun will ever send the remainder, so the retry loop must not wait or
+    tell the owner to try again."""
+
+
 class JobTimeout(BaseException):
     """Raised by the job alarm. A BaseException on purpose: requests/urllib3
     and the broker retry layer only catch Exception, so they cannot turn the
@@ -1296,6 +1302,14 @@ def _retry_opg_entries(con, broker: Broker, risk: RiskEngine, snap: AccountSnaps
             try:
                 _retry_opg_one(con, broker, risk, snap, p, st, bad=bad, flags=flags, et=et, today=today)
                 break
+            except _OpeningOrderGone as e:
+                # settled, not transient: no wait, no "try again" advice, nothing to resend
+                log.exception("opening order %s gone", p["client_order_id"])
+                con.rollback()
+                why = f"{e};不會再送出,持股以對帳為準,{ENTRY_CUTOFF[0]}:{ENTRY_CUTOFF[1]:02d} ET 後標記為 error"
+                st.lines.append(f"補單暫緩 {p['symbol']}:{why}")
+                notify.send(f"Desk 開盤單查無記錄 {p['symbol']}", why[:1000], notify.CRITICAL)
+                break
             except Exception as e:
                 log.exception("opening retry %s failed", p["client_order_id"])
                 con.rollback()
@@ -1336,8 +1350,8 @@ def _retry_opg_one(con, broker: Broker, risk: RiskEngine, snap: AccountSnapshot,
                    bad, flags, et, today) -> None:
     sym, cid = p["symbol"], p["client_order_id"]
     o = broker.get_order(cid)
-    if o is None:  # recorded as ended short, now missing: nothing sent, retried and paged like a failed read
-        raise LookupError(f"開盤單 {cid} 在券商查無記錄(404)")
+    if o is None:  # recorded as ended short, now gone for good: no rerun can ever send the rest
+        raise _OpeningOrderGone(f"開盤單 {cid} 在券商查無記錄(404)")
     if o.tif != TIF.OPG or o.status not in (OrderStatus.EXPIRED, OrderStatus.CANCELED):
         return
     ordered, filled = float(o.qty or 0), float(o.filled_qty or 0)
