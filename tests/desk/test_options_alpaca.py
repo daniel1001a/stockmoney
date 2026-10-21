@@ -249,7 +249,7 @@ def test_option_chain_parses_quotes_greeks_and_open_interest():
     assert got[1].volume == 0  # last traded on an earlier day: no volume today
     assert got[1].open_interest is None  # not in the contracts list
     req = data.requests[0]
-    assert req.underlying_symbol == "SPY" and req.feed is None  # Alpaca picks the feed
+    assert req.underlying_symbol == "SPY" and req.feed == OptionsFeed("indicative")  # explicit default
     assert c.contract_requests[0].underlying_symbols == ["SPY"]
 
 
@@ -330,6 +330,13 @@ def test_option_feed_from_env_and_validation():
     assert b.option_feed == "opra"
     with pytest.raises(ValueError):
         AlpacaBroker(OptClient(), environ={}, option_feed="sip")
+
+
+def test_option_feed_defaults_to_indicative_when_unset(caplog):
+    with caplog.at_level("INFO", logger="stockmoney.desk.execution.alpaca"):
+        b = AlpacaBroker(OptClient(), environ={}, option_data_client=OptData())
+    assert b.option_feed == "indicative"
+    assert "using indicative" in caplog.text
 
 
 def test_option_minute_bars():
