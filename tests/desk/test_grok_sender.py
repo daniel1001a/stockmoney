@@ -588,3 +588,40 @@ def test_grok_today_delivered_and_missed_counts_rejects(con):
     _deliver_at(con, wed(8, 0))
     st = muse_ops.grok_today(con, wed(8, 45))
     assert st["status"] == "delivered" and st["events"] == 1
+
+
+def test_a_failed_insert_with_the_same_urls_and_second_does_not_own_the_chain(con, monkeypatch):
+    """Grok review 2026-10-21: replaying received time and urls cannot tell a
+    failed verified insert from the legacy copy that won when both match."""
+    from stockmoney.desk.learn import chains, tables
+    tables.ensure_schema(con)
+    box = FakeMailbox()
+    send(box, grok_daily("grok-20261012-0737"))  # verified, first
+    send(box, grok_daily("grok-20261012-0738"), auth="")  # legacy, same trigger and urls
+    inbox.poll(con, box, CONFIG, now=NOW)
+    con.execute("UPDATE bridge_messages SET received_at=?", (NOW.isoformat(),))  # same second
+    real, calls = chains.add_chain, {"n": 0}
+
+    def add_chain(c, chain, created_at=None):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("database is locked")
+        return real(c, chain, created_at)
+    monkeypatch.setattr(chains, "add_chain", add_chain)
+    assert chains.ingest_grok(con) == {"added": 1, "skipped": 1}
+    owner = next(iter(chains.grok_chain_owners(con).values()))
+    assert owner["msg_id"] == "grok-20261012-0738"
+    assert [i for i in corroboration._grok_items(con, verified_only=True) if i["kind"] == "chain"] == []
+
+
+def test_a_chain_without_a_recorded_owner_is_not_verified(con):
+    from stockmoney.desk.learn import chains, tables
+    tables.ensure_schema(con)
+    box = FakeMailbox()
+    send(box, grok_daily("grok-20261012-0737"))
+    inbox.poll(con, box, CONFIG, now=NOW)
+    chains.ingest_grok(con)
+    assert [i for i in corroboration._grok_items(con, verified_only=True) if i["kind"] == "chain"]
+    con.execute("DELETE FROM chain_owners")  # as if ingested before chain_owners existed
+    assert chains.grok_chain_owners(con) == {}
+    assert [i for i in corroboration._grok_items(con, verified_only=True) if i["kind"] == "chain"] == []

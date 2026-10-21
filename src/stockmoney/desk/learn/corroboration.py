@@ -95,9 +95,9 @@ def _grok_items(con, verified_only: bool = False) -> list[dict]:
 
     ``verified_only``: keep only items from grok_verified GROK_DAILY messages
     (Grok's own address, token and DKIM) that cite at least one URL. A chain
-    row is credited to the message that actually wrote it
-    (chains.grok_chain_owners, the same order ingest_grok uses), so another
-    message with the same trigger in the same second cannot vouch for it.
+    row is credited to the message whose insert wrote it (chain_owners,
+    recorded by ingest_grok), so another message with the same trigger in the
+    same second cannot vouch for it.
     grok_legacy items are dropped."""
     from stockmoney.desk.bridge.inbox import SOURCE_GROK_VERIFIED, has_source_column, source_of
     from stockmoney.desk.learn.chains import grok_chain_owners

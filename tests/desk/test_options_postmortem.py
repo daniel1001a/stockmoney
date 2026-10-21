@@ -249,12 +249,14 @@ def test_o0_only_for_unexplained_losses(con):
 
 def _grok_chain(con, cid, ticker, at, url, source="grok_verified"):
     """A Grok chain plus the GROK_DAILY it came in (received at the chain's created_at),
-    stored under the id ingest_grok would give it."""
+    stored under the id and owner ingest_grok would give it."""
     trigger = f"trigger {cid}"
     con.execute("INSERT INTO chains (chain_id, created_at, source, trigger_text, urls_json, impacts_json) "
                 "VALUES (?,?,?,?,?,?)",
                 (chains.chain_id("grok", trigger, at), ostore.iso(at), "grok", trigger, json.dumps([url]),
                  json.dumps([{"ticker": ticker}])))
+    con.execute("INSERT INTO chain_owners (chain_id, msg_id) VALUES (?,?)",
+                (chains.chain_id("grok", trigger, at), f"grok-{cid}"))
     _bridge(con, f"grok-{cid}", "GROK_DAILY", at,
             {"type": "GROK_DAILY", "events": [], "chains": [
                 {"trigger": trigger, "urls": [url], "steps": ["s"], "confidence": 0.5,

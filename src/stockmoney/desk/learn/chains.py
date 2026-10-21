@@ -153,37 +153,26 @@ def ingest_grok(con) -> dict:
             continue
         try:
             before = con.total_changes
-            add_chain(con, chain, datetime.fromisoformat(r["received_at"]))
-            added += con.total_changes > before
+            cid = add_chain(con, chain, datetime.fromisoformat(r["received_at"]))
+            if con.total_changes > before:
+                # the message whose insert actually wrote the row owns it
+                con.execute("INSERT OR REPLACE INTO chain_owners (chain_id, msg_id) VALUES (?,?)", (cid, r["msg_id"]))
+                added += 1
         except Exception:
             skipped += 1
     return {"added": added, "skipped": skipped}
 
 
 def grok_chain_owners(con) -> dict[str, object]:
-    """chain_id -> the bridge_messages row whose chain is the one stored under
-    that id: the first valid message in ``ingest_grok`` order whose received
-    time and urls match the stored row. A message whose insert failed, so a
-    later same-day copy of the trigger was stored instead, is not the owner.
-    Read-only."""
-    stored = {}
-    for c, at, urls in con.execute("SELECT chain_id, created_at, urls_json FROM chains"):
-        try:
-            stored[c] = (datetime.fromisoformat(at).astimezone(timezone.utc), json.loads(urls or "[]"))
-        except (TypeError, ValueError):
-            continue
-    owners: dict[str, object] = {}
-    for r, chain in _grok_chains(con):
-        if chain is None:
-            continue
-        try:
-            created = datetime.fromisoformat(r["received_at"]).astimezone(timezone.utc)
-        except ValueError:
-            continue
-        cid = chain_id(chain.source, chain.trigger, created)
-        if cid not in owners and stored.get(cid) == (created, list(chain.urls)):
-            owners[cid] = r
-    return owners
+    """chain_id -> the bridge_messages row recorded by ``ingest_grok`` as the
+    one whose insert wrote the chain. A message whose insert failed, or that
+    found the id already taken, is never the owner, whatever its urls. A chain
+    with no recorded owner (ingested before chain_owners existed) has none, so
+    it is never treated as verified. Read-only."""
+    if con.execute("SELECT 1 FROM sqlite_master WHERE name='chain_owners'").fetchone() is None:
+        return {}
+    rows = {r["msg_id"]: r for r, _ in _grok_chains(con)}
+    return {cid: rows[m] for cid, m in con.execute("SELECT chain_id, msg_id FROM chain_owners") if m in rows}
 
 
 def chain_id(source: str, trigger: str, created_at: datetime) -> str:

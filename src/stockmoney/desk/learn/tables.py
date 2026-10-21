@@ -13,6 +13,8 @@ CREATE TABLE IF NOT EXISTS chains (
   chain_id TEXT PRIMARY KEY, created_at TEXT, source TEXT, trigger_text TEXT, urls_json TEXT,
   steps_json TEXT, impacts_json TEXT, checkpoints_json TEXT, confidence REAL,
   invalidations_json TEXT DEFAULT '[]', falsifiable INTEGER DEFAULT 0);
+CREATE TABLE IF NOT EXISTS chain_owners (
+  chain_id TEXT PRIMARY KEY, msg_id TEXT);
 CREATE TABLE IF NOT EXISTS chain_scores (
   chain_id TEXT, ticker TEXT, horizon INTEGER, declared INTEGER, direction TEXT, base_date TEXT,
   scored_date TEXT, excess_ret REAL, hit INTEGER, confidence REAL, scored_at TEXT,
