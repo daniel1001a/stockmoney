@@ -16,6 +16,13 @@ Convention (same as the shadow books, broker.Account.process_open):
 Fields stay NULL until enough bars exist: status 'pending' (< 5 sessions after
 entry), 'partial' (5..19), 'done' (20).
 
+legacy_only: since the Muse downgrade (2026-10-21) premarket also logs buys
+it let through that the old Muse rule would have blocked
+(``policy.record_legacy``). Those rows get legacy_only=1 and are reported in
+their own groups, so the old rule's blocks can be scored against what the new
+rule did. A logged buy that was blocked anyway (for example by veto.check) is
+already a blocked row and is not counted twice.
+
 first_block: repeated ALERT blocks of one event span several plans. A block is
 a repeat when the same symbol was blocked at most FLAG_DAYS calendar days
 earlier (chained), so a run of daily re-blocks counts as one event.
@@ -40,7 +47,7 @@ _CLASS_LABEL = {"muse_alert": "Muse ALERT", "muse_risk_flags": "Muse 風險旗�
                 "muse_other": "Muse 其他", "other": "非 Muse(對帳/風控/掛單衝突等)"}
 COLS = ("client_order_id", "plan_date", "symbol", "strategy", "block_class", "severity", "note", "ref_price",
         "stop", "entry_day", "entry_px", "ret_5", "ret_20", "excess_5", "excess_20", "stop_ret_5", "stop_ret_20",
-        "stop_hit", "first_block", "status", "updated_at")
+        "stop_hit", "first_block", "legacy_only", "status", "updated_at")
 
 
 def classify(note: str | None) -> tuple[str, str | None]:
@@ -135,7 +142,18 @@ def refresh(con, bars: Bars, through: pd.Timestamp) -> dict:
     rows = con.execute("SELECT client_order_id, plan_date, symbol, strategy, stop, ref_price, note "
                        "FROM planned_orders WHERE status='blocked' AND side='buy' AND asset_class='us_equity'"
                        ).fetchall()
-    first = _first_blocks(rows)
+    from stockmoney.desk.bridge.policy import legacy_rows
+    blocked_ids = {r["client_order_id"] for r in rows}
+    plans = {r["client_order_id"]: r for r in con.execute(
+        "SELECT client_order_id, strategy, stop, ref_price FROM planned_orders").fetchall()}
+    legacy = [{"client_order_id": r["client_order_id"], "plan_date": r["plan_date"], "symbol": r["symbol"],
+               "strategy": plans[r["client_order_id"]]["strategy"], "stop": plans[r["client_order_id"]]["stop"],
+               "ref_price": plans[r["client_order_id"]]["ref_price"], "note": r["reason"], "legacy_only": 1}
+              for r in legacy_rows(con)
+              if r["client_order_id"] not in blocked_ids and r["client_order_id"] in plans]
+    rows = [{**dict(r), "legacy_only": 0} for r in rows]
+    first = {**_first_blocks(rows), **_first_blocks(legacy)}
+    rows = rows + legacy
     have = {r["client_order_id"]: tuple(r[c] for c in COLS[:-1])
             for r in con.execute("SELECT * FROM blocked_counterfactual").fetchall()}
     added = updated = 0
@@ -145,7 +163,7 @@ def refresh(con, bars: Bars, through: pd.Timestamp) -> dict:
         o = outcome(bars, r["symbol"], r["plan_date"], _num(r["stop"]))
         rec = {"client_order_id": cid, "plan_date": r["plan_date"], "symbol": r["symbol"], "strategy": r["strategy"],
                "block_class": block_class, "severity": severity, "note": r["note"], "ref_price": r["ref_price"],
-               "stop": r["stop"], **o, "first_block": first[cid]}
+               "stop": r["stop"], **o, "first_block": first[cid], "legacy_only": r["legacy_only"]}
         vals = tuple(rec[c] for c in COLS[:-1])
         if have.get(cid) == vals:
             continue
@@ -171,7 +189,8 @@ def report(con) -> str:
                     "平均值只用每個事件的第一次擋單計算(同一標的 3 天內重複擋單算同一事件)。"
                     "停損報酬假設計畫停損價被執行。這些都不是實際成交。", ""]
     df["group"] = df.apply(lambda r: f"{_CLASS_LABEL.get(r.block_class, r.block_class)}"
-                                     + (f" {r.severity}" if r.block_class == "muse_alert" and r.severity else ""),
+                                     + (f" {r.severity}" if r.block_class == "muse_alert" and r.severity else "")
+                                     + ("(舊規則會擋,新規則放行)" if r.get("legacy_only") == 1 else ""),
                            axis=1)
     for g, d in df.groupby("group", sort=True):
         ev = d[d.first_block == 1]

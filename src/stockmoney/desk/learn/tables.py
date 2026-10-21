@@ -44,6 +44,8 @@ ADDED_COLUMNS = {
     "chains": [("invalidations_json", "TEXT DEFAULT '[]'"), ("falsifiable", "INTEGER DEFAULT 0")],
     # 1 / 0 / NULL (inputs unavailable): Grok and Muse independently named the symbol in the 3 days before entry
     "trade_postmortem": [("grok_muse_independent_same_symbol", "INTEGER")],
+    # 1: the stock buy was not blocked; only the pre-2026-10-21 Muse rule would have blocked it
+    "blocked_counterfactual": [("legacy_only", "INTEGER DEFAULT 0")],
 }
 
 

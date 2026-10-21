@@ -170,3 +170,39 @@ def test_blocking_code_does_not_import_counterfactual():
     code = ("import sys; import stockmoney.desk.bridge.policy, stockmoney.desk.run; "
             "assert 'stockmoney.desk.learn.counterfactual' not in sys.modules")
     subprocess.run([sys.executable, "-c", code], check=True, env={**os.environ, "PYTHONPATH": "src"})
+
+
+def test_legacy_only_rows_from_the_muse_downgrade(con):
+    """A buy the new Muse rule let through but the old rule would have blocked
+    is logged with legacy_only=1 and its own report group; a logged buy that
+    was blocked anyway (e.g. by veto) is counted once, as a real block."""
+    from datetime import datetime, timezone
+    from stockmoney.desk.bridge import policy
+    bars = make_bars()
+    at = datetime(2026, 10, 2, 12, tzinfo=timezone.utc)
+    block(con, "passed", "2026-10-01", note=None)
+    con.execute("UPDATE planned_orders SET status='submitted' WHERE client_order_id='passed'")
+    policy.record_legacy(con, "passed", "2026-10-01", "AAPL", "Muse ALERT elevated: x", at)
+    block(con, "vetoed", "2026-10-01", sym="MSFT", note="research veto: muse + filings")
+    policy.record_legacy(con, "vetoed", "2026-10-01", "MSFT", "Muse ALERT elevated: y", at)
+    assert cf.refresh(con, bars, bars.dates[-1]) == {"added": 2, "updated": 0, "rows": 2}
+    got = {r["client_order_id"]: r for r in con.execute("SELECT * FROM blocked_counterfactual").fetchall()}
+    assert got["passed"]["legacy_only"] == 1 and got["passed"]["block_class"] == "muse_alert"
+    assert got["passed"]["severity"] == "elevated" and got["passed"]["ret_20"] is not None
+    assert got["vetoed"]["legacy_only"] == 0
+    assert cf.refresh(con, bars, bars.dates[-1])["added"] == 0  # idempotent
+    text = cf.report(con)
+    assert any("Muse ALERT elevated(舊規則會擋,新規則放行)" in l for l in text.splitlines())
+
+
+def test_old_tables_get_the_legacy_only_column(tmp_path):
+    import sqlite3
+    p = tmp_path / "old.sqlite"
+    c = sqlite3.connect(p)
+    c.execute("CREATE TABLE blocked_counterfactual (client_order_id TEXT PRIMARY KEY, status TEXT)")
+    c.commit()
+    c.close()
+    with store.connect(p) as c:
+        tables.ensure_schema(c)
+        cols = {r[1] for r in c.execute("PRAGMA table_info(blocked_counterfactual)").fetchall()}
+    assert "legacy_only" in cols

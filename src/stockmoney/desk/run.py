@@ -1075,6 +1075,10 @@ def _premarket_one(con, broker: Broker, risk: RiskEngine, ledger: Ledger, snap: 
             _mark(con, p, "blocked", flags.blocked[sym])
             st.lines.append(f"擋下 {sym}:{flags.blocked[sym]}")
             return
+        if sym in flags.legacy_blocked:  # log only: the old Muse rule would have blocked it
+            from stockmoney.desk.bridge.policy import record_legacy
+            record_legacy(con, cid, p["plan_date"], sym, flags.legacy_blocked[sym], et)
+            st.lines.append(f"Muse 降權放行 {sym}(舊規則會擋):{flags.legacy_blocked[sym]}")
         if (why := _order_conflict(con, broker, sym, cid)):
             _mark(con, p, "blocked", why)
             st.lines.append(f"擋下 {sym}:{why}")

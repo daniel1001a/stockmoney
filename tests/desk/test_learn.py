@@ -329,6 +329,32 @@ def test_shadow_step_runs_the_earnings_guarded_book(con):
     shadow.step(con, bars, ind, d[300], start=str(d[280].date()))
     assert "shadow:combined_earn7" in store.load_accounts(con)
 
+    assert "shadow:combined_muse_strict" in store.load_accounts(con)
+
+
+def test_muse_strict_book_applies_the_old_rule_point_in_time(con):
+    """shadow:combined_muse_strict (Muse downgrade control, 2026-10-21): an
+    info ALERT blocks entries only from the premarket after it was received,
+    for FLAG_DAYS; without a connection nothing is blocked."""
+    from stockmoney.desk.bridge import inbox
+    from stockmoney.desk.bridge.mailbox import BridgeConfig, FakeMailbox
+    from stockmoney.desk.bridge.outbox import build_subject
+    cfg = BridgeConfig(desk_address="desk@example.com", muse_address="muse@example.com", shared_token="t" * 32)
+    box = FakeMailbox()
+    got = datetime(2026, 10, 12, 18, tzinfo=timezone.utc)  # Mon 14:00 ET
+    body = ('{"msg_id":"alert0001","sent_at":"%s","type":"ALERT","ticker":"NVDA","severity":"info",'
+            '"headline":"probe","source_urls":["https://example.com/x"],"observed_at":"%s"}'
+            % (got.isoformat(), got.isoformat()))
+    box.inject("muse@example.com", build_subject("ALERT", "alert0001", cfg.shared_token), body)
+    inbox.poll(con, box, cfg, now=got)
+    blocked = shadow.muse_legacy_fn(con)
+    assert not blocked("NVDA", pd.Timestamp("2026-10-09"))  # decided before the message arrived
+    assert blocked("NVDA", pd.Timestamp("2026-10-12")) and blocked("nvda", pd.Timestamp("2026-10-13"))
+    assert not blocked("AAPL", pd.Timestamp("2026-10-12"))
+    assert not blocked("NVDA", pd.Timestamp("2026-10-16"))  # older than FLAG_DAYS at that premarket
+    assert not shadow.muse_legacy_fn(None)("NVDA", pd.Timestamp("2026-10-12"))
+
+
 
 # ------------------------------------------------------------------ console views
 from stockmoney.desk.learn import views

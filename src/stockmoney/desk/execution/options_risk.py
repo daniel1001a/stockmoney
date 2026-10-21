@@ -395,13 +395,15 @@ def options_mismatches(book: OptionsBook | sqlite3.Connection, snapshot: Account
 def muse_blocked(con, now: datetime) -> dict[str, str]:
     """Underlyings Muse flags in force at ``now`` block option entries. Every
     ticker counts as a candidate for this sleeve (nothing is "held" here), so
-    any ALERT or research risk flag on the underlying blocks. Like the stock
+    any ALERT or research risk flag on the underlying blocks: the 2026-10-21
+    Muse downgrade covers stock entries only, so this sleeve keeps the
+    pre-downgrade rule (``legacy_blocked``). Like the stock
     premarket, a failure to read the flags is logged and loses the veto; it
     does not stop trading."""
     try:
         from stockmoney.desk.bridge.policy import active_flags
         f = active_flags(con, now, ())
-        return {**f.no_add, **f.blocked}
+        return {**f.no_add, **f.legacy_blocked, **f.blocked}
     except Exception as e:
         log.warning("Muse flags unavailable for the options sleeve: %s", e)
         return {}
