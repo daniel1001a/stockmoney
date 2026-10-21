@@ -127,3 +127,24 @@ def test_schedule_hook_is_opt_in():
     assert ds.DEFAULT_JOBS == ["premarket", "postopen", "postclose", "recover", "learn"]
     sh = (ROOT / "scripts/desk_job.sh").read_text()
     assert "stockmoney.desk.options.run session" in sh and 'stockmoney.desk.run "$1"' in sh
+
+
+def test_intraday_shadow_schedule_hook():
+    """Step 7c: the intraday shadow tick is opt-in, 09:45-15:55 ET every 10 minutes on
+    weekdays, and dispatches to the shadow-only module (no order path)."""
+    sys.path.insert(0, str(ROOT / "scripts"))
+    try:
+        import desk_schedule as ds
+    finally:
+        sys.path.pop(0)
+    spec = ds.JOBS["intraday_shadow"]
+    assert spec["weekdays"] is True
+    assert "intraday_shadow" not in ds.DEFAULT_JOBS
+    times = spec["times"]
+    assert times[0] == (9, 45) and times[-1] == (15, 55)
+    assert len(times) == 38
+    assert all(0 <= h < 24 and m in (45, 55, 5, 15, 25, 35) for h, m in times)
+    p = ds.plist("intraday_shadow", spec)
+    assert len(p["StartCalendarInterval"]) == 38 * 5  # 38 slots x Mon-Fri
+    sh = (ROOT / "scripts/desk_job.sh").read_text()
+    assert "stockmoney.desk.intraday tick" in sh

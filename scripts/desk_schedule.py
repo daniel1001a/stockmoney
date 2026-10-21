@@ -20,6 +20,22 @@ ROOT = Path(__file__).resolve().parents[1]
 LABEL = "com.stockmoney.desk.{}"
 WEEKDAYS = range(1, 6)  # launchd: 1=Mon .. 5=Fri
 
+
+def _ten_min_slots(start: tuple[int, int], end: tuple[int, int]) -> list[tuple[int, int]]:
+    """(hour, minute) every 10 minutes from start to end, inclusive of both ends."""
+    out = []
+    h, m = start
+    while (h, m) <= end:
+        out.append((h, m))
+        m += 10
+        if m >= 60:
+            m -= 60
+            h += 1
+    return out
+
+
+_TEN_MIN_SLOTS = _ten_min_slots((9, 45), (15, 55))
+
 JOBS = {
     "premarket": {"times": [(8, 45)], "weekdays": True},   # read Muse, submit market-on-open orders
     "postopen": {"times": [(9, 50)], "weekdays": True},    # sync fills, place protective stops
@@ -34,6 +50,13 @@ JOBS = {
     # options leftover cleanup at every load: sells a paper option position a dead session left
     # open (only while the market is open), pages unknown broker option positions
     "options-recover": {"run_at_load": True},
+    # intraday shadow of the daily setups (stockmoney.desk.intraday): SHADOW ONLY, no
+    # order path exists in that module. Every 10 minutes 09:45-15:55 ET; `tick` refuses
+    # outside the regular session and has its own TICK_TIMEOUT_S alarm, so a hung run
+    # never overlaps the next one. Writes only intraday_shadow; no lock file is taken
+    # (sqlite busy_timeout handles the shared desk.sqlite), so it never contends with
+    # run.lock or options.lock.
+    "intraday_shadow": {"times": _TEN_MIN_SLOTS, "weekdays": True},
 }
 
 
