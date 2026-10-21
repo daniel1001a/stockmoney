@@ -18,7 +18,10 @@ Flow of one stock trade:
                  over every other held symbol, then entries
   postopen       an exit premarket had to defer (stop cancel not confirmed)
                  is sent as a DAY market sell; an opening sell that ended
-                 unfilled gets its stop back and is re-planned for the next run
+                 unfilled gets its stop back and is re-planned for the next run; an opening
+                 buy that ended short (expired/cancelled, filled < qty) gets
+                 one DAY market buy for the missing shares, through the same
+                 risk checks, before 10:30 ET only
 The broker holds the truth. A reconcile mismatch halts new entries and pages
 the owner; exits and protective stops keep running for every symbol that still
 reconciles (a mismatched symbol is left alone for a human, and its exit stays
@@ -1201,11 +1204,128 @@ def _protect_late_fills(con, broker: Broker, ledger: Ledger, risk: RiskEngine, c
         return [f"盤中進場停損單失敗:{type(e).__name__}: {e}"]
 
 
-def postopen(con, broker: Broker, now: datetime, limits: Limits | None = None) -> str:
+def _opg_retry_key(today: str, p) -> str:
+    return f"{today}:opgretry:{p['client_order_id']}"
+
+
+def _opg_retry_candidates(con, today: str) -> list:
+    """Today's entry plans whose opening order ended (expired or cancelled)
+    and that were not retried yet. The broker order then says whether any
+    shares are missing."""
+    rows = con.execute(
+        "SELECT p.*, s.submitted_at AS s_at FROM planned_orders p JOIN submitted s "
+        "ON s.client_order_id=p.client_order_id WHERE p.side='buy' AND p.status='submitted' "
+        "AND s.kind='entry' AND s.recorded=1 AND s.status IN (?, ?) ORDER BY p.client_order_id",
+        (OrderStatus.EXPIRED.value, OrderStatus.CANCELED.value)).fetchall()
+    return [r for r in rows if _today(datetime.fromisoformat(r["s_at"])) == today
+            and con.execute("SELECT 1 FROM plan_attempts WHERE key=?", (_opg_retry_key(today, r),)).fetchone() is None]
+
+
+def _retry_opg_entries(con, broker: Broker, risk: RiskEngine, snap: AccountSnapshot, plans, st: _Run, *,
+                       bad, flags, et, today) -> None:
+    """An opening (OPG) entry that ended with fewer shares than ordered gets
+    exactly one DAY market order for the missing shares, through the same
+    risk path as premarket (RiskEngine.check with the live price, bridge
+    flags as of now, reconcile state, order conflicts). Never after
+    ENTRY_CUTOFF, never for the part already filled, never twice for one
+    plan: the attempt is recorded in plan_attempts before anything is sent,
+    and the retry id ``<cid>-rt`` is checked at the broker. The price band
+    and every limit are the ones premarket uses; nothing is widened."""
+    for p in plans:
+        try:
+            _retry_opg_one(con, broker, risk, snap, p, st, bad=bad, flags=flags, et=et, today=today)
+        except Exception as e:
+            log.exception("opening retry %s failed", p["client_order_id"])
+            con.rollback()
+            why = f"開盤單補單失敗:{type(e).__name__}: {e}"
+            con.execute("INSERT OR IGNORE INTO plan_attempts VALUES (?, 1)", (_opg_retry_key(today, p),))
+            _mark(con, p, "submitted" if _filled_any(broker.get_order(p["client_order_id"])) else "error", why)
+            con.commit()
+            st.lines.append(f"補單失敗 {p['symbol']}:{why}")
+            notify.send(f"Desk 補單失敗 {p['symbol']}", why[:1000], notify.CRITICAL)
+    con.commit()
+
+
+def _retry_opg_one(con, broker: Broker, risk: RiskEngine, snap: AccountSnapshot, p, st: _Run, *,
+                   bad, flags, et, today) -> None:
+    sym, cid = p["symbol"], p["client_order_id"]
+    o = broker.get_order(cid)
+    if o is None or o.tif != TIF.OPG or o.status not in (OrderStatus.EXPIRED, OrderStatus.CANCELED):
+        return
+    ordered, filled = float(o.qty or 0), float(o.filled_qty or 0)
+    rest = floor(ordered - filled + 1e-9)  # only the missing shares, never the filled part
+    if rest <= 0:
+        return
+    rcid = f"{cid}-rt"
+    # one attempt per plan, whatever its outcome; committed with the write-ahead row below
+    con.execute("INSERT OR IGNORE INTO plan_attempts VALUES (?, 1)", (_opg_retry_key(today, p),))
+    prior = con.execute("SELECT status FROM submitted WHERE client_order_id=?", (rcid,)).fetchone()
+    if (prior and prior["status"] not in (PENDING_SUBMIT, NOT_SENT)) or broker.get_order(rcid) is not None:
+        con.commit()
+        return
+    head = f"開盤單 {cid} 結束為 {o.status.value},已成交 {filled:g}/{ordered:g}"
+
+    def stop_here(status: str, why: str) -> None:
+        # a partly filled plan stays 'submitted' (shares are held); a plan with
+        # nothing bought takes the status premarket would have given it
+        _mark(con, p, "submitted" if filled > 0 else status, f"{head},未補單:{why}")
+        st.lines.append(f"{sym} 開盤單未全數成交({filled:g}/{ordered:g}),未補單:{why}")
+        con.commit()
+
+    c = st.clock(et)
+    if (c.hour, c.minute) >= ENTRY_CUTOFF:
+        return stop_here("expired", f"超過補單時間窗(執行於 {c:%H:%M} ET,超過 10:30),剩餘 {rest} 股作廢")
+    if bad:
+        return stop_here("blocked", "對帳不一致,暫停新進場")
+    if sym in flags.blocked:
+        return stop_here("blocked", flags.blocked[sym])
+    if sym in flags.no_add:
+        return stop_here("blocked", flags.no_add[sym])
+    if (why := _retry_conflict(con, broker, sym, rcid)):
+        return stop_here("blocked", why)
+    px = _live_price(broker, sym)
+    qty = rest
+    if px is not None and px > p["ref_price"]:
+        qty = floor(rest * p["ref_price"] / px + 1e-9)  # the premarket scale-down, on the remainder
+    if qty <= 0:
+        return stop_here("blocked", f"以即時價 {px:g} 重算後股數為 0")
+    intent = OrderIntent(rcid, sym, AssetClass(p["asset_class"]), Side.BUY, qty=qty,
+                         order_type=OrderType.MARKET, tif=TIF.DAY, strategy=p["strategy"], reason=p["reason"])
+    d = risk.check(intent, snap, ref_price=p["ref_price"], orders_this_run=st.n, market_price=px)
+    if not d.allow:
+        return stop_here("blocked", f"風控擋下:{d.reason}")
+    note = d.reason if px is not None else f"{d.reason}(無即時報價,只以前收盤價檢查)"
+    _submit(con, broker, d.intent, "entry", p["stop"], plan=p,
+            note=f"{head},盤中市價補單 {rcid} {d.intent.qty:g} 股:{note}")
+    risk.reserve(d.intent, px if px is not None else p["ref_price"])
+    st.n += 1
+    st.sent.append(rcid)
+    st.lines.append(f"補買 {sym} {d.intent.qty:g} 股(盤中市價,開盤單成交 {filled:g}/{ordered:g})")
+
+
+def _retry_conflict(con, broker: Broker, sym: str, rcid: str) -> str | None:
+    """_order_conflict for a retry, except that the symbol's own protective
+    stop (placed for the shares the opening order did buy) is not a
+    competing entry."""
+    r = con.execute("SELECT client_order_id FROM submitted WHERE symbol=? AND recorded=0 AND client_order_id<>? "
+                    "AND kind<>'stop'", (sym, rcid)).fetchone()
+    if r:
+        return f"已有未入帳的 {sym} 委託 {r[0]}"
+    for o in broker.open_orders():
+        if norm(o.symbol) != norm(sym) or o.client_order_id == rcid:
+            continue
+        if o.side == Side.SELL and o.order_type in (OrderType.STOP, OrderType.STOP_LIMIT):
+            continue
+        return f"券商已有 {sym} 的未完成委託 {o.client_order_id}"
+    return None
+
+
+def postopen(con, broker: Broker, now: datetime, limits: Limits | None = None, mailbox=None) -> str:
     """Sync fills, send any exit that premarket had to leave planned (an
     unconfirmed stop cancel, a mismatch since cleared, a missed premarket) as
-    a DAY market sell while the market is open, then the stop pass and the
-    orphan sweep."""
+    a DAY market sell while the market is open, give an opening entry that
+    ended short one DAY market order for the missing shares (see
+    _retry_opg_entries), then the stop pass and the orphan sweep."""
     ensure_schema(con)
     broker = stock_only(broker)
     st = _Run(job="postopen", late=True)
@@ -1232,6 +1352,13 @@ def postopen(con, broker: Broker, now: datetime, limits: Limits | None = None) -
         events += st.lines
     elif sells:
         events.append("市場未開,出場計畫留待下一次執行:" + "、".join(r["symbol"] for r in sells))
+    retries = _opg_retry_candidates(con, today)
+    if retries and broker.is_equity_market_open():
+        flags = _bridge_flags(con, ledger, now, mailbox)  # Muse flags as of now, not as of premarket
+        n_lines = len(st.lines)
+        _retry_opg_entries(con, broker, risk, snap, retries, st, bad=bad, flags=flags,
+                           et=now.astimezone(ET), today=today)
+        events += st.lines[n_lines:]
     events += _premarket_stops(con, broker, risk, today, bad, st)
     if st.sent:
         events += _protect_late_fills(con, broker, ledger, risk, st.sent, today)
