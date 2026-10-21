@@ -9,7 +9,7 @@ from stockmoney.desk import store
 from stockmoney.desk.bridge import inbox
 from stockmoney.desk.execution.ledger import ensure_schema as ledger_schema
 from stockmoney.desk.indicators import compute
-from stockmoney.desk.learn import earnings, options_postmortem as opm, postmortem, tables
+from stockmoney.desk.learn import chains, earnings, options_postmortem as opm, postmortem, tables
 from stockmoney.desk.options import store as ostore
 from stockmoney.desk.options.config import FEED_CAVEAT
 from stockmoney.desk.run import ensure_schema as run_schema
@@ -248,12 +248,17 @@ def test_o0_only_for_unexplained_losses(con):
 # grok_muse_independent_same_symbol ------------------------------------------------------------
 
 def _grok_chain(con, cid, ticker, at, url, source="grok_verified"):
-    """A Grok chain plus the GROK_DAILY it came in (received at the chain's created_at)."""
+    """A Grok chain plus the GROK_DAILY it came in (received at the chain's created_at),
+    stored under the id ingest_grok would give it."""
+    trigger = f"trigger {cid}"
     con.execute("INSERT INTO chains (chain_id, created_at, source, trigger_text, urls_json, impacts_json) "
                 "VALUES (?,?,?,?,?,?)",
-                (cid, ostore.iso(at), "grok", f"trigger {cid}", json.dumps([url]), json.dumps([{"ticker": ticker}])))
+                (chains.chain_id("grok", trigger, at), ostore.iso(at), "grok", trigger, json.dumps([url]),
+                 json.dumps([{"ticker": ticker}])))
     _bridge(con, f"grok-{cid}", "GROK_DAILY", at,
-            {"type": "GROK_DAILY", "events": [], "chains": [{"trigger": f"trigger {cid}"}]})
+            {"type": "GROK_DAILY", "events": [], "chains": [
+                {"trigger": trigger, "urls": [url], "steps": ["s"], "confidence": 0.5,
+                 "impacts": [{"ticker": ticker, "direction": "up", "horizon_days": 5}]}]})
     con.execute("UPDATE bridge_messages SET source=? WHERE msg_id=?", (source, f"grok-{cid}"))
 
 

@@ -94,12 +94,13 @@ def _grok_items(con, verified_only: bool = False) -> list[dict]:
     """Chains (by impact ticker) and events from stored Grok data.
 
     ``verified_only``: keep only items from grok_verified GROK_DAILY messages
-    (Grok's own address, token and DKIM) that cite at least one URL; a chain
-    is tied to its message by its trigger plus our receipt time
-    (chains.created_at is the message's received_at), so a legacy message
-    received in the same second does not pass its chains off as verified.
+    (Grok's own address, token and DKIM) that cite at least one URL. A chain
+    row is credited to the message that actually wrote it
+    (chains.grok_chain_owners, the same order ingest_grok uses), so another
+    message with the same trigger in the same second cannot vouch for it.
     grok_legacy items are dropped."""
     from stockmoney.desk.bridge.inbox import SOURCE_GROK_VERIFIED, has_source_column, source_of
+    from stockmoney.desk.learn.chains import grok_chain_owners
     has_bridge = con.execute("SELECT 1 FROM sqlite_master WHERE name='bridge_messages'").fetchone() is not None
     msgs = []
     if has_bridge:
@@ -109,23 +110,19 @@ def _grok_items(con, verified_only: bool = False) -> list[dict]:
             if verified_only and source_of(r["source"], "GROK_DAILY") != SOURCE_GROK_VERIFIED:
                 continue
             msgs.append(r)
-    verified_chains = set()
-    for r in msgs:
-        try:
-            for c in json.loads(r["parsed_json"]).get("chains", []):
-                verified_chains.add((c["trigger"], _when(r["received_at"])))
-        except (ValueError, AttributeError, KeyError, TypeError):
-            continue
+    owners = grok_chain_owners(con) if verified_only else {}
     items = []
-    for r in con.execute("SELECT chain_id, created_at, trigger_text, urls_json, impacts_json FROM chains "
+    for r in con.execute("SELECT chain_id, created_at, urls_json, impacts_json FROM chains "
                          "WHERE source='grok'").fetchall():
         try:
             urls, imps = json.loads(r["urls_json"]), json.loads(r["impacts_json"])
         except ValueError:
             continue
         at = _when(r["created_at"])
-        if verified_only and (not urls or (r["trigger_text"], at) not in verified_chains):
-            continue
+        if verified_only:
+            owner = owners.get(r["chain_id"])
+            if not urls or owner is None or source_of(owner["source"], "GROK_DAILY") != SOURCE_GROK_VERIFIED:
+                continue
         for t in {_tick(i["ticker"]) for i in imps}:
             items.append({"ref": f"chain:{r['chain_id']}", "kind": "chain", "ticker": t, "urls": urls, "at": at})
     for r in msgs:

@@ -323,6 +323,25 @@ def test_a_legacy_chain_received_in_the_same_second_is_not_counted_verified(con)
     assert kept == {"Export curbs on AI GPUs"}
 
 
+def test_a_verified_message_with_the_same_trigger_and_second_does_not_vouch_for_a_legacy_chain(con):
+    from stockmoney.desk.learn import chains, tables
+    tables.ensure_schema(con)
+    box = FakeMailbox()
+    send(box, grok_daily("grok-20261012-0736"), auth="")  # legacy, stored first
+    send(box, grok_daily("grok-20261012-0737"))  # verified, same trigger
+    inbox.poll(con, box, CONFIG, now=NOW)
+    con.execute("UPDATE bridge_messages SET received_at=?", (NOW.isoformat(),))  # same second
+    assert chains.ingest_grok(con)["added"] == 1
+    owner = next(iter(chains.grok_chain_owners(con).values()))
+    assert owner["msg_id"] == "grok-20261012-0736"
+    assert [i for i in corroboration._grok_items(con, verified_only=True) if i["kind"] == "chain"] == []
+    # the verified copy stored first is kept
+    con.execute("DELETE FROM chains")
+    con.execute("DELETE FROM bridge_messages WHERE msg_id='grok-20261012-0736'")
+    assert chains.ingest_grok(con)["added"] == 1
+    assert [i for i in corroboration._grok_items(con, verified_only=True) if i["kind"] == "chain"]
+
+
 # ---------------------------------------------------------------- resends
 
 def test_identical_resend_is_silent_and_changed_resend_is_rejected(con):

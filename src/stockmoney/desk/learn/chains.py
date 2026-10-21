@@ -105,24 +105,22 @@ def _valid_invalidations(raw) -> list[dict]:
     return out
 
 
-def ingest_grok(con) -> dict:
-    """Copy chains out of stored GROK_DAILY messages into the chains table.
-
-    Reads ``bridge_messages`` (already sender/token/schema validated by the
-    bridge) and never writes to it. ``created_at`` is OUR ``received_at``, not
-    anything Grok wrote, so a chain cannot be back-dated. Idempotent: the chain
-    id is derived from source + trigger + received day. A chain that does not
-    validate here is skipped and counted, never raised."""
+def _grok_chains(con):
+    """Every GROK_DAILY chain in the order ``ingest_grok`` stores them (receipt
+    time, then arrival order): yields (message row, Chain or None if it does
+    not validate). Shared by ``grok_chain_owners`` so a chain row can be traced
+    to the message that actually wrote it."""
     if con.execute("SELECT 1 FROM sqlite_master WHERE name='bridge_messages'").fetchone() is None:
-        return {"added": 0, "skipped": 0}
-    added = skipped = 0
-    for r in con.execute("SELECT parsed_json, received_at FROM bridge_messages WHERE type='GROK_DAILY' "
-                         "ORDER BY received_at").fetchall():
+        return
+    has_source = "source" in {r[1] for r in con.execute("PRAGMA table_info(bridge_messages)")}
+    src = "source" if has_source else "NULL"
+    for r in con.execute(f"SELECT msg_id, type, parsed_json, received_at, {src} AS source FROM bridge_messages "
+                         "WHERE type='GROK_DAILY' ORDER BY received_at, rowid").fetchall():
         try:
             msg = json.loads(r["parsed_json"])
             raw_chains = msg.get("chains", [])
         except (ValueError, AttributeError):
-            skipped += 1
+            yield r, None
             continue
         for c in raw_chains:
             try:
@@ -135,12 +133,51 @@ def ingest_grok(con) -> dict:
                     # absent in older messages; a bad condition is dropped, never fatal to the chain
                     "invalidations": _valid_invalidations(c.get("invalidations")),
                     "confidence": c["confidence"], "source": "grok"})
-                before = con.total_changes
-                add_chain(con, chain, datetime.fromisoformat(r["received_at"]))
-                added += con.total_changes > before
             except Exception:
-                skipped += 1
+                chain = None
+            yield r, chain
+
+
+def ingest_grok(con) -> dict:
+    """Copy chains out of stored GROK_DAILY messages into the chains table.
+
+    Reads ``bridge_messages`` (already sender/token/schema validated by the
+    bridge) and never writes to it. ``created_at`` is OUR ``received_at``, not
+    anything Grok wrote, so a chain cannot be back-dated. Idempotent: the chain
+    id is derived from source + trigger + received day. A chain that does not
+    validate here is skipped and counted, never raised."""
+    added = skipped = 0
+    for r, chain in _grok_chains(con):
+        if chain is None:
+            skipped += 1
+            continue
+        try:
+            before = con.total_changes
+            add_chain(con, chain, datetime.fromisoformat(r["received_at"]))
+            added += con.total_changes > before
+        except Exception:
+            skipped += 1
     return {"added": added, "skipped": skipped}
+
+
+def grok_chain_owners(con) -> dict[str, object]:
+    """chain_id -> the bridge_messages row whose chain ``ingest_grok`` stored
+    under that id (the first valid one in its order; later same-day copies of
+    the trigger are ignored by INSERT OR IGNORE). Read-only."""
+    owners: dict[str, object] = {}
+    for r, chain in _grok_chains(con):
+        if chain is None:
+            continue
+        try:
+            owners.setdefault(chain_id(chain.source, chain.trigger, datetime.fromisoformat(r["received_at"])), r)
+        except ValueError:
+            continue
+    return owners
+
+
+def chain_id(source: str, trigger: str, created_at: datetime) -> str:
+    created = created_at.astimezone(timezone.utc)
+    return hashlib.sha1(f"{source}|{trigger}|{created.astimezone(ET).date()}".encode()).hexdigest()[:12]
 
 
 def _sym(t: str) -> str:
@@ -151,7 +188,7 @@ def add_chain(con, chain: Chain, created_at: datetime | None = None) -> str:
     """Store a chain; returns its id. Re-adding the same trigger on the same
     day is a no-op (same id)."""
     created = (created_at or datetime.now(timezone.utc)).astimezone(timezone.utc)
-    cid = hashlib.sha1(f"{chain.source}|{chain.trigger}|{created.astimezone(ET).date()}".encode()).hexdigest()[:12]
+    cid = chain_id(chain.source, chain.trigger, created)
     con.execute(
         "INSERT OR IGNORE INTO chains (chain_id, created_at, source, trigger_text, urls_json, steps_json, "
         "impacts_json, checkpoints_json, confidence, invalidations_json, falsifiable) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
