@@ -169,6 +169,13 @@
 
 `scripts/classify_scan.py --engine claude|jev|shadow`(預設 claude)。Jev(釘 `jev-1.13.0`)做高頻低複雜度判斷:相關性、是否值得升級為候選、各 ticker 的情緒;ticker 由程式碼找出,Jev 只判斷不生成。不確定、候選價值高或 Jev 出錯的項目升級給 Claude CLI。原始機率先寫入 `jev_judgments`(migration 041)再依門檻路由,門檻(`jev_classify.py` 常數)為暫定值。
 
+2026-10-21 補充(去重與略過):
+- 去重:同一標的、正規化後文字相同(NFKC、忽略大小寫與標點),或同一則 ALERT / RESEARCH_REPLY / IDEA 以 `-rN` 重送,只判斷第一則。之後的副本照樣寫入帳本,`dup_of` 指向第一則,沿用其原始機率(token 記 0),再以副本自己的旁路重新路由,所以降風險的副本仍會 pass。第一則判斷失敗時副本自行判斷。已升級的第一則,其副本不再重複做深度分析。既有帳本列只補標 `dup_of`,不改判斷。
+- 沒有 risk_flags 的 RESEARCH_REPLY 記為 `skipped`(原因 `research_reply_no_risk_flags`),不再被誤記為 pass。有 risk_flags 的照舊旁路通過。
+- 深度分析每次上限 10 則為硬上限,呼叫端傳更大的值也會被截到 10。
+- 週五學習報告新增「情報預篩週報」:升級率與省下的 Claude 呼叫、封存項目中 Claude 標註為重要的比例、高風險分數標的事後 5 日超額報酬(對 SPY,只用於校準降風險,每組不足 5 筆顯示資料不足)、Jev 與 Claude 標註不一致的案例。標註以 `desk_prescreen.py labels FILE.csv` 匯入 `prescreen_labels`,只用於報告,不改路由或門檻。
+- 快照重算(2026-10-20 帳本 600 列,套用去重與略過):去重 70 列、略過 8 列,剩 522 則獨立判斷。60 則抽樣標註:pass 精確度 16/22 = 72.7%(原 16/30 = 53.3%),封存但重要 2/29 = 6.9%(原 2/30 = 6.7%)。門檻未變,仍維持 shadow。
+
 驗證流程:
 1. 影子期 5 個交易日:`--engine shadow`,套用 Claude 結果,Jev 只記錄(需 `TYPESAFE_API_KEY`,只放伺服器端,由使用者設定)。
 2. 以 Sonnet 暫代標註建立驗證集,對照 `jev_judgments`,依資料校準門檻、檢查升級率與直接路由的準確度。
@@ -186,14 +193,22 @@
 |---|---|
 | pass | 旁路(ALERT elevated/critical、有 risk_flags 的 RESEARCH_REPLY、GROK event severity critical/elevated),或 actionable >= 0.70,或風險分數 >= 2.0 且信心 >= 0.60 |
 | archive | relevant < 0.30,或其餘低訊號 |
-| hold | 介於兩者之間 |
-| error | Jev 失敗,下次重跑 |
+| hold | 介於兩者之間(不確定,見下方升級規則) |
+| skipped | 沒有 risk_flags 的 RESEARCH_REPLY(狀態摘要),不呼叫 Jev |
+| error | Jev 失敗,下次重跑;旁路項目在 Jev 失敗時仍記為 pass(機率留空) |
 
 規則:
 - 只標記,不刪除、不隱藏。chains / calls 的 5/20/60 日評分照常以全部資料計算,預篩只決定誰值得付費深度分析。
 - 降低風險的訊號永不被過濾(旁路)。
-- pass 的項目才進深度分析(Claude CLI,`--tools ""`,結果存 `deep_json`:傳導、受影響標的、風險備註、待查證項目)。輸出不接任何下單路徑,也不改任何參數。
+- pass 的項目優先進深度分析,hold(不確定)在同一上限內排在 pass 之後升級給 Claude(Claude CLI,`--tools ""`,結果存 `deep_json`:傳導、受影響標的、風險備註、待查證項目)。輸出不接任何下單路徑,也不改任何參數。
 - `DESK_PRESCREEN=off|shadow|on`,預設 off。shadow 只判斷與記錄,on 才做深度分析(每次最多 10 則,每項最多重試 3 次)。需 `TYPESAFE_API_KEY`(由使用者設定)。
+
+2026-10-21 補充(去重與略過):
+- 去重:同一標的、正規化後文字相同(NFKC、忽略大小寫與標點),或同一則 ALERT / RESEARCH_REPLY / IDEA 以 `-rN` 重送,只判斷第一則。之後的副本照樣寫入帳本,`dup_of` 指向第一則,沿用其原始機率(token 記 0),再以副本自己的旁路重新路由,所以降風險的副本仍會 pass。第一則判斷失敗時副本自行判斷。已升級的第一則,其副本不再重複做深度分析。既有帳本列只補標 `dup_of`,不改判斷。
+- 沒有 risk_flags 的 RESEARCH_REPLY 記為 `skipped`(原因 `research_reply_no_risk_flags`),不再被誤記為 pass。有 risk_flags 的照舊旁路通過。
+- 深度分析每次上限 10 則為硬上限,呼叫端傳更大的值也會被截到 10。
+- 週五學習報告新增「情報預篩週報」:升級率與省下的 Claude 呼叫、封存項目中 Claude 標註為重要的比例、高風險分數標的事後 5 日超額報酬(對 SPY,只用於校準降風險,每組不足 5 筆顯示資料不足)、Jev 與 Claude 標註不一致的案例。標註以 `desk_prescreen.py labels FILE.csv` 匯入 `prescreen_labels`,只用於報告,不改路由或門檻。
+- 快照重算(2026-10-20 帳本 600 列,套用去重與略過):去重 70 列、略過 8 列,剩 522 則獨立判斷。60 則抽樣標註:pass 精確度 16/22 = 72.7%(原 16/30 = 53.3%),封存但重要 2/29 = 6.9%(原 2/30 = 6.7%)。門檻未變,仍維持 shadow。
 
 驗證流程:
 1. 影子期 5 個交易日:`DESK_PRESCREEN=shadow`,累積 `prescreen_judgments`。
@@ -204,6 +219,8 @@
 .venv/bin/python scripts/desk_prescreen.py items            # 列出待判斷項目(不呼叫 API)
 .venv/bin/python scripts/desk_prescreen.py run --mode shadow
 .venv/bin/python scripts/desk_prescreen.py report
+.venv/bin/python scripts/desk_prescreen.py labels FILE.csv  # 匯入重要性標註(item_id, important 或 sonnet_important)
+.venv/bin/python scripts/desk_prescreen.py weekly           # 週報段落(不呼叫 API)
 .venv/bin/python -m pytest tests/desk/test_prescreen.py -q
 ```
 
