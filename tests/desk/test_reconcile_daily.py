@@ -193,6 +193,13 @@ def test_stop_diffs_missing_price_duplicate_and_orphan(con):
     assert "2 張停損單" in got["NVDA"] and "孤兒停損" in got["TSLA"]
 
 
+def test_option_stop_orders_are_not_orphan_stock_stops(con):
+    _hold(con, "AAPL", 10, 95.0)
+    orders = [_stop_order("AAPL", 95.0, "o1"), _stop_order("AAPL250117C00150000", 1.0, "o2")]
+    s = reconcile.summarize(con, DAY, orders)
+    assert s["stop_diffs"] == [] and s["zero_diff"]
+
+
 def test_stop_within_a_cent_is_not_a_difference(con):
     _hold(con, "AAPL", 10, 95.004)
     s = reconcile.summarize(con, DAY, [_stop_order("AAPL", 95.0)])

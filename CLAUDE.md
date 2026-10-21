@@ -8,7 +8,7 @@ This project is part of a multi-AI system. Roles:
 
 - **Claude Code**: sole executor for all code changes. Reads this file and `docs/desk/` for project state.
 - **Grok Build** (via `grok-build-plugin-cc`): read-only review and second opinion. Never edits files. Use `/grok-build:review` after significant changes.
-- **Grok chat**: research, X platform intelligence, strategy validation. Produces `GROK_DAILY` reports (see `docs/desk/GROK_PROMPT.md`).
+- **Grok chat**: research, X platform intelligence, strategy validation. Produces `GROK_DAILY` reports (see `docs/desk/GROK_PROMPT.md`). Since 2026-10-12 it may also propose intraday options playbooks (`OPTIONS_PLAN`) for the options sleeve only; rules and the risk layer decide execution (see `docs/desk/OPTIONS_PLAN.md`).
 - **Grok Bot**: background sentinel. Runs daily post-close summaries and paper trading data checks. Does not modify code.
 - **Muse**: social intelligence and life manager. Sends `SOCIAL_DAILY`, `CALLS`, `ALERT`, `IDEA` via Gmail bridge (see `docs/desk/MUSE_BRIDGE.md`). Inputs can only reduce risk, never open positions or change parameters.
 
