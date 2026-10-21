@@ -29,7 +29,8 @@ def con(tmp_path):
 
 
 def put(con, msg_id, type_, msg, received=RECV):
-    con.execute("INSERT INTO bridge_messages VALUES (?,?,?,?,?,?,?)",
+    con.execute("INSERT INTO bridge_messages (msg_id, type, sender, sent_at, received_at, raw_body, parsed_json) "
+                "VALUES (?,?,?,?,?,?,?)",
                 (msg_id, type_, "s", received, received, "{}", json.dumps(msg)))
 
 

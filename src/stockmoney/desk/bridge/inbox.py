@@ -1,12 +1,24 @@
 """Inbound side of the Muse bridge: read mail, validate, store.
 
 Every message is untrusted. A message is accepted only if ALL of these hold:
-sender is the allowlisted Muse address, subject is ``[SMD/<TYPE>/<msg_id>] <token>``
-with the shared token (constant-time compare), size is under the limit, the
+sender is an allowlisted address, subject is ``[SMD/<TYPE>/<msg_id>] <token>``
+with that sender's token (constant-time compare), TYPE is one that sender may
+send, size is under the limit, the
 body is exactly one JSON object that validates against the strict ``Inbound``
 schema, TYPE and msg_id in the subject equal the body's, and msg_id is new.
+A resend whose JSON is identical to the stored message is dropped silently
+(no reject, no feedback); same msg_id with different content is duplicate_msg_id.
 OPTIONS_PLAN is the one exception to "Inbound schema": its body is the options
 sleeve's OptionsPlan, whose plan_id plays the msg_id role (see _process_plan).
+
+Senders: MUSE_ADDRESS (Muse types, and Grok types on the legacy channel) and,
+when GROK_ADDRESS + GROK_SHARED_TOKEN are both set, GROK_ADDRESS (GROK_DAILY and
+OPTIONS_PLAN only). Each stored row carries ``source``: ``muse``,
+``grok_verified`` (Grok type over Grok's own channel, Grok's token, and a
+Gmail-written dkim=pass for the GROK_ADDRESS domain) or ``grok_legacy`` (Grok
+type over the Muse channel, or Grok's channel without that DKIM pass; the
+reason is in ``source_reason``). Only grok_verified may count as an
+independent source in veto.py / postmortem.
 
 Accepted messages are stored; everything else goes to ``bridge_rejects`` with a
 reason. ``poll`` never raises on bad mail. Free text inside messages is stored
@@ -15,7 +27,9 @@ a model. This module produces no orders and imports nothing from execution.
 """
 from __future__ import annotations
 
+import hashlib
 import hmac
+import json
 import logging
 import re
 import time
@@ -24,7 +38,7 @@ from datetime import datetime, timedelta, timezone
 from pydantic import TypeAdapter, ValidationError
 
 from stockmoney.desk import notify
-from stockmoney.desk.bridge.mailbox import BridgeConfig, Mailbox, RawMail
+from stockmoney.desk.bridge.mailbox import BridgeConfig, Mailbox, RawMail, dkim_problem
 from stockmoney.desk.bridge.schema import Inbound
 from stockmoney.desk.options import plan as oplan
 from stockmoney.desk.options.config import OptionsConfig
@@ -42,10 +56,13 @@ SUBJECT_RE = re.compile(r"^((?:(?i:re|fw|fwd)\s*:\s*)*)\[SMD/([A-Z_]{1,32})/([A-
 OUTBOUND_ONLY_TYPES = frozenset({"WATCHLIST", "RESEARCH_REQUEST", "REPORT", "FEEDBACK"})
 _INBOUND = TypeAdapter(Inbound)
 
+SOURCE_MUSE, SOURCE_GROK_VERIFIED, SOURCE_GROK_LEGACY = "muse", "grok_verified", "grok_legacy"
+GROK_TYPES = frozenset({"GROK_DAILY", "OPTIONS_PLAN"})
+
 BRIDGE_SCHEMA = """
 CREATE TABLE IF NOT EXISTS bridge_messages (
   msg_id TEXT PRIMARY KEY, type TEXT NOT NULL, sender TEXT, sent_at TEXT, received_at TEXT NOT NULL,
-  raw_body TEXT NOT NULL, parsed_json TEXT NOT NULL);
+  raw_body TEXT NOT NULL, parsed_json TEXT NOT NULL, source TEXT, source_reason TEXT);
 CREATE INDEX IF NOT EXISTS idx_bridge_messages_received ON bridge_messages (received_at);
 CREATE TABLE IF NOT EXISTS bridge_rejects (
   id INTEGER PRIMARY KEY AUTOINCREMENT, received_at TEXT NOT NULL, sender TEXT, subject TEXT,
@@ -54,8 +71,29 @@ CREATE INDEX IF NOT EXISTS idx_bridge_rejects_received ON bridge_rejects (receiv
 """
 
 
+# Columns added after the first release; ensure_schema adds them to old databases.
+ADDED_COLUMNS = {"bridge_messages": {"source": "TEXT", "source_reason": "TEXT"}}
+
+
 def ensure_schema(con) -> None:
     con.executescript(BRIDGE_SCHEMA)
+    for table, cols in ADDED_COLUMNS.items():
+        have = {r[1] for r in con.execute(f"PRAGMA table_info({table})")}
+        for name, decl in cols.items():
+            if name not in have:
+                con.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
+
+
+def source_of(source: str | None, msg_type: str) -> str:
+    """The stored source, or the fallback for rows written before the column
+    existed: a Grok type is grok_legacy (it came over the Muse channel), else muse."""
+    if source:
+        return source
+    return SOURCE_GROK_LEGACY if msg_type in GROK_TYPES else SOURCE_MUSE
+
+
+def has_source_column(con) -> bool:
+    return "source" in {r[1] for r in con.execute("PRAGMA table_info(bridge_messages)")}
 
 
 def _iso(dt: datetime) -> str:
@@ -69,8 +107,11 @@ def _clean(text: str, limit: int) -> str:
     return "".join(c if c.isprintable() else " " for c in text)[:limit]
 
 
-def _redact(text: str, token: str) -> str:
-    return text.replace(token, "<token>") if token else text
+def _redact(text: str, *tokens: str) -> str:
+    for token in tokens:
+        if token:
+            text = text.replace(token, "<token>")
+    return text
 
 
 def _token_ok(given: str, expected: str) -> bool:
@@ -81,8 +122,10 @@ def _reject(con, received_at: datetime, mail: RawMail, reason: str, config: Brid
     log.warning("bridge reject uid=%s sender=%s reason=%s", mail.uid, _clean(mail.sender, 100), reason)
     con.execute(
         "INSERT INTO bridge_rejects (received_at, sender, subject, msg_id, reason, body_excerpt) VALUES (?,?,?,?,?,?)",
-        (_iso(received_at), _clean(mail.sender, 200), _clean(_redact(mail.subject, config.shared_token), 300),
-         _clean(msg_id, 64) or None, reason, _clean(_redact(mail.body, config.shared_token), EXCERPT_CHARS)),
+        (_iso(received_at), _clean(mail.sender, 200),
+         _clean(_redact(mail.subject, config.shared_token, config.grok_token), 300),
+         _clean(msg_id, 64) or None, reason,
+         _clean(_redact(mail.body, config.shared_token, config.grok_token), EXCERPT_CHARS)),
     )
 
 
@@ -113,6 +156,18 @@ def _validation_reason(e: ValidationError, prefix: str = "") -> str:
                 part += f" ({detail})"
         parts.append(part)
     return "schema_invalid " + "; ".join(parts)
+
+
+def content_hash(body: str) -> str | None:
+    """sha256 of the body's JSON object in canonical form (sorted keys, compact),
+    so a resend that differs only in greeting, fence or line wrapping matches.
+    None when the body holds no parseable JSON."""
+    try:
+        obj = json.loads(repair_string_newlines(extract_json(body)))
+    except (ValueError, RecursionError):
+        return None
+    canon = json.dumps(obj, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+    return hashlib.sha256(canon.encode("utf-8")).hexdigest()
 
 
 _FENCE_RE = re.compile(r"```(?:json)?\s*(\{.*?\})\s*```", re.S)
@@ -167,7 +222,10 @@ def _process(con, mail: RawMail, config: BridgeConfig, received_at: datetime) ->
     if mail.error:
         _reject(con, received_at, mail, "transport_error " + _clean(mail.error, 150), config)
         return False
-    if not mail.sender or mail.sender != config.muse_address.strip().lower():
+    from_muse = bool(mail.sender) and mail.sender == config.muse_address.strip().lower()
+    from_grok = (not from_muse and config.grok_enabled and bool(mail.sender)
+                 and mail.sender == config.grok_address.strip().lower())
+    if not (from_muse or from_grok):
         _reject(con, received_at, mail, "sender_not_allowed", config)
         return False
     m = SUBJECT_RE.match(mail.subject)
@@ -175,7 +233,8 @@ def _process(con, mail: RawMail, config: BridgeConfig, received_at: datetime) ->
         _reject(con, received_at, mail, "bad_subject", config)
         return False
     prefix, subj_type, subj_id, token = m.groups()
-    if not _token_ok(token, config.shared_token):
+    # each sender is checked against its own token only
+    if not _token_ok(token, config.grok_token if from_grok else config.shared_token):
         _reject(con, received_at, mail, "bad_token", config, subj_id)
         return False
     if subj_type in OUTBOUND_ONLY_TYPES:
@@ -185,6 +244,22 @@ def _process(con, mail: RawMail, config: BridgeConfig, received_at: datetime) ->
         # because is_echo_subject() recognises the stored subject.
         _reject(con, received_at, mail, "schema_invalid outbound_only_type", config, subj_id)
         return False
+    if from_grok and subj_type not in GROK_TYPES:
+        # not in muse_ops.FIXES: never answered with feedback
+        _reject(con, received_at, mail, "type_not_allowed_for_sender", config, subj_id)
+        return False
+    # grok_verified needs all three: GROK_ADDRESS sender, GROK_SHARED_TOKEN
+    # (checked above) and Gmail's own DKIM pass for the GROK_ADDRESS domain.
+    # A DKIM failure is not a reject: the mail is kept as grok_legacy (which
+    # never votes) and the reason is stored next to it.
+    source_reason = None
+    if from_grok:
+        source_reason = dkim_problem(mail.auth_results, config.grok_address.rsplit("@", 1)[-1]) or None
+        source = SOURCE_GROK_LEGACY if source_reason else SOURCE_GROK_VERIFIED
+        if source_reason:
+            log.warning("bridge: %s from GROK_ADDRESS kept as grok_legacy: %s", subj_id, source_reason)
+    else:
+        source = SOURCE_GROK_LEGACY if subj_type in GROK_TYPES else SOURCE_MUSE
     replied = bool(prefix)
 
     def fail(reason: str) -> bool:
@@ -196,7 +271,7 @@ def _process(con, mail: RawMail, config: BridgeConfig, received_at: datetime) ->
     if mail.oversized or mail.size > MAX_RAW_BYTES or len(mail.body.encode("utf-8", "replace")) > MAX_RAW_BYTES:
         return fail("oversized")
     if subj_type == "OPTIONS_PLAN":
-        return _process_plan(con, mail, config, received_at, subj_id, fail)
+        return _process_plan(con, mail, config, received_at, subj_id, fail, source, source_reason)
     try:
         msg = _INBOUND.validate_json(repair_string_newlines(extract_json(mail.body)), strict=True)
     except ValidationError as e:
@@ -207,17 +282,24 @@ def _process(con, mail: RawMail, config: BridgeConfig, received_at: datetime) ->
         return fail("type_mismatch")
     if msg.msg_id != subj_id:
         return fail("msg_id_mismatch")
-    if con.execute("SELECT 1 FROM bridge_messages WHERE msg_id=?", (msg.msg_id,)).fetchone():
+    prior = con.execute("SELECT type, raw_body FROM bridge_messages WHERE msg_id=?", (msg.msg_id,)).fetchone()
+    if prior is not None:
+        if prior[0] == msg.type and content_hash(prior[1]) == content_hash(mail.body):
+            # an identical resend: already received, nothing to store or correct
+            log.info("bridge: identical resend of %s ignored", msg.msg_id)
+            return False
         return fail("duplicate_msg_id")
     con.execute(
-        "INSERT INTO bridge_messages (msg_id, type, sender, sent_at, received_at, raw_body, parsed_json) "
-        "VALUES (?,?,?,?,?,?,?)",
-        (msg.msg_id, msg.type, mail.sender, _iso(msg.sent_at), _iso(received_at), mail.body, msg.model_dump_json()),
+        "INSERT INTO bridge_messages (msg_id, type, sender, sent_at, received_at, raw_body, parsed_json, source, "
+        "source_reason) VALUES (?,?,?,?,?,?,?,?,?)",
+        (msg.msg_id, msg.type, mail.sender, _iso(msg.sent_at), _iso(received_at), mail.body, msg.model_dump_json(),
+         source, source_reason),
     )
     return True
 
 
-def _process_plan(con, mail: RawMail, config: BridgeConfig, received_at: datetime, subj_id: str, fail) -> bool:
+def _process_plan(con, mail: RawMail, config: BridgeConfig, received_at: datetime, subj_id: str, fail,
+                  source: str = SOURCE_GROK_LEGACY, source_reason: str | None = None) -> bool:
     """OPTIONS_PLAN (docs/desk/MUSE_BRIDGE.md): the body is validated by the
     options sleeve's own strict ``OptionsPlan`` and stored by the SAME
     ``options.plan.ingest`` the CLI uses (received_at = our clock). Its only
@@ -244,10 +326,10 @@ def _process_plan(con, mail: RawMail, config: BridgeConfig, received_at: datetim
     if res.status == "rejected":  # parse passed above, so: the id belongs to a different accepted plan
         return fail("plan_id_reused")
     con.execute(
-        "INSERT OR IGNORE INTO bridge_messages (msg_id, type, sender, sent_at, received_at, raw_body, parsed_json) "
-        "VALUES (?,?,?,?,?,?,?)",
+        "INSERT OR IGNORE INTO bridge_messages (msg_id, type, sender, sent_at, received_at, raw_body, parsed_json, "
+        "source, source_reason) VALUES (?,?,?,?,?,?,?,?,?)",
         (p.plan_id, "OPTIONS_PLAN", mail.sender, _iso(p.generated_at), _iso(received_at), mail.body,
-         p.model_dump_json()),
+         p.model_dump_json(), source, source_reason),
     )
     if res.status == "duplicate":
         return False

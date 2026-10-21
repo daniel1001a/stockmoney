@@ -39,9 +39,18 @@ class BridgeConfig:
     smtp_port: int = 465  # 465 = implicit SSL, 587 = STARTTLS
     muse_address: str = ""
     shared_token: str = ""
+    # Grok's own channel (optional). Only active when both are set; otherwise
+    # Grok types keep arriving over the Muse channel (tagged grok_legacy).
+    grok_address: str = ""
+    grok_token: str = ""
+
+    @property
+    def grok_enabled(self) -> bool:
+        return bool(self.grok_address and self.grok_token)
 
     def __repr__(self) -> str:  # never leak secrets into logs
         return (f"BridgeConfig(desk={self.desk_address!r}, muse={self.muse_address!r}, "
+                f"grok={self.grok_address!r}, "
                 f"imap={self.imap_host}:{self.imap_port}, smtp={self.smtp_host}:{self.smtp_port})")
 
     @classmethod
@@ -52,8 +61,20 @@ class BridgeConfig:
         if missing:
             raise ConfigError("missing environment variables: " + ", ".join(missing))
         token = env["MUSE_SHARED_TOKEN"]
-        if len(token) < MIN_TOKEN_LENGTH or re.search(r"\s", token):
-            raise ConfigError(f"MUSE_SHARED_TOKEN must be >= {MIN_TOKEN_LENGTH} chars with no whitespace")
+        _check_token("MUSE_SHARED_TOKEN", token)
+        muse_address = env["MUSE_ADDRESS"].strip().lower()
+        grok_address = (env.get("GROK_ADDRESS") or "").strip().lower()
+        grok_token = env.get("GROK_SHARED_TOKEN") or ""
+        if bool(grok_address) != bool(grok_token):
+            raise ConfigError("set both GROK_ADDRESS and GROK_SHARED_TOKEN, or neither")
+        if grok_token:
+            _check_token("GROK_SHARED_TOKEN", grok_token)
+        if grok_address and grok_token:
+            # Separate identities or the per-sender allowlist means nothing.
+            if grok_address == muse_address:
+                raise ConfigError("GROK_ADDRESS must differ from MUSE_ADDRESS")
+            if grok_token == token:
+                raise ConfigError("GROK_SHARED_TOKEN must differ from MUSE_SHARED_TOKEN")
         return cls(
             desk_address=env["DESK_MAIL_ADDRESS"].strip(),
             app_password=env["DESK_MAIL_APP_PASSWORD"],
@@ -61,9 +82,16 @@ class BridgeConfig:
             imap_port=int(env.get("DESK_MAIL_IMAP_PORT") or 993),
             smtp_host=env.get("DESK_MAIL_SMTP") or "smtp.gmail.com",
             smtp_port=int(env.get("DESK_MAIL_SMTP_PORT") or 465),
-            muse_address=env["MUSE_ADDRESS"].strip().lower(),
+            muse_address=muse_address,
             shared_token=token,
+            grok_address=grok_address,
+            grok_token=grok_token,
         )
+
+
+def _check_token(name: str, token: str) -> None:
+    if len(token) < MIN_TOKEN_LENGTH or re.search(r"\s", token):
+        raise ConfigError(f"{name} must be >= {MIN_TOKEN_LENGTH} chars with no whitespace")
 
 
 @dataclass(frozen=True)
@@ -81,6 +109,9 @@ class RawMail:
     size: int
     oversized: bool = False
     error: str = ""
+    # value of the top-most Authentication-Results header, only when Gmail
+    # wrote it (authserv-id mx.google.com); "" otherwise. See trusted_auth_results.
+    auth_results: str = ""
 
 
 class Mailbox(Protocol):
@@ -96,6 +127,60 @@ def _sender_of(msg) -> str:
     if len(froms) != 1:
         return ""  # multiple From headers are a spoofing trick; treat as no sender
     return parseaddr(str(froms[0]))[1].strip().lower()
+
+
+GMAIL_AUTHSERV_ID = "mx.google.com"
+
+
+def _unfold(value: str) -> str:
+    text = " ".join(str(value).split())
+    while True:  # RFC 8601 comments, e.g. "(p=REJECT sp=REJECT dis=NONE)"; may contain ';'
+        stripped = re.sub(r"\([^()]*\)", " ", text)
+        if stripped == text:
+            return " ".join(text.split())
+        text = stripped
+
+
+def trusted_auth_results(msg) -> str:
+    """The Authentication-Results value Gmail itself added, or "".
+
+    Gmail prepends its header above everything the sender wrote, so only the
+    top-most Authentication-Results header is considered, and only when its
+    authserv-id is mx.google.com. A same-named header placed in the message
+    by the sender sits below Gmail's and is never read; if the top-most one is
+    not Gmail's, there is no trusted result at all."""
+    headers = msg.get_all("Authentication-Results") or []
+    if not headers:
+        return ""
+    top = _unfold(headers[0])
+    authserv = top.split(";", 1)[0].strip().split(" ")[0].lower()
+    return top if authserv == GMAIL_AUTHSERV_ID else ""
+
+
+def dkim_problem(auth_results: str, domain: str) -> str:
+    """"" when ``auth_results`` (from trusted_auth_results) holds a dkim=pass
+    whose header.d or header.i domain is ``domain`` or a subdomain of it; else
+    a short reason. The selector (header.s) is ignored on purpose: SES
+    generates it and may rotate it. A pass for another domain (e.g. the SES
+    d=amazonses.com signature alone) does not count."""
+    domain = domain.strip().lower().rstrip(".")
+    if not auth_results:
+        return "dkim_header_missing"
+    if not domain:
+        return "dkim_no_domain"
+    passed: set[str] = set()
+    for res in auth_results.split(";")[1:]:
+        m = re.match(r"\s*dkim\s*=\s*([a-z]+)\b(.*)$", res, re.I)
+        if not m or m.group(1).lower() != "pass":
+            continue
+        for key, val in re.findall(r"\bheader\.([di])\s*=\s*(\S+)", m.group(2), re.I):
+            d = val.rsplit("@", 1)[-1] if key.lower() == "i" else val
+            passed.add(d.strip().strip('"').lower().rstrip("."))
+    if not passed:
+        return "dkim_no_pass"
+    if any(d == domain or d.endswith("." + domain) for d in passed):
+        return ""
+    return "dkim_domain_mismatch"
 
 
 def _subject_of(msg) -> str:
@@ -146,7 +231,11 @@ def parse_raw_mail(uid: str, raw: bytes, size: int) -> RawMail:
         body = _text_body(msg)
     except (ValueError, LookupError, UnicodeDecodeError) as e:
         return RawMail(uid, sender, subject, "", size, error=f"body: {type(e).__name__}: {e}"[:200])
-    return RawMail(uid, sender, subject, body, size)
+    try:
+        auth = trusted_auth_results(msg)
+    except Exception:  # a malformed header means "no trusted result", never a crash
+        auth = ""
+    return RawMail(uid, sender, subject, body, size, auth_results=auth)
 
 
 def _fetch_meta_and_literal(data) -> tuple[bytes, bytes | None]:
@@ -239,13 +328,20 @@ class ImapSmtpMailbox:
         # Server-side filter: only unread mail FROM the configured sender whose
         # subject carries the bridge tag. The mailbox may be a personal inbox;
         # everything else is never downloaded, stored or marked read.
-        sender = self.config.muse_address.replace('"', "").replace("\\", "").strip()
+        clean = lambda a: a.replace('"', "").replace("\\", "").strip()
+        sender = clean(self.config.muse_address)
         if not sender:
             raise imaplib.IMAP4.error("MUSE_ADDRESS is required to search the mailbox")
-        typ, data = imap.uid("SEARCH", None, "UNSEEN", "FROM", f'"{sender}"', "SUBJECT", '"SMD"')
-        if typ != "OK":
-            raise imaplib.IMAP4.error("UID SEARCH failed")
-        uids = [u.decode("ascii") for u in (data[0] or b"").split()]
+        senders = [sender]
+        if self.config.grok_enabled and clean(self.config.grok_address) not in ("", sender):
+            senders.append(clean(self.config.grok_address))
+        found: set[int] = set()
+        for s in senders:
+            typ, data = imap.uid("SEARCH", None, "UNSEEN", "FROM", f'"{s}"', "SUBJECT", '"SMD"')
+            if typ != "OK":
+                raise imaplib.IMAP4.error("UID SEARCH failed")
+            found.update(int(u) for u in (data[0] or b"").split())
+        uids = [str(u) for u in sorted(found)]
         out: list[RawMail] = []
         for uid in uids:
             try:
@@ -303,11 +399,14 @@ class FakeMailbox:
         self.sent: list[tuple[str, str, str]] = []
 
     def inject(self, sender: str, subject: str, body: str, *, size: int | None = None,
-               oversized: bool = False, error: str = "") -> str:
+               oversized: bool = False, error: str = "", auth_results: str = "") -> str:
+        """``auth_results`` stands for the trusted Gmail Authentication-Results
+        value (what ``trusted_auth_results`` would return for the real mail)."""
         uid = str(self._next)
         self._next += 1
         n = len(body.encode("utf-8", "replace")) if size is None else size
-        self._mails[uid] = RawMail(uid, sender.lower(), subject, body, n, oversized=oversized, error=error)
+        self._mails[uid] = RawMail(uid, sender.lower(), subject, body, n, oversized=oversized, error=error,
+                                   auth_results=auth_results)
         return uid
 
     def fetch_unseen(self, max_bytes: int) -> list[RawMail]:
