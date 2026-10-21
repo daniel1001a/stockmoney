@@ -342,6 +342,32 @@ def test_a_verified_message_with_the_same_trigger_and_second_does_not_vouch_for_
     assert [i for i in corroboration._grok_items(con, verified_only=True) if i["kind"] == "chain"]
 
 
+def test_a_verified_message_whose_chain_insert_failed_does_not_own_the_legacy_copy(con, monkeypatch):
+    """Grok review 2026-10-21: owners used to follow the first valid message,
+    so a verified copy whose insert failed (locked DB) vouched for the legacy
+    chain stored after it."""
+    from stockmoney.desk.learn import chains, tables
+    tables.ensure_schema(con)
+    box = FakeMailbox()
+    send(box, grok_daily("grok-20261012-0737"))  # verified, first
+    legacy = grok_daily("grok-20261012-0738")
+    legacy["chains"][0]["urls"] = ["https://x.com/b/status/9"]
+    send(box, legacy, auth="")  # legacy, same trigger, other urls
+    inbox.poll(con, box, CONFIG, now=NOW)
+    real, calls = chains.add_chain, {"n": 0}
+
+    def add_chain(c, chain, created_at=None):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("database is locked")
+        return real(c, chain, created_at)
+    monkeypatch.setattr(chains, "add_chain", add_chain)
+    assert chains.ingest_grok(con) == {"added": 1, "skipped": 1}
+    owner = next(iter(chains.grok_chain_owners(con).values()))
+    assert owner["msg_id"] == "grok-20261012-0738"
+    assert [i for i in corroboration._grok_items(con, verified_only=True) if i["kind"] == "chain"] == []
+
+
 # ---------------------------------------------------------------- resends
 
 def test_identical_resend_is_silent_and_changed_resend_is_rejected(con):

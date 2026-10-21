@@ -161,17 +161,28 @@ def ingest_grok(con) -> dict:
 
 
 def grok_chain_owners(con) -> dict[str, object]:
-    """chain_id -> the bridge_messages row whose chain ``ingest_grok`` stored
-    under that id (the first valid one in its order; later same-day copies of
-    the trigger are ignored by INSERT OR IGNORE). Read-only."""
+    """chain_id -> the bridge_messages row whose chain is the one stored under
+    that id: the first valid message in ``ingest_grok`` order whose received
+    time and urls match the stored row. A message whose insert failed, so a
+    later same-day copy of the trigger was stored instead, is not the owner.
+    Read-only."""
+    stored = {}
+    for c, at, urls in con.execute("SELECT chain_id, created_at, urls_json FROM chains"):
+        try:
+            stored[c] = (datetime.fromisoformat(at).astimezone(timezone.utc), json.loads(urls or "[]"))
+        except (TypeError, ValueError):
+            continue
     owners: dict[str, object] = {}
     for r, chain in _grok_chains(con):
         if chain is None:
             continue
         try:
-            owners.setdefault(chain_id(chain.source, chain.trigger, datetime.fromisoformat(r["received_at"])), r)
+            created = datetime.fromisoformat(r["received_at"]).astimezone(timezone.utc)
         except ValueError:
             continue
+        cid = chain_id(chain.source, chain.trigger, created)
+        if cid not in owners and stored.get(cid) == (created, list(chain.urls)):
+            owners[cid] = r
     return owners
 
 
