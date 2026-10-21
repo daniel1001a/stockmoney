@@ -1241,7 +1241,10 @@ def _expire_unretried_opg(con, broker: Broker, now: datetime) -> list[str]:
     no run before 10:30 ET tried again): after ENTRY_CUTOFF, or on a later day,
     the attempt is recorded as spent and the plan takes the status the cutoff
     path gives it ('expired' with nothing bought, else 'submitted' for the
-    held shares). Nothing is sent. An order that still cannot be read is left
+    held shares; 'error' when the order vanished and nothing further can be
+    learned from it, so the earnings reminder stops treating it as an upcoming
+    buy, but stop management keeps watching whatever the ledger holds, which
+    is unaffected). Nothing is sent. An order that still cannot be read is left
     for the next run."""
     et = now.astimezone(ET)
     today, late = _today(now), (et.hour, et.minute) >= ENTRY_CUTOFF
@@ -1255,9 +1258,10 @@ def _expire_unretried_opg(con, broker: Broker, now: datetime) -> list[str]:
             log.exception("opening order %s unreadable while closing its retry window", p["client_order_id"])
             continue
         con.execute("INSERT OR IGNORE INTO plan_attempts VALUES (?, 1)", (_opg_retry_key(day, p),))
-        if o is None:  # a settled 404: fills unknown, keep 'submitted' and let reconcile say what is held
-            why = f"開盤單 {p['client_order_id']} 在券商查無記錄(404),超過補單時間窗({day} 10:30 ET),未補單,持股以對帳為準"
-            _mark(con, p, "submitted", why)
+        if o is None:  # a settled 404: the order is gone for good, nothing more will ever fill from it
+            why = (f"開盤單 {p['client_order_id']} 在券商查無記錄(404),超過補單時間窗({day} 10:30 ET),"
+                   "未補單,持股以對帳為準,需人工確認")
+            _mark(con, p, "error", why)  # terminal: not 'planned'/'submitted', so it stops looking like an upcoming buy
             con.commit()
             lines.append(f"{p['symbol']} {why}")
             continue

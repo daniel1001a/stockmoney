@@ -298,8 +298,8 @@ def test_a_missing_opening_order_pages_at_postopen_and_is_settled_after_the_cuto
         lines = run._expire_unretried_opg(con, b, WED.replace(hour=16, minute=45))
         assert len(lines) == 1 and "404" in lines[0]
         row = plan_status(con, cid)
-        assert row["status"] == "submitted" and "持股以對帳為準" in row["note"]
-        assert run._opg_unretried(con) == []
+        assert row["status"] == "error" and "持股以對帳為準" in row["note"] and "需人工確認" in row["note"]
+        assert run._opg_unretried(con) == []  # no longer status='submitted', so it drops out of this query too
         assert run._expire_unretried_opg(con, b, WED.replace(hour=16, minute=50)) == []
 
 
