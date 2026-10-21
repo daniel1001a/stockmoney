@@ -193,7 +193,7 @@ H1 已在 2.1(a) 登記(出場放寬,對應影子帳戶 `shadow:combined_t35`)�
 | 被擋買單反事實(5 日,只算獨立事件) | Muse ALERT elevated 4 件 +2.19%(超額 +3.76%);ALERT info 7 件中 3 件已滿 5 日 -0.40%(超額 +1.18%,守停損 -1.67%);RESEARCH_REPLY 風險旗標 3 件中 2 件 +2.81%(超額 +3.88%);20 日全部未滿 | `blocked_counterfactual` |
 | 對帳 | 10-19 漏單 2 筆(EOG、PG 開盤單 expired);10-20 零差異 | `reconcile_daily` |
 | 期權實際 | 9 筆,-$1,286:invalidation 6 筆 -$753、premium_stop 2 筆 -$780、time_stop 1 筆 +$247 | `options_positions` |
-| 期權影子 | 88 筆,+$10,118:invalidation 44 筆 -$3,296、time_stop 19 筆 +$8,327、atr_trail 18 筆 +$7,008、premium_stop 6 筆 -$2,092、breakeven 1 筆 +$172;exit_variant A 44 筆 +$6,068、B 44 筆 +$4,051 | `options_book_positions` |
+| 期權影子 | 88 筆,+$10,118.4:invalidation 44 筆 -$3,296.0、time_stop 19 筆 +$8,326.7、atr_trail 18 筆 +$7,007.7、premium_stop 6 筆 -$2,092.0、breakeven 1 筆 +$172.0;exit_variant A 44 筆 +$6,067.7、B 44 筆 +$4,050.7 | `options_positions`(mode=shadow) |
 | invalidation 出場的 MAE / MFE | 實際 -15.4% / +5.3%;影子 -11.3% / +7.1% | 期權部位與影子帳本 |
 | 期權驗屍卡症狀 | OQ 快速出場(10 分鐘內)5 筆 -$567(其中 1 筆同時 O8 執行異常);O0 正常虧損 3 筆 -$968 | `trade_postmortem`(options:) |
 
