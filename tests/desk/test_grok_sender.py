@@ -299,11 +299,28 @@ def test_postmortem_grok_items_keep_only_verified(con):
     send(box, grok_daily("grok-20261012-0737"), auth="")
     send(box, grok_daily("grok-20261012-0738"), sender=SENDER, token=TOKEN)
     inbox.poll(con, box, CONFIG, now=NOW)
-    con.execute("CREATE TABLE chains (chain_id TEXT, created_at TEXT, source TEXT, urls_json TEXT, impacts_json TEXT)")
+    con.execute("CREATE TABLE chains (chain_id TEXT, created_at TEXT, source TEXT, trigger_text TEXT, urls_json TEXT, "
+                "impacts_json TEXT)")
     events = {i["ref"].split(":")[1] for i in corroboration._grok_items(con, verified_only=True)
               if i["kind"] == "event"}
     assert events == {"grok-20261012-0736"}
     assert len({i["ref"] for i in corroboration._grok_items(con) if i["kind"] == "event"}) == 3
+
+
+def test_a_legacy_chain_received_in_the_same_second_is_not_counted_verified(con):
+    from stockmoney.desk.learn import chains, tables
+    tables.ensure_schema(con)
+    box = FakeMailbox()
+    send(box, grok_daily("grok-20261012-0736"))
+    legacy = grok_daily("grok-20261012-0737")
+    legacy["chains"][0]["trigger"] = "Unsigned rumor"
+    send(box, legacy, auth="")
+    inbox.poll(con, box, CONFIG, now=NOW)
+    con.execute("UPDATE bridge_messages SET received_at=?", (NOW.isoformat(),))  # same second
+    assert chains.ingest_grok(con)["added"] == 2
+    kept = {con.execute("SELECT trigger_text FROM chains WHERE chain_id=?", (i["ref"].split(":")[1],)).fetchone()[0]
+            for i in corroboration._grok_items(con, verified_only=True) if i["kind"] == "chain"}
+    assert kept == {"Export curbs on AI GPUs"}
 
 
 # ---------------------------------------------------------------- resends
