@@ -1254,8 +1254,11 @@ def _expire_unretried_opg(con, broker: Broker, now: datetime) -> list[str]:
         except Exception:
             log.exception("opening order %s unreadable while closing its retry window", p["client_order_id"])
             continue
+        if o is None:  # broker has no such order (404): same as unreadable, leave it
+            log.warning("opening order %s not found while closing its retry window", p["client_order_id"])
+            continue
         con.execute("INSERT OR IGNORE INTO plan_attempts VALUES (?, 1)", (_opg_retry_key(day, p),))
-        if o is None or o.tif != TIF.OPG or o.status not in (OrderStatus.EXPIRED, OrderStatus.CANCELED):
+        if o.tif != TIF.OPG or o.status not in (OrderStatus.EXPIRED, OrderStatus.CANCELED):
             con.commit()
             continue
         ordered, filled = float(o.qty or 0), float(o.filled_qty or 0)

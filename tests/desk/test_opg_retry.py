@@ -171,6 +171,7 @@ def test_a_broker_read_failure_before_sending_does_not_spend_the_retry(desk, mon
         out = run.postopen(con, b, POSTOPEN, desk.limits)
         assert retries(b) == [] and "補單暫緩" in out
         assert con.execute("SELECT 1 FROM plan_attempts WHERE key LIKE ?", (f"%{cid}",)).fetchone() is None
+        assert len(run._opg_unretried(con)) == 1
         assert plan_status(con, cid)["status"] == "submitted"
         down["on"] = False
         run.postopen(con, b, POSTOPEN.replace(minute=55), desk.limits)
@@ -263,12 +264,22 @@ def test_the_next_days_postopen_closes_a_window_left_open(desk, monkeypatch):
         assert "超過補單時間窗" in out and plan_status(con, cid)["status"] == "expired" and retries(b) == []
 
 
-def test_an_order_still_unreadable_is_left_for_the_next_run(desk, monkeypatch):
+@pytest.mark.parametrize("read", ["raises", "missing"])
+def test_an_order_still_unreadable_is_left_for_the_next_run(desk, monkeypatch, read):
+    """Grok review 2026-10-21: a 404 (get_order returns None) used to spend
+    the attempt after the cutoff and leave the plan unmarked."""
     from stockmoney.desk.execution.alpaca import BrokerUnavailable
     b = desk.broker
     with store.connect(desk.path) as con:
         cid = opening_short(con, b, desk.limits, 0.0)
-        monkeypatch.setattr(b, "get_order", lambda c: (_ for _ in ()).throw(BrokerUnavailable("down")))
+        _rt_read_fails(b, monkeypatch, 2)
+        run.postopen(con, b, POSTOPEN, desk.limits)
+        assert len(run._opg_unretried(con)) == 1
+        if read == "raises":
+            monkeypatch.setattr(b, "get_order", lambda c: (_ for _ in ()).throw(BrokerUnavailable("down")))
+        else:
+            monkeypatch.setattr(b, "get_order", lambda c: None)
         assert run._expire_unretried_opg(con, b, WED.replace(hour=16, minute=45)) == []
         assert plan_status(con, cid)["status"] == "submitted"
         assert con.execute("SELECT 1 FROM plan_attempts WHERE key LIKE ?", (f"%{cid}",)).fetchone() is None
+        assert len(run._opg_unretried(con)) == 1
