@@ -265,10 +265,7 @@ def test_the_next_days_postopen_closes_a_window_left_open(desk, monkeypatch):
         assert "超過補單時間窗" in out and plan_status(con, cid)["status"] == "expired" and retries(b) == []
 
 
-@pytest.mark.parametrize("read", ["raises", "missing"])
-def test_an_order_still_unreadable_is_left_for_the_next_run(desk, monkeypatch, read):
-    """Grok review 2026-10-21: a 404 (get_order returns None) used to spend
-    the attempt after the cutoff and leave the plan unmarked."""
+def test_an_order_still_unreadable_is_left_for_the_next_run(desk, monkeypatch):
     from stockmoney.desk.execution.alpaca import BrokerUnavailable
     b = desk.broker
     with store.connect(desk.path) as con:
@@ -276,14 +273,34 @@ def test_an_order_still_unreadable_is_left_for_the_next_run(desk, monkeypatch, r
         _rt_read_fails(b, monkeypatch, 2)
         run.postopen(con, b, POSTOPEN, desk.limits)
         assert len(run._opg_unretried(con)) == 1
-        if read == "raises":
-            monkeypatch.setattr(b, "get_order", lambda c: (_ for _ in ()).throw(BrokerUnavailable("down")))
-        else:
-            monkeypatch.setattr(b, "get_order", lambda c: None)
+        monkeypatch.setattr(b, "get_order", lambda c: (_ for _ in ()).throw(BrokerUnavailable("down")))
         assert run._expire_unretried_opg(con, b, WED.replace(hour=16, minute=45)) == []
         assert plan_status(con, cid)["status"] == "submitted"
         assert con.execute("SELECT 1 FROM plan_attempts WHERE key LIKE ?", (f"%{cid}",)).fetchone() is None
         assert len(run._opg_unretried(con)) == 1
+
+
+def test_a_missing_opening_order_pages_at_postopen_and_is_settled_after_the_cutoff(desk, monkeypatch):
+    """Grok review 2026-10-21: a 404 (get_order returns None) is a settled
+    answer. At 09:50 it is retried in-run and paged like a failed read; after
+    the cutoff the window is closed with a note, fills left to reconcile."""
+    b = desk.broker
+    sent_pages = []
+    monkeypatch.setattr(run.notify, "send", lambda subj, body, level=None: sent_pages.append((subj, body)))
+    with store.connect(desk.path) as con:
+        cid = opening_short(con, b, desk.limits, 0.0)
+        run.sync_fills(con, b, run.Ledger(con), "2026-09-09")  # the expiry is recorded, then the order vanishes
+        monkeypatch.setattr(b, "get_order", lambda c: None)
+        out = run.postopen(con, b, POSTOPEN, desk.limits)
+        assert "補單暫緩" in out and "404" in out and retries(b) == []
+        assert any("補單暫緩" in subj and "手動執行 postopen" in body for subj, body in sent_pages)
+        assert plan_status(con, cid)["status"] == "submitted" and len(run._opg_unretried(con)) == 1
+        lines = run._expire_unretried_opg(con, b, WED.replace(hour=16, minute=45))
+        assert len(lines) == 1 and "404" in lines[0]
+        row = plan_status(con, cid)
+        assert row["status"] == "submitted" and "持股以對帳為準" in row["note"]
+        assert run._opg_unretried(con) == []
+        assert run._expire_unretried_opg(con, b, WED.replace(hour=16, minute=50)) == []
 
 
 @pytest.mark.parametrize("ratio, px_open, want", [

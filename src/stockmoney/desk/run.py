@@ -1254,10 +1254,13 @@ def _expire_unretried_opg(con, broker: Broker, now: datetime) -> list[str]:
         except Exception:
             log.exception("opening order %s unreadable while closing its retry window", p["client_order_id"])
             continue
-        if o is None:  # broker has no such order (404): same as unreadable, leave it
-            log.warning("opening order %s not found while closing its retry window", p["client_order_id"])
-            continue
         con.execute("INSERT OR IGNORE INTO plan_attempts VALUES (?, 1)", (_opg_retry_key(day, p),))
+        if o is None:  # a settled 404: fills unknown, keep 'submitted' and let reconcile say what is held
+            why = f"開盤單 {p['client_order_id']} 在券商查無記錄(404),超過補單時間窗({day} 10:30 ET),未補單,持股以對帳為準"
+            _mark(con, p, "submitted", why)
+            con.commit()
+            lines.append(f"{p['symbol']} {why}")
+            continue
         if o.tif != TIF.OPG or o.status not in (OrderStatus.EXPIRED, OrderStatus.CANCELED):
             con.commit()
             continue
@@ -1329,7 +1332,9 @@ def _retry_opg_one(con, broker: Broker, risk: RiskEngine, snap: AccountSnapshot,
                    bad, flags, et, today) -> None:
     sym, cid = p["symbol"], p["client_order_id"]
     o = broker.get_order(cid)
-    if o is None or o.tif != TIF.OPG or o.status not in (OrderStatus.EXPIRED, OrderStatus.CANCELED):
+    if o is None:  # recorded as ended short, now missing: nothing sent, retried and paged like a failed read
+        raise LookupError(f"開盤單 {cid} 在券商查無記錄(404)")
+    if o.tif != TIF.OPG or o.status not in (OrderStatus.EXPIRED, OrderStatus.CANCELED):
         return
     ordered, filled = float(o.qty or 0), float(o.filled_qty or 0)
     rest = floor(ordered - filled + 1e-9)  # only the missing shares, never the filled part
