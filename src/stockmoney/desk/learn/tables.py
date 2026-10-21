@@ -32,6 +32,11 @@ CREATE TABLE IF NOT EXISTS learn_reports (
 CREATE TABLE IF NOT EXISTS link_checks (
   url TEXT PRIMARY KEY, msg_id TEXT, agent TEXT, domain TEXT, status TEXT, http_code INTEGER,
   detail TEXT, checked_day TEXT, checked_at TEXT);
+CREATE TABLE IF NOT EXISTS blocked_counterfactual (
+  client_order_id TEXT PRIMARY KEY, plan_date TEXT, symbol TEXT, strategy TEXT, block_class TEXT,
+  severity TEXT, note TEXT, ref_price REAL, stop REAL, entry_day TEXT, entry_px REAL,
+  ret_5 REAL, ret_20 REAL, excess_5 REAL, excess_20 REAL, stop_ret_5 REAL, stop_ret_20 REAL,
+  stop_hit INTEGER, first_block INTEGER, status TEXT, updated_at TEXT);
 """
 
 # Columns added after a table first shipped; CREATE TABLE IF NOT EXISTS will not add them.
