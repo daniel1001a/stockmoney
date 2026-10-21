@@ -625,3 +625,41 @@ def test_a_chain_without_a_recorded_owner_is_not_verified(con):
     con.execute("DELETE FROM chain_owners")  # as if ingested before chain_owners existed
     assert chains.grok_chain_owners(con) == {}
     assert [i for i in corroboration._grok_items(con, verified_only=True) if i["kind"] == "chain"] == []
+
+
+def test_a_legacy_chain_is_backfilled_when_only_one_message_could_have_written_it(con):
+    """Grok review 2026-10-21 (sixth pass): a chain ingested before
+    chain_owners existed would otherwise lose verified credit forever on the
+    next learn run. When exactly one GROK_DAILY message produces its
+    chain_id, the backfill in ingest_grok recovers that credit."""
+    from stockmoney.desk.learn import chains, tables
+    tables.ensure_schema(con)
+    box = FakeMailbox()
+    send(box, grok_daily("grok-20261012-0737"))
+    inbox.poll(con, box, CONFIG, now=NOW)
+    chains.ingest_grok(con)
+    con.execute("DELETE FROM chain_owners")  # as if ingested before chain_owners existed
+    assert [i for i in corroboration._grok_items(con, verified_only=True) if i["kind"] == "chain"] == []
+    chains.ingest_grok(con)  # next learn run: nothing new to add, but backfill runs
+    owner = next(iter(chains.grok_chain_owners(con).values()))
+    assert owner["msg_id"] == "grok-20261012-0737"
+    assert [i for i in corroboration._grok_items(con, verified_only=True) if i["kind"] == "chain"]
+
+
+def test_a_backfill_collision_between_two_candidates_leaves_the_chain_unowned(con):
+    """Two GROK_DAILY messages with the same trigger landing in the same ET
+    day both could have written the surviving chain row; with no recorded
+    owner there is no way to tell which one did, so backfill must not guess
+    and the chain stays unverified."""
+    from stockmoney.desk.learn import chains, tables
+    tables.ensure_schema(con)
+    box = FakeMailbox()
+    send(box, grok_daily("grok-20261012-0737"))
+    send(box, grok_daily("grok-20261012-0738"))  # same trigger, both verified
+    inbox.poll(con, box, CONFIG, now=NOW)
+    con.execute("UPDATE bridge_messages SET received_at=?", (NOW.isoformat(),))  # same second
+    assert chains.ingest_grok(con)["added"] == 1  # the second is a no-op: same id, already stored
+    con.execute("DELETE FROM chain_owners")  # as if ingested before chain_owners existed
+    assert chains.ingest_grok(con)["added"] == 0  # still nothing new to add, but backfill runs
+    assert chains.grok_chain_owners(con) == {}  # two candidates, no way to tell which wrote it
+    assert [i for i in corroboration._grok_items(con, verified_only=True) if i["kind"] == "chain"] == []

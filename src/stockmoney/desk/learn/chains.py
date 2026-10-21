@@ -160,15 +160,49 @@ def ingest_grok(con) -> dict:
                 added += 1
         except Exception:
             skipped += 1
+    backfill_chain_owners(con)
     return {"added": added, "skipped": skipped}
 
 
+def backfill_chain_owners(con) -> int:
+    """One-shot backfill for chains that were ingested before ``chain_owners``
+    existed, so they never got an owner row at insert time. When exactly one
+    GROK_DAILY message would produce a given chain_id (same trigger landing in
+    the same ET day), that message is the only candidate that could have
+    written it, so it is recorded as the owner. A chain_id produced by two or
+    more candidate messages stays unowned, since there is no way to tell which
+    one actually inserted it; a genuine collision must never be guessed at.
+    Safe to call every run: a chain_id that already has an owner, or that
+    does not exist in ``chains``, is left untouched. Returns the count newly
+    owned."""
+    if con.execute("SELECT 1 FROM sqlite_master WHERE name='chain_owners'").fetchone() is None:
+        return 0
+    candidates: dict[str, set[str]] = {}
+    for r, chain in _grok_chains(con):
+        if chain is None:
+            continue
+        cid = chain_id("grok", chain.trigger, datetime.fromisoformat(r["received_at"]))
+        candidates.setdefault(cid, set()).add(r["msg_id"])
+    owned = {row[0] for row in con.execute("SELECT chain_id FROM chain_owners")}
+    existing = {row[0] for row in con.execute("SELECT chain_id FROM chains")}
+    n = 0
+    for cid, msg_ids in candidates.items():
+        if cid in owned or cid not in existing or len(msg_ids) != 1:
+            continue
+        con.execute("INSERT OR REPLACE INTO chain_owners (chain_id, msg_id) VALUES (?,?)", (cid, next(iter(msg_ids))))
+        n += 1
+    return n
+
+
 def grok_chain_owners(con) -> dict[str, object]:
-    """chain_id -> the bridge_messages row recorded by ``ingest_grok`` as the
-    one whose insert wrote the chain. A message whose insert failed, or that
-    found the id already taken, is never the owner, whatever its urls. A chain
-    with no recorded owner (ingested before chain_owners existed) has none, so
-    it is never treated as verified. Read-only."""
+    """chain_id -> the bridge_messages row recorded as owning the chain: either
+    the message whose insert actually wrote it, or, for a chain ingested
+    before ``chain_owners`` existed, the single unambiguous GROK_DAILY message
+    that ``backfill_chain_owners`` found as the only candidate (see there). A
+    message whose insert failed, or that found the id already taken, is never
+    the owner, whatever its urls. A chain still unowned (a genuine collision
+    on trigger + day) has none, so it is never treated as verified.
+    Read-only."""
     if con.execute("SELECT 1 FROM sqlite_master WHERE name='chain_owners'").fetchone() is None:
         return {}
     rows = {r["msg_id"]: r for r, _ in _grok_chains(con)}
