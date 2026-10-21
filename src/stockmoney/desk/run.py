@@ -62,6 +62,7 @@ from stockmoney.desk.execution.broker import Broker
 from stockmoney.desk.execution.ledger import Ledger, norm
 from stockmoney.desk.execution.reconcile import daily as reconcile_daily
 from stockmoney.desk.execution.reconcile import mismatches
+from stockmoney.desk import profiles
 from stockmoney.desk.execution.risk import Limits, RiskEngine
 from stockmoney.desk.execution.types import (
     AccountSnapshot, AssetClass, BrokerOrder, OrderIntent, OrderStatus, OrderType, Side, TIF,
@@ -86,10 +87,11 @@ PENDING_SUBMIT = "pending_submit"  # written before broker.submit; resolved by s
 NOT_SENT = "not_sent"    # a pending_submit row the broker never received
 
 # Stock-book sizing (backtested values; see docs/desk/OPERATING_PLAN.md)
-RISK_PER_TRADE = 0.0075
-MAX_POSITIONS = 8
-MAX_PER_SECTOR = 2
-MAX_POSITION_PCT = 0.20  # same cap as the backtest Account
+_PROFILE = profiles.active()
+RISK_PER_TRADE = _PROFILE.risk_per_trade
+MAX_POSITIONS = _PROFILE.max_positions
+MAX_PER_SECTOR = _PROFILE.max_per_sector
+MAX_POSITION_PCT = _PROFILE.max_position_pct  # standard = same cap as the backtest Account
 
 _TERMINAL = (OrderStatus.FILLED, OrderStatus.CANCELED, OrderStatus.EXPIRED, OrderStatus.REJECTED)
 _sleep = time.sleep
@@ -620,7 +622,7 @@ def sweep_orphan_stops(con, broker: Broker, ledger: Ledger, day: str) -> list[st
 def postclose(con, broker: Broker, now: datetime, bars: data.Bars | None = None, limits: Limits | None = None) -> str:
     ensure_schema(con)
     today = _today(now)
-    limits = limits or Limits()
+    limits = limits or _PROFILE.limits()
     risk = RiskEngine(limits, con)
     ledger = risk.ledger
     events = sync_fills(con, broker, ledger, today)
@@ -877,7 +879,7 @@ def premarket(con, broker: Broker, now: datetime, limits: Limits | None = None, 
     today = _today(now)
     if not broker.is_equity_market_open() and not _opens_today(broker, now):
         return f"{today} 不開盤,跳過。"
-    risk = RiskEngine(limits or Limits(), con)
+    risk = RiskEngine(limits or _PROFILE.limits(), con)
     ledger = risk.ledger
     sync_fills(con, broker, ledger, today)
     snap = broker.account()
@@ -1180,7 +1182,7 @@ def postopen(con, broker: Broker, now: datetime, limits: Limits | None = None) -
     ensure_schema(con)
     st = _Run(job="postopen", late=True)
     today = _today(now)
-    risk = RiskEngine(limits or Limits(), con)
+    risk = RiskEngine(limits or _PROFILE.limits(), con)
     ledger = risk.ledger
     waiting = {r[0] for r in con.execute("SELECT client_order_id FROM planned_orders WHERE status='planned' "
                                          "AND side='sell'")}
@@ -1222,7 +1224,7 @@ def recover(con, broker: Broker, now: datetime, limits: Limits | None = None) ->
     ensure_schema(con)
     st = _Run(job="recover")
     today = _today(now)
-    risk = RiskEngine(limits or Limits(), con)
+    risk = RiskEngine(limits or _PROFILE.limits(), con)
     ledger = risk.ledger
     events = sync_fills(con, broker, ledger, today)
     snap = broker.account()
