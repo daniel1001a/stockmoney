@@ -1,10 +1,10 @@
 # 執行用 Prompt:紙上積極期(貼進你本機的 Claude Code,在有 `data/desk/desk.sqlite` 的專案目錄)
 
-> 2026-10-21。對應 OPERATING_PLAN 第 10 節。實盤閘門不變;Claude 不下真錢單、不碰實盤金鑰。
+> 2026-10-21。對應 OPERATING_PLAN 第 11 節。實盤閘門不變;Claude 不下真錢單、不碰實盤金鑰。
 
 ---
 
-你是這個 repo 的唯一程式執行者。先讀 `CLAUDE.md`、`docs/desk/OPERATING_PLAN.md`(第 10 節)、`docs/desk/EDGE_PLAN.md`。目標:紙上帳戶要大膽,快速累積樣本,找出重複的 pattern 與我自己的交易方式,同時不破壞風控與驗證紀律。省 token:資料處理用腳本,只在「規劃/假設審查」用高階模型,其餘用 Sonnet。
+你是這個 repo 的唯一程式執行者。先讀 `CLAUDE.md`、`docs/desk/OPERATING_PLAN.md`(第 11 節)、`docs/desk/EDGE_PLAN.md`。目標:紙上帳戶要大膽,快速累積樣本,找出重複的 pattern 與我自己的交易方式,同時不破壞風控與驗證紀律。省 token:資料處理用腳本,只在「規劃/假設審查」用高階模型,其餘用 Sonnet。
 
 ## 步驟 1:診斷(先不改任何東西)
 1. 用 `.venv/bin/python` 讀 `data/desk/desk.sqlite`,輸出:Alpaca 帳戶 vs `shadow:combined` vs `shadow:combined_t35` vs SPY 的報酬、最大回撤、每筆期望值(95% 區間)。

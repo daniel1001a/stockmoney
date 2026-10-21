@@ -1,7 +1,7 @@
 """Risk profiles for the Alpaca book.
 
 ``standard`` is the backtested, audited sizing. ``paper_aggressive`` is a
-paper-only experiment arm (OPERATING_PLAN section 10): bigger bets and more
+paper-only experiment arm (OPERATING_PLAN section 11): bigger bets and more
 slots so the paper month produces enough trades to learn from. The internal
 simulated accounts keep the standard sizing, so they are the control group.
 
