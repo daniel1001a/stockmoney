@@ -59,7 +59,7 @@ def _add_missing_columns(con) -> None:
 
 def ensure_schema(con) -> None:
     from stockmoney.desk import veto
-    from stockmoney.desk.learn import calls, earnings, hypotheses, prescreen
+    from stockmoney.desk.learn import calls, earnings, hypotheses, market_risk, prescreen
     con.executescript(SCHEMA)
     _add_missing_columns(con)
     earnings.ensure_schema(con)
@@ -67,3 +67,4 @@ def ensure_schema(con) -> None:
     prescreen.ensure_schema(con)
     veto.ensure_schema(con)
     hypotheses.ensure_schema(con)
+    market_risk.ensure_schema(con)

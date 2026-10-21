@@ -247,9 +247,12 @@ def test_o0_only_for_unexplained_losses(con):
 
 # grok_muse_independent_same_symbol ------------------------------------------------------------
 
-def _grok_chain(con, cid, ticker, at, url):
+def _grok_chain(con, cid, ticker, at, url, source="grok_verified"):
+    """A Grok chain plus the GROK_DAILY it came in (received at the chain's created_at)."""
     con.execute("INSERT INTO chains (chain_id, created_at, source, urls_json, impacts_json) VALUES (?,?,?,?,?)",
                 (cid, ostore.iso(at), "grok", json.dumps([url]), json.dumps([{"ticker": ticker}])))
+    _bridge(con, f"grok-{cid}", "GROK_DAILY", at, {"type": "GROK_DAILY", "events": []})
+    con.execute("UPDATE bridge_messages SET source=? WHERE msg_id=?", (source, f"grok-{cid}"))
 
 
 def _idea(con, msg_id, ticker, at, url):

@@ -195,8 +195,12 @@ def test_duplicate_msg_id_rejected_second_time(con):
     send(mb, alert(headline="replayed with different text"))
     assert poll(con, mb) == 1
     assert rejects(con) == ["duplicate_msg_id"]
-    # a replay in a later poll is also a duplicate
+    # an identical replay in a later poll is dropped silently (no new reject);
+    # a different body under the same id is still a duplicate
     send(mb, alert())
+    assert poll(con, mb) == 0
+    assert rejects(con) == ["duplicate_msg_id"]
+    send(mb, alert(headline="third version"))
     assert poll(con, mb) == 0
     assert rejects(con) == ["duplicate_msg_id"] * 2
     assert con.execute("SELECT headline FROM (SELECT json_extract(parsed_json,'$.headline') AS headline "

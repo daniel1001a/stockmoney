@@ -201,7 +201,8 @@ def test_grok_prefix_stays_reserved_and_cross_type_id_collision_rejected(con):
     assert poll(con, mb) == 0
     assert "reserved_prefix" in rejects(con)[0]
     # a plan_id already used by a different message type is a duplicate id
-    con.execute("INSERT INTO bridge_messages VALUES (?,?,?,?,?,?,?)",
+    con.execute("INSERT INTO bridge_messages (msg_id, type, sender, sent_at, received_at, raw_body, parsed_json) "
+                "VALUES (?,?,?,?,?,?,?)",
                 (PID, "IDEA", SENDER, "x", "2026-10-13T00:00:00+00:00", "{}", "{}"))
     mb2 = FakeMailbox()
     mail(mb2)

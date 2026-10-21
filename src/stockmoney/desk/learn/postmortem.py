@@ -19,7 +19,7 @@ Symptom rules (all computed from bars known at the time, or after exit for S2):
 Winners are carded too (symptoms may be empty) so wins and losses are compared.
 
 grok_muse_independent_same_symbol (every card, stock and option): 1 when a Grok
-item and a Muse flag on the same symbol, both received in the 3 days before the
+item (grok_verified messages with a URL only; grok_legacy never counts) and a Muse flag on the same symbol, both received in the 3 days before the
 entry, are independent by veto's rule (both sourced, no shared URL or author);
 0 when not; NULL when the inputs are unavailable. Built from bridge_messages and
 chains at their receipt times, never from the corroboration table (that table is
@@ -78,7 +78,7 @@ def gm_inputs(con) -> tuple[list[dict], list[dict]] | None:
     if not (_table_exists(con, "bridge_messages") and _table_exists(con, "chains")):
         return None
     try:
-        return corroboration._grok_items(con), corroboration._muse_flags(con)
+        return corroboration._grok_items(con, verified_only=True), corroboration._muse_flags(con)
     except sqlite3.Error:
         return None
 

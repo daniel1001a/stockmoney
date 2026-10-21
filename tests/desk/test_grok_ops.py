@@ -19,6 +19,7 @@ ET = muse_ops.ET
 MON = datetime(2026, 10, 12, tzinfo=ET)        # Columbus Day: NYSE is open
 SAT = datetime(2026, 10, 17, tzinfo=ET)
 THANKSGIVING = datetime(2026, 11, 26, tzinfo=ET)
+MISS_NOTE = ";沒有收到信(不是空白日報),不代表今天沒有風險"
 
 
 @pytest.fixture(autouse=True)
@@ -72,7 +73,7 @@ def test_grok_miss_reported_once_on_a_trading_day_only_when_enabled(con):
     grok_on(con)
     assert muse_ops.check_deliveries(con, at(MON, 8, 15)) == []  # before the deadline
     misses = muse_ops.check_deliveries(con, at(MON, 8, 30))
-    assert misses == ["Grok 今天沒有準時送出「Grok 盤前日報」(期限 08:30 ET)"]
+    assert misses == ["Grok 今天沒有準時送出「Grok 盤前日報」(期限 08:30 ET)" + MISS_NOTE]
     assert muse_ops.check_deliveries(con, at(MON, 9)) == []  # once per day
 
 
@@ -170,7 +171,7 @@ def test_bad_grok_message_gets_tagged_feedback_to_the_shared_address(con):
     assert to == SENDER and subject.startswith("[SMD/FEEDBACK/")
     assert fb["about_msg_id"] == "grok-20261012-0730" and fb["problem"].startswith("【給 Grok】")
     head = fb["how_to_fix"].split("選填")[0]
-    for name in ("collected_at", "events", "chains", "calls", "attention", "tracked_accounts"):
+    for name in ("collected_at", "events", "chains", "calls", "tracked_accounts"):
         assert name in head
     assert "BTC/USD" in fb["how_to_fix"] and len(fb["how_to_fix"]) < 1000
 
@@ -212,7 +213,7 @@ def test_evening_message_same_day_does_not_count_as_the_morning_delivery(con):
     deliver(box, message_for(MON, "grok-20261012-2000", hour=20))
     assert poll(con, box, CONFIG, now=at(MON, 20, 15)) == 1  # stored
     # the first check of the day runs late (the Mac slept through the morning)
-    assert muse_ops.check_deliveries(con, at(MON, 21)) == ["Grok 今天沒有準時送出「Grok 盤前日報」(期限 08:30 ET)"]
+    assert muse_ops.check_deliveries(con, at(MON, 21)) == ["Grok 今天沒有準時送出「Grok 盤前日報」(期限 08:30 ET)" + MISS_NOTE]
     assert muse_ops.scorecard(con, at(MON, 23), days=1)["deliveries"]["GROK_AM"]["on_time"] == 0
 
 

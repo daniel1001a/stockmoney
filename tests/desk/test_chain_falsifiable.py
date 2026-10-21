@@ -129,7 +129,8 @@ def _grok_msg(chain: dict) -> dict:
 
 def _store_msg(con, msg_id, msg, received="2026-10-12T11:40:00+00:00"):
     bridge_schema(con)
-    con.execute("INSERT INTO bridge_messages VALUES (?,?,?,?,?,?,?)",
+    con.execute("INSERT INTO bridge_messages (msg_id, type, sender, sent_at, received_at, raw_body, parsed_json) "
+                "VALUES (?,?,?,?,?,?,?)",
                 (msg_id, msg.get("type", "GROK_DAILY"), "x", received, received, "{}", json.dumps(msg)))
 
 

@@ -32,7 +32,7 @@ def summarize(type_: str, parsed_json: str) -> str:
     try:
         if type_ == "GROK_DAILY":
             return (f"事件 {len(m['events'])}、事件鏈 {len(m['chains'])}、喊單 {len(m['calls'])}、"
-                    f"熱度 {len(m['attention'])}、追蹤帳號 {len(m['tracked_accounts'])}")
+                    f"熱度 {len(m.get('attention') or [])}、追蹤帳號 {len(m['tracked_accounts'])}")
         if type_ == "SOCIAL_DAILY":
             return f"{len(m['items'])} 個標的的社群快照"
         if type_ == "CALLS":

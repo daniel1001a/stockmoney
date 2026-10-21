@@ -54,7 +54,7 @@ FIXES = {
     "body_not_json": "內文要有一個完整的 JSON 物件(可以用 ```json 框起來),括號要成對。",
     "type_mismatch": "主旨裡的類型要和 JSON 的 \"type\" 欄位完全相同。",
     "msg_id_mismatch": "主旨裡的訊息編號要和 JSON 的 \"msg_id\" 欄位完全相同。",
-    "duplicate_msg_id": "每封信的訊息編號都要不同,建議用「類型縮寫-日期-時間」,例如 sd-20261012-0730。",
+    "duplicate_msg_id": "這個訊息編號已收過另一份內容。內容完全相同的重送會被系統安靜略過;內容不同請換新編號,例如結尾加 -r2(grok-20261021-0730-r2)。新信建議用「類型縮寫-日期-時間」,例如 sd-20261012-0730。",
     "plan_id_reused": "這個 plan_id 已被內容不同的劇本用過。內容不同的重送一定要換新的 plan_id,例如 gp-20261015-0830b;內容完全相同的重送會被系統安靜略過。",
     "oversized": "內容超過 200KB,請減少項目數量或拆成兩封。",
 }
@@ -264,7 +264,10 @@ def check_deliveries(con, now: datetime) -> list[str]:
         start = datetime.combine(day, e.window_start, ET)
         got = _delivered(con, e, day, start, now)
         if not got and _once(con, f"miss:{key}:{day}"):
-            misses.append(f"{e.who} 今天沒有準時送出「{e.name}」(期限 {e.deadline:%H:%M} ET)")
+            # "no mail" is not "nothing happened": an empty daily is a delivery
+            # (events: []) and never lands here
+            note = ";沒有收到信(不是空白日報),不代表今天沒有風險" if e.who == "Grok" else ""
+            misses.append(f"{e.who} 今天沒有準時送出「{e.name}」(期限 {e.deadline:%H:%M} ET){note}")
     for r in con.execute(
         "SELECT msg_id, ticker, deadline FROM bridge_outbox WHERE type='RESEARCH_REQUEST' AND deadline < ?",
         (_iso(now),),
@@ -275,6 +278,62 @@ def check_deliveries(con, now: datetime) -> list[str]:
         if not answered and _once(con, f"late:{r[0]}"):
             misses.append(f"Muse 沒有在期限前回覆 {r[1]} 的進場前查核")
     return misses
+
+
+def grok_today(con, now: datetime) -> dict:
+    """Today's morning GROK_DAILY status, for the console and reports.
+
+    status: not_due (weekend / NYSE holiday), pending (before the deadline,
+    nothing yet), missed (deadline passed with no accepted mail: no mail is not
+    "no risk"), empty (a valid daily with no events), delivered. Uses the same
+    window and collected-date rule as check_deliveries; works whether or not
+    the miss notification is switched on (``check_on`` says which)."""
+    e = EXPECTATIONS["GROK_AM"]
+    local = now.astimezone(ET)
+    day = local.date()
+    start = datetime.combine(day, e.window_start, ET)
+    rejected = con.execute("SELECT COUNT(*) FROM bridge_rejects WHERE received_at>=? AND received_at<=? "
+                           "AND subject LIKE '%SMD/GROK_DAILY/%'", (_iso(start), _iso(now))).fetchone()[0]
+    out = {"day": day.isoformat(), "deadline": f"{e.deadline:%H:%M}", "msg_id": None, "events": None,
+           "rejected": rejected, "check_on": "GROK_AM" in enabled_expectations(con)}
+    rows = []
+    if local.time() >= e.window_start:
+        rows = con.execute(
+            "SELECT msg_id, parsed_json FROM bridge_messages WHERE type='GROK_DAILY' AND received_at>=? "
+            "AND received_at<=? AND substr(json_extract(parsed_json,'$.collected_at'),1,10)=? "
+            "AND substr(json_extract(parsed_json,'$.collected_at'),12,5)<? ORDER BY received_at",
+            (_iso(start), _iso(now), day.isoformat(), f"{e.collected_before:%H:%M}")).fetchall()
+    if rows:
+        events = 0
+        for r in rows:
+            try:
+                events += len(json.loads(r[1]).get("events") or [])
+            except (ValueError, TypeError, AttributeError):
+                continue
+        out.update(msg_id=rows[-1][0], events=events, status="delivered" if events else "empty")
+    elif not _due(e, day):
+        out["status"] = "not_due"
+    elif local.time() < e.deadline:
+        out["status"] = "pending"
+    else:
+        out["status"] = "missed"
+    return out
+
+
+GROK_TODAY_LABEL = {
+    "not_due": "今天休市,不檢查早報",
+    "pending": "早報尚未收到(期限 {deadline} ET 前)",
+    "missed": "漏交:{deadline} ET 前沒有收到信,不代表今天沒有風險",
+    "empty": "已收到空白日報({msg_id}):Pika 回報今天沒有事件",
+    "delivered": "已收到早報({msg_id}):{events} 則事件",
+}
+
+
+def grok_today_text(st: dict) -> str:
+    text = GROK_TODAY_LABEL[st["status"]].format(**st)
+    if st["rejected"] and st["status"] in ("pending", "missed"):
+        text += f";今天有 {st['rejected']} 封 GROK_DAILY 被拒,見被拒絕的訊息"
+    return text
 
 
 # ------------------------------------------------------------------ Grok scope

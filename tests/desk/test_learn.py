@@ -220,7 +220,8 @@ def test_grok_chains_are_ingested_with_our_clock_and_once(con):
                       {"trigger": "bad", "steps": [], "impacts": [], "confidence": 2}]}
     from stockmoney.desk.bridge.inbox import ensure_schema as bridge_schema
     bridge_schema(con)
-    con.execute("INSERT INTO bridge_messages VALUES (?,?,?,?,?,?,?)",
+    con.execute("INSERT INTO bridge_messages (msg_id, type, sender, sent_at, received_at, raw_body, parsed_json) "
+                "VALUES (?,?,?,?,?,?,?)",
                 ("grok-20261012-0730", "GROK_DAILY", "x", "2026-10-12T07:30:00-04:00",
                  "2026-10-12T11:40:00+00:00", "{}", json.dumps(msg)))
     assert chains.ingest_grok(con) == {"added": 1, "skipped": 1}
@@ -372,7 +373,8 @@ def test_views_separate_muse_and_grok_messages_and_rejects(con):
             ("grok-20261012-0730", "GROK_DAILY", {"events": [1], "chains": [], "calls": [], "attention": [],
                                                   "tracked_accounts": ["@a"]})]
     for i, (mid, typ, body) in enumerate(rows):
-        con.execute("INSERT INTO bridge_messages VALUES (?,?,?,?,?,?,?)",
+        con.execute("INSERT INTO bridge_messages (msg_id, type, sender, sent_at, received_at, raw_body, parsed_json) "
+                "VALUES (?,?,?,?,?,?,?)",
                     (mid, typ, "s", "t", f"2026-10-12T0{i}:00:00+00:00", "{}", json.dumps(body)))
     con.execute("INSERT INTO bridge_rejects (received_at, subject, msg_id, reason) VALUES "
                 "('2026-10-12T01:00:00+00:00','[SMD/GROK_DAILY/grok-x1] t','grok-x1','schema_invalid')")
@@ -424,7 +426,8 @@ from stockmoney.desk.learn import calls as author_calls
 def _put_calls(con, msg_id, received_at, calls, type_="CALLS"):
     from stockmoney.desk.bridge.inbox import ensure_schema as bridge_schema
     bridge_schema(con)
-    con.execute("INSERT INTO bridge_messages VALUES (?,?,?,?,?,?,?)",
+    con.execute("INSERT INTO bridge_messages (msg_id, type, sender, sent_at, received_at, raw_body, parsed_json) "
+                "VALUES (?,?,?,?,?,?,?)",
                 (msg_id, type_, "x", received_at, received_at, "{}", json.dumps({"calls": calls})))
 
 
