@@ -6,6 +6,7 @@ here is logged and never touches an order or the trading lock.
 
 Steps (each isolated, a failure in one does not stop the others):
   1. post-mortem cards for closed trades
+  1b. counterfactual outcomes of blocked stock buys (blocked_counterfactual, read-only log)
   2. advance shadow books
   3. score due event chains, judge due invalidation conditions, label
      Muse/Grok source independence
@@ -31,8 +32,8 @@ import pandas as pd
 
 from stockmoney.desk import data, notify, store, veto
 from stockmoney.desk.indicators import compute
-from stockmoney.desk.learn import (allocator, calls, chains, corroboration, earnings, filings, h_reports, hypotheses,
-                                   invalidation, links, postmortem, prescreen, shadow, tables)
+from stockmoney.desk.learn import (allocator, calls, chains, corroboration, counterfactual, earnings, filings,
+                                   h_reports, hypotheses, invalidation, links, postmortem, prescreen, shadow, tables)
 
 log = logging.getLogger(__name__)
 ET = ZoneInfo("America/New_York")
@@ -116,6 +117,10 @@ def run(con, now: datetime, bars: data.Bars | None = None, shadow_start: str | N
     con.commit()
     if pm is not None:
         parts.append(f"驗屍卡:新增 {pm['new']},更新 {pm['updated']}。")
+    cf = guarded("counterfactual", lambda: counterfactual.refresh(con, bars, through))
+    con.commit()
+    if cf and (cf["added"] or cf["updated"]):
+        parts.append(f"被擋買單反事實:新增 {cf['added']},更新 {cf['updated']}。")
     rep, hyps = guarded("symptom_report", lambda: postmortem.symptom_report(con, day)) or ("", [])
     sh = guarded("shadow", lambda: shadow.step(con, bars, ind, through, start=shadow_start))
     con.commit()
@@ -178,6 +183,7 @@ def run(con, now: datetime, bars: data.Bars | None = None, shadow_start: str | N
               guarded("link_report", lambda: links.report(con)) or "", "",
               guarded("prescreen_report", lambda: prescreen.report(con)) or "", "",
               guarded("filings_report", lambda: filings.report(con)) or "", "",
+              guarded("counterfactual_report", lambda: counterfactual.report(con)) or "", "",
               guarded("veto_report", lambda: veto.report(con, (through - pd.Timedelta(days=7)).date().isoformat())) or "", "",
               guarded("h_reports", lambda: h_reports.run_all(con, bars)) or ""]
     con.commit()
