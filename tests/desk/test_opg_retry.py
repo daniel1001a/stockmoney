@@ -154,8 +154,8 @@ def test_muse_flags_are_read_at_postopen_and_block_adding_to_a_held_symbol(desk,
 
 def test_a_broker_read_failure_before_sending_does_not_spend_the_retry(desk, monkeypatch):
     """Grok review 2026-10-21: an unreachable broker used to record the one
-    attempt although nothing was sent. Now the plan stays a candidate and the
-    next run before the cutoff sends the retry."""
+    attempt although nothing was sent. Now the plan stays a candidate (after
+    one in-run wait and retry) and a manual run before the cutoff sends it."""
     from stockmoney.desk.execution.alpaca import BrokerUnavailable
     b = desk.broker
     real = b.get_order
@@ -205,3 +205,70 @@ def test_a_failed_send_with_an_unreadable_opening_order_does_not_abort_postopen(
         assert con.execute("SELECT 1 FROM plan_attempts WHERE key LIKE ?", (f"%{cid}",)).fetchone() is not None
         assert plan_status(con, cid)["status"] == "submitted"
         assert [s.qty for s in stops(b, "AAPL")] == [20]
+
+
+def _rt_read_fails(b, monkeypatch, times):
+    from stockmoney.desk.execution.alpaca import BrokerUnavailable
+    real = b.get_order
+    left = {"n": times}
+
+    def get_order(c):
+        if c.endswith("-rt") and left["n"] > 0:
+            left["n"] -= 1
+            raise BrokerUnavailable("timed out")
+        return real(c)
+    monkeypatch.setattr(b, "get_order", get_order)
+
+
+def test_a_transient_read_failure_is_retried_within_the_same_postopen(desk, monkeypatch):
+    """Grok re-review 2026-10-21: no scheduled run comes after 09:50 before
+    the cutoff, so a pre-send failure waits once and tries again in-run."""
+    b = desk.broker
+    with store.connect(desk.path) as con:
+        opening_short(con, b, desk.limits, 0.4)
+        _rt_read_fails(b, monkeypatch, 1)
+        out = run.postopen(con, b, POSTOPEN, desk.limits)
+        assert [(o.qty, o.tif) for o in retries(b)] == [(30, TIF.DAY)] and "補單暫緩" not in out
+
+
+@pytest.mark.parametrize("ratio, status", [(0.4, "submitted"), (0.0, "expired")])
+def test_an_unretried_remainder_is_voided_after_the_cutoff(desk, monkeypatch, ratio, status):
+    """The read keeps failing at 09:50: the notice asks for a manual run, and
+    the first run after 10:30 ET (postclose, or the next postopen) closes the
+    window instead of leaving the plan open forever. Nothing is sent."""
+    b = desk.broker
+    with store.connect(desk.path) as con:
+        cid = opening_short(con, b, desk.limits, ratio)
+        _rt_read_fails(b, monkeypatch, 2)
+        out = run.postopen(con, b, POSTOPEN, desk.limits)
+        assert "補單暫緩" in out and "手動執行 postopen" in out
+        assert run._expire_unretried_opg(con, b, POSTOPEN.replace(minute=59)) == []  # still before 10:30
+        lines = run._expire_unretried_opg(con, b, WED.replace(hour=16, minute=45))
+        assert len(lines) == 1 and "作廢" in lines[0]
+        row = plan_status(con, cid)
+        assert row["status"] == status and "超過補單時間窗" in row["note"]
+        assert con.execute("SELECT 1 FROM plan_attempts WHERE key LIKE ?", (f"%{cid}",)).fetchone() is not None
+        assert run._expire_unretried_opg(con, b, WED.replace(hour=16, minute=50)) == []  # once
+        assert retries(b) == []
+
+
+def test_the_next_days_postopen_closes_a_window_left_open(desk, monkeypatch):
+    from datetime import timedelta
+    b = desk.broker
+    with store.connect(desk.path) as con:
+        cid = opening_short(con, b, desk.limits, 0.0)
+        _rt_read_fails(b, monkeypatch, 2)
+        run.postopen(con, b, POSTOPEN, desk.limits)
+        out = run.postopen(con, b, POSTOPEN + timedelta(days=1), desk.limits)
+        assert "超過補單時間窗" in out and plan_status(con, cid)["status"] == "expired" and retries(b) == []
+
+
+def test_an_order_still_unreadable_is_left_for_the_next_run(desk, monkeypatch):
+    from stockmoney.desk.execution.alpaca import BrokerUnavailable
+    b = desk.broker
+    with store.connect(desk.path) as con:
+        cid = opening_short(con, b, desk.limits, 0.0)
+        monkeypatch.setattr(b, "get_order", lambda c: (_ for _ in ()).throw(BrokerUnavailable("down")))
+        assert run._expire_unretried_opg(con, b, WED.replace(hour=16, minute=45)) == []
+        assert plan_status(con, cid)["status"] == "submitted"
+        assert con.execute("SELECT 1 FROM plan_attempts WHERE key LIKE ?", (f"%{cid}",)).fetchone() is None

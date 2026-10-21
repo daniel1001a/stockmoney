@@ -655,6 +655,7 @@ def postclose(con, broker: Broker, now: datetime, bars: data.Bars | None = None,
     risk = RiskEngine(limits, con)
     ledger = risk.ledger
     events = sync_fills(con, broker, ledger, today)
+    events += _expire_unretried_opg(con, broker, now)
     snap = broker.account()
     bad = _check_reconcile(con, ledger, snap, today)
     head = ("對帳不一致,已暫停新進場(出場與停損照常):\n" + "\n".join(bad.values()) + "\n\n") if bad else ""
@@ -1212,17 +1213,62 @@ def _opg_retry_key(today: str, p) -> str:
     return f"{today}:opgretry:{p['client_order_id']}"
 
 
-def _opg_retry_candidates(con, today: str) -> list:
-    """Today's entry plans whose opening order ended (expired or cancelled)
-    and that were not retried yet. The broker order then says whether any
-    shares are missing."""
+def _opg_unretried(con) -> list[tuple[str, object]]:
+    """(submit day, plan) for entry plans whose opening order ended (expired
+    or cancelled) and whose one retry attempt was not spent. The broker order
+    then says whether any shares are missing."""
     rows = con.execute(
         "SELECT p.*, s.submitted_at AS s_at FROM planned_orders p JOIN submitted s "
         "ON s.client_order_id=p.client_order_id WHERE p.side='buy' AND p.status='submitted' "
         "AND s.kind='entry' AND s.recorded=1 AND s.status IN (?, ?) ORDER BY p.client_order_id",
         (OrderStatus.EXPIRED.value, OrderStatus.CANCELED.value)).fetchall()
-    return [r for r in rows if _today(datetime.fromisoformat(r["s_at"])) == today
-            and con.execute("SELECT 1 FROM plan_attempts WHERE key=?", (_opg_retry_key(today, r),)).fetchone() is None]
+    out = []
+    for r in rows:
+        day = _today(datetime.fromisoformat(r["s_at"]))
+        if con.execute("SELECT 1 FROM plan_attempts WHERE key=?", (_opg_retry_key(day, r),)).fetchone() is None:
+            out.append((day, r))
+    return out
+
+
+def _opg_retry_candidates(con, today: str) -> list:
+    """Today's entry plans whose opening order ended and were not retried yet."""
+    return [r for day, r in _opg_unretried(con) if day == today]
+
+
+def _expire_unretried_opg(con, broker: Broker, now: datetime) -> list[str]:
+    """Close the retry window for opening entries whose remainder was never
+    retried (the 09:50 postopen could not reach the broker before sending, and
+    no run before 10:30 ET tried again): after ENTRY_CUTOFF, or on a later day,
+    the attempt is recorded as spent and the plan takes the status the cutoff
+    path gives it ('expired' with nothing bought, else 'submitted' for the
+    held shares). Nothing is sent. An order that still cannot be read is left
+    for the next run."""
+    et = now.astimezone(ET)
+    today, late = _today(now), (et.hour, et.minute) >= ENTRY_CUTOFF
+    lines = []
+    for day, p in _opg_unretried(con):
+        if day == today and not late:
+            continue
+        try:
+            o = broker.get_order(p["client_order_id"])
+        except Exception:
+            log.exception("opening order %s unreadable while closing its retry window", p["client_order_id"])
+            continue
+        con.execute("INSERT OR IGNORE INTO plan_attempts VALUES (?, 1)", (_opg_retry_key(day, p),))
+        if o is None or o.tif != TIF.OPG or o.status not in (OrderStatus.EXPIRED, OrderStatus.CANCELED):
+            con.commit()
+            continue
+        ordered, filled = float(o.qty or 0), float(o.filled_qty or 0)
+        rest = floor(ordered - filled + 1e-9)
+        if rest <= 0:
+            con.commit()
+            continue
+        why = f"超過補單時間窗({day} 10:30 ET,執行於 {et:%m-%d %H:%M} ET),剩餘 {rest} 股作廢"
+        _mark(con, p, "submitted" if filled > 0 else "expired",
+              f"開盤單 {p['client_order_id']} 結束為 {o.status.value},已成交 {filled:g}/{ordered:g},未補單:{why}")
+        con.commit()
+        lines.append(f"{p['symbol']} 開盤單未全數成交({filled:g}/{ordered:g}),未補單:{why}")
+    return lines
 
 
 def _retry_opg_entries(con, broker: Broker, risk: RiskEngine, snap: AccountSnapshot, plans, st: _Run, *,
@@ -1236,30 +1282,44 @@ def _retry_opg_entries(con, broker: Broker, risk: RiskEngine, snap: AccountSnaps
     and the retry id ``<cid>-rt`` is checked at the broker. The price band
     and every limit are the ones premarket uses; nothing is widened."""
     for p in plans:
-        try:
-            _retry_opg_one(con, broker, risk, snap, p, st, bad=bad, flags=flags, et=et, today=today)
-        except Exception as e:
-            log.exception("opening retry %s failed", p["client_order_id"])
-            con.rollback()
-            why = f"開盤單補單失敗:{type(e).__name__}: {e}"
-            if con.execute("SELECT 1 FROM submitted WHERE client_order_id=?",
-                           (f"{p['client_order_id']}-rt",)).fetchone() is None:
-                # nothing was sent (a broker read failed first): the one attempt
-                # is not spent, the next run before the cutoff tries again
-                st.lines.append(f"補單暫緩 {p['symbol']}:{why},下次執行再試")
-                notify.send(f"Desk 補單暫緩 {p['symbol']}", why[:1000], notify.WARN)
-                continue
-            con.execute("INSERT OR IGNORE INTO plan_attempts VALUES (?, 1)", (_opg_retry_key(today, p),))
+        for tries_left in (1, 0):
             try:
-                filled = _filled_any(broker.get_order(p["client_order_id"]))
-            except Exception:
-                log.exception("opening order %s unreadable after a failed retry", p["client_order_id"])
-                filled = True  # unknown: keep the plan 'submitted' rather than call it an error
-            _mark(con, p, "submitted" if filled else "error", why)
-            con.commit()
-            st.lines.append(f"補單失敗 {p['symbol']}:{why}")
-            notify.send(f"Desk 補單失敗 {p['symbol']}", why[:1000], notify.CRITICAL)
+                _retry_opg_one(con, broker, risk, snap, p, st, bad=bad, flags=flags, et=et, today=today)
+                break
+            except Exception as e:
+                log.exception("opening retry %s failed", p["client_order_id"])
+                con.rollback()
+                why = f"開盤單補單失敗:{type(e).__name__}: {e}"
+                if con.execute("SELECT 1 FROM submitted WHERE client_order_id=?",
+                               (f"{p['client_order_id']}-rt",)).fetchone() is not None:
+                    _retry_opg_failed(con, broker, p, st, today, why)
+                    break
+                # nothing was sent (a broker read failed first): the one attempt is
+                # not spent; wait once and try again in this run, since no scheduled
+                # run comes before the cutoff
+                if tries_left:
+                    _sleep(CANCEL_WAIT_S)
+                    continue
+                why += (";今天沒有其他排程會在 10:30 ET 前重試,請在 10:30 ET 前手動執行 postopen,"
+                        "否則收盤後剩餘股數作廢")
+                st.lines.append(f"補單暫緩 {p['symbol']}:{why}")
+                notify.send(f"Desk 補單暫緩 {p['symbol']}", why[:1000], notify.CRITICAL)
     con.commit()
+
+
+def _retry_opg_failed(con, broker: Broker, p, st: _Run, today: str, why: str) -> None:
+    """The retry was sent (its write-ahead row exists) and failed: the one
+    attempt is spent."""
+    con.execute("INSERT OR IGNORE INTO plan_attempts VALUES (?, 1)", (_opg_retry_key(today, p),))
+    try:
+        filled = _filled_any(broker.get_order(p["client_order_id"]))
+    except Exception:
+        log.exception("opening order %s unreadable after a failed retry", p["client_order_id"])
+        filled = True  # unknown: keep the plan 'submitted' rather than call it an error
+    _mark(con, p, "submitted" if filled else "error", why)
+    con.commit()
+    st.lines.append(f"補單失敗 {p['symbol']}:{why}")
+    notify.send(f"Desk 補單失敗 {p['symbol']}", why[:1000], notify.CRITICAL)
 
 
 def _retry_opg_one(con, broker: Broker, risk: RiskEngine, snap: AccountSnapshot, p, st: _Run, *,
@@ -1368,6 +1428,7 @@ def postopen(con, broker: Broker, now: datetime, limits: Limits | None = None, m
         events += st.lines
     elif sells:
         events.append("市場未開,出場計畫留待下一次執行:" + "、".join(r["symbol"] for r in sells))
+    events += _expire_unretried_opg(con, broker, now)
     retries = _opg_retry_candidates(con, today)
     if retries and broker.is_equity_market_open():
         flags = _bridge_flags(con, ledger, now, mailbox)  # Muse flags as of now, not as of premarket
