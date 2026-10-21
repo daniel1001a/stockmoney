@@ -326,6 +326,23 @@ def test_identical_resend_is_silent_and_changed_resend_is_rejected(con):
     assert "-r2" in fix and "grok-20261021-0730-r2" in fix and "安靜" in fix
 
 
+def test_identical_verified_resend_upgrades_a_legacy_row_but_never_downgrades(con):
+    box = FakeMailbox()
+    d = grok_daily()
+    send(box, d, auth="")  # DKIM missing: stored as legacy
+    assert inbox.poll(con, box, CONFIG, now=NOW) == 1
+    assert rows(con)[0]["source"] == "grok_legacy"
+    send(box, d)  # the same mail, now DKIM-signed
+    assert inbox.poll(con, box, CONFIG, now=NOW) == 0
+    r = rows(con)
+    assert len(r) == 1 and r[0]["source"] == "grok_verified"
+    assert r[0]["source_reason"].startswith("verified_by_resend ")
+    assert rejects(con) == []
+    send(box, d, auth="")  # a later unsigned copy does not take it back
+    assert inbox.poll(con, box, CONFIG, now=NOW) == 0
+    assert rows(con)[0]["source"] == "grok_verified" and rejects(con) == []
+
+
 def test_r2_suffix_msg_id_is_valid_and_accepted(con):
     assert validate(grok_daily("grok-20261021-0730-r2")).msg_id == "grok-20261021-0730-r2"
     box = FakeMailbox()

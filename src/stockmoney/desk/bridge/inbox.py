@@ -282,10 +282,19 @@ def _process(con, mail: RawMail, config: BridgeConfig, received_at: datetime) ->
         return fail("type_mismatch")
     if msg.msg_id != subj_id:
         return fail("msg_id_mismatch")
-    prior = con.execute("SELECT type, raw_body FROM bridge_messages WHERE msg_id=?", (msg.msg_id,)).fetchone()
+    prior = con.execute("SELECT type, raw_body, source FROM bridge_messages WHERE msg_id=?",
+                        (msg.msg_id,)).fetchone()
     if prior is not None:
         if prior[0] == msg.type and content_hash(prior[1]) == content_hash(mail.body):
-            # an identical resend: already received, nothing to store or correct
+            # an identical resend: already received, nothing to store or correct,
+            # except that a verified copy upgrades a stored grok_legacy one (the
+            # first copy failed DKIM); received_at stays the first arrival and
+            # source_reason records when the verification arrived
+            if prior[2] == SOURCE_GROK_LEGACY and source == SOURCE_GROK_VERIFIED:
+                con.execute("UPDATE bridge_messages SET source=?, source_reason=?, sender=? WHERE msg_id=?",
+                            (source, f"verified_by_resend {_iso(received_at)}", mail.sender, msg.msg_id))
+                log.info("bridge: verified resend of %s upgraded it from grok_legacy", msg.msg_id)
+                return False
             log.info("bridge: identical resend of %s ignored", msg.msg_id)
             return False
         return fail("duplicate_msg_id")
