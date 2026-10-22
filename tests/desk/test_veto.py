@@ -38,8 +38,8 @@ def _muse_alert(con, sym="AAPL", sev="elevated", urls=("https://a.example/1",), 
 
 
 def _grok(con, sym="AAPL", sev="elevated", urls=("https://b.example/2",), days_ago=0.0, msg_id="g1",
-          source="grok_verified"):
-    _msg(con, msg_id, "GROK_DAILY", {"events": [{"ticker": sym, "headline": "x", "severity": sev, "confirmed": True,
+          source="grok_verified", confirmed=True):
+    _msg(con, msg_id, "GROK_DAILY", {"events": [{"ticker": sym, "headline": "x", "severity": sev, "confirmed": confirmed,
                                                   "first_seen": _iso(days_ago), "urls": list(urls)}]}, days_ago, source)
 
 
@@ -194,3 +194,45 @@ def test_postmortem_card_records_flags_and_vetoes_seen_during_the_hold(con):
     facts = json.loads(con.execute("SELECT facts_json FROM trade_postmortem").fetchone()["facts_json"])
     assert facts["research_flags_in_hold"] == ["insider/elevated: 3 insiders sold"]
     assert facts["veto_blocks_in_hold"] == ["research veto: test"]
+
+
+def test_confirmed_grok_event_with_url_votes(db, make_engine, broker):
+    _grok(db, confirmed=True)
+    _flag(db, "AAPL", "filings")
+    d = make_engine().check(buy(qty=10), broker.account(), 100.0, 0)
+    assert not d.allow and "research veto: 2 independent sources" in d.reason
+    assert db.execute("SELECT COUNT(*) FROM veto_counterfactual").fetchone()[0] == 0
+
+
+def test_unconfirmed_grok_event_never_votes_but_is_logged_as_counterfactual(db, make_engine, broker):
+    _grok(db, confirmed=False)
+    _flag(db, "AAPL", "filings")
+    assert veto.collect(db, "AAPL").keys() == {"filings"}
+    res = veto.check(db, "AAPL")
+    assert not res.blocked and res.counterfactual.startswith("counterfactual: counting unconfirmed Grok events gives 2")
+    assert make_engine().check(buy(qty=10), broker.account(), 100.0, 0).allow
+    rows = db.execute("SELECT symbol, reason FROM veto_counterfactual").fetchall()
+    assert len(rows) == 1 and rows[0]["symbol"] == "AAPL" and "not blocked" in rows[0]["reason"]
+    assert db.execute("SELECT COUNT(*) FROM veto_log").fetchone()[0] == 0
+
+
+def test_unconfirmed_alone_short_of_threshold_has_no_counterfactual(db):
+    _grok(db, confirmed=False)
+    res = veto.check(db, "AAPL")
+    assert not res.blocked and res.counterfactual == ""
+
+
+def test_missing_confirmed_key_counts_as_unconfirmed(db):
+    _msg(db, "g2", "GROK_DAILY", {"events": [{"ticker": "AAPL", "headline": "x", "severity": "critical",
+                                               "first_seen": _iso(), "urls": ["https://b.example/3"]}]},
+         source="grok_verified")
+    _flag(db, "AAPL", "filings")
+    assert not veto.check(db, "AAPL").blocked
+
+
+def test_sell_unaffected_by_unconfirmed_grok(db, make_engine, broker, hold):
+    hold("AAPL", "breakout", 10)
+    _grok(db, confirmed=False, sev="critical")
+    _flag(db, "AAPL", "filings", sev="critical")
+    assert make_engine().check(sell(qty=10), broker.account(), 100.0, 0).allow
+    assert db.execute("SELECT COUNT(*) FROM veto_counterfactual").fetchone()[0] == 0

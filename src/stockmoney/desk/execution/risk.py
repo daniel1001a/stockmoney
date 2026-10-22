@@ -296,6 +296,8 @@ class RiskEngine:
         if vt.blocked:
             veto.record(self.con, intent.symbol, vt)
             return self._block(f"buy blocked: {vt.reason}")
+        if vt.counterfactual:
+            veto.record_counterfactual(self.con, intent.symbol, vt)
         owner = self.ledger.owner(intent.symbol)
         if owner is not None and intent.strategy and owner != intent.strategy:
             return self._block(f"buy blocked: {intent.symbol} is held by strategy '{owner}', "
