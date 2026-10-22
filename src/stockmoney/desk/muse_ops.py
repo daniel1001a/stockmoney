@@ -118,8 +118,12 @@ PLAN_FIELD_FIXES = (
     (r"plans\.\d+\.gap:extra_forbidden", "gap 不是欄位,缺口幅度寫進 thesis 文字。"),
     (r"plans\.\d+\.premarket_price:extra_forbidden", "premarket_price 不是欄位,盤前價寫進 thesis 文字。"),
 )
-PLAN_ITEM_REQUIRED = ("每個劇本必填 underlying/bias/playbook/thesis/catalyst/confidence/evidence_urls;"
-                      "bias 是評分用的假設。看不準方向就不寫,plans 可以是 []。")
+
+
+def plan_item_required() -> str:
+    from stockmoney.desk.options.plan import PlanItem
+    names = "/".join(n for n, f in PlanItem.model_fields.items() if f.is_required())
+    return f"每個劇本必填 {names};bias 是評分用的假設。看不準方向就不寫,plans 可以是 []。"
 
 
 def plan_field_fixes(reason: str) -> str:
@@ -127,13 +131,14 @@ def plan_field_fixes(reason: str) -> str:
     for only the mistakes this reject names."""
     import re
     out = [fix for pat, fix in PLAN_FIELD_FIXES if re.search(pat, reason)]
-    named = {"ticker", "rvol", "timing", "gap", "premarket_price"}
+    # item fields that already have their own row above
+    named = {pat.split("\\.")[-1].split(":")[0] for pat, _ in PLAN_FIELD_FIXES if pat.startswith("plans\\.")}
     other = sorted({f for f in re.findall(r"plans\.\d+\.(\w+):extra_forbidden", reason) if f not in named})
     if other:
         out.append(f"{', '.join(f[:30] for f in other[:3])} 不是劇本欄位,寫進 thesis。")
     if re.search(r"plans\.\d+\.", reason):
         # the reason lists at most 5 errors, so a missing bias can hide behind them
-        out.append(PLAN_ITEM_REQUIRED)
+        out.append(plan_item_required())
     return " ".join(out) + " " if out else ""
 
 

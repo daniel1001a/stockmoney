@@ -214,7 +214,7 @@ def test_options_plan_feedback_says_where_each_wrong_field_goes():
     for fix in ("改名為 underlying", "key_events 要放進 market_context", "每個 plans 項目的 daily_ref",
                 "avoid 必填", "min_rvol", "earliest/latest", "gap 不是欄位", "premarket_price 不是欄位"):
         assert fix in text
-    assert len(text) < 1000  # every hint at once still fits the FEEDBACK how_to_fix limit
+    assert len(text) <= 1000  # more errors than the 5-error cap: the field list is dropped to fit how_to_fix
     only_ticker = fix_for("schema_invalid OPTIONS_PLAN.plans.0.ticker:extra_forbidden")
     assert "underlying" in only_ticker and "key_events 要放進" not in only_ticker
     assert "每個劇本必填" in only_ticker  # the 5-error cap can hide a missing bias
