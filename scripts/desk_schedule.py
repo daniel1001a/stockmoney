@@ -38,7 +38,9 @@ _TEN_MIN_SLOTS = _ten_min_slots((9, 45), (15, 55))
 
 JOBS = {
     "premarket": {"times": [(8, 45)], "weekdays": True},   # read Muse, submit market-on-open orders
-    "postopen": {"times": [(9, 50)], "weekdays": True},    # sync fills, place protective stops
+    # sync fills, place protective stops; the 10:00 run retries what 09:50 could not
+    # reach the broker for (opening-order retry, deferred exits) before the 10:30 cutoff
+    "postopen": {"times": [(9, 50), (10, 0)], "weekdays": True},
     "postclose": {"times": [(16, 45)], "weekdays": True},  # reconcile, trail stops, new signals, report
     "crypto": {"times": [(20, 0)], "weekdays": False},     # daily crypto sleeve, 7 days
     "learn": {"times": [(17, 15)], "weekdays": True},      # read-only: post-mortems, shadow books, chain scoring
