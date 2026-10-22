@@ -10,7 +10,7 @@ Sources (one vote each, however many items they contributed):
             least one URL. grok_legacy messages (Grok types that came over the
             Muse channel) never vote. A confirmed: false event (a single unverified
             account) never votes either; when counting it would have blocked a buy the
-            check reports that as a counterfactual (veto_counterfactual), never a block.
+            check logs that in veto_unconfirmed, never a block.
   filings   research_flags rows (8-K items, late-filing notices) written by learn/filings.py
   insider   research_flags rows (Form 4 discretionary sell cluster)
   earnings  research_flags rows (earnings inside the next days). Beyond the four
@@ -60,7 +60,7 @@ SCHEMA = (
          id INTEGER PRIMARY KEY AUTOINCREMENT, symbol TEXT NOT NULL, blocked_at TEXT NOT NULL,
          reason TEXT, sources_json TEXT)""",
     # buys that WOULD have been blocked had unconfirmed Grok events voted; the buy was not blocked
-    """CREATE TABLE IF NOT EXISTS veto_counterfactual (
+    """CREATE TABLE IF NOT EXISTS veto_unconfirmed (
          id INTEGER PRIMARY KEY AUTOINCREMENT, symbol TEXT NOT NULL, seen_at TEXT NOT NULL,
          reason TEXT, sources_json TEXT)""",
 )
@@ -77,7 +77,7 @@ class VetoResult:
     reason: str = ""
     sources: dict[str, list[dict]] = field(default_factory=dict)  # source -> its flagged items
     # set only when not blocked: the block that counting unconfirmed Grok events would have made
-    counterfactual: str = ""
+    unconfirmed: str = ""
 
 
 def norm(symbol: str) -> str:
@@ -201,7 +201,7 @@ def check(con, symbol: str, now: datetime | None = None, days: int = DAYS, min_s
             what_if = {**items, "grok": items.get("grok", []) + unconfirmed}
             m = vote_count(what_if)
             if m >= min_sources:
-                res.counterfactual = (f"counterfactual: counting unconfirmed Grok events gives {m} sources on "
+                res.unconfirmed = (f"unconfirmed: counting unconfirmed Grok events gives {m} sources on "
                                       f"{norm(symbol)} within {days} trading days, not blocked ({_parts(what_if)})")
         return res
     merged = "muse+grok share a source and count once; " if ("muse" in items and "grok" in items and
@@ -220,15 +220,15 @@ def record(con, symbol: str, res: VetoResult) -> None:
         log.warning("veto_log write failed for %s: %s", symbol, e)
 
 
-def record_counterfactual(con, symbol: str, res: VetoResult) -> None:
+def record_unconfirmed(con, symbol: str, res: VetoResult) -> None:
     """Persist a would-have-blocked buy for the learning layer. Does not commit; never blocks."""
     try:
         ensure_schema(con)
-        con.execute("INSERT INTO veto_counterfactual (symbol, seen_at, reason, sources_json) VALUES (?,?,?,?)",
-                    (norm(symbol), datetime.now(timezone.utc).isoformat(), res.counterfactual,
+        con.execute("INSERT INTO veto_unconfirmed (symbol, seen_at, reason, sources_json) VALUES (?,?,?,?)",
+                    (norm(symbol), datetime.now(timezone.utc).isoformat(), res.unconfirmed,
                      json.dumps(res.sources, default=str)))
     except sqlite3.Error as e:
-        log.warning("veto_counterfactual write failed for %s: %s", symbol, e)
+        log.warning("veto_unconfirmed write failed for %s: %s", symbol, e)
 
 
 def blocks_between(con, symbol: str, start: str, end: str) -> list[str]:

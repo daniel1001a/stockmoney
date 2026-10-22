@@ -201,25 +201,25 @@ def test_confirmed_grok_event_with_url_votes(db, make_engine, broker):
     _flag(db, "AAPL", "filings")
     d = make_engine().check(buy(qty=10), broker.account(), 100.0, 0)
     assert not d.allow and "research veto: 2 independent sources" in d.reason
-    assert db.execute("SELECT COUNT(*) FROM veto_counterfactual").fetchone()[0] == 0
+    assert db.execute("SELECT COUNT(*) FROM veto_unconfirmed").fetchone()[0] == 0
 
 
-def test_unconfirmed_grok_event_never_votes_but_is_logged_as_counterfactual(db, make_engine, broker):
+def test_unconfirmed_grok_event_never_votes_but_is_logged_as_unconfirmed(db, make_engine, broker):
     _grok(db, confirmed=False)
     _flag(db, "AAPL", "filings")
     assert veto.collect(db, "AAPL").keys() == {"filings"}
     res = veto.check(db, "AAPL")
-    assert not res.blocked and res.counterfactual.startswith("counterfactual: counting unconfirmed Grok events gives 2")
+    assert not res.blocked and res.unconfirmed.startswith("unconfirmed: counting unconfirmed Grok events gives 2")
     assert make_engine().check(buy(qty=10), broker.account(), 100.0, 0).allow
-    rows = db.execute("SELECT symbol, reason FROM veto_counterfactual").fetchall()
+    rows = db.execute("SELECT symbol, reason FROM veto_unconfirmed").fetchall()
     assert len(rows) == 1 and rows[0]["symbol"] == "AAPL" and "not blocked" in rows[0]["reason"]
     assert db.execute("SELECT COUNT(*) FROM veto_log").fetchone()[0] == 0
 
 
-def test_unconfirmed_alone_short_of_threshold_has_no_counterfactual(db):
+def test_unconfirmed_alone_short_of_threshold_has_no_unconfirmed_note(db):
     _grok(db, confirmed=False)
     res = veto.check(db, "AAPL")
-    assert not res.blocked and res.counterfactual == ""
+    assert not res.blocked and res.unconfirmed == ""
 
 
 def test_missing_confirmed_key_counts_as_unconfirmed(db):
@@ -235,4 +235,4 @@ def test_sell_unaffected_by_unconfirmed_grok(db, make_engine, broker, hold):
     _grok(db, confirmed=False, sev="critical")
     _flag(db, "AAPL", "filings", sev="critical")
     assert make_engine().check(sell(qty=10), broker.account(), 100.0, 0).allow
-    assert db.execute("SELECT COUNT(*) FROM veto_counterfactual").fetchone()[0] == 0
+    assert db.execute("SELECT COUNT(*) FROM veto_unconfirmed").fetchone()[0] == 0
