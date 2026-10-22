@@ -68,7 +68,7 @@ Grok 是第二個情報員(看 X),說明與完整格式在 `docs/desk/GROK_PROMP
 - 時間:每天美東 07:30(最晚 08:10 寄出)和 20:00 各一封,週末也寄,由 Pika 寄出(專用通道從 `GROK_ADDRESS`,舊通道從 dnial1001a@gmail.com)。只有早上那封計分、做漏交檢查:08:30 前要收到,只算 NYSE 交易日,而且 `collected_at` 要是當天(美東)中午以前;晚上那封照收照存,不計分、不檢查漏交。用 `scripts/muse_check.py grok on|off` 單獨開關,`stage N` 不會影響它;預設是關的,沒開就不會有漏交通知。
 - 漏交與空白日報不同:漏交是 08:30 前沒收到早上那封(開啟檢查時推播「Grok 漏交」,並註明「沒有收到信(不是空白日報),不代表今天沒有風險」);空白日報是收到了、但 events 是空的。儀表板的 Grok 卡片用 `muse_ops.grok_today()` 分成 not_due / pending / missed / empty / delivered 五種狀態顯示。
 - 儲存:存進 `bridge_messages`,和 Muse 的訊息放在一起;`learn/chains.py` 的 `ingest_grok()` 讀出事件鏈並評分。時間一律以 Desk 的 `received_at` 為準,Grok 自己寫的時間只用來稽核。
-- 權限:只能降低風險。`policy.active_flags` 不讀它。研究否決(`veto.py`)只把 `grok_verified`、附連結、而且 `confirmed: true` 的 events 算成 Grok 的一票(2026-10-21 起;`confirmed: false` 不投票,若算進去會擋下某筆買單,就記進 `veto_unconfirmed`,買單照常放行);學習層的 `grok_muse_independent_same_symbol` 只看 `grok_verified` 而且附連結;`grok_legacy` 永遠不投票(照存、照給學習層的事件鏈評分)。
+- 權限:只能降低風險。`policy.active_flags` 不讀它。研究否決(`veto.py`)只把 `grok_verified`、附連結、而且 `confirmed: true` 的 events 算成 Grok 的一票(2026-10-21 起;`confirmed: false` 不投票,若算進去會擋下某筆買單、而且其餘風控都放行,就記進 `veto_unconfirmed`(每個 client_order_id 一筆,是否成交看 `submitted`),買單照常放行);學習層的 `grok_muse_independent_same_symbol` 只看 `grok_verified` 而且附連結;`grok_legacy` 永遠不投票(照存、照給學習層的事件鏈評分)。
 - `market_risk`(可省略):`{level: low|elevated|critical, summary, source_urls}`。只存進 `grok_market_risk` 表(`learn/market_risk.py`),在 5、20 個交易日後對照 SPY 收盤報酬與最大回撤評分。否決、風控、下單都不讀它。
 - `attention`(可省略):只顯示,不進任何計算;所有讀取的地方都容許它不存在。
 - 可證偽:事件鏈可附 `invalidations`(最多 3 個,`close_below` / `close_above` / `data_not_by`,每個都要有 `by_date`),`IDEA` 也可附同一組。沒有價格條件的鏈照收,但標為不可證偽,不列入命中率與 Brier。學習層在 `by_date` 當天或之後,只用已存的日收盤價判定 held / invalidated / no_data;`data_not_by` 永遠是 no_data。

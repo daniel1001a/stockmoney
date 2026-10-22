@@ -298,7 +298,7 @@ class RiskEngine:
             return self._block(f"buy blocked: {vt.reason}")
         d = self._size_buy(intent, snapshot, ref_price, orders_this_run, market_price, md, md_reason)
         if d.allow and vt.unconfirmed:  # only buys that actually pass; a later block is not "let through"
-            veto.record_unconfirmed(self.con, intent.symbol, vt)
+            veto.record_unconfirmed(self.con, intent.symbol, vt, intent.client_order_id)
         return d
 
     def _size_buy(self, intent: OrderIntent, snapshot: AccountSnapshot, ref_price: float,

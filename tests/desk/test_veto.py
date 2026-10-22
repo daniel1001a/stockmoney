@@ -224,6 +224,16 @@ def test_unconfirmed_row_stores_the_what_if_sources(db, make_engine, broker):
     assert src.keys() == {"filings", "grok"} and src["grok"][0]["ref"] == "g1:0"
 
 
+def test_unconfirmed_row_is_one_per_order_on_replay(db, make_engine, broker):
+    _grok(db, confirmed=False)
+    _flag(db, "AAPL", "filings")
+    for _ in range(3):  # write-ahead replay re-runs risk.check for the same pending_submit order
+        assert make_engine().check(buy(qty=10), broker.account(), 100.0, 0).allow
+    assert make_engine().check(buy(qty=10, cid="c2"), broker.account(), 100.0, 0).allow
+    rows = db.execute("SELECT client_order_id FROM veto_unconfirmed ORDER BY id").fetchall()
+    assert [r[0] for r in rows] == ["c1", "c2"]
+
+
 def test_unconfirmed_not_logged_when_a_later_rule_blocks_the_buy(db, make_engine, broker):
     _grok(db, confirmed=False)
     _flag(db, "AAPL", "filings")

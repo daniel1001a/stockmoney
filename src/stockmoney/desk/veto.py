@@ -9,8 +9,9 @@ Sources (one vote each, however many items they contributed):
             from a grok_verified message (Pika's own address and token) and citing at
             least one URL. grok_legacy messages (Grok types that came over the
             Muse channel) never vote. A confirmed: false event (a single unverified
-            account) never votes either; when counting it would have blocked a buy the
-            check logs that in veto_unconfirmed, never a block.
+            account) never votes either; when counting it would have blocked a buy,
+            check() sets VetoResult.unconfirmed (never a block) and the risk engine
+            writes veto_unconfirmed only if the rest of the buy check allows the order.
   filings   research_flags rows (8-K items, late-filing notices) written by learn/filings.py
   insider   research_flags rows (Form 4 discretionary sell cluster)
   earnings  research_flags rows (earnings inside the next days). Beyond the four
@@ -59,10 +60,12 @@ SCHEMA = (
     """CREATE TABLE IF NOT EXISTS veto_log (
          id INTEGER PRIMARY KEY AUTOINCREMENT, symbol TEXT NOT NULL, blocked_at TEXT NOT NULL,
          reason TEXT, sources_json TEXT)""",
-    # buys that WOULD have been blocked had unconfirmed Grok events voted; the buy was not blocked
+    # buys that passed risk but WOULD have been blocked had unconfirmed Grok events voted; one
+    # row per client_order_id, so a write-ahead replay does not add another. Whether the broker
+    # took the order is in submitted (join on client_order_id), not here.
     """CREATE TABLE IF NOT EXISTS veto_unconfirmed (
          id INTEGER PRIMARY KEY AUTOINCREMENT, symbol TEXT NOT NULL, seen_at TEXT NOT NULL,
-         reason TEXT, sources_json TEXT)""",
+         reason TEXT, sources_json TEXT, client_order_id TEXT NOT NULL UNIQUE)""",
 )
 
 
@@ -222,14 +225,16 @@ def record(con, symbol: str, res: VetoResult) -> None:
         log.warning("veto_log write failed for %s: %s", symbol, e)
 
 
-def record_unconfirmed(con, symbol: str, res: VetoResult) -> None:
+def record_unconfirmed(con, symbol: str, res: VetoResult, client_order_id: str) -> None:
     """Persist a would-have-blocked buy for the learning layer. Does not commit; never blocks.
-    Call only once the whole buy check allowed the order, so every row is a buy that went out."""
+    Call only once the whole buy check allowed the order. Every row is a buy risk let through;
+    it may still not have reached the broker (see submitted). Idempotent per client_order_id."""
     try:
         ensure_schema(con)
-        con.execute("INSERT INTO veto_unconfirmed (symbol, seen_at, reason, sources_json) VALUES (?,?,?,?)",
+        con.execute("INSERT OR IGNORE INTO veto_unconfirmed (symbol, seen_at, reason, sources_json, "
+                    "client_order_id) VALUES (?,?,?,?,?)",
                     (norm(symbol), datetime.now(timezone.utc).isoformat(), res.unconfirmed,
-                     json.dumps(res.unconfirmed_sources, default=str)))
+                     json.dumps(res.unconfirmed_sources, default=str), client_order_id))
     except sqlite3.Error as e:
         log.warning("veto_unconfirmed write failed for %s: %s", symbol, e)
 
