@@ -84,6 +84,13 @@ Grok 的輸出一律當作資料處理:系統只讀結構化欄位,不執行其�
 - 同一個代號不能同時出現在 plans 與 avoid。
 - 只輸出一個 JSON 物件,壓成單行,前後不要加任何文字,不使用程式碼區塊。
 
+【常見錯誤(2026-10-15 到 10-21 五份劇本全部因此拒收)】
+- 不要寫 ticker,劇本裡的代號欄位叫 underlying(只有 avoid 裡才用 ticker)。
+- key_events 不能放在頂層,要放進 market_context:"market_context":{"summary":"...","risk_tone":"mixed","key_events":[...]}。
+- daily_ref 不能放在頂層,只能寫在個別劇本裡。
+- market_context、avoid、notes 都必填:沒有內容就寫 market_context 的三個欄位、"avoid":[]、"notes":""。
+- 劇本裡沒有 gap、rvol、premarket_price、timing 這些欄位:gap 與盤前價寫進 thesis 文字;最低 RVOL 用 min_rvol;進場時間窗用 trigger 的 earliest/latest。
+
 【格式範例 1:有觸發的劇本】
 {"protocol":"1","type":"OPTIONS_PLAN","plan_id":"gp-20261013-0745","for_date":"2026-10-13","generated_at":"2026-10-13T07:45:00-04:00","market_context":{"summary":"期貨小漲,半導體盤前偏強,下午兩點有 FOMC 會議紀要","risk_tone":"mixed","key_events":[{"time":"14:00","what":"FOMC 會議紀要"}]},"plans":[{"underlying":"NVDA","bias":"long","playbook":"gap_go","thesis":"新客戶訂單消息,延續性高","catalyst":"新客戶訂單消息","trigger":{"kind":"break_above","level":142.5,"confirm_closes":1,"earliest":"09:35","latest":"10:30"},"invalidation":{"kind":"below","underlying_level":140.8},"target_underlying_pct":1.5,"max_hold_minutes":90,"preferred_dte":"1-3dte","confidence":0.55,"evidence_urls":["https://x.com/example/status/1"],"min_rvol":2.0,"regime":"trend"}],"avoid":[{"ticker":"TSLA","why":"盤前無方向,價差過寬"}],"notes":""}
 

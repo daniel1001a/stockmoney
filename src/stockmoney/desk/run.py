@@ -3,7 +3,7 @@
 
     python -m stockmoney.desk.run postclose   # 16:45 ET: sync fills, reconcile, trail stops, plan tomorrow
     python -m stockmoney.desk.run premarket   # 08:45 ET: Muse flags, risk checks, submit market-on-open
-    python -m stockmoney.desk.run postopen    # 09:50 ET: sync fills, deferred exits, protective stops
+    python -m stockmoney.desk.run postopen    # 09:50 and 10:00 ET: sync fills, deferred exits, protective stops
     python -m stockmoney.desk.run recover     # at boot (launchd RunAtLoad): sync fills, stops, orphan sweep
     python -m stockmoney.desk.run crypto      # 20:00 ET daily: crypto sleeves (Phase 1)
     python -m stockmoney.desk.run bridge      # every 15 min: poll Muse
@@ -85,6 +85,7 @@ log = logging.getLogger("desk.run")
 ET = ZoneInfo("America/New_York")
 OPG_CUTOFF = (9, 25)     # ET: from here on, market-on-open is no longer accepted
 ENTRY_CUTOFF = (10, 30)  # ET: new entries from a stale plan are dropped after this
+LAST_POSTOPEN = (10, 0)  # ET: the later of the two scheduled postopen runs (scripts/desk_schedule.py)
 SESSION_CLOSE = (16, 0)  # ET: regular close, used when the broker has no market calendar
 JOB_TIMEOUT_S = 900      # the Alpaca SDK sets no HTTP timeout; never let a job hang forever
 CANCEL_WAIT_S = 20.0     # how long to wait for an asynchronous cancel or fill to settle
@@ -1243,7 +1244,7 @@ def _opg_retry_candidates(con, today: str) -> list:
 
 def _expire_unretried_opg(con, broker: Broker, now: datetime) -> list[str]:
     """Close the retry window for opening entries whose remainder was never
-    retried (the 09:50 postopen could not reach the broker before sending, and
+    retried (neither postopen could reach the broker before sending, and
     no run before 10:30 ET tried again): after ENTRY_CUTOFF, or on a later day,
     the attempt is recorded as spent and the plan takes the status the cutoff
     path gives it ('expired' with nothing bought, else 'submitted' for the
@@ -1319,13 +1320,16 @@ def _retry_opg_entries(con, broker: Broker, risk: RiskEngine, snap: AccountSnaps
                     _retry_opg_failed(con, broker, p, st, today, why)
                     break
                 # nothing was sent (a broker read failed first): the one attempt is
-                # not spent; wait once and try again in this run, since no scheduled
-                # run comes before the cutoff
+                # not spent; wait once and try again in this run, then leave it to
+                # the 10:00 postopen, or to the owner when this is that run
                 if tries_left:
                     _sleep(CANCEL_WAIT_S)
                     continue
-                why += (";今天沒有其他排程會在 10:30 ET 前重試,請在 10:30 ET 前手動執行 postopen,"
-                        "否則收盤後剩餘股數作廢")
+                if (et.hour, et.minute) < LAST_POSTOPEN:
+                    why += f";{LAST_POSTOPEN[0]}:{LAST_POSTOPEN[1]:02d} ET 的 postopen 會再試一次"
+                else:
+                    why += (";今天沒有其他排程會在 10:30 ET 前重試,請在 10:30 ET 前手動執行 postopen,"
+                            "否則收盤後剩餘股數作廢")
                 st.lines.append(f"補單暫緩 {p['symbol']}:{why}")
                 notify.send(f"Desk 補單暫緩 {p['symbol']}", why[:1000], notify.CRITICAL)
     con.commit()

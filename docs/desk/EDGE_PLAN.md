@@ -203,6 +203,7 @@ H1 已在 2.1(a) 登記(出場放寬,對應影子帳戶 `shadow:combined_t35`)�
 - H2:`combined_earn7` 比 `combined` 少 0.28 個百分點,未平倉、遠低於 30 筆,不下結論。
 - H3:見 2.6。本週實際虧損集中在 orb15(8 / 9 筆),與 H3 一致,但只有一週。
 - 觀察(不列為假設,避免超過 3 條):期權 invalidation 出場在實際與影子都是筆數最多、虧損最大的一類;10-15 的 6 筆實際虧損中有 5 筆在進場 10 分鐘內出場。下次覆盤若仍排第一,再決定是否取代 H1 或 H2 的位置。
+- 候補 H4(事先登記,未啟用,不佔 3 條名額,不改任何行為):我認為進場後前 10 分鐘觸發的期權 invalidation 出場,多數是開盤雜訊而非論點失效,因為影子 invalidation 44 筆合計 -$3,296.0,但這些部位的平均 MFE 仍有 +7.1%(上表),且 10-15 實際 6 筆虧損中 5 筆在 10 分鐘內出場;驗證方式:取代 H1 或 H2 之後才建影子變體(前 10 分鐘只認 premium_stop、不認 invalidation),與現行影子各累積 30 筆已平倉後比較每筆期望值區間下緣與最大回撤;失敗條件:下緣沒有比較高、最大回撤變大,或差異主要來自單一交易日。結論出來前 live 的 invalidation 規則不變。
 
 **3. 需要你決定的事**
 
@@ -240,7 +241,7 @@ H1 已在 2.1(a) 登記(出場放寬,對應影子帳戶 `shadow:combined_t35`)�
 | # | 項目 | 做了什麼 | 入口 | 專屬測試 |
 |---|---|---|---|---|
 | 1 | H1 出場驗證報告 | H1(寬停損)對現行規則的影子比較,結果寫成 `param_changes` 的 DRAFT 紀錄,不改任何設定 | `scripts/desk_learn.py h1-report [--no-record]`;學習任務每次自動附報告 | `tests/desk/test_h_reports.py` |
-| 2 | 研究否決(買單專用) | `veto.py`:Muse / Grok / 申報(8-K、10-Q)/ 內部人(Form 4)/ 財報,4 個交易日內有 2 個以上獨立來源標 elevated 或 critical 才擋**買單**;賣單與停損永遠放行;原因進 `RiskDecision`、`veto_log`、驗屍事實。這是純粹的風控層附加區塊,只能降低風險。8-K 5.02(高階主管異動)屬例行,只記 info;Muse 與 Grok 要各自附來源網址且互不重疊才算兩票,雙方都沒附網址視為同一來源 | `scripts/desk_learn.py filings [--no-fetch]`;學習任務自動收集(EDGAR 需環境變數 `SEC_USER_AGENT`) | `tests/desk/test_veto.py`、`tests/desk/test_filings.py`(含「買單被擋、賣單不擋」) |
+| 2 | 研究否決(買單專用) | `veto.py`:Muse / Grok / 申報(8-K、10-Q)/ 內部人(Form 4)/ 財報,4 個交易日內有 2 個以上獨立來源標 elevated 或 critical 才擋**買單**;賣單與停損永遠放行;原因進 `RiskDecision`、`veto_log`、驗屍事實。這是純粹的風控層附加區塊,只能降低風險。8-K 5.02(高階主管異動)屬例行,只記 info;Grok 只有 `confirmed: true` 的事件才投票(未證實的只記進 `veto_unconfirmed`);Muse 與 Grok 要各自附來源網址且互不重疊才算兩票,雙方都沒附網址視為同一來源 | `scripts/desk_learn.py filings [--no-fetch]`;學習任務自動收集(EDGAR 需環境變數 `SEC_USER_AGENT`) | `tests/desk/test_veto.py`、`tests/desk/test_filings.py`(含「買單被擋、賣單不擋」) |
 | 3 | 驗屍卡到每週假設 | `postmortem.update_cards` 本來就在學習任務內執行;每週五把連續兩週排在虧損前兩名的非 S0 症狀記進 `weekly_hypotheses`(只記錄,狀態為 candidate) | `scripts/desk_learn.py hypotheses [--date] [--no-record] [--list]` | `tests/desk/test_hypotheses.py` |
 | 4 | 執行一致性與對帳 | 每日收盤報告加「券商對帳摘要」:Alpaca 紙上成交對內部計畫的滑價、漏單 / 部分成交、停損單差異(缺漏 / 重複 / 價格不符 / 孤兒);每天一列存 `reconcile_daily`;報告顯示「連續零差異 N 天」(對應第 5 節第 1 條);連續 3 天有差異時只發日報與 ntfy 警示。**唯讀:不停機、不改單**(既有 `mismatches()` 對帳停機機制不變) | `scripts/desk_reconcile.py [--date] [--no-record] [--no-broker] [--list]` | `tests/desk/test_reconcile_daily.py` |
 | 5 | H2 影子延續與報告 | H2(財報前不進場)對照現行規則,影子持續累積;少於 30 筆交易標「樣本不足」;永不自動啟用 | `scripts/desk_learn.py h2-report [--no-record]` | `tests/desk/test_h_reports.py` |

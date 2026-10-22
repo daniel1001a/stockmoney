@@ -5,10 +5,13 @@ the same symbol as elevated or critical within the last ``days`` trading days.
 Sources (one vote each, however many items they contributed):
 
   muse      ALERT with severity elevated / critical, or a RESEARCH_REPLY that lists risk_flags
-  grok      a GROK_DAILY event with severity elevated / critical, from a
-            grok_verified message (Pika's own address and token) and citing at
+  grok      a GROK_DAILY event with severity elevated / critical and confirmed: true,
+            from a grok_verified message (Pika's own address and token) and citing at
             least one URL. grok_legacy messages (Grok types that came over the
-            Muse channel) never vote.
+            Muse channel) never vote. A confirmed: false event (a single unverified
+            account) never votes either; when counting it would have blocked a buy,
+            check() sets VetoResult.unconfirmed (never a block) and the risk engine
+            writes veto_unconfirmed only if the rest of the buy check allows the order.
   filings   research_flags rows (8-K items, late-filing notices) written by learn/filings.py
   insider   research_flags rows (Form 4 discretionary sell cluster)
   earnings  research_flags rows (earnings inside the next days). Beyond the four
@@ -57,6 +60,12 @@ SCHEMA = (
     """CREATE TABLE IF NOT EXISTS veto_log (
          id INTEGER PRIMARY KEY AUTOINCREMENT, symbol TEXT NOT NULL, blocked_at TEXT NOT NULL,
          reason TEXT, sources_json TEXT)""",
+    # buys that passed risk but WOULD have been blocked had unconfirmed Grok events voted; one
+    # row per client_order_id, so a write-ahead replay does not add another. Whether the broker
+    # took the order is in submitted (join on client_order_id), not here.
+    """CREATE TABLE IF NOT EXISTS veto_unconfirmed (
+         id INTEGER PRIMARY KEY AUTOINCREMENT, symbol TEXT NOT NULL, seen_at TEXT NOT NULL,
+         reason TEXT, sources_json TEXT, client_order_id TEXT NOT NULL UNIQUE)""",
 )
 
 
@@ -70,6 +79,9 @@ class VetoResult:
     blocked: bool = False
     reason: str = ""
     sources: dict[str, list[dict]] = field(default_factory=dict)  # source -> its flagged items
+    # set only when not blocked: the block that counting unconfirmed Grok events would have made
+    unconfirmed: str = ""
+    unconfirmed_sources: dict[str, list[dict]] = field(default_factory=dict)  # the what-if, unconfirmed events included
 
 
 def norm(symbol: str) -> str:
@@ -88,7 +100,7 @@ def _has(con, table: str) -> bool:
 
 
 def _bridge_items(con, sym: str, since: str) -> dict[str, list[dict]]:
-    out: dict[str, list[dict]] = {"muse": [], "grok": []}
+    out: dict[str, list[dict]] = {"muse": [], "grok": [], "grok_unconfirmed": []}
     if not _has(con, "bridge_messages"):
         return out
     from stockmoney.desk.bridge.inbox import SOURCE_GROK_VERIFIED, has_source_column, source_of
@@ -107,7 +119,7 @@ def _bridge_items(con, sym: str, since: str) -> dict[str, list[dict]]:
             for i, e in enumerate(m.get("events") or []):
                 try:
                     if norm(e["ticker"]) == sym and e.get("severity") in FLAGGED and e.get("urls"):
-                        out["grok"].append({"ref": f"{r['msg_id']}:{i}", "type": "GROK_DAILY", "urls": [str(u) for u in e.get("urls", [])],
+                        out["grok" if e.get("confirmed") is True else "grok_unconfirmed"].append({"ref": f"{r['msg_id']}:{i}", "type": "GROK_DAILY", "urls": [str(u) for u in e.get("urls", [])],
                                             "detail": f"{e['severity']}: {str(e.get('headline', ''))[:60]}",
                                             "at": r["received_at"]})
                 except (KeyError, TypeError, AttributeError):
@@ -143,13 +155,19 @@ def _filing_items(con, sym: str, since: str) -> dict[str, list[dict]]:
     return out
 
 
-def collect(con, symbol: str, now: datetime | None = None, days: int = DAYS) -> dict[str, list[dict]]:
-    """Flagged items per source for ``symbol`` inside the window; empty sources omitted."""
+def _collect_all(con, symbol: str, now: datetime | None, days: int) -> dict[str, list[dict]]:
     now = now or datetime.now(timezone.utc)
     since = window_start(now, days).isoformat()
     sym = norm(symbol)
     items = {**_bridge_items(con, sym, since), **_filing_items(con, sym, since)}
     return {k: v for k, v in items.items() if v}
+
+
+def collect(con, symbol: str, now: datetime | None = None, days: int = DAYS) -> dict[str, list[dict]]:
+    """Flagged items per voting source for ``symbol`` inside the window; empty sources omitted."""
+    items = _collect_all(con, symbol, now, days)
+    items.pop("grok_unconfirmed", None)
+    return items
 
 
 def _muse_grok_independent(muse: list[dict], grok: list[dict]) -> bool:
@@ -168,21 +186,33 @@ def vote_count(items: dict[str, list[dict]]) -> int:
     return n
 
 
+def _parts(items: dict[str, list[dict]]) -> str:
+    return "; ".join(f"{s}({it[0]['detail']})" for s, it in items.items())
+
+
 def check(con, symbol: str, now: datetime | None = None, days: int = DAYS, min_sources: int = MIN_SOURCES) -> VetoResult:
     """Never raises: any read problem is logged and means no veto."""
     try:
-        items = collect(con, symbol, now, days)
+        items = _collect_all(con, symbol, now, days)
     except (sqlite3.Error, ValueError, TypeError) as e:
         log.warning("research veto read failed for %s: %s: %s", symbol, type(e).__name__, e)
         return VetoResult()
+    unconfirmed = items.pop("grok_unconfirmed", [])
     n = vote_count(items)
     if n < min_sources:
-        return VetoResult(False, "", items)
-    parts = [f"{s}({it[0]['detail']})" for s, it in items.items()]
+        res = VetoResult(False, "", items)
+        if unconfirmed:
+            what_if = {**items, "grok": items.get("grok", []) + unconfirmed}
+            m = vote_count(what_if)
+            if m >= min_sources:
+                res.unconfirmed = (f"unconfirmed: counting unconfirmed Grok events gives {m} sources on "
+                                   f"{norm(symbol)} within {days} trading days, not blocked ({_parts(what_if)})")
+                res.unconfirmed_sources = what_if
+        return res
     merged = "muse+grok share a source and count once; " if ("muse" in items and "grok" in items and
                                                              not _muse_grok_independent(items["muse"], items["grok"])) else ""
     return VetoResult(True, f"research veto: {n} independent sources flagged {norm(symbol)} within {days} trading days "
-                            f"({merged}{'; '.join(parts)})", items)
+                            f"({merged}{_parts(items)})", items)
 
 
 def record(con, symbol: str, res: VetoResult) -> None:
@@ -193,6 +223,20 @@ def record(con, symbol: str, res: VetoResult) -> None:
                     (norm(symbol), datetime.now(timezone.utc).isoformat(), res.reason, json.dumps(res.sources, default=str)))
     except sqlite3.Error as e:
         log.warning("veto_log write failed for %s: %s", symbol, e)
+
+
+def record_unconfirmed(con, symbol: str, res: VetoResult, client_order_id: str) -> None:
+    """Persist a would-have-blocked buy for the learning layer. Does not commit; never blocks.
+    Call only once the whole buy check allowed the order. Every row is a buy risk let through;
+    it may still not have reached the broker (see submitted). Idempotent per client_order_id."""
+    try:
+        ensure_schema(con)
+        con.execute("INSERT OR IGNORE INTO veto_unconfirmed (symbol, seen_at, reason, sources_json, "
+                    "client_order_id) VALUES (?,?,?,?,?)",
+                    (norm(symbol), datetime.now(timezone.utc).isoformat(), res.unconfirmed,
+                     json.dumps(res.unconfirmed_sources, default=str), client_order_id))
+    except sqlite3.Error as e:
+        log.warning("veto_unconfirmed write failed for %s: %s", symbol, e)
 
 
 def blocks_between(con, symbol: str, start: str, end: str) -> list[str]:

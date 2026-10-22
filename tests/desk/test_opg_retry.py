@@ -223,8 +223,8 @@ def _rt_read_fails(b, monkeypatch, times):
 
 
 def test_a_transient_read_failure_is_retried_within_the_same_postopen(desk, monkeypatch):
-    """Grok re-review 2026-10-21: no scheduled run comes after 09:50 before
-    the cutoff, so a pre-send failure waits once and tries again in-run."""
+    """Grok re-review 2026-10-21: a pre-send failure waits once and tries
+    again in-run before leaving it to the 10:00 postopen."""
     b = desk.broker
     with store.connect(desk.path) as con:
         opening_short(con, b, desk.limits, 0.4)
@@ -235,15 +235,19 @@ def test_a_transient_read_failure_is_retried_within_the_same_postopen(desk, monk
 
 @pytest.mark.parametrize("ratio, status", [(0.4, "submitted"), (0.0, "expired")])
 def test_an_unretried_remainder_is_voided_after_the_cutoff(desk, monkeypatch, ratio, status):
-    """The read keeps failing at 09:50: the notice asks for a manual run, and
-    the first run after 10:30 ET (postclose, or the next postopen) closes the
-    window instead of leaving the plan open forever. Nothing is sent."""
+    """The read keeps failing at 09:50 and 10:00: the 10:00 notice asks for a
+    manual run, and the first run after 10:30 ET (postclose, or the next
+    postopen) closes the window instead of leaving the plan open forever.
+    Nothing is sent."""
     b = desk.broker
     with store.connect(desk.path) as con:
         cid = opening_short(con, b, desk.limits, ratio)
-        _rt_read_fails(b, monkeypatch, 2)
+        _rt_read_fails(b, monkeypatch, 4)
         out = run.postopen(con, b, POSTOPEN, desk.limits)
+        assert "補單暫緩" in out and "10:00 ET 的 postopen 會再試一次" in out and "手動執行" not in out
+        out = run.postopen(con, b, POSTOPEN.replace(hour=10, minute=0), desk.limits)
         assert "補單暫緩" in out and "手動執行 postopen" in out
+        assert retries(b) == []
         assert run._expire_unretried_opg(con, b, POSTOPEN.replace(minute=59)) == []  # still before 10:30
         lines = run._expire_unretried_opg(con, b, WED.replace(hour=16, minute=45))
         assert len(lines) == 1 and "作廢" in lines[0]
@@ -325,3 +329,28 @@ def test_the_retry_does_not_rescale_an_order_already_scaled_at_premarket(desk, r
         b.prices["AAPL"] = px_open
         run.postopen(con, b, POSTOPEN, desk.limits)
         assert [o.qty for o in retries(b)] == [want]
+
+
+def test_the_10am_postopen_sends_the_retry_the_0950_run_could_not(desk, monkeypatch):
+    """The 09:50 run cannot read the broker before sending; the 10:00 run
+    (scripts/desk_schedule.py) sends the one retry, through the same path."""
+    b = desk.broker
+    with store.connect(desk.path) as con:
+        cid = opening_short(con, b, desk.limits, 0.4)
+        _rt_read_fails(b, monkeypatch, 2)
+        run.postopen(con, b, POSTOPEN, desk.limits)
+        assert retries(b) == []
+        run.postopen(con, b, POSTOPEN.replace(hour=10, minute=0), desk.limits)
+        assert [(o.qty, o.tif) for o in retries(b)] == [(30, TIF.DAY)]
+        assert plan_status(con, cid)["status"] == "submitted"
+
+
+def test_last_postopen_matches_the_schedule():
+    import importlib.util
+    from pathlib import Path
+    path = Path(__file__).resolve().parents[2] / "scripts/desk_schedule.py"
+    spec = importlib.util.spec_from_file_location("desk_schedule", path)
+    sched = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(sched)
+    times = sched.JOBS["postopen"]["times"]
+    assert times == [(9, 50), (10, 0)] and max(times) == run.LAST_POSTOPEN < run.ENTRY_CUTOFF

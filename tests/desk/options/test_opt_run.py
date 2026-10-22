@@ -148,3 +148,24 @@ def test_intraday_shadow_schedule_hook():
     assert len(p["StartCalendarInterval"]) == 38 * 5  # 38 slots x Mon-Fri
     sh = (ROOT / "scripts/desk_job.sh").read_text()
     assert "stockmoney.desk.intraday tick" in sh
+
+
+def test_scanshadow_schedule_and_path():
+    """scanshadow is managed by the generator (same 17:30 ET weekday slot the hand-installed
+    plist had), and the dispatcher puts the claude CLI's install dir on launchd's bare PATH
+    (the job failed with FileNotFoundError: 'claude' from 10/15)."""
+    sys.path.insert(0, str(ROOT / "scripts"))
+    try:
+        import desk_schedule as ds
+    finally:
+        sys.path.pop(0)
+    spec = ds.JOBS["scanshadow"]
+    assert "scanshadow" not in ds.DEFAULT_JOBS
+    p = ds.plist("scanshadow", spec)
+    assert p["StartCalendarInterval"] == [{"Weekday": d, "Hour": 17, "Minute": 30} for d in range(1, 6)]
+    assert p["ProgramArguments"][1] == "scanshadow"
+    sh = (ROOT / "scripts/desk_job.sh").read_text()
+    path_line = next(line for line in sh.splitlines() if line.startswith("export PATH="))
+    assert '$HOME/.local/bin' in path_line and path_line.endswith(':$PATH"')
+    # the PATH export runs before any job is dispatched
+    assert sh.index(path_line) < sh.index('job=$1')
