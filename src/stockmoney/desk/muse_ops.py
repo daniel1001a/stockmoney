@@ -104,6 +104,30 @@ PLAN_RULES = (
 )
 
 
+# Field names Grok's OPTIONS_PLAN mails (10-15 to 10-21) used that the model does
+# not have, each with where the information belongs instead. Matched against the
+# reject's loc so only the mistakes this mail made are named.
+PLAN_FIELD_FIXES = (
+    (r"OPTIONS_PLAN\.daily_ref:extra_forbidden", "頂層不能有 daily_ref,要引用 GROK_DAILY 就寫在每個 plans 項目的 daily_ref。"),
+    (r"OPTIONS_PLAN\.key_events:extra_forbidden",
+     'key_events 要放進 market_context:"market_context":{"summary":..,"risk_tone":..,"key_events":[{"time":..,"what":..}]}。'),
+    (r"OPTIONS_PLAN\.avoid:missing", "avoid 必填,沒有就寫 []。"),
+    (r"plans\.\d+\.ticker:extra_forbidden", "plans 項目的 ticker 要改名為 underlying。"),
+    (r"plans\.\d+\.rvol:extra_forbidden", "rvol 不是欄位,最低相對成交量寫在 min_rvol。"),
+    (r"plans\.\d+\.timing:extra_forbidden", "timing 不是欄位,進場時間窗寫在 trigger 的 earliest/latest。"),
+    (r"plans\.\d+\.gap:extra_forbidden", "gap 不是欄位,缺口幅度寫進 thesis 文字。"),
+    (r"plans\.\d+\.premarket_price:extra_forbidden", "premarket_price 不是欄位,盤前價寫進 thesis 文字。"),
+)
+
+
+def plan_field_fixes(reason: str) -> str:
+    """Where each misplaced or renamed field in an OPTIONS_PLAN reject belongs,
+    for only the mistakes this reject names."""
+    import re
+    out = [fix for pat, fix in PLAN_FIELD_FIXES if re.search(pat, reason)]
+    return " ".join(out) + " " if out else ""
+
+
 def fix_for(reason: str) -> str:
     """The correction text for a stored reject reason."""
     if "json_invalid" in reason:
@@ -112,7 +136,7 @@ def fix_for(reason: str) -> str:
     hint = fields_hint(reason)
     text = f"{hint} {base}" if hint else base
     if "OPTIONS_PLAN" in reason:
-        text = f"{text} {PLAN_RULES}"
+        text = f"{plan_field_fixes(reason)}{text} {PLAN_RULES}"
     return f"{text} {GROK_RULES}" if "GROK_DAILY" in reason else text
 
 

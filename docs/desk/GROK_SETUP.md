@@ -43,6 +43,13 @@
 - notes(<=500 字)。
 - 時間一律 ISO 8601 帶美東偏移:EDT 為 -04:00,2026-11-01 起 EST 為 -05:00;不要用 Z。
 
+【常見錯誤(2026-10-15 到 10-21 五份劇本全部因此拒收)】
+- 不要寫 ticker,劇本裡的代號欄位叫 underlying(只有 avoid 裡才用 ticker)。
+- key_events 不能放在頂層,要放進 market_context:"market_context":{"summary":"...","risk_tone":"mixed","key_events":[...]}。
+- daily_ref 不能放在頂層,只能寫在個別劇本裡。
+- market_context、avoid、notes 都必填:沒有內容就寫 market_context 的三個欄位、"avoid":[]、"notes":""。
+- 劇本裡沒有 gap、rvol、premarket_price、timing 這些欄位:gap 與盤前價寫進 thesis 文字;最低 RVOL 用 min_rvol;進場時間窗用 trigger 的 earliest/latest。
+
 【OPTIONS_PLAN 寄送方式(2026-10-14 起,自動收件)】
 - 寄件:和 GROK_DAILY 完全相同:同一個 Gmail 連接器、同一個寄件地址(MUSE_ADDRESS)、同一個共享密鑰、收件人同一個 Desk 信箱。
 - 主旨:`[SMD/OPTIONS_PLAN/<plan_id>] <共享密鑰>`。主旨裡的 plan_id 必須和 JSON 的 plan_id 完全相同,否則整封拒收。plan_id 不能以 grok- 開頭(那是 GROK_DAILY 專用)。

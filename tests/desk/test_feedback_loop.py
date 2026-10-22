@@ -200,3 +200,22 @@ def test_feedback_lists_the_fields_of_the_rejected_type():
         assert name in text.split("選填")[0]
     assert "window_start" not in text.split("選填")[0]
     assert len(text) < 1000  # fits the FEEDBACK how_to_fix limit
+
+
+def test_options_plan_feedback_says_where_each_wrong_field_goes():
+    # the shape of Grok's 10-15..10-21 rejects: top-level daily_ref/key_events, ticker not underlying
+    from stockmoney.desk.muse_ops import fix_for
+    reason = ("schema_invalid OPTIONS_PLAN.daily_ref:extra_forbidden; OPTIONS_PLAN.key_events:extra_forbidden; "
+              "OPTIONS_PLAN.market_context:missing; OPTIONS_PLAN.avoid:missing; "
+              "OPTIONS_PLAN.plans.0.ticker:extra_forbidden; OPTIONS_PLAN.plans.0.rvol:extra_forbidden; "
+              "OPTIONS_PLAN.plans.0.timing:extra_forbidden; OPTIONS_PLAN.plans.1.gap:extra_forbidden; "
+              "OPTIONS_PLAN.plans.1.premarket_price:extra_forbidden")
+    text = fix_for(reason)
+    for fix in ("改名為 underlying", "key_events 要放進 market_context", "每個 plans 項目的 daily_ref",
+                "avoid 必填", "min_rvol", "earliest/latest", "gap 不是欄位", "premarket_price 不是欄位"):
+        assert fix in text
+    assert len(text) < 1000  # every hint at once still fits the FEEDBACK how_to_fix limit
+    only_ticker = fix_for("schema_invalid OPTIONS_PLAN.plans.0.ticker:extra_forbidden")
+    assert "underlying" in only_ticker and "key_events 要放進" not in only_ticker
+    # an avoid item's ticker is a real field; a plain GROK_DAILY reject gets none of these
+    assert "改名" not in fix_for("schema_invalid GROK_DAILY.ticker:extra_forbidden")
