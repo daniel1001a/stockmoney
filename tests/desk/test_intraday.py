@@ -179,6 +179,27 @@ def test_cli_refuses_outside_hours_before_any_io(tmp_path, capsys):
     assert not db_path.exists()
 
 
+def test_cli_skips_slot_when_db_locked(tmp_path, monkeypatch, caplog):
+    """Grok review of step 7c: the options session can hold desk.sqlite past the 30s
+    timeout; the scheduled tick logs and skips that slot instead of crashing."""
+    def locked(path):
+        raise sqlite3.OperationalError("database is locked")
+    monkeypatch.setattr(intraday, "_connect", locked)
+    rc = intraday.main(["intraday", "tick", "--db", str(tmp_path / "x.sqlite")],
+                       clock=lambda: et(11, 0), client_factory=lambda feed: Exploding())
+    assert rc == 0
+    assert "資料庫忙碌" in caplog.text
+
+
+def test_cli_other_db_errors_still_raise(tmp_path, monkeypatch):
+    def broken(path):
+        raise sqlite3.OperationalError("no such table: intraday_shadow")
+    monkeypatch.setattr(intraday, "_connect", broken)
+    with pytest.raises(sqlite3.OperationalError):
+        intraday.main(["intraday", "tick", "--db", str(tmp_path / "x.sqlite")],
+                      clock=lambda: et(11, 0), client_factory=lambda feed: Exploding())
+
+
 def test_refuses_stale_daily_cache(db):
     stale = daily_history(end=date(2026, 10, 19))
     res = intraday.tick(db, et(11, 0), Exploding(), stale)
