@@ -436,6 +436,14 @@ def main(argv: list[str], *, clock=lambda: datetime.now(timezone.utc), client_fa
     except TickTimeout as e:
         log.error("%s", e)
         return 1
+    except sqlite3.OperationalError as e:
+        msg = str(e).lower()
+        if "locked" not in msg and "busy" not in msg:
+            raise
+        # another process (the options session) held desk.sqlite past the timeout: nothing
+        # was committed, this slot is skipped and the next one runs normally, never a halt
+        log.warning("盤中影子:資料庫忙碌,略過本時段:%s", e)
+        return 0
     finally:
         signal.alarm(0)
 

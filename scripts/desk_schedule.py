@@ -53,9 +53,11 @@ JOBS = {
     # intraday shadow of the daily setups (stockmoney.desk.intraday): SHADOW ONLY, no
     # order path exists in that module. Every 10 minutes 09:45-15:55 ET; `tick` refuses
     # outside the regular session and has its own TICK_TIMEOUT_S alarm, so a hung run
-    # never overlaps the next one. Writes only intraday_shadow; no lock file is taken
-    # (sqlite busy_timeout handles the shared desk.sqlite), so it never contends with
-    # run.lock or options.lock.
+    # never overlaps the next one. Writes only intraday_shadow; no lock file is taken, so
+    # it never waits on run.lock or options.lock. If the options session holds desk.sqlite
+    # past the 30s busy timeout the slot is logged and skipped. Unlike the daily jobs a
+    # missed slot is NOT caught up: launchd coalesces missed fires into one run at wake,
+    # which evaluates only that moment (or nothing after the close). Gaps stay gaps.
     "intraday_shadow": {"times": _TEN_MIN_SLOTS, "weekdays": True},
 }
 
