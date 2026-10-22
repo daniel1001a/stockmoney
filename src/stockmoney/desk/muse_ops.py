@@ -118,6 +118,8 @@ PLAN_FIELD_FIXES = (
     (r"plans\.\d+\.gap:extra_forbidden", "gap 不是欄位,缺口幅度寫進 thesis 文字。"),
     (r"plans\.\d+\.premarket_price:extra_forbidden", "premarket_price 不是欄位,盤前價寫進 thesis 文字。"),
 )
+PLAN_ITEM_REQUIRED = ("每個劇本必填 underlying/bias/playbook/thesis/catalyst/confidence/evidence_urls;"
+                      "bias 是評分用的假設。看不準方向就不寫,plans 可以是 []。")
 
 
 def plan_field_fixes(reason: str) -> str:
@@ -125,6 +127,13 @@ def plan_field_fixes(reason: str) -> str:
     for only the mistakes this reject names."""
     import re
     out = [fix for pat, fix in PLAN_FIELD_FIXES if re.search(pat, reason)]
+    named = {"ticker", "rvol", "timing", "gap", "premarket_price"}
+    other = sorted({f for f in re.findall(r"plans\.\d+\.(\w+):extra_forbidden", reason) if f not in named})
+    if other:
+        out.append(f"{', '.join(f[:30] for f in other[:3])} 不是劇本欄位,寫進 thesis。")
+    if re.search(r"plans\.\d+\.", reason):
+        # the reason lists at most 5 errors, so a missing bias can hide behind them
+        out.append(PLAN_ITEM_REQUIRED)
     return " ".join(out) + " " if out else ""
 
 
@@ -136,7 +145,10 @@ def fix_for(reason: str) -> str:
     hint = fields_hint(reason)
     text = f"{hint} {base}" if hint else base
     if "OPTIONS_PLAN" in reason:
-        text = f"{plan_field_fixes(reason)}{text} {PLAN_RULES}"
+        fixes = plan_field_fixes(reason)
+        text = f"{fixes}{text} {PLAN_RULES}"
+        if len(text) > 1000:  # how_to_fix limit: the per-field fixes matter more than the field list
+            text = f"{fixes}{base} {PLAN_RULES}"[:1000]
     return f"{text} {GROK_RULES}" if "GROK_DAILY" in reason else text
 
 

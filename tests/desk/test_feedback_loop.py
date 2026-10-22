@@ -217,5 +217,22 @@ def test_options_plan_feedback_says_where_each_wrong_field_goes():
     assert len(text) < 1000  # every hint at once still fits the FEEDBACK how_to_fix limit
     only_ticker = fix_for("schema_invalid OPTIONS_PLAN.plans.0.ticker:extra_forbidden")
     assert "underlying" in only_ticker and "key_events 要放進" not in only_ticker
+    assert "每個劇本必填" in only_ticker  # the 5-error cap can hide a missing bias
+    assert "每個劇本必填" not in fix_for("schema_invalid OPTIONS_PLAN.market_context:missing")
+
+
+def test_options_plan_feedback_names_unlisted_extra_plan_fields():
+    # 10-22 reject: a data-only plan with premarket_gap, which no fixed hint names
+    from stockmoney.desk.muse_ops import fix_for
+    text = fix_for("schema_invalid OPTIONS_PLAN.daily_ref:extra_forbidden; OPTIONS_PLAN.key_events:extra_forbidden; "
+                   "OPTIONS_PLAN.market_context:missing; OPTIONS_PLAN.plans.0.ticker:extra_forbidden; "
+                   "OPTIONS_PLAN.plans.0.premarket_gap:extra_forbidden")
+    assert "premarket_gap 不是劇本欄位" in text and "plans 可以是 []" in text
+    assert "ticker 不是劇本欄位" not in text  # ticker keeps its own rename hint
+    assert len(text) < 1000
+
+
+def test_options_plan_feedback_avoid_ticker_is_not_flagged():
+    from stockmoney.desk.muse_ops import fix_for
     # an avoid item's ticker is a real field; a plain GROK_DAILY reject gets none of these
     assert "改名" not in fix_for("schema_invalid GROK_DAILY.ticker:extra_forbidden")
