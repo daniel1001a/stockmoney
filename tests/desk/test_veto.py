@@ -216,6 +216,24 @@ def test_unconfirmed_grok_event_never_votes_but_is_logged_as_unconfirmed(db, mak
     assert db.execute("SELECT COUNT(*) FROM veto_log").fetchone()[0] == 0
 
 
+def test_unconfirmed_row_stores_the_what_if_sources(db, make_engine, broker):
+    _grok(db, confirmed=False)
+    _flag(db, "AAPL", "filings")
+    assert make_engine().check(buy(qty=10), broker.account(), 100.0, 0).allow
+    src = json.loads(db.execute("SELECT sources_json FROM veto_unconfirmed").fetchone()[0])
+    assert src.keys() == {"filings", "grok"} and src["grok"][0]["ref"] == "g1:0"
+
+
+def test_unconfirmed_not_logged_when_a_later_rule_blocks_the_buy(db, make_engine, broker):
+    _grok(db, confirmed=False)
+    _flag(db, "AAPL", "filings")
+    d = make_engine().check(buy(qty=10, limit_price=130.0), broker.account(), 100.0, 0)
+    assert not d.allow and "research veto" not in d.reason
+    d = make_engine().check(buy(qty=10), broker.account(), 100.0, 99)
+    assert not d.allow and "orders already this run" in d.reason
+    assert db.execute("SELECT COUNT(*) FROM veto_unconfirmed").fetchone()[0] == 0
+
+
 def test_unconfirmed_alone_short_of_threshold_has_no_unconfirmed_note(db):
     _grok(db, confirmed=False)
     res = veto.check(db, "AAPL")

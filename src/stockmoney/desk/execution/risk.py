@@ -296,8 +296,14 @@ class RiskEngine:
         if vt.blocked:
             veto.record(self.con, intent.symbol, vt)
             return self._block(f"buy blocked: {vt.reason}")
-        if vt.unconfirmed:
+        d = self._size_buy(intent, snapshot, ref_price, orders_this_run, market_price, md, md_reason)
+        if d.allow and vt.unconfirmed:  # only buys that actually pass; a later block is not "let through"
             veto.record_unconfirmed(self.con, intent.symbol, vt)
+        return d
+
+    def _size_buy(self, intent: OrderIntent, snapshot: AccountSnapshot, ref_price: float,
+                  orders_this_run: int, market_price: float | None, md: str, md_reason: str) -> RiskDecision:
+        l = self.limits
         owner = self.ledger.owner(intent.symbol)
         if owner is not None and intent.strategy and owner != intent.strategy:
             return self._block(f"buy blocked: {intent.symbol} is held by strategy '{owner}', "

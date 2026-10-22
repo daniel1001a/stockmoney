@@ -78,6 +78,7 @@ class VetoResult:
     sources: dict[str, list[dict]] = field(default_factory=dict)  # source -> its flagged items
     # set only when not blocked: the block that counting unconfirmed Grok events would have made
     unconfirmed: str = ""
+    unconfirmed_sources: dict[str, list[dict]] = field(default_factory=dict)  # the what-if, unconfirmed events included
 
 
 def norm(symbol: str) -> str:
@@ -202,7 +203,8 @@ def check(con, symbol: str, now: datetime | None = None, days: int = DAYS, min_s
             m = vote_count(what_if)
             if m >= min_sources:
                 res.unconfirmed = (f"unconfirmed: counting unconfirmed Grok events gives {m} sources on "
-                                      f"{norm(symbol)} within {days} trading days, not blocked ({_parts(what_if)})")
+                                   f"{norm(symbol)} within {days} trading days, not blocked ({_parts(what_if)})")
+                res.unconfirmed_sources = what_if
         return res
     merged = "muse+grok share a source and count once; " if ("muse" in items and "grok" in items and
                                                              not _muse_grok_independent(items["muse"], items["grok"])) else ""
@@ -221,12 +223,13 @@ def record(con, symbol: str, res: VetoResult) -> None:
 
 
 def record_unconfirmed(con, symbol: str, res: VetoResult) -> None:
-    """Persist a would-have-blocked buy for the learning layer. Does not commit; never blocks."""
+    """Persist a would-have-blocked buy for the learning layer. Does not commit; never blocks.
+    Call only once the whole buy check allowed the order, so every row is a buy that went out."""
     try:
         ensure_schema(con)
         con.execute("INSERT INTO veto_unconfirmed (symbol, seen_at, reason, sources_json) VALUES (?,?,?,?)",
                     (norm(symbol), datetime.now(timezone.utc).isoformat(), res.unconfirmed,
-                     json.dumps(res.sources, default=str)))
+                     json.dumps(res.unconfirmed_sources, default=str)))
     except sqlite3.Error as e:
         log.warning("veto_unconfirmed write failed for %s: %s", symbol, e)
 
