@@ -12,6 +12,9 @@ cd "$ROOT" || exit 1
 mkdir -p data/desk/logs
 LOG="data/desk/logs/$(date +%Y-%m-%d).log"
 if [[ -f .env ]]; then set -a; source .env; set +a; fi
+# launchd starts jobs with a bare PATH (/usr/bin:/bin:/usr/sbin:/sbin); the claude CLI that
+# scanshadow shells out to lives in ~/.local/bin (native installer)
+export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
 # Options jobs default to shadow-only (no paper orders) until the owner sets DESK_OPTIONS_ORDERS=paper in .env.
 if [[ "$1" == options* ]]; then export DESK_OPTIONS_ORDERS="${DESK_OPTIONS_ORDERS:-off}"; fi
 echo "=== $(date '+%F %T %Z') job=$1 ===" >> "$LOG"

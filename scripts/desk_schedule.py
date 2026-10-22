@@ -59,11 +59,14 @@ JOBS = {
     # missed slot is NOT caught up: launchd coalesces missed fires into one run at wake,
     # which evaluates only that moment (or nothing after the close). Gaps stay gaps.
     "intraday_shadow": {"times": _TEN_MIN_SLOTS, "weekdays": True},
+    # nightly RSS/Reddit ingest + Jev shadow classification (logging only, never orders)
+    "scanshadow": {"times": [(17, 30)], "weekdays": True},
 }
 
 
 # bridge needs the Muse mailbox configured; crypto is a Phase 1 placeholder; options and
-# options-recover are the intraday options sleeve (docs/desk/OPTIONS_PLAN.md). All are opt-in (--jobs ...).
+# options-recover are the intraday options sleeve (docs/desk/OPTIONS_PLAN.md); scanshadow needs
+# the claude CLI. All are opt-in (--jobs ...).
 DEFAULT_JOBS = ["premarket", "postopen", "postclose", "recover", "learn"]
 
 
