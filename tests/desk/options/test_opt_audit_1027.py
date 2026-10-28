@@ -198,3 +198,28 @@ def test_restart_after_live_sources_change_keeps_frozen_setup_out_of_live(tmp_pa
     r.run(et(9, 52))
     assert r.pos("shadow") and not r.pos("live")
     assert not any(o.side == Side.BUY for o in r.broker.orders.values())
+
+
+@pytest.mark.parametrize("change", ["untrusted", "shadow_only"])
+def test_restart_after_plan_loses_trust_keeps_frozen_grok_setup_out_of_live(tmp_path, con, change):
+    """grok_plan setups built under a plan that is no longer the trusted plan in
+    force (backfilled grok_legacy, or a verified resend after the cutoff) must
+    not open live after a same-day restart (Grok review)."""
+    from stockmoney.desk.options import plan as oplan
+    from test_opt_engine import _plan
+    oplan.ingest(con, _plan(), et(8, 0))
+    r = Rig(tmp_path, con, max_live_per_underlying=2)
+    r.run(et(9, 40))
+    setup = next(s for s in ostore.setups(con, str(DAY)) if s["source"] == "grok_plan")
+    assert setup["live_eligible"] and setup["state"] == "WAITING"
+    if change == "untrusted":
+        con.execute("UPDATE options_plans SET source='grok_legacy'")
+    else:
+        con.execute("UPDATE options_plans SET shadow_only=1")
+    con.commit()
+    r.eng = r.new_engine()
+    r.run(et(10, 50))
+    assert not [p for p in r.pos(source="grok_plan") if p["mode"] == "live"]
+    if change == "untrusted":
+        s = next(s for s in ostore.setups(con, str(DAY)) if s["source"] == "grok_plan")
+        assert s["state"] == "SUPERSEDED" and not r.pos(source="grok_plan")

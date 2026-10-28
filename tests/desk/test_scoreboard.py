@@ -40,13 +40,13 @@ def make_bars(n=80):
     return Bars(op, close + 1, op - 3, close, pd.DataFrame(1e6, index=idx, columns=op.columns))
 
 
-def grok_daily(con, mid, received_at, in_play=None):
+def grok_daily(con, mid, received_at, in_play=None, source="grok_verified"):
     body = {"type": "GROK_DAILY", "summary": "s"}
     if in_play is not None:
         body["in_play"] = in_play
     con.execute("INSERT INTO bridge_messages (msg_id, type, sender, sent_at, received_at, raw_body, parsed_json, source) "
                 "VALUES (?,?,?,?,?,?,?,?)", (mid, "GROK_DAILY", "g", received_at, received_at, "{}",
-                                             json.dumps(body), "grok"))
+                                             json.dumps(body), source))
 
 
 def item(ticker, direction, confirmed=True, confidence=0.8):
@@ -96,6 +96,16 @@ def test_in_play_open_to_close_hit_brier_and_confirmed_split(con):
     assert m["hit_rate"] == (2, 0.5)
     assert m["mean_signed"][1] == pytest.approx(-0.005)
     assert m["brier"][1] == pytest.approx(((0.8 - 1) ** 2 + (0.6 - 0) ** 2) / 2)
+
+
+def test_unverified_in_play_scores_apart_from_grok(con):
+    """grok_legacy mail never grades Grok's authority; it scores apart."""
+    bars = make_bars()
+    d = bars.dates[-5]
+    grok_daily(con, "m1", f"{d.date()}T12:00:00+00:00", [item("AAPL", "up")], source="grok_legacy")
+    grok_daily(con, "m2", f"{d.date()}T12:30:00+00:00", [item("AAPL", "up")])
+    got = sorted(o["source"] for o in sb.in_play_obs(con, bars))
+    assert got == ["grok_in_play", "grok_in_play:confirmed", "grok_in_play:legacy"]
 
 
 def test_in_play_down_direction_scores_the_short_side(con):
@@ -240,5 +250,5 @@ def test_alerts_scored_per_sender(con):
                     (mid, "ALERT", "x", f"{d.date()}T12:00:00+00:00", f"{d.date()}T12:00:00+00:00", "{}",
                      json.dumps({"type": "ALERT", "ticker": "NVDA", "severity": "elevated"}), src))
     got = sorted(o["source"] for o in sb.alert_obs(con, bars))
-    assert got == ["grok_alert", "muse_alert"]
+    assert got == ["grok_alert", "grok_alert:legacy", "muse_alert"]
     assert "grok_alert" in sb.FIXED and "grok_alert" in sb.LABEL

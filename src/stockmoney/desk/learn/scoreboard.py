@@ -74,6 +74,7 @@ LABEL = {
     "grok_market_risk": "Grok 大盤風險(SPY 5 日)", "grok_calls": "Grok 轉述喊單(5 日超額)",
     "muse_calls": "Muse 喊單(5 日超額)", "muse_alert": "Muse ALERT elevated/critical(5 日超額)",
     "grok_alert": "Grok ALERT elevated/critical(5 日超額)",
+    "grok_alert:legacy": "Grok ALERT 未驗證通道(只供參考)", "grok_in_play:legacy": "Grok in_play 未驗證通道(只供參考)",
     "muse_alert_block": "Muse ALERT 擋單", "muse_risk_flags_block": "Muse 風險旗標擋單",
     "research_veto_block": "研究否決擋單(Muse/Grok/申報)", "muse_legacy_rule": "舊 Muse 規則(會擋未擋)",
     "grok_options_plan:live": "Grok 期權劇本(紙上實單)", "grok_options_plan:shadow": "Grok 期權劇本(影子)",
@@ -117,12 +118,17 @@ def session_for(received_at: str, sessions: pd.DatetimeIndex) -> pd.Timestamp | 
 
 def in_play_obs(con, bars: Bars) -> list[dict]:
     """GROK_DAILY.in_play items scored open-to-close on their session D.
-    One observation per (ticker, direction, D); the first receipt wins."""
+    One observation per (channel, ticker, direction, D); the first receipt
+    wins. Only grok_verified mail grades Grok (the order path reads nothing
+    else); unverified mail scores apart as grok_in_play:legacy."""
     if not _has(con, "bridge_messages"):
         return []
+    from stockmoney.desk.bridge.inbox import SOURCE_GROK_VERIFIED, has_source_column, source_of
     out, seen = [], set()
-    for r in con.execute("SELECT received_at, parsed_json FROM bridge_messages WHERE type='GROK_DAILY' "
+    src_col = "source" if has_source_column(con) else "NULL AS source"
+    for r in con.execute(f"SELECT received_at, parsed_json, {src_col} FROM bridge_messages WHERE type='GROK_DAILY' "
                          "ORDER BY received_at, msg_id").fetchall():
+        verified = source_of(r["source"], "GROK_DAILY") == SOURCE_GROK_VERIFIED
         try:
             items = (json.loads(r["parsed_json"]) or {}).get("in_play") or []
         except (ValueError, AttributeError):
@@ -135,17 +141,21 @@ def in_play_obs(con, bars: Bars) -> list[dict]:
                 sym, direction = _sym(it["ticker"]), it["direction"]
             except (KeyError, TypeError):
                 continue
-            if direction not in ("up", "down") or sym not in bars.close.columns or (sym, direction, d) in seen:
+            if direction not in ("up", "down") or sym not in bars.close.columns or \
+                    (verified, sym, direction, d) in seen:
                 continue
             o, c = _num(bars.open.at[d, sym]), _num(bars.close.at[d, sym])
             if not o or c is None:
                 continue
-            seen.add((sym, direction, d))
+            seen.add((verified, sym, direction, d))
             signed = (c / o - 1) * (1 if direction == "up" else -1)
             hit = int(signed > 0)
             conf = it.get("confidence")
             conf = float(conf) if isinstance(conf, (int, float)) and 0 <= conf <= 1 else None
             day = d.date()
+            if not verified:
+                out.append(_obs(day, "grok_in_play:legacy", hit, signed, conf))
+                continue
             out.append(_obs(day, "grok_in_play", hit, signed, conf))
             split = "grok_in_play:confirmed" if it.get("confirmed") is True else "grok_in_play:unconfirmed"
             out.append(_obs(day, split, hit, signed, conf))
@@ -187,17 +197,19 @@ def calls_obs(con) -> list[dict]:
 def alert_obs(con, bars: Bars) -> list[dict]:
     """Elevated/critical ALERTs: 5-session excess vs SPY from the first
     complete close after receipt. One per (sender, ticker, ET receipt day);
-    Grok's own-channel ALERTs score as grok_alert, everything else as muse_alert."""
+    Muse's ALERTs score as muse_alert, verified Grok ALERTs as grok_alert and
+    unverified Grok mail apart as grok_alert:legacy."""
     if not _has(con, "bridge_messages") or MARKET not in bars.close.columns:
         return []
-    from stockmoney.desk.bridge.inbox import SOURCE_MUSE, has_source_column, source_of
+    from stockmoney.desk.bridge.inbox import SOURCE_GROK_VERIFIED, SOURCE_MUSE, has_source_column, source_of
     from stockmoney.desk.learn.calls import base_session
     sessions, spy = bars.dates, bars.close[MARKET]
     out, seen = [], set()
     src_col = "source" if has_source_column(con) else "NULL AS source"
     for r in con.execute(f"SELECT received_at, parsed_json, {src_col} FROM bridge_messages WHERE type='ALERT' "
                          "ORDER BY received_at, msg_id").fetchall():
-        label = "muse_alert" if source_of(r["source"], "ALERT") == SOURCE_MUSE else "grok_alert"
+        label = {SOURCE_MUSE: "muse_alert", SOURCE_GROK_VERIFIED: "grok_alert"}.get(
+            source_of(r["source"], "ALERT"), "grok_alert:legacy")
         try:
             m = json.loads(r["parsed_json"]) or {}
             sym, sev = _sym(m["ticker"]), m.get("severity")

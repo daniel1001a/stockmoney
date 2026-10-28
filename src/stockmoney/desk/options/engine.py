@@ -373,7 +373,15 @@ class Engine:
         active = self._active
         if not ostore.universe(self.con, self._dstr):
             return  # before ~09:25: the universe build adds the plan's names
-        if active is not None and active.plan.plan_id != self._plan_seen:
+        if active is None:
+            # no trusted plan in force (e.g. a restart after the trust rule
+            # changed): setups of an earlier plan must not stay armed
+            cur = self.con.execute("UPDATE options_setups SET state=?, live_note=? WHERE day=? AND source=? "
+                                   "AND state=?", (SUPERSEDED, "no trusted plan in force", self._dstr, GROK,
+                                                   WAITING))
+            if cur.rowcount:
+                self.con.commit()
+        elif active.plan.plan_id != self._plan_seen:
             self._add_plan(active, now)
             self.con.commit()
         self._plan_seen = active.plan.plan_id if active else None
@@ -640,6 +648,11 @@ class Engine:
         if src == "orb15" and m.get("day_rvol") is None:
             return "rvol_unknown"
         if src == GROK:
+            # live_eligible was frozen at insert: re-check that this setup's plan
+            # is still the trusted plan in force and was received before the cutoff
+            a = self._active
+            if a is None or a.plan.plan_id != s["plan_id"] or a.shadow_only:
+                return "plan_not_in_force"
             item = spec["item"]
             if item["playbook"] not in cfg.grok_live_playbooks:
                 return "grok_playbook_shadow_only"
