@@ -111,11 +111,12 @@ def test_grok_sender_with_wrong_or_muse_token_is_rejected(con):
 
 
 def test_grok_sender_may_send_only_grok_types(con):
+    # GROK_ADDRESS may send GROK_DAILY, OPTIONS_PLAN, ALERT, RESEARCH_REPLY and
+    # PONG (inbox.GROK_SENDER_TYPES); Muse's own types stay Muse's
     box = FakeMailbox()
-    alert = {"protocol": "1", "msg_id": "alert-0001", "sent_at": "2026-10-12T07:30:00-04:00", "type": "ALERT",
-             "ticker": "NVDA", "severity": "critical", "headline": "x", "source_urls": ["https://a.example/1"],
-             "observed_at": "2026-10-12T07:00:00-04:00"}
-    send(box, alert)
+    idea = {"protocol": "1", "msg_id": "idea-00001", "sent_at": "2026-10-12T07:30:00-04:00", "type": "IDEA",
+            "ticker": "NVDA", "thesis": "x", "horizon_days": 30, "source_urls": ["https://a.example/1"]}
+    send(box, idea)
     assert inbox.poll(con, box, CONFIG, now=NOW) == 0
     assert rejects(con) == ["type_not_allowed_for_sender"]
     assert "type_not_allowed_for_sender" not in muse_ops.FIXES  # never answered with feedback

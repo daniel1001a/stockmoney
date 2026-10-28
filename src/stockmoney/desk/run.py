@@ -1555,7 +1555,20 @@ def crypto(con, broker: Broker, now: datetime) -> str:
     return "加密貨幣策略於第 1 階段上線。" + ("\n" + "\n".join(events) if events else "")
 
 
-def bridge(con, now: datetime, mailbox=None) -> str:
+def _grok_outbound(con, now: datetime, box, config) -> list[str]:
+    """DESK_BRIEF / RESEARCH_REQUEST to Grok; a failure is logged, never fatal."""
+    from stockmoney.desk import grok_outbound
+    try:
+        return grok_outbound.run(con, box, now, config)
+    except Exception as e:
+        log.warning("grok outbound failed: %s", e)
+        return [f"寄給 Grok 失敗:{type(e).__name__}"]
+
+
+def bridge(con, now: datetime, mailbox=None, grok_config=None) -> str:
+    """Poll the inbox, run the bridge checks, then send what Grok is due. With an
+    injected ``mailbox`` (tests) the Grok outbound runs only when ``grok_config``
+    is given, so a test never picks up the real environment."""
     from stockmoney.desk import muse_ops
     from stockmoney.desk.bridge import inbox, mailbox as mb
     from stockmoney.desk.bridge.policy import active_flags
@@ -1570,9 +1583,13 @@ def bridge(con, now: datetime, mailbox=None) -> str:
         with mb.ImapSmtpMailbox(mb.BridgeConfig.from_env()) as box:
             n = inbox.poll(con, box, now=now)
             ops = muse_ops.run_checks(con, now, box)
+            sent = _grok_outbound(con, now, box, grok_config)
     else:
         n = inbox.poll(con, mailbox, now=now)
         ops = muse_ops.run_checks(con, now, mailbox)
+        sent = _grok_outbound(con, now, mailbox, grok_config) if grok_config is not None else []
+    if sent:
+        ops = "\n".join([ops, *sent]) if ops else "\n".join(sent)
     held = set(Ledger(con).positions())
     for note in active_flags(con, now, held).notify:
         _notify_once(con, f"muse:{note[:100]}", "Muse 警報", note, notify.WARN, _today(now))

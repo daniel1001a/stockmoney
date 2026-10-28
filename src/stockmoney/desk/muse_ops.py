@@ -19,11 +19,16 @@ SCHEMA = """
 CREATE TABLE IF NOT EXISTS bridge_outbox (
   msg_id TEXT PRIMARY KEY, type TEXT, ticker TEXT, deadline TEXT, sent_at TEXT);
 CREATE TABLE IF NOT EXISTS bridge_ops (key TEXT PRIMARY KEY, at TEXT);
+CREATE TABLE IF NOT EXISTS bridge_pings (
+  msg_id TEXT PRIMARY KEY, channel TEXT NOT NULL, nonce TEXT NOT NULL, sent_at TEXT NOT NULL);
 """
 
 
 def ensure_schema(con) -> None:
     con.executescript(SCHEMA)
+    # bridge_outbox.channel (2026-10-27): "muse" or "grok"; NULL on older rows means muse
+    if "channel" not in {r[1] for r in con.execute("PRAGMA table_info(bridge_outbox)")}:
+        con.execute("ALTER TABLE bridge_outbox ADD COLUMN channel TEXT")
     from stockmoney.desk.bridge.inbox import ensure_schema as inbox_schema
     inbox_schema(con)
 
@@ -36,15 +41,15 @@ def _once(con, key: str) -> bool:
     return True
 
 
-def log_outbound(con, msg) -> None:
+def log_outbound(con, msg, channel: str = "muse") -> None:
     # the message's own send time (the orchestrator's clock), so rolling-window
     # counts below agree with the ``now`` they are given
     sent = getattr(msg, "sent_at", None)
     con.execute(
-        "INSERT OR IGNORE INTO bridge_outbox VALUES (?,?,?,?,?)",
+        "INSERT OR IGNORE INTO bridge_outbox (msg_id, type, ticker, deadline, sent_at, channel) VALUES (?,?,?,?,?,?)",
         (msg.msg_id, msg.type, getattr(msg, "ticker", None),
          _iso(msg.deadline) if getattr(msg, "deadline", None) else None,
-         _iso(sent) if sent else store.now()))
+         _iso(sent) if sent else store.now(), channel))
 
 
 # ------------------------------------------------------------------ feedback
@@ -72,10 +77,10 @@ def fields_hint(reason: str) -> str:
     list that type's required and optional top-level fields from the real
     model, so the sender can fix a missing or misplaced field without guessing."""
     import re
-    from stockmoney.desk.bridge.schema import Alert, Calls, GrokDaily, Idea, ResearchReply, SocialDaily
+    from stockmoney.desk.bridge.schema import Alert, Calls, GrokDaily, Idea, Pong, ResearchReply, SocialDaily
     from stockmoney.desk.options.plan import OptionsPlan
     models = {"OPTIONS_PLAN": OptionsPlan, "SOCIAL_DAILY": SocialDaily, "CALLS": Calls, "ALERT": Alert,
-              "RESEARCH_REPLY": ResearchReply, "IDEA": Idea, "GROK_DAILY": GrokDaily}
+              "RESEARCH_REPLY": ResearchReply, "IDEA": Idea, "GROK_DAILY": GrokDaily, "PONG": Pong}
     m = re.match(r"schema_invalid\s+([A-Z_]+)\.", reason)
     model = models.get(m.group(1)) if m else None
     if model is None:
@@ -158,7 +163,8 @@ def fix_for(reason: str) -> str:
 
 
 # Hard ceiling on correction mail so that no loop, whatever its cause, can
-# flood Muse's mailbox: 10 per rolling 24 hours, the owner told once.
+# flood a mailbox: 10 per rolling 24 hours PER CHANNEL (Muse, Grok), the owner
+# told once per channel. Drop notices (accepted with fields dropped) count too.
 FEEDBACK_CAP = 10
 FEEDBACK_WINDOW = timedelta(hours=24)
 
@@ -181,11 +187,52 @@ def pending_feedback(con) -> list[tuple[str, str, str]]:
     return out
 
 
-def feedback_sent_since(con, since: datetime) -> list[str]:
-    """sent_at (newest first) of FEEDBACK mails sent after ``since``."""
-    return [r[0] for r in con.execute(
-        "SELECT sent_at FROM bridge_outbox WHERE type='FEEDBACK' AND sent_at > ? ORDER BY sent_at DESC",
-        (_iso(since),)).fetchall()]
+def feedback_sent_since(con, since: datetime, channel: str | None = None) -> list[str]:
+    """sent_at (newest first) of FEEDBACK mails sent after ``since``; with
+    ``channel``, only that channel's (a NULL channel is a pre-2026-10-27 Muse mail)."""
+    sql = "SELECT sent_at FROM bridge_outbox WHERE type='FEEDBACK' AND sent_at > ?"
+    args: tuple = (_iso(since),)
+    if channel is not None:
+        sql += " AND COALESCE(channel,'muse')=?"
+        args += (channel,)
+    return [r[0] for r in con.execute(sql + " ORDER BY sent_at DESC", args).fetchall()]
+
+
+DROP_FIX = ("訊息已接受,但上面列出的欄位或項目不合格式,已被丟棄、沒有存入。"
+            "對照範本修正:多餘欄位不要寫,網址只能 https,清單項目每一筆都要完整。下一封照範本寫就不會再收到這封通知。")
+
+
+def pending_drop_notices(con) -> list[tuple[str, str, str, str]]:
+    """(key, msg_id, summary, sender) for accepted messages that were pruned
+    (bridge_messages.dropped_json) and not yet answered. A pruned Re:/Fwd: mail
+    is stored with feedback=false and never answered."""
+    from stockmoney.desk.bridge.inbox import drop_summary
+    if "dropped_json" not in {r[1] for r in con.execute("PRAGMA table_info(bridge_messages)")}:
+        return []
+    out = []
+    for r in con.execute("SELECT msg_id, sender, dropped_json FROM bridge_messages WHERE dropped_json IS NOT NULL "
+                         "ORDER BY received_at, msg_id").fetchall():
+        try:
+            d = json.loads(r[2])
+        except ValueError:
+            continue
+        if not isinstance(d, dict) or not d.get("feedback") or not d.get("dropped"):
+            continue
+        key = f"fbd:{r[0]}"
+        if not con.execute("SELECT 1 FROM bridge_ops WHERE key=?", (key,)).fetchone():
+            out.append((key, r[0], f"{len(d['dropped'])} 個欄位/項目被丟棄:{drop_summary(d['dropped'])}", r[1] or ""))
+    return out
+
+
+def _channel_for(sender: str | None, config) -> str:
+    """The channel a reply goes back on: Grok's own address gets Grok's channel."""
+    s = (sender or "").strip().lower()
+    return "grok" if config.grok_enabled and s and s == config.grok_address.strip().lower() else "muse"
+
+
+def _reject_sender(con, key: str) -> str:
+    r = con.execute("SELECT sender FROM bridge_rejects WHERE id=?", (key.removeprefix("fb:"),)).fetchone()
+    return (r[0] if r else "") or ""
 
 
 def _is_plan_reject(con, key: str) -> bool:
@@ -195,30 +242,56 @@ def _is_plan_reject(con, key: str) -> bool:
     return bool(r and r[0] and r[0].lstrip().find("[SMD/OPTIONS_PLAN/") >= 0)
 
 
-def send_feedback(con, box, now: datetime) -> int:
+def send_feedback(con, box, now: datetime, config=None) -> int:
+    """Answer correctable rejects and pruned (accepted-with-drops) messages on
+    the channel they came from: Grok's address gets Grok's channel and token,
+    everything else Muse's. Capped per channel."""
     from stockmoney.desk.bridge import outbox
+    from stockmoney.desk.bridge.mailbox import BridgeConfig
     from stockmoney.desk.bridge.schema import Feedback
-    pending = pending_feedback(con)
-    budget = FEEDBACK_CAP - len(feedback_sent_since(con, now - FEEDBACK_WINDOW))
+    rejects, drops = pending_feedback(con), pending_drop_notices(con)
+    if not rejects and not drops:
+        return 0
+    config = config or BridgeConfig.from_env()
+    items = []  # (key, channel, Feedback fields)
+    for key, about, reason in rejects:
+        channel = _channel_for(_reject_sender(con, key), config)
+        # Grok's legacy mail comes from Muse's address, so its corrections land in
+        # the mailbox Muse reads; the tag tells Muse to leave them alone (MUSE_PROMPT.md)
+        legacy_grok = about.lower().startswith("grok-") or _is_plan_reject(con, key)
+        tag = "【給 Grok】" if channel == "muse" and legacy_grok else ""
+        items.append((key, channel, dict(about_msg_id=about[:64], problem=f"{tag}訊息 {about} 被拒絕:{reason}"[:1000],
+                                         how_to_fix=fix_for(reason))))
+    for key, about, summary, sender in drops:
+        channel = _channel_for(sender, config)
+        tag = "【給 Grok】" if channel == "muse" and about.lower().startswith("grok-") else ""
+        items.append((key, channel, dict(about_msg_id=about[:64],
+                                         problem=f"{tag}訊息 {about} 已接受(非致命):{summary}"[:1000],
+                                         how_to_fix=DROP_FIX)))
     n = 0
-    for key, about, reason in pending[: max(budget, 0)]:
-        # Grok sends from the same address, so its corrections land in the mailbox
-        # Muse reads; the tag tells Muse to leave them alone (MUSE_PROMPT.md)
-        tag = "【給 Grok】" if about.lower().startswith("grok-") or _is_plan_reject(con, key) else ""
-        msg = Feedback(msg_id=outbox.new_msg_id("fb"), sent_at=now, about_msg_id=about[:64],
-                       problem=f"{tag}訊息 {about} 被拒絕:{reason}"[:1000], how_to_fix=fix_for(reason))
-        outbox.send(box, msg)
-        log_outbound(con, msg)
+    left = {"muse": 0, "grok": 0}
+    budget = {c: FEEDBACK_CAP - len(feedback_sent_since(con, now - FEEDBACK_WINDOW, c)) for c in left}
+    for key, channel, fields in items:
+        if budget[channel] <= 0:
+            left[channel] += 1
+            continue
+        msg = Feedback(msg_id=outbox.new_msg_id("fb"), sent_at=now, **fields)
+        outbox.send(box, msg, config, channel=channel)
+        log_outbound(con, msg, channel)
         _once(con, key)
+        budget[channel] -= 1
         n += 1
-    if len(pending) > n:  # left unsent: they go out as the window frees up
-        recent = feedback_sent_since(con, now - FEEDBACK_WINDOW)
+    for channel, waiting in left.items():
+        if not waiting:  # left unsent: they go out as the window frees up
+            continue
+        recent = feedback_sent_since(con, now - FEEDBACK_WINDOW, channel)
         # one notice per capped episode: keyed by the newest mail inside the cap
         marker = recent[FEEDBACK_CAP - 1] if len(recent) >= FEEDBACK_CAP else _iso(now)
-        if _once(con, f"fbcap:{marker}"):
+        who = "Muse" if channel == "muse" else "Grok"
+        if _once(con, f"fbcap:{marker}" if channel == "muse" else f"fbcap:grok:{marker}"):
             notify.send(
-                "Muse 格式修正信已達上限",
-                f"24 小時內已寄 {FEEDBACK_CAP} 則格式修正給 Muse,還有 {len(pending) - n} 則待寄,暫停寄出。"
+                f"{who} 格式修正信已達上限",
+                f"24 小時內已寄 {FEEDBACK_CAP} 則格式修正給 {who},還有 {waiting} 則待寄,暫停寄出。"
                 "請檢查橋樑是否在互相回信。",
                 notify.WARN)
     return n
@@ -310,14 +383,18 @@ def check_deliveries(con, now: datetime) -> list[str]:
             note = ";沒有收到信(不是空白日報),不代表今天沒有風險" if e.who == "Grok" else ""
             misses.append(f"{e.who} 今天沒有準時送出「{e.name}」(期限 {e.deadline:%H:%M} ET){note}")
     for r in con.execute(
-        "SELECT msg_id, ticker, deadline FROM bridge_outbox WHERE type='RESEARCH_REQUEST' AND deadline < ?",
+        "SELECT msg_id, ticker, deadline, COALESCE(channel,'muse') FROM bridge_outbox "
+        "WHERE type='RESEARCH_REQUEST' AND deadline < ?",
         (_iso(now),),
     ).fetchall():
         answered = con.execute(
             "SELECT 1 FROM bridge_messages WHERE type='RESEARCH_REPLY' AND json_extract(parsed_json,'$.request_id')=?",
             (r[0],)).fetchone()
         if not answered and _once(con, f"late:{r[0]}"):
-            misses.append(f"Muse 沒有在期限前回覆 {r[1]} 的進場前查核")
+            if r[3] == "grok":
+                misses.append(f"Grok 沒有在期限前回覆 {r[1]} 的盤後原因查詢")
+            else:
+                misses.append(f"Muse 沒有在期限前回覆 {r[1]} 的進場前查核")
     return misses
 
 
@@ -358,6 +435,33 @@ def grok_today(con, now: datetime) -> dict:
         out["status"] = "pending"
     else:
         out["status"] = "missed"
+    return out
+
+
+IN_PLAY_CUTOFF = time(9, 20)  # ET; the same cutoff as OPTIONS_PLAN (later: shadow only)
+
+
+def grok_in_play(con, day) -> list[dict]:
+    """The ``in_play`` candidates of ``day``'s morning GROK_DAILY mail: only
+    grok_verified rows received that ET day before 09:20 ET (by the desk's own
+    clock, received_at). grok_legacy and Muse rows never count. Each item is
+    the stored dict plus ``msg_id`` and ``received_at``; a later message comes
+    after an earlier one. A candidate is a proposal only: rules and the risk
+    layer decide every order."""
+    start = datetime.combine(day, time(0, 0), ET)
+    cutoff = datetime.combine(day, IN_PLAY_CUTOFF, ET)
+    out = []
+    for msg_id, received_at, parsed in con.execute(
+            "SELECT msg_id, received_at, parsed_json FROM bridge_messages WHERE type='GROK_DAILY' "
+            "AND source='grok_verified' AND received_at>=? AND received_at<? ORDER BY received_at, msg_id",
+            (_iso(start), _iso(cutoff))).fetchall():
+        try:
+            items = json.loads(parsed).get("in_play") or []
+        except (ValueError, TypeError, AttributeError):
+            continue
+        for it in items:
+            if isinstance(it, dict):
+                out.append(dict(it, msg_id=msg_id, received_at=received_at))
     return out
 
 
@@ -416,7 +520,7 @@ def run_checks(con, now: datetime, box=None) -> str:
     if box is not None:
         n = send_feedback(con, box, now)
         if n:
-            lines.append(f"已寄 {n} 則格式修正給 Muse")
+            lines.append(f"已寄 {n} 則格式修正信")
     for m in check_deliveries(con, now):
         notify.send("Grok 漏交" if m.startswith("Grok ") else "Muse 漏交", m, notify.WARN)
         lines.append(m)
@@ -455,4 +559,54 @@ def scorecard(con, now: datetime, days: int = 7) -> dict:
             "SELECT 1 FROM bridge_messages WHERE type='RESEARCH_REPLY' AND json_extract(parsed_json,'$.request_id')=?",
             (r[0],)).fetchone())
     out["research"] = {"requested": len(req), "answered": answered}
+    return out
+
+
+# ---------------------------------------------------------------- PING / PONG handshake (2026-10-27)
+
+PING_ASK = ("Handshake test. Reply with a PONG that echoes this nonce and states what you can do "
+            "(email read/send, HTTP GET/POST, scheduling and the times you run).")
+
+
+def send_ping(con, box, channel: str, now: datetime, config=None):
+    """Send a PING on ``channel`` ("grok" or "muse") and record its nonce."""
+    import secrets
+
+    from stockmoney.desk.bridge import outbox
+    from stockmoney.desk.bridge.schema import Ping
+    ensure_schema(con)
+    msg = Ping(msg_id=outbox.new_msg_id(f"ping-{channel}"), sent_at=now,
+               nonce=secrets.token_hex(8), ask=PING_ASK)
+    outbox.send(box, msg, config, channel=channel)
+    log_outbound(con, msg, channel)
+    con.execute("INSERT INTO bridge_pings VALUES (?,?,?,?)", (msg.msg_id, channel, msg.nonce, _iso(now)))
+    return msg
+
+
+def ping_results(con, limit: int = 20) -> list[dict]:
+    """Each PING (newest first) with the PONG that echoed its nonce from the same
+    channel, if any: round trip in seconds and the capabilities it declared."""
+    ensure_schema(con)
+    from stockmoney.desk.bridge import inbox
+    inbox.ensure_schema(con)
+    pongs: dict[tuple[str, str], tuple] = {}
+    for received, parsed, source in con.execute(
+            "SELECT received_at, parsed_json, source FROM bridge_messages WHERE type='PONG' ORDER BY received_at"):
+        try:
+            p = json.loads(parsed)
+        except (TypeError, ValueError):
+            continue
+        ch = "grok" if str(source or "").startswith("grok") else "muse"
+        pongs.setdefault((ch, p.get("nonce", "")), (received, p, source))
+    out = []
+    for msg_id, ch, nonce, sent in con.execute(
+            "SELECT msg_id, channel, nonce, sent_at FROM bridge_pings ORDER BY sent_at DESC LIMIT ?", (limit,)):
+        hit = pongs.get((ch, nonce))
+        row = dict(msg_id=msg_id, channel=ch, nonce=nonce, sent_at=sent, answered=hit is not None)
+        if hit:
+            received, p, source = hit
+            row.update(received_at=received, source=source,
+                       rtt_s=round((datetime.fromisoformat(received) - datetime.fromisoformat(sent)).total_seconds()),
+                       capabilities=p.get("capabilities"), notes=p.get("notes", ""))
+        out.append(row)
     return out

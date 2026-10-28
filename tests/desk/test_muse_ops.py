@@ -48,7 +48,7 @@ def test_feedback_only_for_authenticated_mail(con):
     box = FakeMailbox()
     now = datetime(2026, 10, 12, 12, 0, tzinfo=timezone.utc)
     bad = social("sd-bad-0001", now)
-    bad["items"] = [{"ticker": "NVDA"}]  # missing required fields
+    del bad["collected_at"]  # a missing required field: never repaired by leniency
     deliver(box, bad)
     deliver(box, social("sd-spoof-01", now), sender="attacker@example.com")
     deliver(box, social("sd-token-01", now), token="wrong-token-0123456789")
