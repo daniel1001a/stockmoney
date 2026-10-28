@@ -144,3 +144,4 @@ def test_h1b_registered():
     book = shadow.VARIANTS["shadow:combined_hold60"]("2026-10-28", None)
     assert book["pullback"].params["max_hold_days"] == 60
     assert book["breakout"].params["trail_atr"] == 3.0
+    assert book["pullback"].params["trail_atr"] == 3.0

@@ -154,6 +154,9 @@ def render(res: dict) -> str:
     if res["hypothesis"] in ("H5", "H5b"):
         lines.append("限制:本報告不檢查「優勢是否主要來自單一時期」;通過前須用 scripts/desk_wind_replay.py "
                      "確認 2016-2020 與 2021 以後兩段都成立(EDGE_PLAN 2.7 候補 H5)。")
+    if res["hypothesis"] == "H1b":
+        lines.append("限制:持有上限 60 天是看過 2016-2026 歷史重播(scripts/desk_h1_replay.py)後才挑的,"
+                     "歷史區間與現行大幅重疊;只有影子帳戶的前瞻樣本算數(EDGE_PLAN 2.7 候補 H1b)。")
     if res["hypothesis"] == "H1":
         lines.append("限制:影子帳戶 t35 只放寬移動停損,沒有包含 EDGE_PLAN 2.1(a) 的「回檔持有上限 40 改 60 天」,"
                      "也沒有隨機對照百分位;這兩項需另行驗證才能完整回答 H1。")
