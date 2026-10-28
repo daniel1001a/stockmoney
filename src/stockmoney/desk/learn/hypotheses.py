@@ -38,7 +38,7 @@ def build(con, today: str) -> list[dict]:
     """Candidate hypotheses as of ``today`` (pure read)."""
     stats = postmortem.week_stats(con, today, 2)
     out = []
-    for code in postmortem.candidate_symptoms(stats):
+    for code in postmortem.candidate_symptoms(stats)[:postmortem.MAX_HYPOTHESES]:
         out.append({"week": iso_week(today), "symptom": code, "label": postmortem.LABEL[code], "week_end": today,
                     "loss_this": stats[0]["loss"][code], "loss_prev": stats[1]["loss"][code],
                     "n_this": stats[0]["cnt"][code], "n_prev": stats[1]["cnt"][code],
