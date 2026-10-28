@@ -397,9 +397,14 @@ def lenient_validate(text: str, subj_type: str):
     if not isinstance(data, dict) or data.get("type") != subj_type or model is None:
         return None, []
     dropped: list[dict] = []
+    # a list that had items must keep at least one: pruning GROK_DAILY.events to
+    # nothing would read as an intentional empty digest
+    filled = [k for k, v in data.items() if isinstance(v, list) and v]
     for _ in range(_MAX_PRUNE_STEPS):
         try:
             msg = _INBOUND.validate_json(json.dumps(data), strict=True)
+            if any(not data.get(k) for k in filled):
+                return None, []
             return msg, dropped
         except ValidationError as e:
             errors = e.errors()

@@ -664,3 +664,26 @@ def test_a_backfill_collision_between_two_candidates_leaves_the_chain_unowned(co
     assert chains.ingest_grok(con)["added"] == 0  # still nothing new to add, but backfill runs
     assert chains.grok_chain_owners(con) == {}  # two candidates, no way to tell which wrote it
     assert [i for i in corroboration._grok_items(con, verified_only=True) if i["kind"] == "chain"] == []
+
+
+@pytest.mark.parametrize("auth, confirmed, hard", [
+    (GOOD_AR, True, True),
+    (GOOD_AR, None, False),
+    (GOOD_AR, False, False),
+    ("", True, False),  # grok_legacy: notice only
+])
+def test_grok_critical_hard_blocks_only_when_verified_and_confirmed(con, auth, confirmed, hard):
+    from stockmoney.desk.bridge import policy
+    box = FakeMailbox()
+    alert = {"protocol": "1", "msg_id": "alert-grok-0009", "sent_at": "2026-10-12T07:30:00-04:00", "type": "ALERT",
+             "ticker": "NVDA", "severity": "critical", "headline": "x", "source_urls": ["https://a.example/1"],
+             "observed_at": "2026-10-12T07:00:00-04:00"}
+    if confirmed is not None:
+        alert["confirmed"] = confirmed
+    send(box, alert, auth=auth)
+    assert inbox.poll(con, box, CONFIG, now=NOW) == 1
+    flags = policy.active_flags(con, NOW, held=())
+    assert ("NVDA" in flags.blocked) is hard
+    assert "NVDA" in flags.legacy_blocked and any("NVDA" in n for n in flags.notify)
+    held = policy.active_flags(con, NOW, held={"NVDA"})
+    assert ("NVDA" in held.no_add) is hard

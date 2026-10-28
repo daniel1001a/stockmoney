@@ -353,6 +353,22 @@ def test_verified_resend_upgrades_an_unverified_plan(con, now, shadow):
     assert rejects(con) == []
 
 
+def test_verified_resend_of_an_old_plan_never_displaces_a_newer_trusted_plan(con):
+    """A (unverified, 08:00), B (verified, 08:10), A resent verified (08:20):
+    A becomes trusted but keeps its receipt time, so B stays in force."""
+    mb = FakeMailbox()
+    mail(mb, auth_results=GOOD_AR.replace("dkim=pass", "dkim=fail"))
+    assert poll(con, mb, now=et(8, 0)) == 1
+    pid_b = "gp-20261013-0810"
+    mail(mb, json.loads(_plan(level=601.5, plan_id=pid_b)))
+    assert poll(con, mb, now=et(8, 10)) == 1
+    mail(mb)
+    assert poll(con, mb, now=et(8, 20)) == 1
+    a = con.execute("SELECT source, received_at FROM options_plans WHERE plan_id=?", (PID,)).fetchone()
+    assert a["source"] == "grok_verified" and datetime.fromisoformat(a["received_at"]) == et(8, 0)
+    assert oplan.active_plan(con, DAY).plan.plan_id == pid_b
+
+
 def test_unverified_resend_never_downgrades_or_upgrades(con):
     mb = FakeMailbox()
     mail(mb)
@@ -363,7 +379,26 @@ def test_unverified_resend_never_downgrades_or_upgrades(con):
 
 
 def test_plan_row_without_source_is_untrusted(con):
-    """A row stored before the source column existed (NULL) is not owner."""
+    """A NULL source is unknown, never owner."""
     oplan.ingest(con, json.dumps(plan(), ensure_ascii=False), EARLY)
     con.execute("UPDATE options_plans SET source=NULL")
     assert oplan.active_plan(con, DAY) is None
+
+
+def test_pre_column_plans_are_backfilled_by_channel(con):
+    """Plans stored before the source column existed: a bridge plan becomes
+    grok_legacy (untrusted), a CLI plan becomes owner (still in force)."""
+    mb = FakeMailbox()
+    mail(mb, sender=MUSE, token=TOKEN)
+    assert poll(con, mb) == 1
+    oplan.ingest(con, _plan(level=601.5, plan_id="gp-20261013-0810"), et(8, 40))
+    # rebuild the table without the column, as an old database had it
+    con.executescript("""
+        CREATE TABLE old AS SELECT id, plan_id, for_date, received_at, status, shadow_only, error, sha, raw
+          FROM options_plans;
+        DROP TABLE options_plans;
+        ALTER TABLE old RENAME TO options_plans;""")
+    ostore.ensure_schema(con)
+    got = dict(con.execute("SELECT plan_id, source FROM options_plans").fetchall())
+    assert got == {PID: "grok_legacy", "gp-20261013-0810": "owner"}
+    assert oplan.active_plan(con, DAY).plan.plan_id == "gp-20261013-0810"

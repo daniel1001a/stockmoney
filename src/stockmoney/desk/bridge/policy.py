@@ -37,7 +37,8 @@ from typing import Collection
 
 from pydantic import TypeAdapter, ValidationError
 
-from stockmoney.desk.bridge.inbox import SOURCE_MUSE, _clean, ensure_schema, has_source_column, source_of
+from stockmoney.desk.bridge.inbox import (SOURCE_GROK_VERIFIED, SOURCE_MUSE, _clean, ensure_schema,
+                                         has_source_column, source_of)
 from stockmoney.desk.bridge.schema import Alert, Inbound, ResearchReply, Severity
 
 FLAG_DAYS = 3
@@ -100,16 +101,21 @@ def active_flags(con, now: datetime, held: Collection[str] = ()) -> BridgeFlags:
             continue
         ticker = msg.ticker.upper()
         is_held = ticker in held_set
-        who = "Muse" if source_of(source, typ) == SOURCE_MUSE else "Grok"
+        label = source_of(source, typ)
+        who = "Muse" if label == SOURCE_MUSE else "Grok"
         if isinstance(msg, Alert):
             headline = _clean(msg.headline, 140)
+            # a Grok critical hard-blocks only from the verified channel and when
+            # Grok marks it confirmed; otherwise it stays a soft flag + notice
+            hard = msg.severity is Severity.critical and (
+                label == SOURCE_MUSE or (label == SOURCE_GROK_VERIFIED and msg.confirmed is True))
             if when >= flag_cutoff:
                 if not is_held:
                     reason = f"{who} ALERT {msg.severity.value}: {headline}"
                     _add(legacy, ticker, reason)
-                    if msg.severity is Severity.critical:
+                    if hard:
                         _add(blocked, ticker, reason)
-                elif msg.severity is Severity.critical:
+                elif hard:
                     _add(no_add, ticker, f"{who} critical ALERT: {headline}")
             if when >= notify_cutoff and msg.severity in (Severity.critical, Severity.elevated):
                 role = "held" if is_held else "candidate"

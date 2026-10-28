@@ -209,6 +209,20 @@ def test_dropping_the_only_url_of_an_alert_rejects(con):
     assert inbox.poll(con, box, CONFIG, now=NOW) == 0
 
 
+def test_pruning_never_empties_a_list_that_had_items():
+    """GROK_DAILY whose only event is bad must reject, not pass as an empty
+    digest; with a second good event the bad one is dropped."""
+    d = grok_daily()
+    d["events"][0]["severity"] = "apocalyptic"
+    assert inbox.lenient_validate(json.dumps(d), "GROK_DAILY") == (None, [])
+    good = copy.deepcopy(grok_daily()["events"][0])
+    d["events"].append(good)
+    msg, dropped = inbox.lenient_validate(json.dumps(d), "GROK_DAILY")
+    assert msg is not None and len(msg.events) == 1 and dropped
+    r = reply(risk_flags=[{"bad": 1}])
+    assert inbox.lenient_validate(json.dumps(r), "RESEARCH_REPLY") == (None, [])
+
+
 def test_options_plan_stays_strict(con):
     box = FakeMailbox()
     plan = {"protocol": "1", "msg_id": "grok-plan-20261027", "sent_at": "2026-10-27T08:00:00-04:00",

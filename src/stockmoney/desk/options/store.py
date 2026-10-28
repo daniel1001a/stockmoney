@@ -85,6 +85,18 @@ def ensure_schema(con) -> None:
         have = {r[1] for r in con.execute(f"PRAGMA table_info({table})")}
         if col not in have:
             con.execute(f"ALTER TABLE {table} ADD COLUMN {col} {typ}")
+            if (table, col) == ("options_plans", "source"):
+                _backfill_plan_source(con)
+
+
+def _backfill_plan_source(con) -> None:
+    """Label the plans stored before the source column existed: a plan that came
+    in over the mail bridge is grok_legacy (untrusted), the rest were ingested
+    from the owner's CLI."""
+    if con.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='bridge_messages'").fetchone():
+        con.execute("UPDATE options_plans SET source='grok_legacy' WHERE source IS NULL AND plan_id IN "
+                    "(SELECT msg_id FROM bridge_messages WHERE type='OPTIONS_PLAN')")
+    con.execute("UPDATE options_plans SET source='owner' WHERE source IS NULL")
 
 
 def iso(t: datetime) -> str:

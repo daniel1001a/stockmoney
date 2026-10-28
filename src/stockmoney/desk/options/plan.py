@@ -249,16 +249,22 @@ def ingest(con, text: str, received_at: datetime, cfg: OptionsConfig | None = No
                                                  text[:MAX_PLAN_BYTES]))
         con.commit()
         return IngestResult("rejected", _peek_id(text), "", True, str(e))
-    prior = con.execute("SELECT id, sha, shadow_only, source FROM options_plans WHERE plan_id=? AND status='accepted'",
-                        (p.plan_id,)).fetchone()
+    prior = con.execute("SELECT id, sha, shadow_only, source, received_at FROM options_plans "
+                        "WHERE plan_id=? AND status='accepted'", (p.plan_id,)).fetchone()
     if prior is not None:
         if prior["sha"] == sha:
             if source in TRUSTED_SOURCES and prior["source"] not in TRUSTED_SOURCES:
                 # the same plan resent over a trusted channel: it becomes trusted
-                # as of THIS receipt (the shadow cutoff is judged on the resend)
+                # (the shadow cutoff is judged on the resend). It moves to the
+                # resend clock only if no trusted plan for that day arrived after
+                # it, so an old plan cannot displace a newer trusted one.
                 shadow = is_shadow_only(p.for_date, received_at, cfg)
+                newer = con.execute("SELECT 1 FROM options_plans WHERE for_date=? AND status='accepted' AND id<>? "
+                                    "AND source IN (?, ?) AND received_at > ? LIMIT 1",
+                                    (str(p.for_date), prior["id"], *TRUSTED_SOURCES,
+                                     prior["received_at"])).fetchone()
                 con.execute("UPDATE options_plans SET source=?, shadow_only=?, received_at=? WHERE id=?",
-                            (source, int(shadow), at, prior["id"]))
+                            (source, int(shadow), prior["received_at"] if newer else at, prior["id"]))
                 con.commit()
                 return IngestResult("upgraded", p.plan_id, str(p.for_date), shadow)
             return IngestResult("duplicate", p.plan_id, str(p.for_date), bool(prior["shadow_only"]))
