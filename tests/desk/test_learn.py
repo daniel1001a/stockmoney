@@ -174,6 +174,88 @@ def test_chain_scoring_uses_prior_close_and_declared_horizon(con):
     assert chains.score_due(con, bars, d[-1]) == 0  # idempotent
 
 
+def test_chain_scores_record_order_and_sector_excess(con):
+    bars = make_bars()
+    d = bars.dates
+    created = datetime(d[300].year, d[300].month, d[300].day, 15, 0, tzinfo=timezone.utc)
+    ch = chains.Chain(trigger="t2", steps=["s"], confidence=0.6, source="owner", impacts=[
+        chains.Impact(ticker="AAPL", direction="down", horizon_days=5, order=2),
+        chains.Impact(ticker="XLK", direction="up", horizon_days=5)])
+    cid = chains.add_chain(con, ch, created)
+    chains.score_due(con, bars, d[-1])
+    r = con.execute("SELECT * FROM chain_scores WHERE chain_id=? AND ticker='AAPL' AND horizon=5", (cid,)).fetchone()
+    assert r["order_n"] == 2 and r["sector_etf"] == "XLK"
+    ret = bars.close.at[d[304], "AAPL"] / bars.close.at[d[299], "AAPL"] - 1
+    exp = ret - (bars.close.at[d[304], "XLK"] / bars.close.at[d[299], "XLK"] - 1)
+    assert r["excess_sector"] == pytest.approx(exp)
+    assert r["hit_sector"] == int(exp < 0)  # declared down
+    etf = con.execute("SELECT * FROM chain_scores WHERE chain_id=? AND ticker='XLK' AND horizon=5", (cid,)).fetchone()
+    assert etf["order_n"] == 1 and etf["sector_etf"] is None and etf["excess_sector"] is None
+    con.execute("UPDATE chains SET falsifiable=1")
+    split = chains.by_order(con)
+    assert split[2]["n"] == 1 and split[2]["sector_n"] == 1 and split[1]["sector_n"] == 0
+    assert "依傳導層級" in chains.report(con)
+
+
+def test_chain_impact_order_is_1_or_2():
+    assert chains.Impact(ticker="AAPL", direction="up", horizon_days=5).order == 1
+    with pytest.raises(Exception):
+        chains.Impact(ticker="AAPL", direction="up", horizon_days=5, order=3)
+    from stockmoney.desk.bridge.schema import GrokImpact
+    assert GrokImpact(ticker="MU", direction="down", horizon_days=20, order=2).order == 2
+    with pytest.raises(Exception):
+        GrokImpact(ticker="MU", direction="down", horizon_days=20, order=0)
+
+
+def test_chain_rejects_a_repeated_ticker():
+    imp = dict(direction="up", horizon_days=5)
+    with pytest.raises(Exception):
+        chains.Chain(trigger="t", steps=["s"], confidence=0.5, impacts=[
+            chains.Impact(ticker="BRK.B", **imp), chains.Impact(ticker="BRK-B", order=2, **imp)])
+    from stockmoney.desk.bridge.schema import GrokChain
+    g = dict(trigger="t", urls=["https://x.com/a/status/1"], steps=["s"], confidence=0.5)
+    with pytest.raises(Exception):
+        GrokChain(**g, impacts=[{"ticker": "MU", **imp}, {"ticker": "MU", "order": 2, **imp}])
+
+
+def test_chain_sector_columns_backfill_on_a_later_pass(con):
+    bars = make_bars()
+    d = bars.dates
+    created = datetime(d[300].year, d[300].month, d[300].day, 15, 0, tzinfo=timezone.utc)
+    cid = chains.add_chain(con, _chain("up", 5), created)
+    chains.score_due(con, bars, d[-1])
+    fresh = con.execute("SELECT excess_ret, hit FROM chain_scores WHERE chain_id=? AND horizon=5", (cid,)).fetchone()
+    # as scored before the sector columns existed
+    con.execute("UPDATE chain_scores SET sector_etf=NULL, excess_sector=NULL, hit_sector=NULL")
+    con.execute("UPDATE chain_scores SET excess_ret=9, hit=-1 WHERE horizon=20")  # stored on another price basis
+    con.execute("UPDATE chain_scores SET scored_date='1999-01-01' WHERE horizon=60")  # another window
+    assert chains.score_due(con, bars, d[-1]) == 0  # fills are not new scores
+    r = con.execute("SELECT * FROM chain_scores WHERE chain_id=? AND horizon=5", (cid,)).fetchone()
+    assert r["sector_etf"] == "XLK" and r["excess_sector"] is not None and r["hit_sector"] in (0, 1)
+    assert (r["excess_ret"], r["hit"]) == (fresh["excess_ret"], fresh["hit"])
+    for h in (20, 60):  # left alone, the stored SPY score is never rewritten
+        rh = con.execute("SELECT * FROM chain_scores WHERE chain_id=? AND horizon=?", (cid, h)).fetchone()
+        assert rh["excess_sector"] is None
+    r20 = con.execute("SELECT excess_ret, hit FROM chain_scores WHERE chain_id=? AND horizon=20", (cid,)).fetchone()
+    assert (r20["excess_ret"], r20["hit"]) == (9, -1)
+
+
+def test_chain_report_counts_impacts_outside_the_universe(con):
+    bars = make_bars()
+    d = bars.dates
+    created = datetime(d[300].year, d[300].month, d[300].day, 15, 0, tzinfo=timezone.utc)
+    chains.add_chain(con, chains.Chain(trigger="t3", steps=["s"], confidence=0.5, source="owner", impacts=[
+        chains.Impact(ticker="AAPL", direction="up", horizon_days=5),
+        chains.Impact(ticker="ZZZQ", direction="down", horizon_days=5, order=2)]), created)
+    chains.add_chain(con, chains.Chain(trigger="only outside", steps=["s"], confidence=0.5, source="owner", impacts=[
+        chains.Impact(ticker="ZZZQ", direction="up", horizon_days=5)]), created)
+    chains.score_due(con, bars, d[-1])
+    assert chains.unscorable(con) == 2
+    rep = chains.report(con)
+    assert "2 個 impact 的代號不在追蹤股票池內" in rep
+    assert "only outside" not in rep  # never scorable, so not listed as waiting
+
+
 def test_chain_after_close_uses_same_day_close(con):
     bars = make_bars()
     d = bars.dates
@@ -187,7 +269,7 @@ def test_chain_authority_stays_log_only_until_enough_good_samples(con):
     assert chains.authority(con)[0] == "log_only"
     for i in range(60):
         con.execute("INSERT INTO chains (chain_id, falsifiable) VALUES (?,1)", (f"c{i}",))
-        con.execute("INSERT INTO chain_scores VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+        con.execute("INSERT INTO chain_scores (chain_id, ticker, horizon, declared, direction, base_date, scored_date, excess_ret, hit, confidence, scored_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                     (f"c{i}", "AAPL", 20, 1, "up", "2026-01-01", "2026-02-01", 0.01, int(i % 10 != 0), 0.7, "x"))
     assert chains.authority(con)[0] == "eligible_for_review"
     con.execute("UPDATE chain_scores SET hit=0")

@@ -2,10 +2,13 @@
 reason from events to unpriced consequences becomes a measured number.
 
 A chain = trigger event -> first/second-order steps -> impacts (ticker,
-direction, horizon in {5,20,60} sessions) -> checkpoints -> confidence.
-Scoring: excess return vs SPY from the last close known when the chain was
-written; hit = direction matched the sign. Brier uses ``confidence`` as the
-probability the declared direction is right, only at the declared horizon.
+direction, horizon in {5,20,60} sessions, order 1 or 2) -> checkpoints ->
+confidence. Scoring: excess return vs SPY from the last close known when the
+chain was written; hit = direction matched the sign. Brier uses ``confidence``
+as the probability the declared direction is right, only at the declared
+horizon. The excess vs the stock's sector ETF is recorded beside it
+(``excess_sector`` / ``hit_sector``, NULL for ETFs and names without a
+sector) so a call that only rode its sector can be told apart.
 
 Authority: none. Chains are logged and scored. They do not touch orders. The
 permission ladder in docs/desk/EDGE_PLAN.md 2.3 is reported by ``authority``;
@@ -21,11 +24,11 @@ from typing import Annotated, Literal
 from zoneinfo import ZoneInfo
 
 import pandas as pd
-from pydantic import BaseModel, ConfigDict, Field, StringConstraints, TypeAdapter
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints, TypeAdapter, model_validator
 
 from stockmoney.desk import store
 from stockmoney.desk.data import Bars
-from stockmoney.desk.universe import MARKET
+from stockmoney.desk.universe import ALL_SYMBOLS, MARKET, sector_of
 
 ET = ZoneInfo("America/New_York")
 HORIZONS = (5, 20, 60)
@@ -39,6 +42,7 @@ class Impact(BaseModel):
     ticker: Ticker
     direction: Literal["up", "down"]
     horizon_days: Literal[5, 20, 60]
+    order: Literal[1, 2] = 1  # 1: directly hit by the trigger; 2: second-order (supplier, customer, competitor)
 
 
 class Checkpoint(BaseModel):
@@ -82,6 +86,14 @@ class Chain(BaseModel):
     invalidations: list[Invalidation] = Field(default_factory=list, max_length=6)
     confidence: float = Field(ge=0, le=1)
     source: Literal["claude", "owner", "grok", "muse"] = "claude"
+
+    @model_validator(mode="after")
+    def _one_impact_per_ticker(self):
+        # chain_scores keys on (chain_id, ticker, horizon): a repeated ticker could not be scored apart
+        tickers = [_sym(i.ticker) for i in self.impacts]
+        if len(set(tickers)) != len(tickers):
+            raise ValueError("each ticker may appear once in impacts")
+        return self
 
     @property
     def falsifiable(self) -> bool:
@@ -244,8 +256,16 @@ def base_session(created_at: str, sessions: pd.DatetimeIndex) -> pd.Timestamp | 
     return ok[-1] if len(ok) else None
 
 
+BASIS_TOL = 1e-6  # stored SPY excess vs a recompute; larger means the cache was restated
+
+
 def score_due(con, bars: Bars, through: pd.Timestamp) -> int:
-    """Score every impact whose horizon has fully elapsed. Idempotent."""
+    """Score every impact whose horizon has fully elapsed; returns rows added
+    (backfilled sector columns are not counted). Idempotent. A scored row whose
+    sector columns are still NULL gets them once the sector ETF close is
+    available, but only when the current bars reproduce its stored SPY excess
+    (same window, same price basis); the stored excess and hit are never
+    rewritten."""
     n = 0
     sessions = bars.dates[bars.dates <= through]
     spy = bars.close[MARKET]
@@ -261,19 +281,39 @@ def score_due(con, bars: Bars, through: pd.Timestamp) -> int:
             for h in HORIZONS:
                 if b + h >= len(sessions):
                     continue
-                if con.execute("SELECT 1 FROM chain_scores WHERE chain_id=? AND ticker=? AND horizon=?",
-                               (r["chain_id"], imp["ticker"], h)).fetchone():
-                    continue
                 t = sessions[b + h]
                 px0, px1 = bars.close.at[base, sym], bars.close.at[t, sym]
                 s0, s1 = spy.at[base], spy.at[t]
                 if any(pd.isna(x) for x in (px0, px1, s0, s1)):
                     continue
-                ex = float(px1 / px0 - 1) - float(s1 / s0 - 1)
-                hit = int((ex > 0) == (imp["direction"] == "up"))
-                con.execute("INSERT INTO chain_scores VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                up = imp["direction"] == "up"
+                ret = float(px1 / px0 - 1)
+                etf = sector_of(sym)
+                ex_sec = hit_sec = None
+                if etf in bars.close.columns:
+                    e0, e1 = bars.close.at[base, etf], bars.close.at[t, etf]
+                    if not (pd.isna(e0) or pd.isna(e1)):
+                        ex_sec = ret - float(e1 / e0 - 1)
+                        hit_sec = int((ex_sec > 0) == up)
+                key = (r["chain_id"], imp["ticker"], h)
+                ex = ret - float(s1 / s0 - 1)
+                hit = int((ex > 0) == up)
+                old = con.execute("SELECT excess_sector, excess_ret, base_date, scored_date FROM chain_scores "
+                                  "WHERE chain_id=? AND ticker=? AND horizon=?", key).fetchone()
+                if old:
+                    # rows scored before the sector columns existed, or while the ETF close was missing
+                    if (old["excess_sector"] is None and ex_sec is not None
+                            and (old["base_date"], old["scored_date"]) == (str(base.date()), str(t.date()))
+                            and old["excess_ret"] is not None and abs(old["excess_ret"] - ex) <= BASIS_TOL):
+                        con.execute("UPDATE chain_scores SET sector_etf=?, excess_sector=?, hit_sector=? "
+                                    "WHERE chain_id=? AND ticker=? AND horizon=?", (etf, ex_sec, hit_sec, *key))
+                    continue
+                con.execute("INSERT INTO chain_scores (chain_id, ticker, horizon, declared, direction, base_date, "
+                            "scored_date, excess_ret, hit, confidence, scored_at, order_n, sector_etf, excess_sector, "
+                            "hit_sector) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                             (r["chain_id"], imp["ticker"], h, int(h == imp["horizon_days"]), imp["direction"],
-                             str(base.date()), str(t.date()), ex, hit, r["confidence"], store.now()))
+                             str(base.date()), str(t.date()), ex, hit, r["confidence"], store.now(),
+                             int(imp.get("order", 1)), etf if ex_sec is not None else None, ex_sec, hit_sec))
                 n += 1
     return n
 
@@ -305,6 +345,31 @@ def summary(con) -> dict:
             "hit_lo": _wilson_lo(hits, n), "brier": brier, "brier_coin": 0.25}
 
 
+def by_order(con) -> dict[int, dict]:
+    """Declared-horizon scores of falsifiable chains split by impact order, with
+    the sector-relative hit rate where a sector ETF applies. Report only."""
+    out: dict[int, dict] = {}
+    for r in con.execute("SELECT COALESCE(s.order_n, 1) AS o, COUNT(*) AS n, SUM(s.hit) AS hits, "
+                         "COUNT(s.hit_sector) AS sn, SUM(s.hit_sector) AS shits FROM chain_scores s "
+                         "JOIN chains c ON c.chain_id=s.chain_id WHERE s.declared=1 AND c.falsifiable=1 "
+                         "GROUP BY o ORDER BY o").fetchall():
+        out[r["o"]] = {"n": r["n"], "hit_rate": r["hits"] / r["n"], "sector_n": r["sn"],
+                       "sector_hit_rate": (r["shits"] / r["sn"]) if r["sn"] else None}
+    return out
+
+
+def _in_universe(ticker: str) -> bool:
+    """score_due prices from the desk bars, which hold exactly ALL_SYMBOLS."""
+    return _sym(ticker) in set(ALL_SYMBOLS)
+
+
+def unscorable(con) -> int:
+    """Impacts whose ticker has no price series in the desk universe."""
+    return sum(not _in_universe(i["ticker"])
+               for (raw,) in con.execute("SELECT impacts_json FROM chains WHERE impacts_json IS NOT NULL")
+               for i in json.loads(raw))
+
+
 def authority(con) -> tuple[str, str]:
     """Where the permission ladder stands. Never grants anything by itself."""
     s = summary(con)
@@ -326,11 +391,22 @@ def report(con) -> str:
              f"權限階段:{level}。{why}"]
     if s["scored_unfalsifiable"]:
         lines.append(f"另有 {s['scored_unfalsifiable']} 筆來自不可證偽事件鏈的評分,只記錄,不列入命中率與 Brier。")
+    split = by_order(con)
+    if split:
+        lines.append("依傳導層級(宣告時間窗,可列入證據):" + ";".join(
+            f"第 {o} 層 {d['n']} 筆,對 SPY 命中 {d['hit_rate']:.0%}"
+            + (f",對板塊 ETF 命中 {d['sector_hit_rate']:.0%}({d['sector_n']} 筆)" if d["sector_n"] else "")
+            for o, d in split.items()) + "。少於 30 筆不下結論。")
+    outside = unscorable(con)
+    if outside:
+        lines.append(f"另有 {outside} 個 impact 的代號不在追蹤股票池內,無法評分(第 2 層的供應商、客戶常在池外)。")
     from stockmoney.desk.learn import corroboration, invalidation
     lines += [x for x in (invalidation.report(con), corroboration.report(con)) if x]
-    pending = con.execute(
-        "SELECT chain_id, trigger_text FROM chains c WHERE NOT EXISTS (SELECT 1 FROM chain_scores s "
-        "WHERE s.chain_id=c.chain_id AND s.declared=1) ORDER BY created_at DESC LIMIT 5").fetchall()
+    # a chain whose every impact is outside the universe can never be scored: not "waiting"
+    pending = [p for p in con.execute(
+        "SELECT chain_id, trigger_text, impacts_json FROM chains c WHERE NOT EXISTS (SELECT 1 FROM chain_scores s "
+        "WHERE s.chain_id=c.chain_id AND s.declared=1) ORDER BY created_at DESC").fetchall()
+        if any(_in_universe(i["ticker"]) for i in json.loads(p["impacts_json"] or "[]"))][:5]
     if pending:
         lines += ["", "等待驗證:"] + [f"- {p['trigger_text'][:60]}" for p in pending]
     return "\n".join(lines)

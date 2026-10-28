@@ -48,6 +48,9 @@ ADDED_COLUMNS = {
     "trade_postmortem": [("grok_muse_independent_same_symbol", "INTEGER")],
     # 1: the stock buy was not blocked; only the pre-2026-10-21 Muse rule would have blocked it
     "blocked_counterfactual": [("legacy_only", "INTEGER DEFAULT 0")],
+    # 1st / 2nd-order impact, and the excess return vs the stock's sector ETF (record only; ``hit`` stays vs SPY)
+    "chain_scores": [("order_n", "INTEGER DEFAULT 1"), ("sector_etf", "TEXT"), ("excess_sector", "REAL"),
+                     ("hit_sector", "INTEGER")],
 }
 
 

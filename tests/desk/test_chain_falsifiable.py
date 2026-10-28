@@ -161,7 +161,7 @@ def test_unfalsifiable_chain_is_excluded_from_evidence_counts(con):
     con.execute("INSERT INTO chains (chain_id, falsifiable) VALUES ('f', 1), ('u', 0)")
     for cid in ("f", "u"):
         for i in range(3):
-            con.execute("INSERT INTO chain_scores VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            con.execute("INSERT INTO chain_scores (chain_id, ticker, horizon, declared, direction, base_date, scored_date, excess_ret, hit, confidence, scored_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                         (cid, f"T{i}", 5, 1, "up", "2026-01-01", "2026-01-08", 0.01, 1, 0.7, "x"))
     s = chains.summary(con)
     assert s["scored"] == 3 and s["hits"] == 3 and s["scored_unfalsifiable"] == 3 and s["unfalsifiable"] == 1
@@ -171,7 +171,7 @@ def test_unfalsifiable_chain_is_excluded_from_evidence_counts(con):
 def test_authority_ignores_unfalsifiable_scores(con):
     con.execute("INSERT INTO chains (chain_id, falsifiable) VALUES ('u', 0)")
     for i in range(60):
-        con.execute("INSERT INTO chain_scores VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+        con.execute("INSERT INTO chain_scores (chain_id, ticker, horizon, declared, direction, base_date, scored_date, excess_ret, hit, confidence, scored_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                     ("u", f"T{i}", 20, 1, "up", "2026-01-01", "2026-02-01", 0.01, 1, 0.7, "x"))
     assert chains.authority(con)[0] == "log_only"
     assert chains.summary(con)["scored"] == 0

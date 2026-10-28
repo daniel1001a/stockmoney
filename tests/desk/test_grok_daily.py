@@ -116,7 +116,7 @@ def test_chain_serialisation_matches_ingest_grok_fields():
     assert dumped["invalidations"] == [{"kind": "close_above", "symbol": "NVDA", "level": 150.0,
                                         "by_date": "2026-10-30"}]
     assert isinstance(dumped["urls"][0], str) and dumped["checkpoints"][0]["date"] == "2026-10-20"
-    assert set(dumped["impacts"][0]) == {"ticker", "direction", "horizon_days"}
+    assert set(dumped["impacts"][0]) == {"ticker", "direction", "horizon_days", "order"}
     # the worst case still fits the learning layer's own limits
     Chain.model_validate({**json.loads(GrokChain.model_validate(worst_case()["chains"][0]).model_dump_json()),
                           "impacts": [{"ticker": "MU", "direction": "down", "horizon_days": 60}], "source": "grok"})
@@ -272,13 +272,14 @@ def test_list_limits(path, limit):
     *head, last = path.split(".")
     for p in head:
         node = node[int(p)] if p.isdigit() else node[p]
-    node[last] = list(node[last])[:1] * limit
+    if last != "impacts":  # worst_case already has 6 impacts, one per ticker (repeats are rejected)
+        node[last] = list(node[last])[:1] * limit
     validate(base)
     over = copy.deepcopy(base)
     node = over
     for p in head:
         node = node[int(p)] if p.isdigit() else node[p]
-    node[last] = node[last] + node[last][:1]
+    node[last] = node[last] + [{**node[last][0], "ticker": "SPY"} if last == "impacts" else node[last][0]]
     assert rejected(over)
 
 
