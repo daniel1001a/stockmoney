@@ -145,11 +145,14 @@ def test_open_records_row_and_sizes_within_premium_cap(con):
     assert row["status"] == "OPEN" and row["wind"] == "tailwind" and row["source"] == "wind"
     assert row["qty"] == 5  # floor(1000 / (1.96 * 100))
     assert row["entry_debit"] * 100 * row["qty"] <= CFG.max_premium_per_trade
-    # QQQ had no chain: a structural skip is written, so it is not retried
-    q = con.execute("SELECT status, skip_reason FROM options_spreads_shadow WHERE underlying = 'QQQ'").fetchone()
-    assert tuple(q) == ("SKIPPED", "no_expiry")
-    # second slot the same day opens nothing new
-    assert spreads.open_new(con, FakeData({"SPY": chain(now)}), et(DAY, 10, 10), CFG) == []
+    # QQQ had no chain: retried each slot, the skip is written only on the last one
+    q = "SELECT status, skip_reason FROM options_spreads_shadow WHERE underlying = 'QQQ'"
+    assert con.execute(q).fetchone() is None
+    # a later slot the same day opens nothing new
+    data = FakeData({"SPY": chain(now)})
+    assert spreads.open_new(con, data, et(DAY, 10, 55), CFG) == []
+    assert data.chain_calls == ["QQQ"]
+    assert tuple(con.execute(q).fetchone()) == ("SKIPPED", "no_expiry")
 
 
 def test_stale_legs_retry_until_the_last_slot(con):
@@ -165,7 +168,17 @@ def test_stale_legs_retry_until_the_last_slot(con):
         c.as_of = last - timedelta(minutes=5)
     spreads.open_new(con, FakeData({"SPY": stale}), last, CFG)
     row = con.execute("SELECT status, skip_reason FROM options_spreads_shadow WHERE underlying = 'SPY'").fetchone()
-    assert tuple(row) == ("SKIPPED", "no_long_leg")
+    assert tuple(row) == ("SKIPPED", "stale_quotes")
+
+
+def test_candidates_are_capped(con):
+    set_wind(con, "2026-10-27", "tailwind")
+    syms = ["NVDA", "AMD", "AAPL", "MSFT", "META", "AMZN", "GOOGL"]
+    con.executemany("INSERT INTO signals VALUES (?,?,?,?,?)",
+                    [(s, "2026-10-27", "pullback", s, 1.0 - i / 10) for i, s in enumerate(syms)])
+    got = spreads.candidates(con, DAY, OptionsConfig(index=("SPY", "QQQ"), mega_cap=tuple(syms)))
+    assert len(got) == spreads.MAX_CANDIDATES
+    assert {"SPY", "QQQ", "NVDA", "AMD"} <= {s for s, _ in got}
 
 
 def _opened(con):
@@ -188,7 +201,15 @@ def test_no_exit_on_entry_day_but_marked(con):
     assert spreads.mark_and_exit(con, data, now, CFG) == []
     row = con.execute("SELECT status, marks, last_value FROM options_spreads_shadow WHERE underlying = 'SPY'").fetchone()
     assert row["status"] == "OPEN" and row["marks"] == 1
-    assert row["last_value"] == pytest.approx((0.5 - 0.03) - (0.5 + 0.03))
+    assert row["last_value"] == 0.0  # raw (0.5 - 0.03) - (0.5 + 0.03) < 0 is clamped
+
+
+def test_mark_is_clamped_to_width(con):
+    row = _opened(con)
+    nxt = et(date(2026, 10, 29), 10, 0)
+    spreads.mark_and_exit(con, FakeData(quotes=_quotes(nxt, 9.0, 9.1, 0.01, 0.05)), nxt, CFG)
+    r = con.execute("SELECT exit_value FROM options_spreads_shadow WHERE id = ?", (row["id"],)).fetchone()
+    assert r["exit_value"] == row["width"]
 
 
 def test_take_profit_stop_and_time_exits(con):
@@ -223,15 +244,44 @@ def test_stale_mark_is_skipped_and_expired_settles_at_intrinsic(con):
     assert spreads.mark_and_exit(con, FakeData(quotes=q), nxt, CFG) == []
     after = et(EXP + timedelta(days=3), 10, 0)
     out = spreads.mark_and_exit(con, FakeData(stock={"SPY": (103.0, 103.2)}), after, CFG)
-    assert out == [("SPY", "expiry")]
+    assert out == [("SPY", "expiry_late")]
     r = con.execute("SELECT exit_value FROM options_spreads_shadow WHERE underlying = 'SPY'").fetchone()
     assert r["exit_value"] == pytest.approx(3.1)
+
+
+def test_expiry_day_settles_from_same_day_stock_quote(con):
+    _opened(con)
+    early = et(EXP, 15, 0)
+    assert spreads.mark_and_exit(con, FakeData(stock={"SPY": (103.0, 103.2)}), early, CFG) == []
+    close = et(EXP, 15, 30)
+    out = spreads.mark_and_exit(con, FakeData(stock={"SPY": (103.0, 103.2)}), close, CFG)
+    assert out == [("SPY", "expiry")]
+
+
+def test_expired_without_any_price_closes_at_last_mark(con):
+    _opened(con)
+    con.execute("UPDATE options_spreads_shadow SET last_value = 7.0")  # clamped to the width
+    after = et(EXP + timedelta(days=1), 10, 0)
+    assert spreads.mark_and_exit(con, FakeData(), after, CFG) == [("SPY", "expiry_unpriced")]
+    r = con.execute("SELECT status, exit_value FROM options_spreads_shadow").fetchone()
+    assert r["status"] == "CLOSED" and r["exit_value"] == 5.0
+    assert "到期後才結算(不計入)1 筆" in spreads.report(con)
 
 
 def test_report_says_too_few_samples(con):
     _opened(con)
     text = spreads.report(con)
-    assert "持有中 1 筆" in text and "樣本不足" in text
+    assert "持有中 1 筆" in text and "樣本不足" in text and "wind 0" in text
+
+
+def test_report_shows_lower_bound_per_source(con):
+    rows = [(f"2026-10-{d:02d}", "SPY", "wind", "tailwind", "CLOSED", 2.0, 1, 100.0 if d % 2 else -50.0,
+             "take_profit") for d in range(1, 21)]
+    con.executemany("INSERT INTO options_spreads_shadow (day, underlying, source, wind, status, entry_debit,"
+                    " qty, pnl_usd, exit_reason) VALUES (?,?,?,?,?,?,?,?,?)", rows)
+    text = spreads.report(con)
+    assert "wind:已平倉 20 筆" in text and "下緣" in text and "單日最大 +100" in text
+    assert "樣本不足 30(每個來源),不評估:wind 20" in text
 
 
 def test_main_refuses_outside_session(tmp_path):

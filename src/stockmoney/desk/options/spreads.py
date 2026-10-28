@@ -24,8 +24,17 @@ Exit, checked every slot from the next session on (fixed a priori, not fitted):
 take profit when the closing value reaches the debit plus half the maximum
 profit; stop when it falls to half the debit; time exit at 2 calendar days or
 fewer to expiry. The closing value is long bid minus SLIP less short ask plus
-SLIP; a slot with a stale leg is not marked. An expired spread left open (no
-fresh quote near the end) settles at intrinsic from the stock quote.
+SLIP, clamped to [0, width] (what the spread can be worth); a slot with a stale
+leg is not marked. On expiry day from EXPIRY_SETTLE ET, a spread whose legs
+have no fresh quote settles at intrinsic from the stock mid; one still open
+after expiry (no quote at all that day) settles at the next stock mid and is
+labelled ``expiry_late``; with no stock mid either it closes at its last mark
+as ``expiry_unpriced``. Both are excluded from the H6 statistics.
+
+Every skip reason is retried each slot of the entry window and written only
+on its last slot; ``stale_quotes`` means the expiry had contracts but none with
+a fresh two-sided quote. Network reads happen before any write so a slow chain
+never holds the database lock.
 
     python -m stockmoney.desk.options.spreads tick      # one slot: open, mark, close
     python -m stockmoney.desk.options.spreads report
@@ -65,6 +74,8 @@ TIME_EXIT_DTE = 2
 ENTRY_WINDOW = (time(9, 45), time(11, 0))
 WIND_SYMBOLS = ("SPY", "QQQ")
 MIN_SAMPLES = 30
+MAX_CANDIDATES = 6  # index ETFs plus the top-scored signals: bounds chain downloads per slot
+EXPIRY_SETTLE = time(15, 30)
 TICK_TIMEOUT_S = 240
 
 SCHEMA = """
@@ -104,8 +115,10 @@ def entry_debit(long_ask: float, short_bid: float, cfg: OptionsConfig) -> float:
     return (long_ask + slip(long_ask, cfg)) - (short_bid - slip(short_bid, cfg))
 
 
-def close_value(long_bid: float, short_ask: float, cfg: OptionsConfig) -> float:
-    return (long_bid - slip(long_bid, cfg)) - (short_ask + slip(short_ask, cfg))
+def close_value(long_bid: float, short_ask: float, width: float, cfg: OptionsConfig) -> float:
+    """Exit value of the spread, clamped to what a call debit spread can be worth."""
+    raw = (long_bid - slip(long_bid, cfg)) - (short_ask + slip(short_ask, cfg))
+    return min(max(raw, 0.0), width)
 
 
 @dataclass
@@ -123,6 +136,8 @@ def pick(chain: list, day: date, now: datetime, cfg: OptionsConfig) -> tuple[Pic
         return None, "no_expiry"
     expiry = min({c.expiry for c in calls}, key=lambda e: (abs((e - day).days - DTE_TARGET), e))
     legs = [c for c in calls if c.expiry == expiry and c.delta is not None and fresh(c, now, cfg)]
+    if not legs:
+        return None, "stale_quotes"
     longs = [c for c in legs if LONG_BAND[0] <= c.delta <= LONG_BAND[1]]
     if not longs:
         return None, "no_long_leg"
@@ -149,6 +164,8 @@ def candidates(con, day: date, cfg: OptionsConfig) -> list[tuple[str, str]]:
     rows = con.execute("SELECT symbol, strategy FROM signals WHERE date = ? ORDER BY score DESC",
                        (prev.isoformat(),)).fetchall()
     for sym, strat in rows:
+        if len(out) >= MAX_CANDIDATES:
+            break
         if sym in universe and sym not in out:
             out[sym] = f"signal:{strat}"
     return sorted(out.items())
@@ -171,7 +188,8 @@ def open_new(con, data, now: datetime, cfg: OptionsConfig) -> list[str]:
     done = {r[0] for r in con.execute("SELECT underlying FROM options_spreads_shadow WHERE day = ?",
                                       (day.isoformat(),))}
     held = {r[0] for r in con.execute("SELECT underlying FROM options_spreads_shadow WHERE status = 'OPEN'")}
-    opened = []
+    last_slot = et.time() >= (datetime.combine(day, ENTRY_WINDOW[1]) - timedelta(minutes=10)).time()
+    picks = []  # network first: no write (and so no lock) is held while chains download
     for und, source in candidates(con, day, cfg):
         if und in done or und in held:
             continue
@@ -179,13 +197,14 @@ def open_new(con, data, now: datetime, cfg: OptionsConfig) -> list[str]:
             chain = data.option_chain(und, day + timedelta(days=DTE_MIN), day + timedelta(days=DTE_MAX))
         except Exception as e:  # noqa: BLE001 - one failed chain must not stop the others
             log.warning("spreads: chain %s failed: %s", und, e)
+            picks.append((und, source, None, "chain_error"))
             continue
-        p, reason = pick(chain, day, now, cfg)
+        picks.append((und, source, *pick(chain, day, now, cfg)))
+    opened = []
+    for und, source, p, reason in picks:
         if p is None:
-            if reason not in ("no_long_leg", "no_short_leg"):  # quotes may be fresh at a later slot
+            if last_slot:  # every reason may clear at a later slot of the window
                 _skip(con, day.isoformat(), und, source, state, reason)
-            elif et.time() >= (datetime.combine(day, ENTRY_WINDOW[1]) - timedelta(minutes=10)).time():
-                _skip(con, day.isoformat(), und, source, state, reason)  # last slot of the window
             continue
         qty = contracts_for(p.debit, cfg)
         if qty == 0:
@@ -212,23 +231,39 @@ def _close(con, row, now: datetime, value: float, reason: str, cfg: OptionsConfi
 
 def mark_and_exit(con, data, now: datetime, cfg: OptionsConfig) -> list[tuple[str, str]]:
     """Mark every open spread; close on the fixed rules. Returns (underlying, reason)."""
-    day = now.astimezone(ET).date()
-    closed = []
-    for row in con.execute("SELECT * FROM options_spreads_shadow WHERE status = 'OPEN'").fetchall():
+    et = now.astimezone(ET)
+    day = et.date()
+    rows = con.execute("SELECT * FROM options_spreads_shadow WHERE status = 'OPEN'").fetchall()
+    quotes = {}  # network first, writes after
+    for row in rows:
         expiry = date.fromisoformat(row["expiry"])
-        if day > expiry:
-            q = data.stock_quote(row["underlying"])
-            if q is None:
-                continue
-            px = sum(q) / 2
+        lg = sh = None
+        if day <= expiry:
+            lg, sh = data.option_quote(row["long_occ"]), data.option_quote(row["short_occ"])
+        stock = None
+        if day > expiry or (day == expiry and et.time() >= EXPIRY_SETTLE
+                            and not (fresh(lg, now, cfg) and fresh(sh, now, cfg))):
+            stock = data.stock_quote(row["underlying"])
+        quotes[row["id"]] = (lg, sh, stock)
+    closed = []
+    for row in rows:
+        expiry = date.fromisoformat(row["expiry"])
+        lg, sh, stock = quotes[row["id"]]
+        if day >= expiry and stock is not None and not (fresh(lg, now, cfg) and fresh(sh, now, cfg)):
+            px = sum(stock) / 2
             value = min(max(px - row["long_strike"], 0.0), row["width"])
-            _close(con, row, now, value, "expiry", cfg)
-            closed.append((row["underlying"], "expiry"))
+            reason = "expiry" if day == expiry else "expiry_late"
+            _close(con, row, now, value, reason, cfg)
+            closed.append((row["underlying"], reason))
             continue
-        lg, sh = data.option_quote(row["long_occ"]), data.option_quote(row["short_occ"])
+        if day > expiry:  # no price at all after expiry: never leave the name blocked
+            value = min(max(row["last_value"] or 0.0, 0.0), row["width"])
+            _close(con, row, now, value, "expiry_unpriced", cfg)
+            closed.append((row["underlying"], "expiry_unpriced"))
+            continue
         if not (fresh(lg, now, cfg) and fresh(sh, now, cfg)):
             continue
-        value = close_value(lg.bid, sh.ask, cfg)
+        value = close_value(lg.bid, sh.ask, row["width"], cfg)
         con.execute("UPDATE options_spreads_shadow SET last_value = ?, last_mark_time = ?, marks = marks + 1"
                     " WHERE id = ?", (value, _iso(now), row["id"]))
         if day <= date.fromisoformat(row["day"]):
@@ -264,20 +299,40 @@ def tick(con, data, now: datetime, cfg: OptionsConfig | None = None) -> tuple[li
 def report(con) -> str:
     """Closed spreads per source (H6 evidence) plus what is open."""
     ensure_schema(con)
+    from stockmoney.desk.learn.h_reports import trade_stats  # lazy: keep the tick import light
+
     lines = ["== 價差影子(H6,只記錄) =="]
-    rows = con.execute(
-        "SELECT source, COUNT(*), SUM(pnl_usd > 0), SUM(pnl_usd), AVG(pnl_usd / (entry_debit * 100 * qty))"
-        " FROM options_spreads_shadow WHERE status = 'CLOSED' GROUP BY source ORDER BY source").fetchall()
-    for src, n, wins, pnl, r in rows:
-        lines.append(f"{src}:已平倉 {n} 筆,勝 {wins},淨損益 {pnl:+,.0f},每筆平均報酬(對成本) {r:+.1%}")
-    if not rows:
-        lines.append("尚無已平倉")
+    sources = [r[0] for r in con.execute(
+        "SELECT DISTINCT source FROM options_spreads_shadow WHERE status != 'SKIPPED' ORDER BY source")]
+    short = []
+    for src in sources:
+        closed = con.execute(
+            "SELECT day, pnl_usd, pnl_usd / (entry_debit * 100 * qty) AS ret FROM options_spreads_shadow"
+            " WHERE status = 'CLOSED' AND source = ? AND exit_reason NOT IN ('expiry_late', 'expiry_unpriced')", (src,)).fetchall()
+        st = trade_stats([{"ret": r["ret"]} for r in closed])
+        if st["n"] < MIN_SAMPLES:
+            short.append(f"{src} {st['n']}")
+        if not st["n"]:
+            continue
+        pnl = sum(r["pnl_usd"] for r in closed)
+        by_day: dict[str, float] = {}
+        for r in closed:
+            by_day[r["day"]] = by_day.get(r["day"], 0.0) + r["pnl_usd"]
+        top = max(by_day.values(), key=abs)
+        lcb = "n/a" if st["lcb"] is None else f"{st['lcb']:+.1%}"
+        lines.append(f"{src}:已平倉 {st['n']} 筆,勝率 {st['win_rate']:.0%},淨損益 {pnl:+,.0f},"
+                     f"每筆報酬(對成本)平均 {st['mean']:+.1%} 下緣 {lcb},單日最大 {top:+,.0f}")
+    if not sources:
+        lines.append("尚無開倉")
     n_open = con.execute("SELECT COUNT(*) FROM options_spreads_shadow WHERE status = 'OPEN'").fetchone()[0]
     skips = con.execute("SELECT skip_reason, COUNT(*) FROM options_spreads_shadow WHERE status = 'SKIPPED'"
                         " GROUP BY skip_reason ORDER BY 2 DESC").fetchall()
     lines.append(f"持有中 {n_open} 筆" + (";略過 " + ", ".join(f"{k} {v}" for k, v in skips) if skips else ""))
-    if not rows or min(r[1] for r in rows) < MIN_SAMPLES:
-        lines.append(f"樣本不足 {MIN_SAMPLES}(每個來源),不評估")
+    late = con.execute("SELECT COUNT(*) FROM options_spreads_shadow WHERE exit_reason IN ('expiry_late', 'expiry_unpriced')").fetchone()[0]
+    if late:
+        lines.append(f"到期後才結算(不計入){late} 筆")
+    if short or not sources:
+        lines.append(f"樣本不足 {MIN_SAMPLES}(每個來源),不評估" + (":" + ", ".join(short) if short else ""))
     return "\n".join(lines)
 
 
