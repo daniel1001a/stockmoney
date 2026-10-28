@@ -17,6 +17,7 @@ Steps (each isolated, a failure in one does not stop the others):
   3e. H1 / H2 shadow comparison reports; a changed verdict is logged as a DRAFT in param_changes
   3f. research flags (earnings, SEC 8-K / Form 4) for the buy-only research veto; EDGAR needs SEC_USER_AGENT
   3g. Fridays: weekly hypotheses recorded in weekly_hypotheses (record only, changes no parameter)
+  3h. per-source credibility scoreboard (source_scores, read-only; last 20 / 60 sessions and all-time)
   4. allocator recommendation (Fridays or when none logged this week)
   5. report -> data/desk/learn/<date>.md and learn_reports; Friday push summary
 """
@@ -35,7 +36,7 @@ from stockmoney.desk import data, notify, store, veto
 from stockmoney.desk.indicators import compute
 from stockmoney.desk.learn import (allocator, calls, chains, corroboration, counterfactual, earnings, filings,
                                    h_reports, hypotheses, invalidation, links, market_risk, options_postmortem,
-                                   postmortem, prescreen, shadow, tables)
+                                   postmortem, prescreen, scoreboard, shadow, tables)
 
 log = logging.getLogger(__name__)
 ET = ZoneInfo("America/New_York")
@@ -167,6 +168,8 @@ def run(con, now: datetime, bars: data.Bars | None = None, shadow_start: str | N
         parts.append(f"情報預篩({ps['mode']}):判斷 {ps['judged']} 則(通過 {ps['pass']}、保留 {ps['hold']}、"
                      f"封存 {ps['archive']}),重複沿用 {ps.get('dup', 0)}、略過 {ps.get('skipped', 0)},"
                      f"失敗 {ps['error']};深度分析完成 {ps['deep_done']}。")
+    guarded("scoreboard", lambda: scoreboard.refresh(con, bars, through))
+    con.commit()
 
     friday = through.weekday() == 4
     hyp_text = guarded("hypotheses", lambda: hypotheses.run(con, day, include_weekly=False)) if friday else None
@@ -202,6 +205,7 @@ def run(con, now: datetime, bars: data.Bars | None = None, shadow_start: str | N
               guarded("counterfactual_report", lambda: counterfactual.report(con)) or "", "",
               guarded("market_risk_report", lambda: market_risk.report(con)) or "", "",
               guarded("veto_report", lambda: veto.report(con, (through - pd.Timedelta(days=7)).date().isoformat())) or "", "",
+              guarded("scoreboard_report", lambda: scoreboard.report(con, day)) or "", "",
               guarded("h_reports", lambda: h_reports.run_all(con, bars)) or ""]
     con.commit()
     if alloc_text:
