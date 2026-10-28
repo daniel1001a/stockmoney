@@ -39,9 +39,10 @@ elif [[ "$1" == "options" ]]; then
 elif [[ "$1" == "options-recover" ]]; then
   .venv/bin/python -m stockmoney.desk.options.run recover >> "$LOG" 2>&1
 elif [[ "$1" == "intraday_shadow" ]]; then
+  SLOT_AT=$(date +%s)  # the spreads entry window keys off the fire time, not its own (delayed) start
   .venv/bin/python -m stockmoney.desk.intraday tick --feed sip >> "$LOG" 2>&1
   S1=$?
-  .venv/bin/python -m stockmoney.desk.options.spreads tick >> "$LOG" 2>&1
+  .venv/bin/python -m stockmoney.desk.options.spreads tick --slot-at "$SLOT_AT" >> "$LOG" 2>&1
   S2=$?
   (exit $(( S1 ? S1 : S2 )))
 else

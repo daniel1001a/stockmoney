@@ -187,6 +187,29 @@ def test_too_expensive_and_delayed_runs_do_not_skip_early(con):
     assert spreads.open_new(con, FakeData({"SPY": chain(last)}), last, CFG) == ["SPY"]
 
 
+def test_last_slot_keeps_its_slot_when_delayed(con):
+    set_wind(con, "2026-10-27", "tailwind")
+    now = et(DAY, 11, 0)  # the 10:55 fire after the intraday alarm used its 300s
+    assert spreads.open_new(con, FakeData({"SPY": chain(now)}), now, CFG) == []
+    data = FakeData({"SPY": chain(now)})
+    assert spreads.open_new(con, data, now, CFG, slot=et(DAY, 10, 55)) == ["SPY"]
+    q = "SELECT status, skip_reason FROM options_spreads_shadow WHERE underlying = 'QQQ'"
+    assert tuple(con.execute(q).fetchone()) == ("SKIPPED", "no_expiry")
+
+
+def test_main_passes_the_slot_and_ignores_an_implausible_one(tmp_path, monkeypatch):
+    seen = []
+    monkeypatch.setattr(spreads, "tick", lambda con, data, now, slot=None: seen.append(slot) or ([], []))
+    now = et(DAY, 11, 0).astimezone(timezone.utc)
+    db = str(tmp_path / "d.sqlite")
+    fire = int(et(DAY, 10, 55).timestamp())
+    assert spreads.main(["x", "tick", "--db", db, "--slot-at", str(fire)], clock=lambda: now,
+                        data_factory=object) == 0
+    assert spreads.main(["x", "tick", "--db", db, "--slot-at", str(fire - 3600)], clock=lambda: now,
+                        data_factory=object) == 0
+    assert seen == [et(DAY, 10, 55).astimezone(timezone.utc), None]
+
+
 def test_candidates_are_capped(con):
     set_wind(con, "2026-10-27", "tailwind")
     syms = ["NVDA", "AMD", "AAPL", "MSFT", "META", "AMZN", "GOOGL"]

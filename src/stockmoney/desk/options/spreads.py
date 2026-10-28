@@ -76,6 +76,7 @@ WIND_SYMBOLS = ("SPY", "QQQ")
 MIN_SAMPLES = 30
 MAX_CANDIDATES = 6  # index ETFs plus the top-scored signals: bounds chain downloads per slot
 EXPIRY_SETTLE = time(15, 30)
+MAX_SLOT_LAG_S = 600  # the intraday tick ahead of this one has a 300s alarm
 TICK_TIMEOUT_S = 240
 
 SCHEMA = """
@@ -176,9 +177,12 @@ def _skip(con, day: str, und: str, source: str, state: str | None, reason: str) 
                 " VALUES (?,?,?,?, 'SKIPPED', ?)", (day, und, source, state, reason))
 
 
-def open_new(con, data, now: datetime, cfg: OptionsConfig) -> list[str]:
-    """Open spreads for today's candidates (entry window, tailwind only)."""
-    et = now.astimezone(ET)
+def open_new(con, data, now: datetime, cfg: OptionsConfig, slot: datetime | None = None) -> list[str]:
+    """Open spreads for today's candidates (entry window, tailwind only).
+    ``slot`` is when the scheduler fired this run: the window and the last-slot
+    test use it, so a run delayed by the intraday tick before it keeps its
+    slot; quote freshness always uses ``now``."""
+    et = (slot or now).astimezone(ET)
     day = et.date()
     if not ENTRY_WINDOW[0] <= et.time() < ENTRY_WINDOW[1]:
         return []
@@ -188,7 +192,7 @@ def open_new(con, data, now: datetime, cfg: OptionsConfig) -> list[str]:
     done = {r[0] for r in con.execute("SELECT underlying FROM options_spreads_shadow WHERE day = ?",
                                       (day.isoformat(),))}
     held = {r[0] for r in con.execute("SELECT underlying FROM options_spreads_shadow WHERE status = 'OPEN'")}
-    # the 10:55 slot only: a 10:45 run delayed by the intraday tick's alarm must not write skips
+    # the 10:55 slot only
     last_slot = et.time() >= (datetime.combine(day, ENTRY_WINDOW[1]) - timedelta(minutes=5)).time()
     picks = []  # network first: no write (and so no lock) is held while chains download
     for und, source in candidates(con, day, cfg):
@@ -287,13 +291,14 @@ def regular_hours(now: datetime) -> bool:
     return time(9, 30) <= et.time() < time(*close_time(et.date()))
 
 
-def tick(con, data, now: datetime, cfg: OptionsConfig | None = None) -> tuple[list[str], list[tuple[str, str]]]:
+def tick(con, data, now: datetime, cfg: OptionsConfig | None = None,
+         slot: datetime | None = None) -> tuple[list[str], list[tuple[str, str]]]:
     cfg = cfg or OptionsConfig()
     ensure_schema(con)
     wind.ensure_schema(con)
     closed = mark_and_exit(con, data, now, cfg)
     con.commit()
-    opened = open_new(con, data, now, cfg)
+    opened = open_new(con, data, now, cfg, slot)
     con.commit()
     return opened, closed
 
@@ -349,8 +354,14 @@ def main(argv: list[str], *, clock=lambda: datetime.now(timezone.utc), data_fact
     ap = argparse.ArgumentParser(prog="python -m stockmoney.desk.options.spreads")
     ap.add_argument("cmd", choices=("tick", "report"))
     ap.add_argument("--db", type=Path, default=DB_PATH)
+    ap.add_argument("--slot-at", type=int, default=None, help="epoch seconds the scheduler fired this run")
     a = ap.parse_args(argv[1:])
     now = clock()
+    slot = None
+    if a.slot_at is not None:
+        slot = datetime.fromtimestamp(a.slot_at, timezone.utc)
+        if not 0 <= (now - slot).total_seconds() <= MAX_SLOT_LAG_S:
+            slot = None  # implausible: fall back to the process clock
     if a.cmd == "tick" and not regular_hours(now):
         return 0  # holiday or outside the session: nothing to quote
 
@@ -368,7 +379,7 @@ def main(argv: list[str], *, clock=lambda: datetime.now(timezone.utc), data_fact
             if data_factory is None:
                 from stockmoney.desk.options.marketdata import AlpacaOptionsData
                 data_factory = AlpacaOptionsData
-            opened, closed = tick(con, data_factory(), now)
+            opened, closed = tick(con, data_factory(), now, slot=slot)
             for und in opened:
                 print(f"價差影子開倉 {und}")
             for und, reason in closed:
