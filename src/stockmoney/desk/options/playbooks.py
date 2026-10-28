@@ -24,7 +24,7 @@ bar that starts inside its own window and closes by the window end.
 from __future__ import annotations
 
 import math
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import date, datetime, time
 from typing import Callable
 from zoneinfo import ZoneInfo
@@ -398,8 +398,17 @@ def vwap_reclaim(bars: pd.DataFrame, now: datetime, prev_close: float | None, sy
     return None
 
 
+def orb15_5m(bars: pd.DataFrame, now: datetime, prev_close: float | None, symbol: str,
+             cfg: OptionsConfig, ctx: dict | None = None) -> Signal | None:
+    """SHADOW ONLY. orb15's trigger, unchanged; only the close invalidation
+    differs: a completed 5-minute bar (config close_inv_minutes) closing
+    back inside the range, not a 1-minute close (engine._close_invalidated)."""
+    sig = orb15(bars, now, prev_close, symbol, cfg, ctx)
+    return None if sig is None else replace(sig, source="orb15_5m")
+
+
 RULES: dict[str, Callable[..., Signal | None]] = {
-    "gap_go": gap_go, "gap_fade": gap_fade, "orb15": orb15, "vwap_reclaim": vwap_reclaim,
+    "gap_go": gap_go, "gap_fade": gap_fade, "orb15": orb15, "orb15_5m": orb15_5m, "vwap_reclaim": vwap_reclaim,
 }
 
 

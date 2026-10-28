@@ -58,24 +58,27 @@ def flat_of(early):
 
 
 def to_flat_with_unfillable_limit(r, early):
-    """Run to the forced flat; the limit exit is sent but cannot fill (the
-    quote drops below the limit right after it is placed)."""
+    """Run to the forced flat; the exit is sent but does not fill (it stays
+    NEW). Since the 2026-10-27 audit the forced flat is a market sell from the
+    first order (only take_profit sells by limit), so the stuck order is a
+    market sell; the cancel / replace mechanics under test do not depend on
+    the order type."""
     hh, mm = flat_of(early)
     r.run(et(hh, mm - 1), step=60)
     r.clock.set(et(hh, mm))
     real = r.broker.submit
 
+    first = []
+
     def submit(intent):
-        if intent.order_type != OrderType.LIMIT:
+        if intent.side != Side.SELL or first:
             return real(intent)
-        r.broker.fill = "never"
-        o = real(intent)
-        r.broker.fill = "immediate"
-        r.broker.mult[C601N] = 0.5  # the bid falls under the limit: it stays NEW
-        return o
+        first.append(intent)
+        r.broker.stuck.add(intent.client_order_id)
+        return real(intent)
     r.broker.submit = submit
     r.eng.tick()
-    lim = [o for o in sells(r) if o.order_type == OrderType.LIMIT]
+    lim = [o for o in sells(r) if o.order_type == OrderType.MARKET]
     assert lim and lim[0].status == OrderStatus.NEW
     return lim[0]
 
@@ -95,11 +98,11 @@ def test_g1_cancel_fails_and_order_gone_from_open_orders_is_not_replaced_blind(t
     r.broker.open_orders = lambda: [o for o in real_open() if o.client_order_id != lim.client_order_id]
     hh, mm = flat_of(early)
     r.run(et(hh, mm + 8), step=2)
-    assert [o.order_type for o in sells(r)] == [OrderType.LIMIT]
+    assert [o.order_type for o in sells(r)] == [OrderType.MARKET]
     assert sum("出場單撤不掉" in t for t in titles(r)) >= 2
     lim.status = OrderStatus.CANCELED  # the broker finally confirms it: replaced in the same pass
     r.run(et(hh, mm + 9), step=2)
-    assert [o.order_type for o in sells(r)] == [OrderType.LIMIT, OrderType.MARKET] and C601N not in r.broker.positions
+    assert [o.order_type for o in sells(r)] == [OrderType.MARKET, OrderType.MARKET] and C601N not in r.broker.positions
 
 
 def test_h1_filled_exit_with_failing_cancel_and_lagging_account_never_sells_twice(tmp_path, con):
@@ -115,7 +118,7 @@ def test_h1_filled_exit_with_failing_cancel_and_lagging_account_never_sells_twic
     r.broker.get_order = down
     r.broker.cancel = down
     r.run(et(15, 52), step=2)
-    assert [o.order_type for o in sells(r)] == [OrderType.LIMIT]  # no second 10-lot sell
+    assert [o.order_type for o in sells(r)] == [OrderType.MARKET]  # no second 10-lot sell
     assert any("出場單撤不掉" in t for t in titles(r))
     r.broker.get_order = real_get
     del r.broker.positions[C601N]  # the account catches up
@@ -146,12 +149,12 @@ def test_g1_cancel_fails_and_order_still_working_never_double_sells_pages_repeat
     r.broker.cancel = boom
     hh, mm = flat_of(early)
     r.run(et(hh, mm + 14), step=2)
-    assert [o.order_type for o in sells(r)] == [OrderType.LIMIT]  # no second sell while the first works
+    assert [o.order_type for o in sells(r)] == [OrderType.MARKET]  # no second sell while the first works
     pages = [a for a in r.sent if "出場單撤不掉" in a[0]]
     assert len(pages) >= 2  # escalation: re-paged every 5 minutes, not once
     assert len(tried) < 60  # cancel retried with backoff, not every 2-second tick
     r.eng.flatten_now("session_end")
-    assert [o.order_type for o in sells(r)] == [OrderType.LIMIT]
+    assert [o.order_type for o in sells(r)] == [OrderType.MARKET]
 
 
 @pytest.mark.parametrize("early", [False, True])
@@ -162,7 +165,7 @@ def test_g1_terminal_on_the_last_tick_replaced_in_the_same_tick(tmp_path, con, e
     r.clock.set(et(*end) - timedelta(seconds=2))
     lim.status = OrderStatus.CANCELED  # the broker finally canceled it
     r.eng.tick()  # the session's last tick
-    mk = [o for o in sells(r) if o.order_type == OrderType.MARKET]
+    mk = [o for o in sells(r) if o.order_type == OrderType.MARKET and o.client_order_id != lim.client_order_id]
     assert len(mk) == 1 and C601N not in r.broker.positions
     if early:
         assert r.eng.session_end() == et(13, 0) and r.eng._flat() == et(12, 45)
@@ -343,10 +346,8 @@ def test_h4_market_reprice_on_the_last_tick_is_replaced_in_the_same_tick(tmp_pat
     r, lp = entered(tmp_path, con)
     r.eng._sleep = lambda s: None
     r.broker.fill = "never"
-    r.clock.set(et(15, 59, 38))
-    r.eng.tick()  # the forced exit (a limit at the bid) ...
     r.clock.set(et(15, 59, 40))
-    r.eng.tick()  # ... is canceled at once at the flat and replaced by a market sell
+    r.eng.tick()  # the forced exit: a market sell from the first order (2026-10-27 audit)
     mk = [o for o in sells(r) if o.order_type == OrderType.MARKET]
     assert len(mk) == 1 and mk[0].status == OrderStatus.NEW
     r.clock.set(et(15, 59, 58))  # the session's last tick: the market sell is 18 s old ...
@@ -383,7 +384,7 @@ def test_h4_flatten_now_cancels_rereads_and_replaces_in_one_call(tmp_path, con):
     r, lp = entered(tmp_path, con)
     r.eng._sleep = lambda s: None
     lim = to_flat_with_unfillable_limit(r, False)
-    r.clock.advance(1)
+    r.clock.advance(21)  # past exit_timeout_s: a market exit is only canceled once stale
     r.eng.flatten_now("session_end")  # one call: cancel the limit, confirm, market sell, see it filled
     assert lim.status == OrderStatus.CANCELED
     p = ostore.position(con, lp["position_id"])
@@ -396,8 +397,8 @@ def test_h4_unconfirmed_cancel_sends_nothing_and_pages(tmp_path, con):
     r.eng._sleep = waits.append
     lim = to_flat_with_unfillable_limit(r, False)
     r.broker.cancel = lambda cid: None  # the cancel is accepted but the order never shows as canceled
-    r.clock.advance(1)
+    r.clock.advance(21)  # past exit_timeout_s: a market exit is only canceled once stale
     r.eng.flatten_now("session_end")
-    assert [o.order_type for o in sells(r)] == [OrderType.LIMIT]
+    assert [o.order_type for o in sells(r)] == [OrderType.MARKET]
     assert any("出場單撤不掉" in t for t in titles(r))
     assert sum(waits) < 10 * 3  # bounded: under 10 s per round, 3 rounds at most

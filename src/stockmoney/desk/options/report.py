@@ -94,6 +94,59 @@ def _stance_section(title: str, rows: list[dict], by_id: dict, mult: int) -> lis
     return out
 
 
+def slippage(con, day: str, mult: int) -> tuple[list[dict], dict[str, dict]]:
+    """Paper fills against the quote they were sent on (options_orders ref_bid /
+    ref_ask, read only). Per filled order: slip = fill - mid on a buy, mid - fill
+    on a sell (positive = paid away), as % of the mid and in dollars (x mult x
+    filled qty). Per playbook: the summed slip of every measured fill of its
+    positions over their entry premium (entry_price x mult x qty_initial).
+    Orders sent without a quote (ref_bid/ref_ask NULL) are counted, not measured."""
+    q = con.execute(
+        "SELECT o.client_order_id, o.kind, o.side, o.order_type, o.reason, o.filled_qty, o.avg_price, o.ref_bid,"
+        " o.ref_ask, p.position_id, p.underlying, p.source, p.entry_price, p.qty_initial FROM options_orders o"
+        " JOIN options_positions p ON p.position_id = o.position_id WHERE p.day=? AND p.mode='live'"
+        " AND o.filled_qty > 0 AND o.avg_price IS NOT NULL ORDER BY o.submitted_at, o.client_order_id", (day,))
+    rows, by_pb, premium = [], {}, {}
+    for r in map(dict, q):
+        g = by_pb.setdefault(r["source"], {"fills": 0, "unmeasured": 0, "slip_usd": 0.0, "premium_usd": 0.0})
+        g["fills"] += 1
+        if not (r["ref_bid"] and r["ref_ask"] and r["ref_bid"] > 0 and r["ref_ask"] > 0):
+            g["unmeasured"] += 1
+            continue
+        mid = (r["ref_bid"] + r["ref_ask"]) / 2
+        slip = (r["avg_price"] - mid) if r["side"] == "buy" else (mid - r["avg_price"])
+        r.update(mid=mid, slip_pct=slip / mid, slip_usd=slip * mult * r["filled_qty"])
+        rows.append(r)
+        g["slip_usd"] += r["slip_usd"]
+        if r["position_id"] not in premium and r["entry_price"]:
+            premium[r["position_id"]] = r["entry_price"] * mult * (r["qty_initial"] or 0)
+            g["premium_usd"] += premium[r["position_id"]]
+    for g in by_pb.values():
+        g["cost_pct"] = g["slip_usd"] / g["premium_usd"] if g["premium_usd"] else None
+    return rows, by_pb
+
+
+def _slippage_section(con, day: str, mult: int) -> list[str]:
+    rows, by_pb = slippage(con, day, mult)
+    out = ["## 紙上成交滑價(成交價 vs 送單當下報價中價,正數 = 付出去)", ""]
+    if not by_pb:
+        return out + ["今天沒有成交的紙上單。", ""]
+    if rows:
+        out += ["| 標的 | 劇本 | 進/出 | 原因 | 單別 | 口數 | 成交價 | 中價 | 滑價 % | 滑價 $ |",
+                "|---|---|---|---|---|---|---|---|---|---|"]
+        out += [f"| {r['underlying']} | {r['source']} | {'進' if r['kind'] == 'entry' else '出'} | "
+                f"{REASON_LABEL.get(r['reason'] or '', r['reason'] or '-')} | {r['order_type'] or '-'} | "
+                f"{r['filled_qty']:g} | {r['avg_price']:.2f} | {r['mid']:.3f} | {r['slip_pct']:+.1%} | "
+                f"{r['slip_usd']:+.0f} |" for r in rows]
+        out.append("")
+    out += ["### 依劇本:來回成本佔進場權利金", "", "| 劇本 | 成交筆數 | 無報價未計 | 滑價合計 $ | 進場權利金 $ | 成本/權利金 |",
+            "|---|---|---|---|---|---|"]
+    for k, g in sorted(by_pb.items()):
+        pct = f"{g['cost_pct']:+.1%}" if g["cost_pct"] is not None else "-"
+        out.append(f"| {k} | {g['fills']} | {g['unmeasured']} | {g['slip_usd']:+.0f} | {g['premium_usd']:.0f} | {pct} |")
+    return out + [""]
+
+
 def _group(rows: list[dict], key) -> dict[str, list[dict]]:
     g: dict[str, list[dict]] = defaultdict(list)
     for r in rows:
@@ -188,6 +241,7 @@ def build(con, day: str, cfg: OptionsConfig | None = None, header: str = "") -> 
     else:
         lines.append("今天沒有紙上實單。")
     lines.append("")
+    lines += _slippage_section(con, day, mult)
 
     # ---- shadow, main variant only
     lines += [f"## 影子帳戶:主變體({live_dte}・出場 {live_ev},扣價差與費用後)", "",
