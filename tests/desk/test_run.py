@@ -233,3 +233,16 @@ def test_advisory_only_sends_no_stock_buys_but_keeps_stops(tmp_path):
         for sym, pos in ledger.positions().items():
             assert sym in stops and stops[sym].stop_price == pytest.approx(pos.stop, abs=0.01)
         assert reconcile(ledger, broker.account()) == []
+
+
+def test_stock_entries_production_default_is_off():
+    """The autouse conftest fixture patches STOCK_ENTRIES_DEFAULT on for legacy
+    tests, so read the shipped value from the source instead (owner decision
+    2026-10-27: mid/long-term stocks are advisory only)."""
+    import ast
+    import inspect
+
+    tree = ast.parse(inspect.getsource(run))
+    (val,) = [n.value for n in ast.walk(tree) if isinstance(n, ast.Assign)
+              and any(getattr(t, "id", None) == "STOCK_ENTRIES_DEFAULT" for t in n.targets)]
+    assert isinstance(val, ast.Constant) and val.value is False

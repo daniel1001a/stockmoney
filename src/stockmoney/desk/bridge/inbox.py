@@ -465,7 +465,7 @@ def _process_plan(con, mail: RawMail, config: BridgeConfig, received_at: datetim
     other = con.execute("SELECT type FROM bridge_messages WHERE msg_id=?", (p.plan_id,)).fetchone()
     if other is not None and other[0] != "OPTIONS_PLAN":
         return fail("duplicate_msg_id")
-    res = oplan.ingest(con, text, received_at, OptionsConfig())
+    res = oplan.ingest(con, text, received_at, OptionsConfig(), source=source)
     if res.status == "rejected":  # parse passed above, so: the id belongs to a different accepted plan
         return fail("plan_id_reused")
     con.execute(
@@ -476,7 +476,12 @@ def _process_plan(con, mail: RawMail, config: BridgeConfig, received_at: datetim
     )
     if res.status == "duplicate":
         return False
-    note = " (shadow_only: 09:20 ET 後收到,當天只進影子帳戶)" if res.shadow_only else ""
+    if source != SOURCE_GROK_VERIFIED:
+        note = f" (未驗證來源 {source}:只存檔,不進交易)"
+    elif res.shadow_only:
+        note = " (shadow_only: 09:20 ET 後收到,當天只進影子帳戶)"
+    else:
+        note = ""
     try:
         notify.send("OPTIONS_PLAN 已收到", f"OPTIONS_PLAN 已收到: {len(p.plans)} 個劇本{note}", notify.INFO)
     except Exception:  # a notification failure never undoes a stored plan

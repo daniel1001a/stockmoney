@@ -124,6 +124,16 @@ def test_error_falls_back_to_counting(db, jev):
     assert row["error"] == "RuntimeError" and row["excluded"] == 0
 
 
+def test_malformed_judgement_keeps_every_item(db, monkeypatch):
+    """A judge row the drop step cannot read (p set, p_pos None) must fail open
+    to the plain count, never raise out of the BUY check."""
+    monkeypatch.setattr(veto, "_judge", lambda sym, todo: [
+        {"p": 0.1, "p_pos": None, "latency_ms": 1, "error": "", "model": "x"} for _ in todo])
+    _alert(db, "AAPL", PG_BEAT)
+    _earnings(db, "AAPL")
+    assert veto.check(db, "AAPL").blocked
+
+
 def test_no_client_counts_as_before(db):
     """conftest gives no client: the PG case still blocks, the row says why."""
     _alert(db, "AAPL", PG_BEAT)

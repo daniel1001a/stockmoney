@@ -310,7 +310,17 @@ def _positive(j: dict) -> bool:
 def _filter_catalysts(con, symbol: str, items: dict[str, list[dict]], min_sources: int,
                       client_order_id: str) -> dict[str, list[dict]]:
     """Drop free-text items Jev reads as positive catalysts, when the decision is in play
-    (would block, or passes on exactly one vote). Writes veto_jev_shadow; never raises."""
+    (would block, or passes on exactly one vote). Writes veto_jev_shadow; never raises:
+    any failure keeps every item (fail-open to the plain vote count)."""
+    try:
+        return _filter_catalysts_inner(con, symbol, items, min_sources, client_order_id)
+    except Exception as e:  # never let the filter break a buy check
+        log.warning("veto Jev filter failed for %s: %s: %s", symbol, type(e).__name__, e)
+        return items
+
+
+def _filter_catalysts_inner(con, symbol: str, items: dict[str, list[dict]], min_sources: int,
+                            client_order_id: str) -> dict[str, list[dict]]:
     before = vote_count(items)
     if before < 1 or (before != 1 and before < min_sources):
         return items

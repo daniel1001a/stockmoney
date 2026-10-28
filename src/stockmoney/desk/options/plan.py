@@ -222,9 +222,17 @@ def is_shadow_only(for_date: _dt.date, received_at: datetime, cfg: OptionsConfig
     return received_at.astimezone(ET) > cutoff
 
 
-def ingest(con, text: str, received_at: datetime, cfg: OptionsConfig | None = None) -> IngestResult:
+# plan sources active_plan() reads; anything else (Muse, grok_legacy) is stored for audit only
+TRUSTED_SOURCES = ("owner", "grok_verified")
+
+
+def ingest(con, text: str, received_at: datetime, cfg: OptionsConfig | None = None,
+           source: str = "owner") -> IngestResult:
     """Validate and store. Idempotent: the same text twice is reported as a
-    duplicate of the first; a DIFFERENT plan reusing a plan_id is rejected."""
+    duplicate of the first; a DIFFERENT plan reusing a plan_id is rejected.
+    A plan from an untrusted ``source`` is stored shadow_only and is never
+    returned by active_plan() (CLAUDE.md section 0: only grok_verified may
+    propose live candidates)."""
     cfg = cfg or OptionsConfig()
     ostore.ensure_schema(con)
     # never raises on hostile text: a lone surrogate cannot be UTF-8 encoded (hash and store a
@@ -251,10 +259,10 @@ def ingest(con, text: str, received_at: datetime, cfg: OptionsConfig | None = No
                     "VALUES (?,?,?,?,?,?,?,?)", (p.plan_id, str(p.for_date), at, "rejected", 1, err, sha, text))
         con.commit()
         return IngestResult("rejected", p.plan_id, str(p.for_date), True, err)
-    shadow = is_shadow_only(p.for_date, received_at, cfg)
-    con.execute("INSERT INTO options_plans (plan_id, for_date, received_at, status, shadow_only, error, sha, raw) "
-                "VALUES (?,?,?,?,?,?,?,?)", (p.plan_id, str(p.for_date), at, "accepted", int(shadow), "", sha,
-                                             text.strip()))
+    shadow = is_shadow_only(p.for_date, received_at, cfg) or source not in TRUSTED_SOURCES
+    con.execute("INSERT INTO options_plans (plan_id, for_date, received_at, status, shadow_only, error, sha, raw, "
+                "source) VALUES (?,?,?,?,?,?,?,?,?)", (p.plan_id, str(p.for_date), at, "accepted", int(shadow), "",
+                                                       sha, text.strip(), source))
     con.commit()
     return IngestResult("accepted", p.plan_id, str(p.for_date), shadow)
 
@@ -280,7 +288,8 @@ def active_plan(con, day: _dt.date) -> ActivePlan | None:
     from the stored text, so the same strict schema applies on every read."""
     ostore.ensure_schema(con)
     r = con.execute("SELECT raw, received_at, shadow_only FROM options_plans WHERE for_date=? AND status='accepted' "
-                    "ORDER BY received_at DESC, id DESC LIMIT 1", (str(day),)).fetchone()
+                    "AND COALESCE(source, 'owner') IN (?, ?) ORDER BY received_at DESC, id DESC LIMIT 1",
+                    (str(day), *TRUSTED_SOURCES)).fetchone()
     if r is None:
         return None
     return ActivePlan(parse(r["raw"]), datetime.fromisoformat(r["received_at"]), bool(r["shadow_only"]))

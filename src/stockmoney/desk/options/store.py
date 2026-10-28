@@ -69,6 +69,9 @@ _ADDED = (("options_setups", "rvol", "REAL"), ("options_setups", "regime_json", 
           # the quote an order was sent against (arrival price), and the quote time on each fill
           ("options_orders", "ref_bid", "REAL"), ("options_orders", "ref_ask", "REAL"),
           ("options_orders", "ref_quote_at", "TEXT"), ("options_fills", "quote_at", "TEXT"),
+          # who sent the plan: NULL/owner (CLI) or a bridge source; only owner and
+          # grok_verified plans are ever read back by active_plan()
+          ("options_plans", "source", "TEXT"),
           # a live exit that triggered and is not filled yet (JSON: reason, qty, open_at, at): the
           # engine keeps exiting it every poll until filled, even if the trigger flickers off
           ("options_positions", "pending_exit", "TEXT"))
