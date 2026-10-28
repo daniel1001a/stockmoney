@@ -116,7 +116,7 @@ def test_chain_serialisation_matches_ingest_grok_fields():
     assert dumped["invalidations"] == [{"kind": "close_above", "symbol": "NVDA", "level": 150.0,
                                         "by_date": "2026-10-30"}]
     assert isinstance(dumped["urls"][0], str) and dumped["checkpoints"][0]["date"] == "2026-10-20"
-    assert set(dumped["impacts"][0]) == {"ticker", "direction", "horizon_days"}
+    assert set(dumped["impacts"][0]) == {"ticker", "direction", "horizon_days", "order"}
     # the worst case still fits the learning layer's own limits
     Chain.model_validate({**json.loads(GrokChain.model_validate(worst_case()["chains"][0]).model_dump_json()),
                           "impacts": [{"ticker": "MU", "direction": "down", "horizon_days": 60}], "source": "grok"})
