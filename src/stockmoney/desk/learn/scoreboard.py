@@ -66,13 +66,14 @@ CREATE TABLE IF NOT EXISTS source_scores (
 
 # always listed, in this order, so a silent source is visible as 0
 FIXED = ("grok_in_play", "grok_in_play:confirmed", "grok_in_play:unconfirmed", "grok_chains", "grok_market_risk",
-         "grok_calls", "muse_calls", "muse_alert", "muse_alert_block", "muse_risk_flags_block",
+         "grok_calls", "muse_calls", "muse_alert", "grok_alert", "muse_alert_block", "muse_risk_flags_block",
          "research_veto_block", "muse_legacy_rule", "grok_options_plan:live", "grok_options_plan:shadow")
 LABEL = {
     "grok_in_play": "Grok in_play(開盤到收盤)", "grok_in_play:confirmed": "Grok in_play 已證實",
     "grok_in_play:unconfirmed": "Grok in_play 未證實", "grok_chains": "Grok 事件鏈(宣告時間窗)",
     "grok_market_risk": "Grok 大盤風險(SPY 5 日)", "grok_calls": "Grok 轉述喊單(5 日超額)",
     "muse_calls": "Muse 喊單(5 日超額)", "muse_alert": "Muse ALERT elevated/critical(5 日超額)",
+    "grok_alert": "Grok ALERT elevated/critical(5 日超額)",
     "muse_alert_block": "Muse ALERT 擋單", "muse_risk_flags_block": "Muse 風險旗標擋單",
     "research_veto_block": "研究否決擋單(Muse/Grok/申報)", "muse_legacy_rule": "舊 Muse 規則(會擋未擋)",
     "grok_options_plan:live": "Grok 期權劇本(紙上實單)", "grok_options_plan:shadow": "Grok 期權劇本(影子)",
@@ -184,21 +185,25 @@ def calls_obs(con) -> list[dict]:
 
 
 def alert_obs(con, bars: Bars) -> list[dict]:
-    """Elevated/critical Muse ALERTs: 5-session excess vs SPY from the first
-    complete close after receipt. One per (ticker, ET receipt day)."""
+    """Elevated/critical ALERTs: 5-session excess vs SPY from the first
+    complete close after receipt. One per (sender, ticker, ET receipt day);
+    Grok's own-channel ALERTs score as grok_alert, everything else as muse_alert."""
     if not _has(con, "bridge_messages") or MARKET not in bars.close.columns:
         return []
+    from stockmoney.desk.bridge.inbox import SOURCE_MUSE, has_source_column, source_of
     from stockmoney.desk.learn.calls import base_session
     sessions, spy = bars.dates, bars.close[MARKET]
     out, seen = [], set()
-    for r in con.execute("SELECT received_at, parsed_json FROM bridge_messages WHERE type='ALERT' "
+    src_col = "source" if has_source_column(con) else "NULL AS source"
+    for r in con.execute(f"SELECT received_at, parsed_json, {src_col} FROM bridge_messages WHERE type='ALERT' "
                          "ORDER BY received_at, msg_id").fetchall():
+        label = "muse_alert" if source_of(r["source"], "ALERT") == SOURCE_MUSE else "grok_alert"
         try:
             m = json.loads(r["parsed_json"]) or {}
             sym, sev = _sym(m["ticker"]), m.get("severity")
         except (ValueError, AttributeError, KeyError, TypeError):
             continue
-        key = (sym, _et(r["received_at"]).date())
+        key = (label, sym, _et(r["received_at"]).date())
         if sev not in ("elevated", "critical") or key in seen or sym not in bars.close.columns:
             continue
         seen.add(key)
@@ -213,7 +218,7 @@ def alert_obs(con, bars: Bars) -> list[dict]:
         if None in (px0, px1, s0, s1):
             continue
         ex = (px1 / px0 - 1) - (s1 / s0 - 1)
-        out.append(_obs(base.date(), "muse_alert", int(ex < 0), -ex))
+        out.append(_obs(base.date(), label, int(ex < 0), -ex))
     return out
 
 

@@ -226,3 +226,19 @@ def test_trading_code_does_not_read_the_scoreboard():
     code = ("import sys; import stockmoney.desk.bridge.policy, stockmoney.desk.run; "
             "assert 'stockmoney.desk.learn.scoreboard' not in sys.modules")
     subprocess.run([sys.executable, "-c", code], check=True, env={**os.environ, "PYTHONPATH": "src"})
+
+
+def test_alerts_scored_per_sender(con):
+    """Grok's own-channel ALERTs score as grok_alert, not as Muse's; a Muse
+    ALERT and a Grok ALERT on the same ticker and day both count."""
+    bars = make_bars()
+    d = bars.dates[-10]
+    for mid, src in (("alert-1", "muse"), ("alert-grok-1", "grok_verified"), ("alert-grok-2", "grok_legacy"),
+                     ("alert-0", None)):
+        con.execute("INSERT INTO bridge_messages (msg_id, type, sender, sent_at, received_at, raw_body, parsed_json, "
+                    "source) VALUES (?,?,?,?,?,?,?,?)",
+                    (mid, "ALERT", "x", f"{d.date()}T12:00:00+00:00", f"{d.date()}T12:00:00+00:00", "{}",
+                     json.dumps({"type": "ALERT", "ticker": "NVDA", "severity": "elevated"}), src))
+    got = sorted(o["source"] for o in sb.alert_obs(con, bars))
+    assert got == ["grok_alert", "muse_alert"]
+    assert "grok_alert" in sb.FIXED and "grok_alert" in sb.LABEL

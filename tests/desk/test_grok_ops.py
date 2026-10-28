@@ -259,3 +259,10 @@ def test_morning_collected_after_noon_does_not_count(con):
     deliver(box, d)
     poll(con, box, CONFIG, now=at(MON, 12, 10))
     assert len(muse_ops.check_deliveries(con, at(MON, 12, 15))) == 1
+
+
+@pytest.mark.parametrize("mid, want", [("grok-20261012-0730", True), ("alert-grok-20261027-1", True),
+                                       ("rr-grok-1", True), ("pong-grok-1", True), ("sd-20261012-0730", False),
+                                       ("alert-20261027-1", False), ("a-b-grok-1", False), ("", False)])
+def test_grok_id_prefixes_are_recognised(mid, want):
+    assert muse_ops._is_grok_id(mid) is want

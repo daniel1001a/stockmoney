@@ -183,3 +183,18 @@ def test_param_changes_written_once(con):
     got = {r[0]: (json.loads(r[1]), json.loads(r[2])) for r in rows}
     assert got["live_sources"] == (["gap_go", "orb15", "grok_plan"], ["gap_go", "grok_plan"])
     assert got["exit_max_limit_attempts"] == (3, 1)
+
+
+def test_restart_after_live_sources_change_keeps_frozen_setup_out_of_live(tmp_path, con):
+    """live_eligible is written on the setup row; a restart with orb15 removed
+    from live_sources must not open live from that stale row (Grok review)."""
+    import dataclasses
+    r = Rig(tmp_path, con, live_sources=("orb15",))
+    r.run(et(9, 46))
+    setup = next(s for s in ostore.setups(con, str(DAY)) if s["source"] == "orb15")
+    assert setup["live_eligible"] and not r.pos("live")
+    r.cfg = dataclasses.replace(r.cfg, live_sources=("gap_go", "grok_plan"))
+    r.eng = r.new_engine()
+    r.run(et(9, 52))
+    assert r.pos("shadow") and not r.pos("live")
+    assert not any(o.side == Side.BUY for o in r.broker.orders.values())

@@ -246,3 +246,25 @@ def test_stock_entries_production_default_is_off():
     (val,) = [n.value for n in ast.walk(tree) if isinstance(n, ast.Assign)
               and any(getattr(t, "id", None) == "STOCK_ENTRIES_DEFAULT" for t in n.targets)]
     assert isinstance(val, ast.Constant) and val.value is False
+
+
+def test_plan_buy_converts_between_advisory_and_planned_only(con):
+    """The cid has no status in it: switching STOCK_ENTRIES between two
+    postclose runs converts the unsent row in place instead of leaving the
+    old status while the report claims the new one (Grok review)."""
+    run.ensure_schema(con)
+    day = "2026-10-28"
+
+    def status():
+        return [r[0] for r in con.execute("SELECT status FROM planned_orders WHERE symbol='AAPL'")]
+
+    assert run._plan_buy(con, day, "AAPL", 10, "trend", 90.0, 100.0, "t", "sig1", run.ADVISORY)
+    assert status() == [run.ADVISORY]
+    assert run._plan_buy(con, day, "AAPL", 12, "trend", 91.0, 101.0, "t2", "sig2", "planned")
+    r = con.execute("SELECT status, qty, stop, ref_price, signal_id FROM planned_orders WHERE symbol='AAPL'").fetchone()
+    assert tuple(r) == ("planned", 12, 91.0, 101.0, "sig2")
+    assert run._plan_buy(con, day, "AAPL", 12, "trend", 91.0, 101.0, "t2", "sig2", run.ADVISORY)
+    assert status() == [run.ADVISORY]
+    con.execute("UPDATE planned_orders SET status='submitted'")
+    assert not run._plan_buy(con, day, "AAPL", 12, "trend", 91.0, 101.0, "t2", "sig2", "planned")
+    assert status() == ["submitted"]

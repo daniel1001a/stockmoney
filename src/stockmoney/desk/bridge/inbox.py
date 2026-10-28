@@ -476,6 +476,12 @@ def _process_plan(con, mail: RawMail, config: BridgeConfig, received_at: datetim
     )
     if res.status == "duplicate":
         return False
+    if res.status == "upgraded":
+        # the same plan resent over Grok's verified channel (see the identical-resend
+        # upgrade in process_mail); the plan row was upgraded by ingest
+        con.execute("UPDATE bridge_messages SET source=?, source_reason=?, sender=? WHERE msg_id=?",
+                    (source, f"verified_by_resend {_iso(received_at)}", mail.sender, p.plan_id))
+        log.info("bridge: verified resend of OPTIONS_PLAN %s upgraded it", p.plan_id)
     if source != SOURCE_GROK_VERIFIED:
         note = f" (未驗證來源 {source}:只存檔,不進交易)"
     elif res.shadow_only:

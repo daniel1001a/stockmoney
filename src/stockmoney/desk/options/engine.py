@@ -629,6 +629,12 @@ class Engine:
         """'' when this trigger may send its live order, else why not
         (signal-level rules; the setup-level ones are in _live_note)."""
         cfg, src, m = self.cfg, s["source"], sig.meta
+        # live_eligible is frozen on the setup row; a restart after a config
+        # change must not keep a source live that is no longer live
+        if src in SHADOW_ONLY_SOURCES:
+            return "shadow-only variant"
+        if src not in cfg.live_sources:
+            return "source not live-eligible"
         if src == "gap_go" and m.get("rvol5") is None:
             return "rvol_unknown"
         if src == "orb15" and m.get("day_rvol") is None:

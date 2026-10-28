@@ -826,6 +826,22 @@ def _plan(con, day, sym, side: Side, qty, strategy, stop, ref, reason, signal_id
     return cid
 
 
+def _plan_buy(con, day, sym, qty, strategy, stop, ref, reason, signal_id, status: str) -> bool:
+    """Write a buy row of ``status``. The cid has no status in it, so a row of
+    the other unsent status (planned <-> ADVISORY, after STOCK_ENTRIES was
+    switched) is converted in place with the fresh sizing. True when the row
+    now has ``status``; a submitted/filled/cancelled row is never touched."""
+    cid = _plan(con, day, sym, Side.BUY, qty, strategy, stop, ref, reason, signal_id, status)
+    r = con.execute("SELECT status FROM planned_orders WHERE client_order_id=?", (cid,)).fetchone()
+    if r["status"] == status:
+        return True
+    if {r["status"], status} != {"planned", ADVISORY}:
+        return False
+    con.execute("UPDATE planned_orders SET status=?, qty=?, stop=?, ref_price=?, reason=?, signal_id=?, note='' "
+                "WHERE client_order_id=? AND status=?", (status, qty, stop, ref, reason, signal_id, cid, r["status"]))
+    return True
+
+
 def _plan_entries(con, day, ledger: Ledger, risk: RiskEngine, snap, ctx, signals, exiting: set[str],
                   status: str = "planned") -> list[dict]:
     """Size the next session's buys with the same rules as the backtest
@@ -906,13 +922,14 @@ def _plan_entries(con, day, ledger: Ledger, risk: RiskEngine, snap, ctx, signals
         qty = floor(dollars / s.ref_price)
         if qty <= 0:
             continue
+        if not _plan_buy(con, day, s.symbol, qty, s.strategy, round(s.stop, 2), s.ref_price, s.thesis,
+                         engine.signal_id(s), status):
+            continue  # this cid was already sent today; it is not a new entry
         invested += qty * s.ref_price
         cash -= qty * s.ref_price
         slots -= 1
         per_sector[sec] = per_sector.get(sec, 0) + 1
         planned_syms.add(s.symbol)
-        _plan(con, day, s.symbol, Side.BUY, qty, s.strategy, round(s.stop, 2), s.ref_price, s.thesis,
-              engine.signal_id(s), status)
         out.append({"symbol": s.symbol, "strategy": s.strategy, "qty": qty, "ref": s.ref_price, "stop": s.stop,
                     "reason": s.thesis})
     return out

@@ -331,3 +331,39 @@ def test_verified_plan_supersedes_only_trusted_plans(con):
     mail(mb, json.loads(_plan(level=601.5, plan_id="gp-20261013-0810")), sender=MUSE, token=TOKEN)
     assert poll(con, mb) == 2
     assert oplan.active_plan(con, DAY).plan.plan_id == PID
+
+
+@pytest.mark.parametrize("now, shadow", [(EARLY, 0), (LATE, 1)])
+def test_verified_resend_upgrades_an_unverified_plan(con, now, shadow):
+    """The same plan first arrives with DKIM failing, then over the verified
+    channel: it becomes trusted as of the resend (the shadow cutoff is judged
+    on the resend's receipt), and the bridge row is upgraded too."""
+    mb = FakeMailbox()
+    mail(mb, auth_results=GOOD_AR.replace("dkim=pass", "dkim=fail"))
+    assert poll(con, mb, now=et(8, 0)) == 1
+    assert oplan.active_plan(con, DAY) is None
+    mail(mb)
+    assert poll(con, mb, now=now) == 1
+    row = con.execute("SELECT source, shadow_only, received_at FROM options_plans WHERE status='accepted'").fetchall()
+    assert len(row) == 1 and row[0]["source"] == "grok_verified" and row[0]["shadow_only"] == shadow
+    ap = oplan.active_plan(con, DAY)
+    assert ap.plan.plan_id == PID and ap.shadow_only == bool(shadow) and ap.received_at > et(8, 0)
+    b = con.execute("SELECT source, source_reason FROM bridge_messages WHERE msg_id=?", (PID,)).fetchone()
+    assert b["source"] == "grok_verified" and b["source_reason"].startswith("verified_by_resend")
+    assert rejects(con) == []
+
+
+def test_unverified_resend_never_downgrades_or_upgrades(con):
+    mb = FakeMailbox()
+    mail(mb)
+    mail(mb, sender=MUSE, token=TOKEN)
+    assert poll(con, mb) == 1
+    assert con.execute("SELECT source FROM options_plans").fetchone()[0] == "grok_verified"
+    assert oplan.active_plan(con, DAY).plan.plan_id == PID
+
+
+def test_plan_row_without_source_is_untrusted(con):
+    """A row stored before the source column existed (NULL) is not owner."""
+    oplan.ingest(con, json.dumps(plan(), ensure_ascii=False), EARLY)
+    con.execute("UPDATE options_plans SET source=NULL")
+    assert oplan.active_plan(con, DAY) is None

@@ -7,6 +7,7 @@ bridge's health. Nothing here can affect trading.
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from datetime import datetime, time, timedelta
 from zoneinfo import ZoneInfo
@@ -235,6 +236,15 @@ def _reject_sender(con, key: str) -> str:
     return (r[0] if r else "") or ""
 
 
+_GROK_ID = re.compile(r"^(?:[a-z]+-)?grok-", re.I)
+
+
+def _is_grok_id(about: str) -> bool:
+    """Grok's msg ids: grok-..., and the typed ones it now sends (alert-grok-,
+    rr-grok-, pong-grok-, ...)."""
+    return bool(_GROK_ID.match(about or ""))
+
+
 def _is_plan_reject(con, key: str) -> bool:
     """True when the reject came from an OPTIONS_PLAN subject (Grok's, sent from
     the same address as Muse's mail; its plan_id has no grok- prefix)."""
@@ -258,13 +268,13 @@ def send_feedback(con, box, now: datetime, config=None) -> int:
         channel = _channel_for(_reject_sender(con, key), config)
         # Grok's legacy mail comes from Muse's address, so its corrections land in
         # the mailbox Muse reads; the tag tells Muse to leave them alone (MUSE_PROMPT.md)
-        legacy_grok = about.lower().startswith("grok-") or _is_plan_reject(con, key)
+        legacy_grok = _is_grok_id(about) or _is_plan_reject(con, key)
         tag = "【給 Grok】" if channel == "muse" and legacy_grok else ""
         items.append((key, channel, dict(about_msg_id=about[:64], problem=f"{tag}訊息 {about} 被拒絕:{reason}"[:1000],
                                          how_to_fix=fix_for(reason))))
     for key, about, summary, sender in drops:
         channel = _channel_for(sender, config)
-        tag = "【給 Grok】" if channel == "muse" and about.lower().startswith("grok-") else ""
+        tag = "【給 Grok】" if channel == "muse" and _is_grok_id(about) else ""
         items.append((key, channel, dict(about_msg_id=about[:64],
                                          problem=f"{tag}訊息 {about} 已接受(非致命):{summary}"[:1000],
                                          how_to_fix=DROP_FIX)))

@@ -210,7 +210,7 @@ def _short(e: ValidationError) -> str:
 
 @dataclass(frozen=True)
 class IngestResult:
-    status: str  # accepted | rejected | duplicate
+    status: str  # accepted | rejected | duplicate | upgraded (a trusted resend of an untrusted plan)
     plan_id: str
     for_date: str
     shadow_only: bool
@@ -249,10 +249,18 @@ def ingest(con, text: str, received_at: datetime, cfg: OptionsConfig | None = No
                                                  text[:MAX_PLAN_BYTES]))
         con.commit()
         return IngestResult("rejected", _peek_id(text), "", True, str(e))
-    prior = con.execute("SELECT sha, shadow_only FROM options_plans WHERE plan_id=? AND status='accepted'",
+    prior = con.execute("SELECT id, sha, shadow_only, source FROM options_plans WHERE plan_id=? AND status='accepted'",
                         (p.plan_id,)).fetchone()
     if prior is not None:
         if prior["sha"] == sha:
+            if source in TRUSTED_SOURCES and prior["source"] not in TRUSTED_SOURCES:
+                # the same plan resent over a trusted channel: it becomes trusted
+                # as of THIS receipt (the shadow cutoff is judged on the resend)
+                shadow = is_shadow_only(p.for_date, received_at, cfg)
+                con.execute("UPDATE options_plans SET source=?, shadow_only=?, received_at=? WHERE id=?",
+                            (source, int(shadow), at, prior["id"]))
+                con.commit()
+                return IngestResult("upgraded", p.plan_id, str(p.for_date), shadow)
             return IngestResult("duplicate", p.plan_id, str(p.for_date), bool(prior["shadow_only"]))
         err = "plan_id already used by a different accepted plan"
         con.execute("INSERT INTO options_plans (plan_id, for_date, received_at, status, shadow_only, error, sha, raw) "
@@ -285,10 +293,12 @@ class ActivePlan:
 def active_plan(con, day: _dt.date) -> ActivePlan | None:
     """The plan in force for ``day``: the most recently RECEIVED accepted plan
     (a later plan supersedes an earlier one instead of doubling it). Re-parsed
-    from the stored text, so the same strict schema applies on every read."""
+    from the stored text, so the same strict schema applies on every read.
+    Only trusted sources count; a row stored before the source column existed
+    (NULL) is unknown and therefore untrusted."""
     ostore.ensure_schema(con)
     r = con.execute("SELECT raw, received_at, shadow_only FROM options_plans WHERE for_date=? AND status='accepted' "
-                    "AND COALESCE(source, 'owner') IN (?, ?) ORDER BY received_at DESC, id DESC LIMIT 1",
+                    "AND source IN (?, ?) ORDER BY received_at DESC, id DESC LIMIT 1",
                     (str(day), *TRUSTED_SOURCES)).fetchone()
     if r is None:
         return None
