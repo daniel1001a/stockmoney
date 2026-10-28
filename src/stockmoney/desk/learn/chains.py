@@ -256,12 +256,16 @@ def base_session(created_at: str, sessions: pd.DatetimeIndex) -> pd.Timestamp | 
     return ok[-1] if len(ok) else None
 
 
+BASIS_TOL = 1e-6  # stored SPY excess vs a recompute; larger means the cache was restated
+
+
 def score_due(con, bars: Bars, through: pd.Timestamp) -> int:
     """Score every impact whose horizon has fully elapsed; returns rows added
-    plus rows whose sector columns were filled. Idempotent. A scored row whose
-    sector columns are still NULL gets them filled once the sector ETF close is
-    available; its SPY excess and hit are recomputed from the same bars in the
-    same write, so both comparisons share one price basis."""
+    (backfilled sector columns are not counted). Idempotent. A scored row whose
+    sector columns are still NULL gets them once the sector ETF close is
+    available, but only when the current bars reproduce its stored SPY excess
+    (same window, same price basis); the stored excess and hit are never
+    rewritten."""
     n = 0
     sessions = bars.dates[bars.dates <= through]
     spy = bars.close[MARKET]
@@ -294,16 +298,15 @@ def score_due(con, bars: Bars, through: pd.Timestamp) -> int:
                 key = (r["chain_id"], imp["ticker"], h)
                 ex = ret - float(s1 / s0 - 1)
                 hit = int((ex > 0) == up)
-                old = con.execute("SELECT excess_sector, base_date, scored_date FROM chain_scores "
+                old = con.execute("SELECT excess_sector, excess_ret, base_date, scored_date FROM chain_scores "
                                   "WHERE chain_id=? AND ticker=? AND horizon=?", key).fetchone()
                 if old:
                     # rows scored before the sector columns existed, or while the ETF close was missing
                     if (old["excess_sector"] is None and ex_sec is not None
-                            and (old["base_date"], old["scored_date"]) == (str(base.date()), str(t.date()))):
-                        con.execute("UPDATE chain_scores SET excess_ret=?, hit=?, sector_etf=?, excess_sector=?, "
-                                    "hit_sector=? WHERE chain_id=? AND ticker=? AND horizon=?",
-                                    (ex, hit, etf, ex_sec, hit_sec, *key))
-                        n += 1
+                            and (old["base_date"], old["scored_date"]) == (str(base.date()), str(t.date()))
+                            and old["excess_ret"] is not None and abs(old["excess_ret"] - ex) <= BASIS_TOL):
+                        con.execute("UPDATE chain_scores SET sector_etf=?, excess_sector=?, hit_sector=? "
+                                    "WHERE chain_id=? AND ticker=? AND horizon=?", (etf, ex_sec, hit_sec, *key))
                     continue
                 con.execute("INSERT INTO chain_scores (chain_id, ticker, horizon, declared, direction, base_date, "
                             "scored_date, excess_ret, hit, confidence, scored_at, order_n, sector_etf, excess_sector, "

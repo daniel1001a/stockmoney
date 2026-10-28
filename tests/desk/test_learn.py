@@ -223,17 +223,21 @@ def test_chain_sector_columns_backfill_on_a_later_pass(con):
     d = bars.dates
     created = datetime(d[300].year, d[300].month, d[300].day, 15, 0, tzinfo=timezone.utc)
     cid = chains.add_chain(con, _chain("up", 5), created)
-    n = chains.score_due(con, bars, d[-1])
+    chains.score_due(con, bars, d[-1])
     fresh = con.execute("SELECT excess_ret, hit FROM chain_scores WHERE chain_id=? AND horizon=5", (cid,)).fetchone()
-    # as scored before the sector columns existed, on an older price basis
-    con.execute("UPDATE chain_scores SET sector_etf=NULL, excess_sector=NULL, hit_sector=NULL, excess_ret=9, hit=-1")
-    con.execute("UPDATE chain_scores SET scored_date='1999-01-01' WHERE horizon=60")  # another window: left alone
-    assert chains.score_due(con, bars, d[-1]) == n - 1  # filled rows are counted
+    # as scored before the sector columns existed
+    con.execute("UPDATE chain_scores SET sector_etf=NULL, excess_sector=NULL, hit_sector=NULL")
+    con.execute("UPDATE chain_scores SET excess_ret=9, hit=-1 WHERE horizon=20")  # stored on another price basis
+    con.execute("UPDATE chain_scores SET scored_date='1999-01-01' WHERE horizon=60")  # another window
+    assert chains.score_due(con, bars, d[-1]) == 0  # fills are not new scores
     r = con.execute("SELECT * FROM chain_scores WHERE chain_id=? AND horizon=5", (cid,)).fetchone()
     assert r["sector_etf"] == "XLK" and r["excess_sector"] is not None and r["hit_sector"] in (0, 1)
-    assert (r["excess_ret"], r["hit"]) == (fresh["excess_ret"], fresh["hit"])  # SPY side repriced in the same write
-    r60 = con.execute("SELECT * FROM chain_scores WHERE chain_id=? AND horizon=60", (cid,)).fetchone()
-    assert r60["excess_sector"] is None and r60["excess_ret"] == 9
+    assert (r["excess_ret"], r["hit"]) == (fresh["excess_ret"], fresh["hit"])
+    for h in (20, 60):  # left alone, the stored SPY score is never rewritten
+        rh = con.execute("SELECT * FROM chain_scores WHERE chain_id=? AND horizon=?", (cid, h)).fetchone()
+        assert rh["excess_sector"] is None
+    r20 = con.execute("SELECT excess_ret, hit FROM chain_scores WHERE chain_id=? AND horizon=20", (cid,)).fetchone()
+    assert (r20["excess_ret"], r20["hit"]) == (9, -1)
 
 
 def test_chain_report_counts_impacts_outside_the_universe(con):
