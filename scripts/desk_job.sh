@@ -5,7 +5,8 @@
 # "learn" is the read-only learning job (own module, own lock; never touches orders).
 # "options" is the intraday options session (own module, own lock, runs until the close).
 # "options-recover" sells options leftovers of a dead session (same lock; exits if a session runs).
-# "intraday_shadow" is a read-only shadow tick (stockmoney.desk.intraday): no order path, own timeout alarm.
+# "intraday_shadow" is a read-only shadow tick (stockmoney.desk.intraday): no order path, own timeout alarm;
+# the defined-risk spread shadow (stockmoney.desk.options.spreads, H6, no order path) runs after it.
 set -u
 ROOT="${0:A:h:h}"
 cd "$ROOT" || exit 1
@@ -38,7 +39,12 @@ elif [[ "$1" == "options" ]]; then
 elif [[ "$1" == "options-recover" ]]; then
   .venv/bin/python -m stockmoney.desk.options.run recover >> "$LOG" 2>&1
 elif [[ "$1" == "intraday_shadow" ]]; then
+  SLOT_AT=$(date +%s)  # the spreads entry window keys off the fire time, not its own (delayed) start
   .venv/bin/python -m stockmoney.desk.intraday tick --feed sip >> "$LOG" 2>&1
+  S1=$?
+  .venv/bin/python -m stockmoney.desk.options.spreads tick --slot-at "$SLOT_AT" >> "$LOG" 2>&1
+  S2=$?
+  (exit $(( S1 ? S1 : S2 )))
 else
   .venv/bin/python -m stockmoney.desk.run "$1" >> "$LOG" 2>&1
 fi

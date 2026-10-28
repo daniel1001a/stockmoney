@@ -158,7 +158,9 @@ class AlpacaOptionsData:
         from alpaca.trading.client import TradingClient
         from alpaca.trading.enums import AssetStatus
         from alpaca.trading.requests import GetOptionContractsRequest
+        from stockmoney.desk.execution.alpaca import install_timeout
         tc = TradingClient(self._key, self._secret, paper=self._paper, raw_data=True)
+        install_timeout(tc)  # one hung open-interest page must not eat the tick's alarm
         out, token = [], None
         while True:
             resp = tc.get_option_contracts(GetOptionContractsRequest(
