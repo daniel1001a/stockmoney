@@ -169,15 +169,18 @@ def backfill(con, ind: Ind, through: pd.Timestamp, recorded_at: str) -> Wind:
 
 
 def options_by_wind(con) -> pd.DataFrame:
-    """Closed options positions (live and shadow) with the wind state of the
-    session before their trade day, i.e. what a 09:30 decision could know."""
+    """Filled and closed options positions with the wind state of the session
+    before their trade day, i.e. what a 09:30 decision could know. Abandoned
+    entries (never filled) are dropped, and only exit variant A is kept so each
+    setup counts once per book (variants are never mixed, options/config.py)."""
     ensure_schema(con)
     if not con.execute("SELECT 1 FROM sqlite_master WHERE name='options_positions'").fetchone():
         return pd.DataFrame()
     rows = con.execute(
-        "SELECT p.day, p.mode, p.source, p.exit_variant, p.direction, p.realized_usd - p.fees_usd AS pnl,"
+        "SELECT p.day, p.mode, p.dte_label, p.source, p.direction, p.realized_usd - p.fees_usd AS pnl,"
         " (SELECT w.state FROM wind_daily w WHERE w.date < p.day ORDER BY w.date DESC LIMIT 1) AS wind"
-        " FROM options_positions p WHERE p.exit_time IS NOT NULL").fetchall()
+        " FROM options_positions p WHERE p.exit_time IS NOT NULL AND p.state != 'ABANDONED'"
+        " AND COALESCE(p.exit_variant, 'A') = 'A'").fetchall()
     return pd.DataFrame([dict(r) for r in rows])
 
 
@@ -194,10 +197,10 @@ def report(con) -> str:
         lines.append(f"| {r[0]} | {STATE_LABEL.get(r[1], r[1])} | {r[2]:+d} | {r[3]} | {', '.join(json.loads(r[4])) or '無'} |")
     df = options_by_wind(con)
     if not df.empty and df["wind"].notna().any():
-        g = df.dropna(subset=["wind"]).groupby(["source", "wind"])["pnl"]
-        lines += ["", "期權已平倉單依前一日風向(每筆淨損益,美元):", "",
-                  "| 來源 | 風向 | 筆數 | 平均 | 合計 |", "|---|---|---|---|---|"]
-        for (src, w), s in g:
-            lines.append(f"| {src} | {STATE_LABEL.get(w, w)} | {len(s)} | {s.mean():+.0f} | {s.sum():+.0f} |")
+        g = df.dropna(subset=["wind"]).groupby(["mode", "dte_label", "source", "wind"])["pnl"]
+        lines += ["", "期權已成交且已平倉單依前一日風向(出場版本 A,每筆淨損益,美元):", "",
+                  "| 帳本 | 天期 | 來源 | 風向 | 筆數 | 平均 | 合計 |", "|---|---|---|---|---|---|---|"]
+        for (mode, dte, src, w), s in g:
+            lines.append(f"| {mode} | {dte} | {src} | {STATE_LABEL.get(w, w)} | {len(s)} | {s.mean():+.0f} | {s.sum():+.0f} |")
         lines.append("任一格少於 30 筆不下結論;同一天多筆高度相關,實際獨立樣本更少。")
     return "\n".join(lines)

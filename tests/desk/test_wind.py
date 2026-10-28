@@ -94,15 +94,17 @@ def test_report_groups_options_by_prior_wind(ind):
     con = _con()
     d = ind.close.index
     wind.record(con, ind, d[400], "x")
-    con.execute("CREATE TABLE options_positions (day TEXT, mode TEXT, source TEXT, exit_variant TEXT,"
-                " direction TEXT, realized_usd REAL, fees_usd REAL, exit_time TEXT)")
-    con.execute("INSERT INTO options_positions VALUES (?,?,?,?,?,?,?,?)",
-                (str(d[401].date()), "shadow", "orb15", "A", "call", 120.0, 2.0, "t"))
-    con.execute("INSERT INTO options_positions VALUES (?,?,?,?,?,?,?,?)",
-                (str(d[401].date()), "shadow", "orb15", "A", "call", 50.0, 1.0, None))  # open: excluded
+    con.execute("CREATE TABLE options_positions (day TEXT, mode TEXT, dte_label TEXT, source TEXT,"
+                " exit_variant TEXT, state TEXT, direction TEXT, realized_usd REAL, fees_usd REAL, exit_time TEXT)")
+    day = str(d[401].date())
+    for row in [("shadow", "1-3dte", "orb15", "A", "EXITED", "call", 120.0, 2.0, "t"),
+                ("shadow", "1-3dte", "orb15", "B", "EXITED", "call", 90.0, 2.0, "t"),  # variant B: excluded
+                ("live", "1-3dte", "orb15", "A", "ABANDONED", "call", 0.0, 0.0, "t"),  # never filled: excluded
+                ("shadow", "1-3dte", "orb15", "A", "OPEN", "call", 50.0, 1.0, None)]:  # open: excluded
+        con.execute("INSERT INTO options_positions VALUES (?,?,?,?,?,?,?,?,?,?)", (day, *row))
     df = wind.options_by_wind(con)
     assert len(df) == 1 and df.pnl.iloc[0] == 118.0 and df.wind.iloc[0] == wind.wind(ind, d[400]).state
-    assert "| orb15 |" in wind.report(con)
+    assert "| shadow | 1-3dte | orb15 |" in wind.report(con)
 
 
 class _Inner:
@@ -129,3 +131,4 @@ def test_wind_guard(monkeypatch):
 def test_registered():
     assert {"shadow:combined_wind", "shadow:combined_nohead"} <= set(shadow.VARIANTS)
     assert HYPOTHESES["H5"]["candidate"] == "shadow:combined_wind"
+    assert HYPOTHESES["H5b"]["candidate"] == "shadow:combined_nohead"
