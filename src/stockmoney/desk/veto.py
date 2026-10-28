@@ -30,12 +30,25 @@ holidays are ignored, which only makes the window slightly longer.
 Direction of authority: this module is read by the risk layer's BUY check only.
 Sells and stops never call it. Missing tables, unreadable rows or any read error
 mean "no veto" (logged); a veto is never inferred from absence of data.
+
+Jev catalyst filter (2026-10-27, docs/desk/OPERATING_PLAN.md): a flagged item is a
+risk vote only when the news is bad for the stock. Structured items (RESEARCH_REPLY
+risk_flags, research_flags rows) are risk by construction and count as before. A
+free-text item (a Muse ALERT or confirmed Grok event headline) is asked of TypeSafe
+Jev (pinned JEV_MODEL, 1 s timeout, no retries) whenever the veto would block or
+passes on exactly one vote; it stops counting only when Jev reads it as clearly
+positive and not negative (an earnings beat, 2026-10-23 PG). No key, a timeout or
+any error keeps the item counting, so Jev can only lift a block, never add one.
+Every judged item is written to veto_jev_shadow (not committed here) for the review.
 """
 from __future__ import annotations
 
 import json
 import logging
+import os
 import sqlite3
+import time
+from concurrent.futures import ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
@@ -43,6 +56,7 @@ from zoneinfo import ZoneInfo
 import numpy as np
 
 from stockmoney.desk.learn import corroboration
+from stockmoney.desk.learn.prescreen import JEV_MODEL
 
 log = logging.getLogger(__name__)
 ET = ZoneInfo("America/New_York")
@@ -50,6 +64,11 @@ DAYS = 4
 MIN_SOURCES = 2
 FLAGGED = ("elevated", "critical")
 SOURCES = ("muse", "grok", "filings", "insider", "earnings")
+JEV_TIMEOUT_S = 1.0  # per check; past it every unanswered item keeps counting
+JEV_MAX_ITEMS = 6  # free-text items asked per check; the rest count as before
+JEV_POSITIVE_MIN = 0.6  # an item stops counting only when P(positive) >= this
+JEV_NEGATIVE_MAX = 0.4  # ... and P(negative) <= this
+JEV_OFF_ENV = "DESK_VETO_JEV"  # '0' turns the Jev filter off (every item counts)
 
 SCHEMA = (
     """CREATE TABLE IF NOT EXISTS research_flags (
@@ -66,6 +85,16 @@ SCHEMA = (
     """CREATE TABLE IF NOT EXISTS veto_unconfirmed (
          id INTEGER PRIMARY KEY AUTOINCREMENT, symbol TEXT NOT NULL, seen_at TEXT NOT NULL,
          reason TEXT, sources_json TEXT, client_order_id TEXT NOT NULL UNIQUE)""",
+    # one row per free-text item Jev was asked about in a check: jev_p = P(negative for the
+    # stock over the next few days), jev_p_positive the mirror question; NULL with error set
+    # when Jev was unavailable or late. excluded = the item stopped counting as a risk vote.
+    # decision_before / decision: 'block' or 'pass' without / with the filter.
+    """CREATE TABLE IF NOT EXISTS veto_jev_shadow (
+         id INTEGER PRIMARY KEY AUTOINCREMENT, symbol TEXT NOT NULL, client_order_id TEXT,
+         item_ref TEXT, source TEXT, item_type TEXT, text TEXT, jev_p REAL, jev_p_positive REAL,
+         excluded INTEGER NOT NULL DEFAULT 0, latency_ms REAL, error TEXT, model TEXT,
+         votes_before INTEGER, votes_after INTEGER, decision_before TEXT, decision TEXT,
+         created_at TEXT NOT NULL)""",
 )
 
 
@@ -121,7 +150,7 @@ def _bridge_items(con, sym: str, since: str) -> dict[str, list[dict]]:
                     if norm(e["ticker"]) == sym and e.get("severity") in FLAGGED and e.get("urls"):
                         out["grok" if e.get("confirmed") is True else "grok_unconfirmed"].append({"ref": f"{r['msg_id']}:{i}", "type": "GROK_DAILY", "urls": [str(u) for u in e.get("urls", [])],
                                             "detail": f"{e['severity']}: {str(e.get('headline', ''))[:60]}",
-                                            "at": r["received_at"]})
+                                            "text": str(e.get("headline") or ""), "at": r["received_at"]})
                 except (KeyError, TypeError, AttributeError):
                     continue
             continue
@@ -132,14 +161,16 @@ def _bridge_items(con, sym: str, since: str) -> dict[str, list[dict]]:
                 continue
         except (KeyError, TypeError, AttributeError):
             continue
+        text = ""  # free text Jev may read; structured risk_flags are risk by construction
         if r["type"] == "ALERT" and m.get("severity") in FLAGGED:
             detail = f"{m['severity']}: {str(m.get('headline', ''))[:60]}"
+            text = str(m.get("headline") or "")
         elif r["type"] == "RESEARCH_REPLY" and m.get("risk_flags"):
             detail = f"risk_flags: {'; '.join(str(f) for f in m['risk_flags'])[:60]}"
         else:
             continue
         out["muse"].append({"ref": r["msg_id"], "type": r["type"], "urls": [str(u) for u in m.get("source_urls", [])],
-                            "detail": detail, "at": r["received_at"]})
+                            "detail": detail, "text": text, "at": r["received_at"]})
     return out
 
 
@@ -190,14 +221,122 @@ def _parts(items: dict[str, list[dict]]) -> str:
     return "; ".join(f"{s}({it[0]['detail']})" for s, it in items.items())
 
 
-def check(con, symbol: str, now: datetime | None = None, days: int = DAYS, min_sources: int = MIN_SOURCES) -> VetoResult:
-    """Never raises: any read problem is logged and means no veto."""
+_client_box: list = []  # the process's TypeSafe client, made on first use
+
+
+def jev_client():
+    """TypeSafe client for the catalyst filter, or None (no key, SDK missing,
+    DESK_VETO_JEV=0). None means every flagged item counts, as before the filter."""
+    if os.environ.get(JEV_OFF_ENV) == "0" or not os.environ.get("TYPESAFE_API_KEY"):
+        return None
+    if not _client_box:
+        try:
+            from typesafe_sdk import RetryPolicy, TypeSafeClient
+            _client_box.append(TypeSafeClient(retry=RetryPolicy(max_retries=0), timeout=JEV_TIMEOUT_S))
+        except Exception as e:  # ImportError, bad config
+            log.warning("veto Jev client unavailable: %s: %s", type(e).__name__, e)
+            return None
+    return _client_box[0]
+
+
+def _ask_jev(client, sym: str, it: dict) -> dict:
+    t0 = time.monotonic()
+    try:
+        from typesafe_sdk import Noul
+        resp = client.system_one(
+            state={"news": {"ticker": sym, "source": it["type"], "text": it["text"]}},
+            questions={
+                "negative": Noul(instructions=f"Is this news negative for the stock price of {sym} over the next few days?"),
+                "positive": Noul(instructions=f"Is this news positive for the stock price of {sym} over the next few days?"),
+            },
+            model=JEV_MODEL, timeout=JEV_TIMEOUT_S)
+        return {"p": float(resp.answers["negative"].noul), "p_pos": float(resp.answers["positive"].noul),
+                "model": str(resp.model or JEV_MODEL), "error": "", "latency_ms": (time.monotonic() - t0) * 1000}
+    except Exception as e:  # TypeSafeError, network, timeout, schema
+        return {"p": None, "p_pos": None, "model": JEV_MODEL, "error": type(e).__name__,
+                "latency_ms": (time.monotonic() - t0) * 1000}
+
+
+def _judge(sym: str, todo: list[tuple[str, dict]]) -> list[dict]:
+    """Jev answers for (source, item) pairs, in order. Fail-open: a missing client,
+    an error or no answer within JEV_TIMEOUT_S gives p None and the item keeps counting."""
+    client = None
+    try:
+        client = jev_client()
+    except Exception as e:
+        log.warning("veto Jev client failed: %s: %s", type(e).__name__, e)
+    if client is None:
+        return [{"p": None, "p_pos": None, "model": "", "error": "unavailable", "latency_ms": None} for _ in todo]
+    t0 = time.monotonic()
+    pool = ThreadPoolExecutor(max_workers=len(todo))
+    try:
+        futs = [pool.submit(_ask_jev, client, sym, it) for _, it in todo]
+        wait(futs, timeout=JEV_TIMEOUT_S)
+        late = (time.monotonic() - t0) * 1000
+        return [f.result() if f.done() else
+                {"p": None, "p_pos": None, "model": JEV_MODEL, "error": "timeout", "latency_ms": late} for f in futs]
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
+
+
+def _positive(j: dict) -> bool:
+    return j["p"] is not None and j["p_pos"] >= JEV_POSITIVE_MIN and j["p"] <= JEV_NEGATIVE_MAX
+
+
+def _filter_catalysts(con, symbol: str, items: dict[str, list[dict]], min_sources: int,
+                      client_order_id: str) -> dict[str, list[dict]]:
+    """Drop free-text items Jev reads as positive catalysts, when the decision is in play
+    (would block, or passes on exactly one vote). Writes veto_jev_shadow; never raises."""
+    before = vote_count(items)
+    if before < 1 or (before != 1 and before < min_sources):
+        return items
+    todo = [(src, it) for src in ("muse", "grok") for it in items.get(src, []) if it.get("text")][:JEV_MAX_ITEMS]
+    if not todo:
+        return items
+    sym = norm(symbol)
+    try:
+        answers = _judge(sym, todo)
+    except Exception as e:  # never let the filter break a buy check
+        log.warning("veto Jev check failed for %s: %s: %s", sym, type(e).__name__, e)
+        return items
+    drop = {id(it) for (_, it), j in zip(todo, answers) if _positive(j)}
+    kept = {s: [it for it in v if id(it) not in drop] for s, v in items.items()}
+    kept = {s: v for s, v in kept.items() if v}
+    after = vote_count(kept)
+
+    def dec(n: int) -> str:
+        return "block" if n >= min_sources else "pass"
+
+    try:
+        ensure_schema(con)
+        now = datetime.now(timezone.utc).isoformat()
+        con.executemany(
+            "INSERT INTO veto_jev_shadow (symbol, client_order_id, item_ref, source, item_type, text, jev_p, "
+            "jev_p_positive, excluded, latency_ms, error, model, votes_before, votes_after, decision_before, "
+            "decision, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            [(sym, client_order_id, str(it["ref"]), src, it["type"], it["text"][:500], j["p"], j["p_pos"],
+              int(id(it) in drop), j["latency_ms"], j["error"], j["model"], before, after, dec(before), dec(after), now)
+             for (src, it), j in zip(todo, answers)])
+    except sqlite3.Error as e:
+        log.warning("veto_jev_shadow write failed for %s: %s", sym, e)
+    for (src, it), j in zip(todo, answers):
+        if id(it) in drop:
+            log.info("veto: %s %s %s not counted, Jev reads it positive (p_neg %.2f, p_pos %.2f)",
+                     sym, src, it["ref"], j["p"], j["p_pos"])
+    return kept
+
+
+def check(con, symbol: str, now: datetime | None = None, days: int = DAYS, min_sources: int = MIN_SOURCES,
+          client_order_id: str = "") -> VetoResult:
+    """Never raises: any read problem is logged and means no veto. Writes
+    veto_jev_shadow rows (uncommitted) when the Jev catalyst filter runs."""
     try:
         items = _collect_all(con, symbol, now, days)
     except (sqlite3.Error, ValueError, TypeError) as e:
         log.warning("research veto read failed for %s: %s: %s", symbol, type(e).__name__, e)
         return VetoResult()
     unconfirmed = items.pop("grok_unconfirmed", [])
+    items = _filter_catalysts(con, symbol, items, min_sources, client_order_id)
     n = vote_count(items)
     if n < min_sources:
         res = VetoResult(False, "", items)

@@ -292,7 +292,8 @@ class RiskEngine:
             tripped, why = self.sleeve_breaker(intent.strategy, snapshot)
             if tripped:
                 return self._block(f"buy blocked: {why}")
-        vt = veto.check(self.con, intent.symbol, days=l.veto_days, min_sources=l.veto_min_sources)
+        vt = veto.check(self.con, intent.symbol, days=l.veto_days, min_sources=l.veto_min_sources,
+                        client_order_id=intent.client_order_id)
         if vt.blocked:
             veto.record(self.con, intent.symbol, vt)
             return self._block(f"buy blocked: {vt.reason}")
