@@ -190,11 +190,39 @@ def test_too_expensive_and_delayed_runs_do_not_skip_early(con):
 def test_last_slot_keeps_its_slot_when_delayed(con):
     set_wind(con, "2026-10-27", "tailwind")
     now = et(DAY, 11, 0)  # the 10:55 fire after the intraday alarm used its 300s
-    assert spreads.open_new(con, FakeData({"SPY": chain(now)}), now, CFG) == []
     data = FakeData({"SPY": chain(now)})
     assert spreads.open_new(con, data, now, CFG, slot=et(DAY, 10, 55)) == ["SPY"]
     q = "SELECT status, skip_reason FROM options_spreads_shadow WHERE underlying = 'QQQ'"
     assert tuple(con.execute(q).fetchone()) == ("SKIPPED", "no_expiry")
+
+
+def test_alarm_mid_run_keeps_names_already_decided(con):
+    set_wind(con, "2026-10-27", "tailwind")
+    now = et(DAY, 10, 55)
+
+    class Hang(FakeData):
+        def option_chain(self, und, lo, hi):
+            if und == "SPY":
+                raise spreads.TickTimeout("alarm")
+            return super().option_chain(und, lo, hi)
+
+    with pytest.raises(spreads.TickTimeout):
+        spreads.open_new(con, Hang({"QQQ": []}), now, CFG)
+    con.rollback()  # what closing the connection does to anything uncommitted
+    rows = con.execute("SELECT underlying, status, skip_reason FROM options_spreads_shadow").fetchall()
+    assert [tuple(r) for r in rows] == [("QQQ", "SKIPPED", "no_expiry")]
+
+
+def test_first_fire_after_the_window_records_missed_names(con):
+    set_wind(con, "2026-10-27", "tailwind")
+    data = FakeData({"SPY": chain(et(DAY, 11, 5))})
+    assert spreads.open_new(con, data, et(DAY, 11, 5), CFG) == []
+    assert data.chain_calls == []
+    rows = con.execute("SELECT underlying, status, skip_reason FROM options_spreads_shadow"
+                       " ORDER BY underlying").fetchall()
+    assert [tuple(r) for r in rows] == [("QQQ", "SKIPPED", "missed_slot"), ("SPY", "SKIPPED", "missed_slot")]
+    assert spreads.open_new(con, data, et(DAY, 11, 15), CFG) == []
+    assert con.execute("SELECT COUNT(*) FROM options_spreads_shadow").fetchone()[0] == 2
 
 
 def test_main_passes_the_slot_and_ignores_an_implausible_one(tmp_path, monkeypatch):

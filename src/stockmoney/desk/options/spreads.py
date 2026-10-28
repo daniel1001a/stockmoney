@@ -77,6 +77,7 @@ MIN_SAMPLES = 30
 MAX_CANDIDATES = 6  # index ETFs plus the top-scored signals: bounds chain downloads per slot
 EXPIRY_SETTLE = time(15, 30)
 MAX_SLOT_LAG_S = 600  # the intraday tick ahead of this one has a 300s alarm
+MISSED_GRACE_MIN = 10  # the first fire after the window records names the last slot never decided
 TICK_TIMEOUT_S = 240
 
 SCHEMA = """
@@ -181,10 +182,13 @@ def open_new(con, data, now: datetime, cfg: OptionsConfig, slot: datetime | None
     """Open spreads for today's candidates (entry window, tailwind only).
     ``slot`` is when the scheduler fired this run: the window and the last-slot
     test use it, so a run delayed by the intraday tick before it keeps its
-    slot; quote freshness always uses ``now``."""
+    slot; quote freshness always uses ``now``. Each underlying is committed
+    as soon as it is decided, so an alarm mid-run keeps what was written."""
     et = (slot or now).astimezone(ET)
     day = et.date()
-    if not ENTRY_WINDOW[0] <= et.time() < ENTRY_WINDOW[1]:
+    window_end = datetime.combine(day, ENTRY_WINDOW[1])
+    missed = ENTRY_WINDOW[1] <= et.time() < (window_end + timedelta(minutes=MISSED_GRACE_MIN)).time()
+    if not (ENTRY_WINDOW[0] <= et.time() < ENTRY_WINDOW[1] or missed):
         return []
     state = wind.state_before(con, day.isoformat())
     if state != "tailwind":
@@ -192,29 +196,32 @@ def open_new(con, data, now: datetime, cfg: OptionsConfig, slot: datetime | None
     done = {r[0] for r in con.execute("SELECT underlying FROM options_spreads_shadow WHERE day = ?",
                                       (day.isoformat(),))}
     held = {r[0] for r in con.execute("SELECT underlying FROM options_spreads_shadow WHERE status = 'OPEN'")}
+    todo = [(u, s) for u, s in candidates(con, day, cfg) if u not in done and u not in held]
+    if missed:  # the last slot died before deciding these: record the gap, never open late
+        for und, source in todo:
+            _skip(con, day.isoformat(), und, source, state, "missed_slot")
+        con.commit()
+        return []
     # the 10:55 slot only
-    last_slot = et.time() >= (datetime.combine(day, ENTRY_WINDOW[1]) - timedelta(minutes=5)).time()
-    picks = []  # network first: no write (and so no lock) is held while chains download
-    for und, source in candidates(con, day, cfg):
-        if und in done or und in held:
-            continue
-        try:
+    last_slot = et.time() >= (window_end - timedelta(minutes=5)).time()
+    opened = []
+    for und, source in todo:
+        try:  # network outside any write: no lock is held while a chain downloads
             chain = data.option_chain(und, day + timedelta(days=DTE_MIN), day + timedelta(days=DTE_MAX))
+            p, reason = pick(chain, day, now, cfg)
         except Exception as e:  # noqa: BLE001 - one failed chain must not stop the others
             log.warning("spreads: chain %s failed: %s", und, e)
-            picks.append((und, source, None, "chain_error"))
-            continue
-        picks.append((und, source, *pick(chain, day, now, cfg)))
-    opened = []
-    for und, source, p, reason in picks:
+            p, reason = None, "chain_error"
         if p is None:
             if last_slot:  # every reason may clear at a later slot of the window
                 _skip(con, day.isoformat(), und, source, state, reason)
+                con.commit()
             continue
         qty = contracts_for(p.debit, cfg)
         if qty == 0:
             if last_slot:  # a cheaper quote may come later in the window
                 _skip(con, day.isoformat(), und, source, state, "too_expensive")
+                con.commit()
             continue
         con.execute(
             "INSERT OR IGNORE INTO options_spreads_shadow (day, underlying, source, wind, status, expiry, long_occ,"
@@ -223,6 +230,7 @@ def open_new(con, data, now: datetime, cfg: OptionsConfig, slot: datetime | None
             (day.isoformat(), und, source, state, p.long.expiry.isoformat(), p.long.occ, p.short.occ,
              p.long.strike, p.short.strike, p.width, qty, p.long.ask, p.short.bid, p.long.delta, p.short.delta,
              p.debit, _iso(now), 2 * qty * cfg.fee_per_contract))
+        con.commit()
         opened.append(und)
     return opened
 
