@@ -126,7 +126,9 @@ def run(con, now: datetime, bars: data.Bars | None = None, shadow_start: str | N
     con.commit()
     if wd:
         parts.append(f"風向:{wd.line()}")
-    pm = guarded("postmortem", lambda: postmortem.update_cards(con, bars, ind))
+    # a card is stamped current only when both inputs above finished this run
+    pm = guarded("postmortem", lambda: postmortem.update_cards(
+        con, bars, ind, inputs_ok=ig is not None and wd is not None, rebuild_finals=bool(ig and ig["added"])))
     con.commit()
     if pm is not None:
         parts.append(f"驗屍卡:新增 {pm['new']},更新 {pm['updated']}。")

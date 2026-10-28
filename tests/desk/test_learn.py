@@ -647,6 +647,36 @@ def test_postmortem_final_card_without_wind_facts_is_rebuilt_once(con):
     assert postmortem.update_cards(con, bars, ind)["updated"] == 0
 
 
+def test_postmortem_final_card_is_not_stamped_when_inputs_failed(con):
+    """A run whose chain ingest or wind backfill failed leaves the final card
+    unstamped; the next good run picks up the missed chain and the wind."""
+    from stockmoney.desk import wind
+    bars = make_bars()
+    ind = compute(bars)
+    d = bars.dates
+    e, x = d[300], d[305]
+    _losing_trade(con, bars, e, x)
+    postmortem.update_cards(con, bars, ind, inputs_ok=False)
+    con.execute("UPDATE trade_postmortem SET status='final'")
+    created = datetime(d[297].year, d[297].month, d[297].day, 21, 0, tzinfo=timezone.utc)
+    chains.add_chain(con, chains.Chain(trigger="t", steps=["s"], confidence=0.5,
+                                       impacts=[{"ticker": "AAPL", "direction": "up", "horizon_days": 5}]), created)
+    assert postmortem.update_cards(con, bars, ind)["updated"] == 1
+    f = json.loads(con.execute("SELECT facts_json FROM trade_postmortem").fetchone()[0])
+    assert len(f["up_chains_before_entry"]) == 1 and f["card_v"] == postmortem.CARD_V
+    con.execute("UPDATE trade_postmortem SET status='final'")
+    assert postmortem.update_cards(con, bars, ind)["updated"] == 0
+    # wind logged later for a session before the entry: the null wind is filled
+    wind.ensure_schema(con)
+    con.execute("INSERT INTO wind_daily (date, state) VALUES (?,?)", (str(d[299].date()), "tailwind"))
+    assert postmortem.update_cards(con, bars, ind)["updated"] == 1
+    f = json.loads(con.execute("SELECT facts_json FROM trade_postmortem").fetchone()[0])
+    assert f["wind_entry"] == "tailwind"
+    con.execute("UPDATE trade_postmortem SET status='final'")
+    assert postmortem.update_cards(con, bars, ind)["updated"] == 0
+    assert postmortem.update_cards(con, bars, ind, rebuild_finals=True)["updated"] == 1
+
+
 def test_postmortem_no_s10_when_entry_is_past_the_impact_horizon(con):
     bars = make_bars()
     ind = compute(bars)
