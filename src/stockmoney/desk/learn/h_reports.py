@@ -1,4 +1,4 @@
-"""Pre-registered hypothesis reports H1, H2 and H5 (docs/desk/EDGE_PLAN.md 2.1(a), 2.5).
+"""Pre-registered hypothesis reports H1, H2, H5 and H5b (docs/desk/EDGE_PLAN.md 2.1(a), 2.5).
 
   H1  shadow:combined_t35   vs shadow:combined   (wider trailing stop, 3.5 ATR)
   H2  shadow:combined_earn7 vs shadow:combined   (no new entries within 7 days of earnings)
