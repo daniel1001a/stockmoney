@@ -4,6 +4,20 @@ Muse 是 Meta 的個人 AI agent(2026-09 推出):能在背景持續工作、能�
 
 分工:**Muse 是 24 小時的眼睛和耳朵,專門看「人」(散戶、網紅、社群情緒);Desk 是大腦和手,只看數字與規則。** 兩者都不信任對方的判斷,只交換可驗證的資料。
 
+## 0. 2026-10-27 協作重新安排(帳戶擁有人決定)
+
+| 角色 | 現況 | 權限 |
+|---|---|---|
+| Grok | 主要情報員。改用自己的地址與密鑰(`GROK_ADDRESS` / `GROK_SHARED_TOKEN` 已設定),協定 v2 見 `GROK_PROMPT.md` | 可提出日內候選(`in_play`、`OPTIONS_PLAN`),規則觸發且風控放行才下單;events / ALERT 參與否決 |
+| Muse | 情報任務暫停(擁有人叫停:效果不佳、準確度不明) | 恢復前一律只能降低風險,不變 |
+| Desk | 大腦與手:規則、風控、下單、學習 | 唯一能下單的一方 |
+| 使用者 | 實盤開關、參數核准 | 最終裁量 |
+
+- Muse 恢復的條件:用來源記分板(`EDGE_PLAN.md`)把 Muse 過去的 SOCIAL_DAILY、CALLS、ALERT、擋單結果打分,證明有價值才恢復,且只恢復有分數的那一項。暫停期間 Muse 寄來的信照收照存,規則不變。
+- 暫停期間 Muse 可選擇做的唯一工作:把 Desk 寄到你 Gmail 的 `REPORT` 摘要轉告你。不需要也可以不做。
+- 推播:Desk 對你的推播照舊走 ntfy(`NTFY_TOPIC`)。agent 通道一律是 email:Muse 的環境連不到 ntfy.sh(見 `MUSE_PROMPT.md`);Grok 能不能用 HTTP POST 由 PING / PONG 握手回報,確認可以之後才評估 ntfy 快速通道,email 永遠保留。
+- Desk 主動寄給 Grok:06:30 ET `DESK_BRIEF`(昨日績效、持倉、問題)、17:45 ET `RESEARCH_REQUEST`(虧損交易與大幅波動的原因),Grok 用早報 notes 與 `RESEARCH_REPLY` 回答。Desk 收信改為交易日 06:00 到 16:30 ET 每 60 秒一次,其他時間每 15 分鐘。這幾項在 Desk 下一版上線後生效。
+
 ## 1. 通道
 
 ```
@@ -45,7 +59,8 @@ Desk ──(寄到你的 Gmail)──> Muse 讀你的信箱 ──> 需要時用
 | `RESEARCH_REPLY` 有風險旗標 | 只算一票,規則同 elevated ALERT(需第二個獨立來源) | 單獨不擋進場 |
 | `SOCIAL_DAILY`、`CALLS` | 只存資料,累積後做統計檢驗 | 驗證通過前不影響任何交易 |
 | `IDEA` | 寫進孵化器 | 不交易 |
-| `GROK_DAILY`(Grok) | 只存資料;事件鏈交給學習層評分 | v1 不擋進場、不推播,驗證通過前不影響任何交易 |
+| `GROK_DAILY`(Grok) | 存資料;事件鏈交給學習層評分;`grok_verified` 且附連結、已證實的 events 參與否決;`in_play`(v2)先影子記錄與計分 | 未達 `EDGE_PLAN.md` 門檻前,`in_play` 不接到下單規則 |
+| `ALERT` / `RESEARCH_REPLY`(Grok,v2) | `grok_verified` 的 ALERT 依 events 規則參與否決;RESEARCH_REPLY 存檔並交給每日覆盤 | 不開倉、不改參數 |
 
 **2026-10-21 Muse 降權(帳戶擁有人決定)**:原規則是任何嚴重度的 `ALERT` 只要命中候選標的就取消進場 3 天,`RESEARCH_REPLY` 有風險旗標就取消進場。這是當初的政策設計,不是實作錯誤;程式與測試都照這張表做。改動後:
 
@@ -60,7 +75,7 @@ Grok 是第二個情報員(看 X),說明與完整格式在 `docs/desk/GROK_PROMP
 
 - 通道(2026-10-21 起,帳號持有人決定):Grok(Pika)有自己的寄件地址與密鑰。主旨格式不變:`[SMD/<TYPE>/<msg_id>] <token>`。`grok-` 開頭的訊息編號只保留給 `GROK_DAILY`,其他類型用了會被拒絕。
   - 環境變數:`GROK_ADDRESS`(一個 email 地址,目前是 super-pika@mail.grokbot.com;程式裡不寫死)與 `GROK_SHARED_TOKEN`(至少 16 個字元、不含空白,檢查規則與 `MUSE_SHARED_TOKEN` 相同)。兩個都設才啟用;只設一個、或與 `MUSE_ADDRESS` / `MUSE_SHARED_TOKEN` 相同,啟動時報錯。兩個都沒設時,行為和以前完全一樣。
-  - 寄件人白名單分開:`GROK_ADDRESS` 只能寄 `GROK_DAILY` 和 `OPTIONS_PLAN`,其他類型拒收為 `type_not_allowed_for_sender`。每個寄件人只比對自己的密鑰(constant-time compare),拿 Muse 的密鑰從 Grok 地址寄會是 `bad_token`。IMAP 搜尋對兩個寄件人各做一次。
+  - 寄件人白名單分開:`GROK_ADDRESS` 只能寄 `GROK_DAILY` 和 `OPTIONS_PLAN`(v2 上線後加上 `ALERT`、`RESEARCH_REPLY`、`PONG`),其他類型拒收為 `type_not_allowed_for_sender`。每個寄件人只比對自己的密鑰(constant-time compare),拿 Muse 的密鑰從 Grok 地址寄會是 `bad_token`。IMAP 搜尋對兩個寄件人各做一次。
   - 來源標記:`bridge_messages.source` 是 `muse`、`grok_verified` 或 `grok_legacy`,`source_reason` 記下降級原因。`grok_verified` = 寄件人是 `GROK_ADDRESS` + 密鑰是 `GROK_SHARED_TOKEN` + DKIM 通過。從 `MUSE_ADDRESS` 寄來的 Grok 類型(舊通道)一律是 `grok_legacy`。加欄位之前的舊資料:Grok 類型視為 `grok_legacy`,其他視為 `muse`。
   - DKIM 檢查(只在 `GROK_ADDRESS` 有設時做):只讀 Gmail 自己加的 `Authentication-Results`,也就是信件最上面那一個,而且它的 authserv-id(第一個分號前的字)必須是 `mx.google.com`;最上面那個不是 Gmail 的,就當作沒有。信件裡更下面的 `Authentication-Results` 可能是寄件人自己偽造的,一律不讀。在那一個標頭裡,要有一項 `dkim=pass`,而且它的 `header.d`,或 `header.i` 的 @ 後面,等於 `GROK_ADDRESS` 的網域或其子網域。不綁 selector(對方換金鑰不會壞)。只有 `d=amazonses.com` 這類寄送服務的簽章通過不算。沒通過或沒有標頭時,信不會被丟掉:照常驗證格式並儲存,但標成 `grok_legacy`,`source_reason` 是 `dkim_header_missing` / `dkim_no_domain` / `dkim_no_pass` / `dkim_domain_mismatch` 之一。
   - 為什麼 DKIM 通過了還要密鑰:DKIM 只證明信是從那個網域寄出,不證明是哪一條線(哪個 agent、哪個帳號)寄的;同網域的其他寄件者也能通過 DKIM。密鑰證明是我們發給 Pika 的那一條線。兩個都要。
@@ -74,7 +89,7 @@ Grok 是第二個情報員(看 X),說明與完整格式在 `docs/desk/GROK_PROMP
 - 可證偽:事件鏈可附 `invalidations`(最多 3 個,`close_below` / `close_above` / `data_not_by`,每個都要有 `by_date`),`IDEA` 也可附同一組。沒有價格條件的鏈照收,但標為不可證偽,不列入命中率與 Brier。學習層在 `by_date` 當天或之後,只用已存的日收盤價判定 held / invalidated / no_data;`data_not_by` 永遠是 no_data。
 - 獨立性:Muse 的 ALERT / RESEARCH_REPLY / IDEA 與 Grok 的事件或事件鏈打到同一標的(前後 3 天)時,學習層比對來源連結(網域加路徑)與作者帳號。有任何重疊就標為 not independent,只算一次確認,不算 Muse 與 Grok 兩次。
 - 範圍:清單(universe 加上 QQQ、TQQQ、BTC/USD)以外的標的,一封超過 5 檔只通知你一次,不拒絕。
-- 格式錯誤:FEEDBACK 會寄到 `MUSE_ADDRESS`(兩個通道都一樣,Desk 不寄信到 `GROK_ADDRESS`),`problem` 開頭是「【給 Grok】」;Muse 的提示詞要它忽略這種 FEEDBACK。修正信每 24 小時最多 10 封,Muse 和 Grok 共用這個上限。
+- 格式錯誤:目前 FEEDBACK 寄到 `MUSE_ADDRESS`(兩個通道都一樣),`problem` 開頭是「【給 Grok】」;Muse 的提示詞要它忽略這種 FEEDBACK。修正信每 24 小時最多 10 封,Muse 和 Grok 共用這個上限。v2 上線後:FEEDBACK 寄回原通道(Grok 通道寄到 `GROK_ADDRESS`),上限改為每個通道各 10 封;資訊類訊息的多餘欄位、壞連結、壞的清單項目改為剔除並回饋,不整封拒收(OPTIONS_PLAN 仍完全嚴格)。
 
 ### 期權劇本 `OPTIONS_PLAN`(Grok,2026-10-14 起自動收件)
 
@@ -97,6 +112,8 @@ Grok 是第二個情報員(看 X),說明與完整格式在 `docs/desk/GROK_PROMP
 - 時間戳:回測一律用 Desk 收到的時間(`received_at`),防止偷看未來。
 
 ## 5. 給 Muse 的完整說明(直接貼給 Muse)
+
+2026-10-27 起暫停,恢復時才貼。暫停期間如果要 Muse 只做轉告,貼這一句即可:「暫停第 1 到 5 項任務。只做第 6 項:收到 Desk 的 `REPORT` 時摘要幾句重點轉告 Daniel。不要寄任何信給 Desk 信箱。」
 
 > **你的角色**
 > 你是 Daniel 交易系統「Trading Desk」的社群情報員。Desk 是自動交易系統,負責看價格和下單;你負責看「人」:社群媒體上散戶與網紅在討論什麼、情緒如何、誰喊了什麼單。你提供的是**資料**,不是建議。不要預測股價,不要建議買賣。
