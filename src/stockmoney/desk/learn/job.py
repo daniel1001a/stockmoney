@@ -18,6 +18,7 @@ Steps (each isolated, a failure in one does not stop the others):
   3f. research flags (earnings, SEC 8-K / Form 4) for the buy-only research veto; EDGAR needs SEC_USER_AGENT
   3g. Fridays: weekly hypotheses recorded in weekly_hypotheses (record only, changes no parameter)
   3h. per-source credibility scoreboard (source_scores, read-only; last 20 / 60 sessions and all-time)
+  3i. wind layer: log wind_daily for each new session, options outcomes sliced by prior-day wind (H5, record only)
   4. allocator recommendation (Fridays or when none logged this week)
   5. report -> data/desk/learn/<date>.md and learn_reports; Friday push summary
 """
@@ -32,7 +33,7 @@ from zoneinfo import ZoneInfo
 
 import pandas as pd
 
-from stockmoney.desk import data, notify, store, veto
+from stockmoney.desk import data, notify, store, veto, wind
 from stockmoney.desk.indicators import compute
 from stockmoney.desk.learn import (allocator, calls, chains, corroboration, counterfactual, earnings, filings,
                                    h_reports, hypotheses, invalidation, links, market_risk, options_postmortem,
@@ -170,6 +171,10 @@ def run(con, now: datetime, bars: data.Bars | None = None, shadow_start: str | N
                      f"失敗 {ps['error']};深度分析完成 {ps['deep_done']}。")
     guarded("scoreboard", lambda: scoreboard.refresh(con, bars, through))
     con.commit()
+    wd = guarded("wind", lambda: wind.backfill(con, ind, through, store.now()))
+    con.commit()
+    if wd:
+        parts.append(f"風向:{wd.line()}")
 
     friday = through.weekday() == 4
     hyp_text = guarded("hypotheses", lambda: hypotheses.run(con, day, include_weekly=False)) if friday else None
@@ -206,6 +211,7 @@ def run(con, now: datetime, bars: data.Bars | None = None, shadow_start: str | N
               guarded("market_risk_report", lambda: market_risk.report(con)) or "", "",
               guarded("veto_report", lambda: veto.report(con, (through - pd.Timedelta(days=7)).date().isoformat())) or "", "",
               guarded("scoreboard_report", lambda: scoreboard.report(con, day)) or "", "",
+              guarded("wind_report", lambda: wind.report(con)) or "", "",
               guarded("h_reports", lambda: h_reports.run_all(con, bars)) or ""]
     con.commit()
     if alloc_text:

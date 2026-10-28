@@ -1,7 +1,8 @@
-"""Pre-registered hypothesis reports H1 and H2 (docs/desk/EDGE_PLAN.md 2.1(a), 2.5).
+"""Pre-registered hypothesis reports H1, H2, H5 and H5b (docs/desk/EDGE_PLAN.md 2.1(a), 2.5).
 
   H1  shadow:combined_t35   vs shadow:combined   (wider trailing stop, 3.5 ATR)
   H2  shadow:combined_earn7 vs shadow:combined   (no new entries within 7 days of earnings)
+  H5  shadow:combined_wind  vs shadow:combined   (new entries only in a tailwind, desk/wind.py)
 
 Both compare the same four things: cumulative return, max drawdown, per-trade
 expectancy with its 95% lower confidence bound (mean - 1.96 * se, EDGE_PLAN
@@ -36,6 +37,10 @@ HYPOTHESES = {
            "title": "H1 出場放寬(移動停損 3.0 改 3.5 ATR)"},
     "H2": {"candidate": "shadow:combined_earn7", "param": "DRAFT:earnings_entry_block_days", "old": 0, "new": 7,
            "title": "H2 財報前 7 天不開新倉"},
+    "H5": {"candidate": "shadow:combined_wind", "param": "DRAFT:wind_entry_gate", "old": "off", "new": "tailwind",
+           "title": "H5 只在順風開新倉(風向層)"},
+    "H5b": {"candidate": "shadow:combined_nohead", "param": "DRAFT:wind_entry_gate", "old": "off", "new": "no_headwind",
+            "title": "H5b 逆風不開新倉(風向層)"},
 }
 DRAFT_MARK = "DRAFT"
 DATA_SEP = " | data="
@@ -143,6 +148,9 @@ def render(res: dict) -> str:
                   f"{res['candidate']['mfe_mae']['n']} 筆;利潤保留率 = 單筆報酬 / MFE 的中位數。",
               f"接受條件(EDGE_PLAN 2.4 / 2.5):兩邊各至少 {MIN_TRADES} 筆已平倉、候選的期望值 95% 下界高於基準、"
               "最大回撤沒有變大。本報告不會改任何規則。"]
+    if res["hypothesis"] in ("H5", "H5b"):
+        lines.append("限制:本報告不檢查「優勢是否主要來自單一時期」;通過前須用 scripts/desk_wind_replay.py "
+                     "確認 2016-2020 與 2021 以後兩段都成立(EDGE_PLAN 2.7 候補 H5)。")
     if res["hypothesis"] == "H1":
         lines.append("限制:影子帳戶 t35 只放寬移動停損,沒有包含 EDGE_PLAN 2.1(a) 的「回檔持有上限 40 改 60 天」,"
                      "也沒有隨機對照百分位;這兩項需另行驗證才能完整回答 H1。")
