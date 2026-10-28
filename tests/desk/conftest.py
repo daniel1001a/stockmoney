@@ -9,6 +9,16 @@ from stockmoney.desk.execution.risk import Limits, RiskEngine
 from stockmoney.desk.execution.types import AssetClass, OrderIntent, Side
 
 
+@pytest.fixture(autouse=True)
+def legacy_desk_defaults(monkeypatch):
+    """Offline, pre-2026-10-27 behavior unless a test says otherwise: stock-sleeve
+    entries on (run.STOCK_ENTRIES_DEFAULT) and no TypeSafe client for the veto's
+    Jev catalyst filter (every flagged item counts, no network)."""
+    from stockmoney.desk import run, veto
+    monkeypatch.setattr(run, "STOCK_ENTRIES_DEFAULT", True)
+    monkeypatch.setattr(veto, "jev_client", lambda: None)
+
+
 @pytest.fixture
 def con(tmp_path):
     with store.connect(tmp_path / "desk.sqlite") as c:
