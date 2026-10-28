@@ -1,6 +1,7 @@
-"""Pre-registered hypothesis reports H1, H2, H5 and H5b (docs/desk/EDGE_PLAN.md 2.1(a), 2.5).
+"""Pre-registered hypothesis reports H1, H1b, H2, H5 and H5b (docs/desk/EDGE_PLAN.md 2.1(a), 2.5).
 
   H1  shadow:combined_t35   vs shadow:combined   (wider trailing stop, 3.5 ATR)
+  H1b shadow:combined_hold60 vs shadow:combined (pullback hold cap 40 -> 60 days)
   H2  shadow:combined_earn7 vs shadow:combined   (no new entries within 7 days of earnings)
   H5  shadow:combined_wind  vs shadow:combined   (new entries only in a tailwind, desk/wind.py)
 
@@ -35,6 +36,8 @@ BASELINE = "shadow:combined"
 HYPOTHESES = {
     "H1": {"candidate": "shadow:combined_t35", "param": "DRAFT:trail_atr", "old": 3.0, "new": 3.5,
            "title": "H1 出場放寬(移動停損 3.0 改 3.5 ATR)"},
+    "H1b": {"candidate": "shadow:combined_hold60", "param": "DRAFT:pullback.max_hold_days", "old": 40, "new": 60,
+            "title": "H1b 回檔策略持有上限 40 改 60 天"},
     "H2": {"candidate": "shadow:combined_earn7", "param": "DRAFT:earnings_entry_block_days", "old": 0, "new": 7,
            "title": "H2 財報前 7 天不開新倉"},
     "H5": {"candidate": "shadow:combined_wind", "param": "DRAFT:wind_entry_gate", "old": "off", "new": "tailwind",
@@ -151,6 +154,9 @@ def render(res: dict) -> str:
     if res["hypothesis"] in ("H5", "H5b"):
         lines.append("限制:本報告不檢查「優勢是否主要來自單一時期」;通過前須用 scripts/desk_wind_replay.py "
                      "確認 2016-2020 與 2021 以後兩段都成立(EDGE_PLAN 2.7 候補 H5)。")
+    if res["hypothesis"] == "H1b":
+        lines.append("限制:持有上限 60 天是看過 2016-2026 歷史重播(scripts/desk_h1_replay.py)後才挑的,"
+                     "歷史區間與現行大幅重疊;只有影子帳戶的前瞻樣本算數(EDGE_PLAN 2.7 候補 H1b)。")
     if res["hypothesis"] == "H1":
         lines.append("限制:影子帳戶 t35 只放寬移動停損,沒有包含 EDGE_PLAN 2.1(a) 的「回檔持有上限 40 改 60 天」,"
                      "也沒有隨機對照百分位;這兩項需另行驗證才能完整回答 H1。")
