@@ -9,7 +9,8 @@ successful send, so a failed send is retried on the next bridge run.
   day's realized P&L per sleeve, its closed trades, the open positions, today's
   earnings calendar (macro: no table yet, omitted) and up to 5 questions about
   moves over 3% in held or traded names.
-- RESEARCH_REQUEST, at or after 17:45 ET on trading days: one per name that
+- RESEARCH_REQUEST, at or after 17:45 ET on trading days once postclose has
+  booked the day (none that day if it has not by 21:00 ET): one per name that
   closed a losing trade today or that is held / traded and moved more than 3%
   today; "why did X move", deadline 21:00 ET. Grok answers with RESEARCH_REPLY
   (request_id = the request's msg_id); muse_ops.check_deliveries reports a late one.
@@ -239,6 +240,17 @@ def _done(con, key: str) -> bool:
     return con.execute("SELECT 1 FROM bridge_ops WHERE key=?", (key,)).fetchone() is not None
 
 
+def _postclose_done(con, day: date) -> bool:
+    """Postclose books the day's sells; the bridge runs apart from it and does
+    not wait on the desk lock, so the requests wait for its marker; by
+    REPLY_BY without it the day is closed with nothing sent."""
+    from stockmoney.desk.run import PLAN_THROUGH_KEY
+    if not con.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='settings'").fetchone():
+        return False
+    r = con.execute("SELECT value FROM settings WHERE key=?", (PLAN_THROUGH_KEY,)).fetchone()
+    return r is not None and r[0] >= str(day)
+
+
 def run(con, box, now: datetime, config=None, returns: Returns | None = None) -> list[str]:
     """Send whatever is due. Returns one line per mail sent (for the job log)."""
     from stockmoney.desk.bridge import outbox
@@ -263,8 +275,10 @@ def run(con, box, now: datetime, config=None, returns: Returns | None = None) ->
         muse_ops.log_outbound(con, msg, "grok")
         muse_ops._once(con, f"brief:{day}")
         lines.append(f"DESK_BRIEF 已寄給 Grok({msg.msg_id})")
-    if local.time() >= REQUEST_AT and not _done(con, f"grokrq:{day}"):
-        msgs = build_requests(con, now, returns)
+    booked = _postclose_done(con, day)
+    if local.time() >= REQUEST_AT and not _done(con, f"grokrq:{day}") and (booked or local.time() >= REPLY_BY):
+        # past the reply deadline without postclose: close the day unsent
+        msgs = build_requests(con, now, returns) if booked else []
         for m in msgs:
             outbox.send(box, m, config, channel="grok")
             muse_ops.log_outbound(con, m, "grok")

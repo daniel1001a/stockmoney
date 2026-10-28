@@ -75,6 +75,8 @@ LABEL = {
     "muse_calls": "Muse 喊單(5 日超額)", "muse_alert": "Muse ALERT elevated/critical(5 日超額)",
     "grok_alert": "Grok ALERT elevated/critical(5 日超額)",
     "grok_alert:legacy": "Grok ALERT 未驗證通道(只供參考)", "grok_in_play:legacy": "Grok in_play 未驗證通道(只供參考)",
+    "grok_chains:legacy": "Grok 事件鏈 未驗證通道(只供參考)", "grok_market_risk:legacy": "Grok 大盤風險 未驗證通道(只供參考)",
+    "grok_calls:legacy": "Grok 轉述喊單 未驗證通道(只供參考)",
     "muse_alert_block": "Muse ALERT 擋單", "muse_risk_flags_block": "Muse 風險旗標擋單",
     "research_veto_block": "研究否決擋單(Muse/Grok/申報)", "muse_legacy_rule": "舊 Muse 規則(會擋未擋)",
     "grok_options_plan:live": "Grok 期權劇本(紙上實單)", "grok_options_plan:shadow": "Grok 期權劇本(影子)",
@@ -162,36 +164,56 @@ def in_play_obs(con, bars: Bars) -> list[dict]:
     return out
 
 
+def _grok(name: str, source) -> str:
+    """``name`` for a GROK_DAILY from the verified channel, ``name:legacy``
+    for anything else (unverified, or no owner known)."""
+    from stockmoney.desk.bridge.inbox import SOURCE_GROK_VERIFIED, source_of
+    return name if source_of(source, "GROK_DAILY") == SOURCE_GROK_VERIFIED else f"{name}:legacy"
+
+
 def chain_obs(con) -> list[dict]:
+    """Grok chains score by the message that wrote the row (chain_owners); an
+    unowned chain is never treated as verified."""
     if not (_has(con, "chain_scores") and _has(con, "chains")):
         return []
-    rows = con.execute("SELECT c.created_at, s.direction, s.excess_ret, s.hit, s.confidence FROM chain_scores s "
-                       "JOIN chains c ON c.chain_id=s.chain_id "
+    from stockmoney.desk.learn.chains import grok_chain_owners
+    owners = grok_chain_owners(con)
+    rows = con.execute("SELECT c.chain_id, c.created_at, s.direction, s.excess_ret, s.hit, s.confidence "
+                       "FROM chain_scores s JOIN chains c ON c.chain_id=s.chain_id "
                        "WHERE s.declared=1 AND c.falsifiable=1 AND c.source='grok'").fetchall()
-    return [_obs(_et(r["created_at"]).date(), "grok_chains", r["hit"],
-                 r["excess_ret"] * (1 if r["direction"] == "up" else -1), r["confidence"]) for r in rows]
+    out = []
+    for r in rows:
+        owner = owners.get(r["chain_id"])
+        label = _grok("grok_chains", owner["source"] if owner is not None else None)
+        out.append(_obs(_et(r["created_at"]).date(), label, r["hit"],
+                        r["excess_ret"] * (1 if r["direction"] == "up" else -1), r["confidence"]))
+    return out
 
 
 def market_risk_obs(con) -> list[dict]:
     if not _has(con, "grok_market_risk"):
         return []
     out = []
-    for r in con.execute("SELECT base_day, level, ret_5 FROM grok_market_risk WHERE ret_5 IS NOT NULL").fetchall():
+    for r in con.execute("SELECT base_day, level, ret_5, source FROM grok_market_risk "
+                         "WHERE ret_5 IS NOT NULL").fetchall():
         sign = 1 if r["level"] == "low" else -1
         signed = r["ret_5"] * sign
-        out.append(_obs(r["base_day"], "grok_market_risk", int(signed > 0) if r["ret_5"] != 0 else 0, signed))
+        out.append(_obs(r["base_day"], _grok("grok_market_risk", r["source"]),
+                        int(signed > 0) if r["ret_5"] != 0 else 0, signed))
     return out
 
 
 def calls_obs(con) -> list[dict]:
     if not (_has(con, "call_scores") and _has(con, "bridge_messages")):
         return []
-    rows = con.execute("SELECT s.base_date, s.excess_ret, s.hit, a.direction, b.type FROM call_scores s "
-                       "JOIN author_calls a USING (call_id) JOIN bridge_messages b ON b.msg_id=a.source_msg "
-                       "WHERE s.horizon=5").fetchall()
+    from stockmoney.desk.bridge.inbox import has_source_column
+    src = "b.source" if has_source_column(con) else "NULL"
+    rows = con.execute(f"SELECT s.base_date, s.excess_ret, s.hit, a.direction, b.type, {src} AS source "
+                       "FROM call_scores s JOIN author_calls a USING (call_id) "
+                       "JOIN bridge_messages b ON b.msg_id=a.source_msg WHERE s.horizon=5").fetchall()
     side = {"long": 1, "short": -1}
-    return [_obs(r["base_date"], "muse_calls" if r["type"] == "CALLS" else "grok_calls", r["hit"],
-                 r["excess_ret"] * side.get(r["direction"], 0)) for r in rows if r["direction"] in side]
+    return [_obs(r["base_date"], "muse_calls" if r["type"] == "CALLS" else _grok("grok_calls", r["source"]),
+                 r["hit"], r["excess_ret"] * side.get(r["direction"], 0)) for r in rows if r["direction"] in side]
 
 
 def alert_obs(con, bars: Bars) -> list[dict]:

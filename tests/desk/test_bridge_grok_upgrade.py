@@ -223,6 +223,18 @@ def test_pruning_never_empties_a_list_that_had_items():
     assert inbox.lenient_validate(json.dumps(r), "RESEARCH_REPLY") == (None, [])
 
 
+def test_pruning_a_side_section_to_empty_keeps_the_digest():
+    """One bad item that is the only one in an optional section (in_play,
+    tracked_accounts) is dropped; the events in the same digest are kept."""
+    d = grok_daily()
+    assert d["events"]
+    d["tracked_accounts"] = ["not a handle!"]
+    d["in_play"] = [{"bad": 1}]
+    msg, dropped = inbox.lenient_validate(json.dumps(d), "GROK_DAILY")
+    assert msg is not None and dropped
+    assert msg.tracked_accounts == [] and msg.in_play == [] and len(msg.events) == len(d["events"])
+
+
 def test_options_plan_stays_strict(con):
     box = FakeMailbox()
     plan = {"protocol": "1", "msg_id": "grok-plan-20261027", "sent_at": "2026-10-27T08:00:00-04:00",
@@ -337,6 +349,12 @@ def desk(con):
     return con
 
 
+def booked(con, day="2026-10-27"):
+    """What postclose leaves behind: the session it planned through."""
+    con.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)")
+    con.execute("INSERT OR REPLACE INTO settings VALUES ('last_postclose_through', ?)", (day,))
+
+
 def returns(day):
     return {PREV: {"AMD": -0.051, "NVDA": 0.012, "QQQ": 0.004, "MSFT": 0.0},
             DAY: {"NVDA": 0.045, "MSFT": -0.01, "AMD": 0.0}}.get(day, {})
@@ -391,6 +409,7 @@ def test_failed_send_is_retried(desk):
 
 def test_research_requests_after_1745(desk):
     desk.execute("INSERT INTO bridge_ops VALUES ('brief:2026-10-27', 'x')")
+    booked(desk)
     box = FakeMailbox()
     assert grok_outbound.run(desk, box, et(17, 44), CONFIG, returns) == []
     lines = grok_outbound.run(desk, box, et(17, 45), CONFIG, returns)
@@ -404,8 +423,30 @@ def test_research_requests_after_1745(desk):
     assert grok_outbound.run(desk, box, et(18, 0), CONFIG, returns) == []
 
 
+def test_research_requests_wait_for_postclose(desk):
+    """A bridge poll after 17:45 that runs before postclose has booked the day
+    sends nothing and leaves the day open; by 21:00 without it the day closes
+    unsent (a request past its own deadline is no use)."""
+    desk.execute("INSERT INTO bridge_ops VALUES ('brief:2026-10-27', 'x')")
+    box = FakeMailbox()
+    assert grok_outbound.run(desk, box, et(17, 50), CONFIG, returns) == []
+    booked(desk, "2026-10-26")  # yesterday's marker does not count
+    assert grok_outbound.run(desk, box, et(18, 0), CONFIG, returns) == []
+    assert box.sent == [] and not grok_outbound._done(desk, "grokrq:2026-10-27")
+    booked(desk)
+    assert len(grok_outbound.run(desk, box, et(18, 5), CONFIG, returns)) == 1
+    assert {r["ticker"] for r in _bodies(box, "RESEARCH_REQUEST")} == {"MSFT", "NVDA"}
+
+    desk.execute("DELETE FROM bridge_ops WHERE key='grokrq:2026-10-27'")
+    booked(desk, "2026-10-26")
+    box = FakeMailbox()
+    assert grok_outbound.run(desk, box, et(21, 0), CONFIG, returns) == []
+    assert box.sent == [] and grok_outbound._done(desk, "grokrq:2026-10-27")
+
+
 def test_late_grok_reply_is_reported_on_the_grok_wording(desk, pages):
     desk.execute("INSERT INTO bridge_ops VALUES ('brief:2026-10-27', 'x')")
+    booked(desk)
     box = FakeMailbox()
     grok_outbound.run(desk, box, et(17, 45), CONFIG, returns)
     out = muse_ops.check_deliveries(desk, et(21, 30))

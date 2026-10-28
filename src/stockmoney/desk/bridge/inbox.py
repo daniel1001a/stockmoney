@@ -73,6 +73,9 @@ GROK_TYPES = frozenset({"GROK_DAILY", "OPTIONS_PLAN"})  # Grok-only types (sourc
 GROK_SENDER_TYPES = GROK_TYPES | {"ALERT", "RESEARCH_REPLY", "PONG"}
 # information-only types: stored, never an order input; these may be pruned (see above)
 INFO_TYPES = frozenset({"GROK_DAILY", "SOCIAL_DAILY", "CALLS", "ALERT", "RESEARCH_REPLY", "IDEA", "PONG"})
+# top-level lists that pruning may not empty when they arrived with items
+_KEEP_NONEMPTY = {"GROK_DAILY": ("events",), "RESEARCH_REPLY": ("risk_flags",),
+                  "SOCIAL_DAILY": ("items",), "CALLS": ("calls",)}
 
 BRIDGE_SCHEMA = """
 CREATE TABLE IF NOT EXISTS bridge_messages (
@@ -397,9 +400,10 @@ def lenient_validate(text: str, subj_type: str):
     if not isinstance(data, dict) or data.get("type") != subj_type or model is None:
         return None, []
     dropped: list[dict] = []
-    # a list that had items must keep at least one: pruning GROK_DAILY.events to
-    # nothing would read as an intentional empty digest
-    filled = [k for k, v in data.items() if isinstance(v, list) and v]
+    # a list whose emptiness means something must keep at least one item:
+    # pruning GROK_DAILY.events to nothing would read as an intentional empty
+    # digest. A side section (in_play, chains, tracked_accounts ...) may go empty.
+    filled = [k for k in _KEEP_NONEMPTY.get(subj_type, ()) if isinstance(data.get(k), list) and data[k]]
     for _ in range(_MAX_PRUNE_STEPS):
         try:
             msg = _INBOUND.validate_json(json.dumps(data), strict=True)

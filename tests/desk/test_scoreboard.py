@@ -124,6 +124,41 @@ def test_market_risk_hit_definition(con):
     assert sorted((o["hit"], round(o["signed"], 3)) for o in obs) == [(0, -0.01), (0, -0.01), (1, 0.005), (1, 0.02)]
 
 
+def test_chains_market_risk_and_calls_grade_only_verified_grok(con):
+    """Unverified GROK_DAILY (grok_legacy, or a row from before the source
+    column) scores under ``:legacy``, never as Grok; an unowned chain is legacy."""
+    from stockmoney.desk.learn import calls as learn_calls
+    learn_calls.ensure_schema(con)
+    for mid, src in (("gv", "grok_verified"), ("gl", "grok_legacy"), ("gn", None)):
+        con.execute("INSERT INTO bridge_messages (msg_id, type, sender, sent_at, received_at, raw_body, parsed_json, "
+                    "source) VALUES (?,?,?,?,?,?,?,?)", (mid, "GROK_DAILY", "g", "2026-10-01T12:00:00+00:00",
+                                                         "2026-10-01T12:00:00+00:00", "{}",
+                                                         json.dumps({"chains": [{}]}), src))
+    for cid, owner in (("cv", "gv"), ("cl", "gl"), ("cu", None)):
+        con.execute("INSERT INTO chains (chain_id, created_at, source, falsifiable) VALUES (?,?,?,1)",
+                    (cid, "2026-10-01T12:00:00+00:00", "grok"))
+        con.execute("INSERT INTO chain_scores (chain_id, ticker, horizon, declared, direction, excess_ret, hit, "
+                    "confidence) VALUES (?,?,?,?,?,?,?,?)", (cid, "AAPL", 5, 1, "up", 0.01, 1, 0.6))
+        if owner:
+            con.execute("INSERT INTO chain_owners VALUES (?,?)", (cid, owner))
+    assert sorted(o["source"] for o in sb.chain_obs(con)) == ["grok_chains", "grok_chains:legacy",
+                                                               "grok_chains:legacy"]
+    con.executemany("INSERT INTO grok_market_risk (msg_id, level, base_day, ret_5, source) VALUES (?,?,?,?,?)",
+                    [("gv", "low", "2026-10-01", 0.01, "grok_verified"), ("gl", "low", "2026-10-01", 0.01,
+                                                                          "grok_legacy"),
+                     ("gn", "low", "2026-10-01", 0.01, None)])
+    assert sorted(o["source"] for o in sb.market_risk_obs(con)) == ["grok_market_risk", "grok_market_risk:legacy",
+                                                                     "grok_market_risk:legacy"]
+    con.execute("INSERT INTO bridge_messages (msg_id, type, sender, sent_at, received_at, raw_body, parsed_json, "
+                "source) VALUES ('mc','CALLS','m','x','x','{}','{}','muse')")
+    for cid, mid in (("k1", "gv"), ("k2", "gl"), ("k3", "gn"), ("k4", "mc")):
+        con.execute("INSERT INTO author_calls (call_id, direction, source_msg) VALUES (?,?,?)", (cid, "long", mid))
+        con.execute("INSERT INTO call_scores (call_id, horizon, base_date, excess_ret, hit) VALUES (?,5,?,?,1)",
+                    (cid, "2026-10-01", 0.02))
+    assert sorted(o["source"] for o in sb.calls_obs(con)) == ["grok_calls", "grok_calls:legacy",
+                                                               "grok_calls:legacy", "muse_calls"]
+
+
 def test_block_sources_and_counterfactual_hit(con):
     rows = [("1", "2026-10-01", "muse_alert", "Muse ALERT elevated: x", -0.03, 1, 0),
             ("2", "2026-10-02", "muse_alert", "Muse ALERT elevated: x", 0.05, 0, 0),  # repeat block: skipped
