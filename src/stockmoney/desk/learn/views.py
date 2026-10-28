@@ -93,6 +93,8 @@ BOOK_LABEL = {
     "shadow:combined_t35": "寬停損 3.5 ATR",
     "shadow:combined_earn7": "財報前 7 天不進場",
     "shadow:combined_muse_strict": "舊 Muse 規則擋單(對照)",
+    "shadow:combined_wind": "只在順風進場(H5)",
+    "shadow:combined_nohead": "逆風不進場",
     "shadow:breakout": "只用突破",
     "shadow:pullback": "只用回檔",
     "shadow:rotation": "只用輪動",

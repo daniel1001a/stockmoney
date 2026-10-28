@@ -1,7 +1,8 @@
-"""Pre-registered hypothesis reports H1 and H2 (docs/desk/EDGE_PLAN.md 2.1(a), 2.5).
+"""Pre-registered hypothesis reports H1, H2 and H5 (docs/desk/EDGE_PLAN.md 2.1(a), 2.5).
 
   H1  shadow:combined_t35   vs shadow:combined   (wider trailing stop, 3.5 ATR)
   H2  shadow:combined_earn7 vs shadow:combined   (no new entries within 7 days of earnings)
+  H5  shadow:combined_wind  vs shadow:combined   (new entries only in a tailwind, desk/wind.py)
 
 Both compare the same four things: cumulative return, max drawdown, per-trade
 expectancy with its 95% lower confidence bound (mean - 1.96 * se, EDGE_PLAN
@@ -36,6 +37,8 @@ HYPOTHESES = {
            "title": "H1 出場放寬(移動停損 3.0 改 3.5 ATR)"},
     "H2": {"candidate": "shadow:combined_earn7", "param": "DRAFT:earnings_entry_block_days", "old": 0, "new": 7,
            "title": "H2 財報前 7 天不開新倉"},
+    "H5": {"candidate": "shadow:combined_wind", "param": "DRAFT:wind_entry_gate", "old": "off", "new": "tailwind",
+           "title": "H5 只在順風開新倉(風向層)"},
 }
 DRAFT_MARK = "DRAFT"
 DATA_SEP = " | data="

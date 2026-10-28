@@ -44,6 +44,28 @@ class EarningsGuard:
         return getattr(self._inner, item)
 
 
+class WindGuard:
+    """Wraps a strategy and drops every entry signal unless the wind state of
+    the decision session is in ``allowed`` (EDGE_PLAN H5). Exits are untouched."""
+
+    def __init__(self, inner: Strategy, allowed: frozenset[str]):
+        self._inner, self._allowed = inner, allowed
+        self.name, self.params = inner.name, inner.params
+
+    def candidates(self, ctx):
+        from stockmoney.desk import wind
+        if wind.wind(ctx.ind, ctx.t).state not in self._allowed:
+            return []
+        return self._inner.candidates(ctx)
+
+    def __getattr__(self, item):
+        return getattr(self._inner, item)
+
+
+def _wind_book(*allowed: str) -> Callable:
+    return lambda day, con=None: {n: WindGuard(REGISTRY[n](), frozenset(allowed)) for n in REGISTRY}
+
+
 def _book(**params) -> Callable:
     return lambda day, con=None: {n: REGISTRY[n](**params.get(n, {})) for n in REGISTRY}
 
@@ -106,6 +128,9 @@ VARIANTS: dict[str, Callable] = {
     "shadow:combined_t35": _book(breakout={"trail_atr": 3.5}, pullback={"trail_atr": 3.5}),
     # control for the 2026-10-21 Muse downgrade: entries filtered by the old Muse rule
     "shadow:combined_muse_strict": _muse_strict_book,
+    # H5 in docs/desk/EDGE_PLAN.md: entries only in a tailwind / never in a headwind (desk/wind.py)
+    "shadow:combined_wind": _wind_book("tailwind"),
+    "shadow:combined_nohead": _wind_book("tailwind", "neutral"),
     "shadow:breakout": _single("breakout"),
     "shadow:pullback": _single("pullback"),
     "shadow:rotation": _single("rotation"),
@@ -194,7 +219,7 @@ def report(con) -> str:
              "| 帳戶 | 累計報酬 | 最大回撤 |", "|---|---|---|"]
     for c in [c for c in eq.columns if c.startswith("bench:") or c in
               ("shadow:combined", "shadow:combined_t35", "shadow:combined_earn7", "shadow:combined_muse_strict",
-               "shadow:breakout", "shadow:pullback", "shadow:rotation")]:
+               "shadow:combined_wind", "shadow:combined_nohead", "shadow:breakout", "shadow:pullback", "shadow:rotation")]:
         lines.append(f"| {c} | {ret[c]:+.2%} | {dd[c]:.2%} |")
     for label, cols in (("隨機進場(多頭排列)", rnd_t), ("隨機進場(不限)", rnd_a)):
         if cols:
