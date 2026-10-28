@@ -102,7 +102,8 @@
 
 **自動排程**(launchd,美東,週一到週五;見 `src/stockmoney/desk/run.py`)
 - 08:45 `premarket`:套用 Muse 旗標、過風控、送開盤市價單(先出場、再補停損、最後進場)
-- 09:50 `postopen`:同步成交、掛券商端停損
+- 09:50 與 10:00 `postopen`:同步成交、掛券商端停損;10:00 那次補做 09:50 連不上券商而沒做的事(開盤單補單、延後的出場),每個計畫仍最多補單一次
+  - 2026-10-21(帳戶擁有者決定):開盤單(OPG)若到期或被取消而未全數成交,`postopen` 對缺少的股數補送一次 DAY 市價買單;走同一套風控(上限、熔斷、kill switch、價格帶、當下的 Muse 旗標),被擋就不送並記錄原因;美東 10:30 後不補,剩餘股數作廢;已成交部分不重送,每筆計畫最多補一次(client id 結尾 `-rt`)
 - 16:45 `postclose`:同步成交、對帳、上移停損、規劃隔天的單,寄日報
 - 每 15 分鐘 `bridge`:收 Muse 的信;開機時 `recover`:補成交、補停損、清孤兒單
 
@@ -168,6 +169,13 @@
 
 `scripts/classify_scan.py --engine claude|jev|shadow`(預設 claude)。Jev(釘 `jev-1.13.0`)做高頻低複雜度判斷:相關性、是否值得升級為候選、各 ticker 的情緒;ticker 由程式碼找出,Jev 只判斷不生成。不確定、候選價值高或 Jev 出錯的項目升級給 Claude CLI。原始機率先寫入 `jev_judgments`(migration 041)再依門檻路由,門檻(`jev_classify.py` 常數)為暫定值。
 
+2026-10-21 補充(去重與略過):
+- 去重:同一標的、正規化後文字相同(NFKC、忽略大小寫與標點),或同一則 ALERT / RESEARCH_REPLY / IDEA 以 `-rN` 重送,只判斷第一則。之後的副本照樣寫入帳本,`dup_of` 指向第一則,沿用其原始機率(token 記 0),再以副本自己的旁路重新路由,所以降風險的副本仍會 pass。第一則判斷失敗時副本自行判斷。已升級的第一則,其副本不再重複做深度分析。既有帳本列只補標 `dup_of`,不改判斷。
+- 沒有 risk_flags 的 RESEARCH_REPLY 記為 `skipped`(原因 `research_reply_no_risk_flags`),不再被誤記為 pass。有 risk_flags 的照舊旁路通過。
+- 深度分析每次上限 10 則為硬上限,呼叫端傳更大的值也會被截到 10。
+- 週五學習報告新增「情報預篩週報」:升級率與省下的 Claude 呼叫、封存項目中 Claude 標註為重要的比例、高風險分數標的事後 5 日超額報酬(對 SPY,只用於校準降風險,每組不足 5 筆顯示資料不足)、Jev 與 Claude 標註不一致的案例。標註以 `desk_prescreen.py labels FILE.csv` 匯入 `prescreen_labels`,只用於報告,不改路由或門檻。
+- 快照重算(2026-10-20 帳本 600 列,套用去重與略過):去重 70 列、略過 8 列,剩 522 則獨立判斷。60 則抽樣標註:pass 精確度 16/22 = 72.7%(原 16/30 = 53.3%),封存但重要 2/29 = 6.9%(原 2/30 = 6.7%)。門檻未變,仍維持 shadow。
+
 驗證流程:
 1. 影子期 5 個交易日:`--engine shadow`,套用 Claude 結果,Jev 只記錄(需 `TYPESAFE_API_KEY`,只放伺服器端,由使用者設定)。
 2. 以 Sonnet 暫代標註建立驗證集,對照 `jev_judgments`,依資料校準門檻、檢查升級率與直接路由的準確度。
@@ -185,14 +193,22 @@
 |---|---|
 | pass | 旁路(ALERT elevated/critical、有 risk_flags 的 RESEARCH_REPLY、GROK event severity critical/elevated),或 actionable >= 0.70,或風險分數 >= 2.0 且信心 >= 0.60 |
 | archive | relevant < 0.30,或其餘低訊號 |
-| hold | 介於兩者之間 |
-| error | Jev 失敗,下次重跑 |
+| hold | 介於兩者之間(不確定,見下方升級規則) |
+| skipped | 沒有 risk_flags 的 RESEARCH_REPLY(狀態摘要),不呼叫 Jev |
+| error | Jev 失敗,下次重跑;旁路項目在 Jev 失敗時仍記為 pass(機率留空) |
 
 規則:
 - 只標記,不刪除、不隱藏。chains / calls 的 5/20/60 日評分照常以全部資料計算,預篩只決定誰值得付費深度分析。
 - 降低風險的訊號永不被過濾(旁路)。
-- pass 的項目才進深度分析(Claude CLI,`--tools ""`,結果存 `deep_json`:傳導、受影響標的、風險備註、待查證項目)。輸出不接任何下單路徑,也不改任何參數。
+- pass 的項目優先進深度分析,hold(不確定)在同一上限內排在 pass 之後升級給 Claude(Claude CLI,`--tools ""`,結果存 `deep_json`:傳導、受影響標的、風險備註、待查證項目)。輸出不接任何下單路徑,也不改任何參數。
 - `DESK_PRESCREEN=off|shadow|on`,預設 off。shadow 只判斷與記錄,on 才做深度分析(每次最多 10 則,每項最多重試 3 次)。需 `TYPESAFE_API_KEY`(由使用者設定)。
+
+2026-10-21 補充(去重與略過):
+- 去重:同一標的、正規化後文字相同(NFKC、忽略大小寫與標點),或同一則 ALERT / RESEARCH_REPLY / IDEA 以 `-rN` 重送,只判斷第一則。之後的副本照樣寫入帳本,`dup_of` 指向第一則,沿用其原始機率(token 記 0),再以副本自己的旁路重新路由,所以降風險的副本仍會 pass。第一則判斷失敗時副本自行判斷。已升級的第一則,其副本不再重複做深度分析。既有帳本列只補標 `dup_of`,不改判斷。
+- 沒有 risk_flags 的 RESEARCH_REPLY 記為 `skipped`(原因 `research_reply_no_risk_flags`),不再被誤記為 pass。有 risk_flags 的照舊旁路通過。
+- 深度分析每次上限 10 則為硬上限,呼叫端傳更大的值也會被截到 10。
+- 週五學習報告新增「情報預篩週報」:升級率與省下的 Claude 呼叫、封存項目中 Claude 標註為重要的比例、高風險分數標的事後 5 日超額報酬(對 SPY,只用於校準降風險,每組不足 5 筆顯示資料不足)、Jev 與 Claude 標註不一致的案例。標註以 `desk_prescreen.py labels FILE.csv` 匯入 `prescreen_labels`,只用於報告,不改路由或門檻。
+- 快照重算(2026-10-20 帳本 600 列,套用去重與略過):去重 70 列、略過 8 列,剩 522 則獨立判斷。60 則抽樣標註:pass 精確度 16/22 = 72.7%(原 16/30 = 53.3%),封存但重要 2/29 = 6.9%(原 2/30 = 6.7%)。門檻未變,仍維持 shadow。
 
 驗證流程:
 1. 影子期 5 個交易日:`DESK_PRESCREEN=shadow`,累積 `prescreen_judgments`。
@@ -203,5 +219,38 @@
 .venv/bin/python scripts/desk_prescreen.py items            # 列出待判斷項目(不呼叫 API)
 .venv/bin/python scripts/desk_prescreen.py run --mode shadow
 .venv/bin/python scripts/desk_prescreen.py report
+.venv/bin/python scripts/desk_prescreen.py labels FILE.csv  # 匯入重要性標註(item_id, important 或 sonnet_important)
+.venv/bin/python scripts/desk_prescreen.py weekly           # 週報段落(不呼叫 API)
 .venv/bin/python -m pytest tests/desk/test_prescreen.py -q
 ```
+
+## 11. 紙上積極期(2026-10-21 使用者指示:紙上要大膽,趕快找 pattern 和自己的交易方式)
+
+**目的**:紙上交易沒有真錢風險,最貴的是時間。標準檔每月只有 20-60 筆交易,學不到東西。積極期用更大的下注和更多的位置換取樣本數,再用內部模擬帳戶(標準檔)當對照組,看「大膽」到底有沒有加分。
+
+**實作**:`desk/profiles.py`,環境變數 `DESK_PROFILE=standard|paper_aggressive`(預設 standard)。
+
+| | standard | paper_aggressive |
+|---|---|---|
+| 每筆風險 | 0.75% | 1.5% |
+| 最多持股 / 同板塊 | 8 / 2 | 12 / 3 |
+| 單檔上限 | 20% | 25% |
+| 單筆訂單上限 | 25% | 30% |
+| 加密曝險上限 | 30% | 40% |
+
+- **只限紙上**:`ALPACA_ENV` 不是 paper 時 `profiles.active()` 直接拒絕。實盤閘門(第 7 節、EDGE_PLAN 第 5 節)不變。
+- 回撤熔斷(-20% 減半、-35% 停新單)、策略虧損停用、kill switch、研究否決**全部保留**,積極只放大下注,不拆煞車。
+- 對照組:內部模擬帳戶與 `shadow:*` 影子帳戶仍用標準檔。積極期結束時比較 Alpaca 帳戶與 shadow:combined 的每筆期望值與回撤。
+- 積極期的結果**不能**直接當成實盤參數:樣本小、倖存者偏差、大下注放大雜訊。它的用途是產生假設,假設仍走第 6 節的流程。
+
+**接下來(依序,每項走「假設 → 回測 → 影子 → 核准」)**
+1. 積極期跑 2-4 週,用驗屍卡症狀統計找重複出現的虧損類型與賺錢類型,寫成假設。
+2. **即時化路徑**(待設計,尚未實作):先做「盤中掃描」——每 5-15 分鐘用 Alpaca 即時資料重算突破/回檔訊號,下單仍走同一個風控層;確認紙上能穩定跑後再考慮串流與日內策略。紙上選擇權模組 2026-10-14 起已在紙上帳戶下單(見 `OPTIONS_PLAN.md`),積極檔不放大選擇權部位;選擇權是否有效依第 4 項的 shadow 對照與實際成交落差評估,實盤前另走閘門。
+3. **Grok + Claude 分工**:Grok 負責 X 上的即時情報與市場排行/情緒(只降風險權限,見 EDGE_PLAN 第 3 節);Claude 負責程式、回測、驗屍與覆盤。兩者獨立指向同一標的記為特徵。新想法的權限擴大(例如讓共識微調部位)要使用者明確核准並修改 `MUSE_BRIDGE.md`。
+4. 用高階模型只做規劃與假設審查(例如 Opus 做週覆盤一次),日常掃描與分類用 Jev / Haiku,控制 token。
+
+## 12. 2026-10-27 變更:中長期只給建議;研究否決排除利多
+
+**股票策略只給建議**(使用者決定「中長期只給建議」):breakout、pullback、rotation 不再自動進場。設定 `stock_entries_enabled`(預設 0,首次讀取時寫入 `param_changes`)。收盤後照常算訊號與部位大小,但寫成 `planned_orders.status='advisory'`,日報列在「中長期建議(不自動下單)」,不送任何 OPG/DAY 買單,開盤剩餘股數也不補單。既有持股的 GTC 停損、出場、對帳、報表照常。要恢復自動進場,由使用者把設定改回 1。
+
+**研究否決排除利多**:證據是 32 次否決後 5 日平均跑贏 SPY 約 2.4-2.9%,且 10-23 PG 因「財報超預期」被算成風險票而擋下。現在自由文字項目(Muse ALERT、Grok 已確認事件)在否決會成立或只差一票時問 Jev(固定 `jev-1.13.0`,逾時 1 秒,不重試);讀成明確利多(P 正面 ≥ 0.6 且 P 負面 ≤ 0.4)才不計票。結構化項目(risk_flags、申報、內部人、財報日)照舊計票。Jev 沒金鑰、逾時或出錯一律照舊計票,所以 Jev 只能解除否決,不能新增。每次判斷寫入 `veto_jev_shadow`(機率、延遲、錯誤、前後決定),週覆盤檢查有沒有放走壞消息。關閉:`DESK_VETO_JEV=0`。

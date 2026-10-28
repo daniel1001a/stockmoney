@@ -169,6 +169,9 @@ elif page == "情報員":
                     for k, v in split[views.GROK].items():
                         label = v["name"] if grok_on else f"{v['name']}(檢查未啟用)"
                         st.metric(label, f"{v['on_time']}/{v['due']}", help="近 7 天準時送達 / 應送達(只算交易日早報)")
+                    today = muse_ops.grok_today(con, datetime.now(timezone.utc))
+                    shown = st.error if today["status"] == "missed" else st.caption
+                    shown("今天早報:" + muse_ops.grok_today_text(today))
                     n_chain = con.execute("SELECT COUNT(*) FROM chains WHERE source='grok'").fetchone()[0]
                     st.metric("已進入評分的事件鏈", n_chain)
                     st.caption(f"最近一封:{last_msg[views.GROK] or '尚無'}")
@@ -185,7 +188,10 @@ elif page == "情報員":
                     st.info("尚未收到 GROK_DAILY。第一封預計由 Pika 在 20:00 ET(晚報)或 07:30 ET(早報)寄出。")
                 else:
                     d = g["data"]
-                    st.caption(f"最新一封:{g['msg_id']},我們收到的時間 {g['received_at']}")
+                    st.caption(f"最新一封:{g['msg_id']},我們收到的時間 {g['received_at']}"
+                               "(這可能是前一天的信;今天是否漏交見總覽)")
+                    if not d["events"]:
+                        st.info("這封是空白日報:Pika 有寄信,回報沒有事件。")
                     st.subheader("事件")
                     st.dataframe(pd.DataFrame(d["events"]), hide_index=True, alt="Grok 事件")
                     st.subheader("事件鏈")
@@ -198,7 +204,12 @@ elif page == "情報員":
                     st.subheader("喊單")
                     st.dataframe(pd.DataFrame(d["calls"]), hide_index=True, alt="Grok 記錄的喊單")
                     st.subheader("熱度變化")
-                    st.dataframe(pd.DataFrame(d["attention"]), hide_index=True, alt="Grok 熱度變化")
+                    st.caption("熱度只供閱讀,不進任何計算或門檻;沒有提供時這裡是空的。")
+                    st.dataframe(pd.DataFrame(d.get("attention") or []), hide_index=True, alt="Grok 熱度變化")
+                    if d.get("market_risk"):
+                        mr = d["market_risk"]
+                        st.subheader("大盤風險判讀(只記錄,不影響下單)")
+                        st.write(f"{mr['level']}:{mr['summary']}")
                 st.subheader("收到的訊息")
                 st.dataframe(views.messages(con, views.GROK), hide_index=True, alt="Pika 收到的訊息")
                 st.subheader("被拒絕的訊息")

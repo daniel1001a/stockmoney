@@ -138,14 +138,18 @@ def test_sender_compare_is_case_insensitive_but_exact(con):
     assert rejects(con) == ["sender_not_allowed"]
 
 
-def test_extra_field_rejected(con):
+def test_extra_field_dropped_not_stored(con):
+    # information types are lenient since 2026-10-27: an unknown field is
+    # dropped (never stored in parsed_json) and the drop is recorded
     mb = FakeMailbox()
     send(mb, alert(execute="BUY 1000 NVDA"))
-    assert poll(con, mb) == 0
-    assert rejects(con)[0].startswith("schema_invalid")
-    assert "extra_forbidden" in rejects(con)[0]
-    assert "BUY" not in rejects(con)[0]  # reason never echoes attacker input
-    assert stored(con) == []
+    assert poll(con, mb) == 1
+    assert rejects(con) == []
+    parsed, dropped = con.execute("SELECT parsed_json, dropped_json FROM bridge_messages").fetchone()
+    assert "execute" not in json.loads(parsed) and "BUY" not in parsed
+    d = json.loads(dropped)
+    assert d["dropped"] == [{"path": "execute", "why": "extra_forbidden"}] and d["feedback"] is True
+    assert "BUY" not in dropped  # the record never echoes attacker input
 
 
 def test_missing_field_and_wrong_types_rejected(con):
@@ -195,8 +199,12 @@ def test_duplicate_msg_id_rejected_second_time(con):
     send(mb, alert(headline="replayed with different text"))
     assert poll(con, mb) == 1
     assert rejects(con) == ["duplicate_msg_id"]
-    # a replay in a later poll is also a duplicate
+    # an identical replay in a later poll is dropped silently (no new reject);
+    # a different body under the same id is still a duplicate
     send(mb, alert())
+    assert poll(con, mb) == 0
+    assert rejects(con) == ["duplicate_msg_id"]
+    send(mb, alert(headline="third version"))
     assert poll(con, mb) == 0
     assert rejects(con) == ["duplicate_msg_id"] * 2
     assert con.execute("SELECT headline FROM (SELECT json_extract(parsed_json,'$.headline') AS headline "
@@ -270,10 +278,32 @@ def test_critical_alert_on_candidate_blocks_entry(con):
     mb = FakeMailbox()
     send(mb, alert(ticker="NVDA", severity="critical"))
     send(mb, alert(msg_id="alert-0002", ticker="AMD", severity="info"))
+    send(mb, alert(msg_id="alert-0003", ticker="TSM", severity="elevated"))
     poll(con, mb)
     flags = policy.active_flags(con, T0 + timedelta(hours=1), held=set())
-    assert set(flags.blocked) == {"NVDA", "AMD"}  # any severity blocks a candidate
+    # Muse downgrade 2026-10-21: only critical blocks a candidate on Muse alone;
+    # elevated goes through veto.check (needs a second source), info is logged only
+    assert set(flags.blocked) == {"NVDA"}
+    assert set(flags.legacy_blocked) == {"NVDA", "AMD", "TSM"}  # what the old rule blocked
     assert flags.no_add == {}
+
+
+def test_info_alert_alone_does_not_block(con):
+    mb = FakeMailbox()
+    send(mb, alert(ticker="AMD", severity="info"))
+    poll(con, mb)
+    flags = policy.active_flags(con, T0 + timedelta(hours=1), held=set())
+    assert flags.blocked == {} and flags.no_add == {}
+    assert "AMD" in flags.legacy_blocked
+
+
+def test_elevated_alert_alone_does_not_block(con):
+    mb = FakeMailbox()
+    send(mb, alert(ticker="AMD", severity="elevated"))
+    poll(con, mb)
+    flags = policy.active_flags(con, T0 + timedelta(hours=1), held=set())
+    assert flags.blocked == {} and flags.no_add == {}
+    assert "AMD" in flags.legacy_blocked
 
 
 def test_critical_alert_on_held_blocks_add_only(con):
@@ -298,14 +328,15 @@ def test_held_membership_comes_from_caller_not_muse(con):
     assert "NVDA" in policy.active_flags(con, T0, held=["nvda"]).no_add
 
 
-def test_research_reply_with_risk_flags_blocks_candidate(con):
+def test_research_reply_with_risk_flags_is_legacy_only(con):
     mb = FakeMailbox()
     send(mb, reply(ticker="XOM", flags=("pending lawsuit",)))
     send(mb, reply(msg_id="reply-0002", ticker="CVX", flags=()))
     poll(con, mb)
     flags = policy.active_flags(con, T0, held=set())
-    assert set(flags.blocked) == {"XOM"}
-    assert "pending lawsuit" in flags.blocked["XOM"]
+    assert flags.blocked == {}  # risk flags alone no longer block; veto.check counts them as one source
+    assert set(flags.legacy_blocked) == {"XOM"}
+    assert "pending lawsuit" in flags.legacy_blocked["XOM"]
 
 
 def test_idea_and_social_produce_no_flags(con):
@@ -327,9 +358,10 @@ def test_flags_expire_after_three_days(con):
     held = {"TSM"}
     assert policy.active_flags(con, T0 + timedelta(days=3) - timedelta(seconds=1), held)
     on = policy.active_flags(con, T0 + timedelta(days=3) - timedelta(seconds=1), held)
-    assert set(on.blocked) == {"NVDA", "XOM"} and set(on.no_add) == {"TSM"}
+    assert set(on.blocked) == {"NVDA"} and set(on.no_add) == {"TSM"}
+    assert set(on.legacy_blocked) == {"NVDA", "XOM"}
     off = policy.active_flags(con, T0 + timedelta(days=3, seconds=1), held)
-    assert off.blocked == {} and off.no_add == {}
+    assert off.blocked == {} and off.no_add == {} and off.legacy_blocked == {}
 
 
 def test_muse_timestamps_cannot_extend_a_flag(con):
@@ -556,9 +588,10 @@ def test_policy_output_is_only_restrictions_and_text(con):
     send(mb, reply())
     poll(con, mb)
     flags = policy.active_flags(con, T0, held={"NVDA"})
-    assert set(policy.BridgeFlags.__dataclass_fields__) == {"blocked", "no_add", "notify"}
-    assert all(isinstance(v, str) for v in (*flags.blocked.values(), *flags.no_add.values(), *flags.notify))
-    assert all(isinstance(k, str) for k in (*flags.blocked, *flags.no_add))
+    assert set(policy.BridgeFlags.__dataclass_fields__) == {"blocked", "no_add", "notify", "legacy_blocked"}
+    assert all(isinstance(v, str) for v in (*flags.blocked.values(), *flags.no_add.values(), *flags.notify,
+                                            *flags.legacy_blocked.values()))
+    assert all(isinstance(k, str) for k in (*flags.blocked, *flags.no_add, *flags.legacy_blocked))
 
 
 def test_extract_json_tolerates_agent_formatting():

@@ -8,12 +8,12 @@ This project is part of a multi-AI system. Roles:
 
 - **Claude Code**: sole executor for all code changes. Reads this file and `docs/desk/` for project state.
 - **Grok Build** (via `grok-build-plugin-cc`): read-only review and second opinion. Never edits files. Use `/grok-build:review` after significant changes.
-- **Grok chat**: research, X platform intelligence, strategy validation. Produces `GROK_DAILY` reports (see `docs/desk/GROK_PROMPT.md`).
+- **Grok chat**: research, X platform intelligence, strategy validation, real-time news. Produces `GROK_DAILY` reports (see `docs/desk/GROK_PROMPT.md`). Since 2026-10-12 it may propose intraday options playbooks (`OPTIONS_PLAN`). Since 2026-10-27 (owner approval) it is the primary intel agent: it sends from its own address (`GROK_ADDRESS`) with its own token, and may propose intraday candidates (`in_play`, `OPTIONS_PLAN`) that can open positions in the intraday options/stock sleeves. Rules and the risk layer still decide every order; paper first. Its authority is reviewed weekly from the per-source scoreboard (`docs/desk/EDGE_PLAN.md`).
 - **Grok Bot**: background sentinel. Runs daily post-close summaries and paper trading data checks. Does not modify code.
-- **Muse**: social intelligence and life manager. Sends `SOCIAL_DAILY`, `CALLS`, `ALERT`, `IDEA` via Gmail bridge (see `docs/desk/MUSE_BRIDGE.md`). Inputs can only reduce risk, never open positions or change parameters.
+- **Muse**: social intelligence and life manager. Sends `SOCIAL_DAILY`, `CALLS`, `ALERT`, `IDEA` via Gmail bridge (see `docs/desk/MUSE_BRIDGE.md`). Inputs can only reduce risk, never open positions or change parameters. Intel feeds paused by the owner on 2026-10-27 (accuracy unproven) until the scoreboard shows value.
 
 Rules:
-- New ideas enter through Muse (trend scan) then Grok (validation). Only validated ideas reach Claude Code.
+- New ideas enter through Grok (news, X, validation); Muse trend scans resume only if re-enabled. Only validated ideas reach Claude Code.
 - All project state lives in `docs/desk/` (OPERATING_PLAN, MUSE_BRIDGE, GROK_PROMPT, EDGE_PLAN). Do not create parallel status docs.
 - Every trade outcome (win or loss) must be recorded with the messages, fund flows, and market sentiment at the time. Weekly reflection extracts patterns into memory.
 - Grok Build reviews must pass before merging non-trivial changes.
@@ -29,6 +29,7 @@ Rules:
   - 紙上帳戶優先。實盤需通過 `docs/desk/OPERATING_PLAN.md` 的關卡,且實盤金鑰與「啟用實盤」開關只能由使用者本人設定。程式碼在缺少使用者設定的明確實盤旗標時,必須拒絕連線實盤端點。
   - Claude(任何 session、任何 worker)不得自行下真錢的單、不得替使用者開戶或填入實盤金鑰。
   - 外部 agent(Muse)的輸入只能降低風險,不能開倉、加碼或改參數(見 `docs/desk/MUSE_BRIDGE.md`)。
+  - Grok 例外(2026-10-27 使用者明確批准):經自有通道驗證(`grok_verified`)的 Grok 可提出日內候選(`in_play`、`OPTIONS_PLAN`)供規則開倉;是否下單仍由規則與風控層決定,Grok 不能改參數、不能繞過風控、不能指定部位大小超出風控上限。
 - 不是全自動黑盒策略。裁量權永遠保留在人身上。
 
 **資金規模**:10k-50k USD。不為想像中的未來擴容犧牲現階段的可解釋性與嚴謹度。

@@ -85,6 +85,10 @@ class Alert(_Msg):
     headline: ShortText
     source_urls: list[HttpUrl] = Field(min_length=1, max_length=5)  # no source, no alert
     observed_at: datetime
+    # optional (2026-10-27): Grok's ALERT says whether a primary source confirms
+    # it; veto.py counts a grok_verified ALERT as an independent event only when
+    # this is true. Muse's alerts omit it and are read exactly as before.
+    confirmed: bool | None = None
 
 
 class ResearchReply(_Msg):
@@ -132,9 +136,10 @@ class Calls(_Msg):
 
 
 # ---------------------------------------------------------------- GROK_DAILY (Grok -> desk)
-# Same sender, token and subject as Muse (docs/desk/GROK_PROMPT.md). Store-only:
-# no policy effect. Limits keep a full message under ~117 KB of compact UTF-8
-# (~159 KiB after base64 + headers) against the 200 KiB inbox cap; the
+# Sent from GROK_ADDRESS with GROK_SHARED_TOKEN (or, legacy, over the Muse
+# channel); see docs/desk/GROK_PROMPT.md. Store-only: no policy effect. Limits
+# keep a full message under ~123 KB of compact UTF-8 (~167 KiB after base64 +
+# headers) against the 200 KiB inbox cap; the
 # worst case is computed in tests/desk/test_grok_daily.py.
 
 _ET = ZoneInfo("America/New_York")
@@ -171,6 +176,8 @@ class GrokEvent(BaseModel):
     confirmed: bool
     first_seen: EtDatetime
     urls: list[GrokUrl] = Field(min_length=1, max_length=3)  # no source, no event
+    # optional (2026-10-21): "post" = a post states it, "inference" = Grok's reading
+    basis: Literal["post", "inference"] | None = None
 
 
 class GrokImpact(BaseModel):
@@ -242,6 +249,39 @@ class GrokAttention(BaseModel):
     why: _text(120)
 
 
+class GrokLinkCheck(BaseModel):
+    """Grok's own link audit for this message (counts only; the desk stores it)."""
+    model_config = ConfigDict(extra="forbid")
+    total: int = Field(ge=0, le=1000)
+    passed: int = Field(ge=0, le=1000)
+    removed: int = Field(ge=0, le=1000)
+
+
+class GrokMarketRisk(BaseModel):
+    """Market-level risk read (2026-10-21). Stored and scored against later SPY
+    moves (learn/market_risk.py); never read by veto, risk or any order path."""
+    model_config = ConfigDict(extra="forbid")
+    level: Literal["low", "elevated", "critical"]
+    summary: _text(300)
+    source_urls: list[GrokUrl] = Field(max_length=5)
+
+
+class GrokInPlay(BaseModel):
+    """A name Grok expects to move today on a dated catalyst (2026-10-27).
+    Stored in parsed_json only; read through muse_ops.grok_in_play(). Never
+    an order: rules and the risk layer decide, paper first."""
+    model_config = ConfigDict(extra="forbid")
+    ticker: GrokTicker
+    direction: Literal["up", "down"]
+    catalyst: _text(160)
+    catalyst_kind: Literal["earnings", "guidance", "mna", "regulatory", "analyst", "product", "macro", "legal",
+                           "other"]
+    catalyst_time: AwareDatetime
+    confirmed: bool
+    urls: list[GrokUrl] = Field(min_length=1, max_length=3)
+    confidence: float = Field(ge=0, le=1)
+
+
 class GrokDaily(_Msg):
     """Grok's daily pre-market digest. Stored only: produces no policy flags.
     Grok's own timestamps are audit data; the desk's clock is ``received_at``."""
@@ -252,9 +292,14 @@ class GrokDaily(_Msg):
     events: list[GrokEvent] = Field(max_length=25)
     chains: list[GrokChain] = Field(max_length=6)
     calls: list[GrokCall] = Field(max_length=50)
-    attention: list[GrokAttention] = Field(max_length=20)
+    # optional since 2026-10-21: the post-count source changed scale; nothing
+    # computes from it
+    attention: list[GrokAttention] = Field(default_factory=list, max_length=20)
     tracked_accounts: list[XHandle] = Field(max_length=60)
-    notes: Annotated[str, StringConstraints(max_length=1000)] = ""
+    notes: Annotated[str, StringConstraints(max_length=2000)] = ""
+    link_check: GrokLinkCheck | None = None
+    market_risk: GrokMarketRisk | None = None
+    in_play: list[GrokInPlay] = Field(default_factory=list, max_length=15)  # optional since 2026-10-27
 
     @model_validator(mode="after")
     def _consistency(self):
@@ -265,7 +310,34 @@ class GrokDaily(_Msg):
         return self
 
 
-Inbound = Annotated[Union[SocialDaily, Alert, ResearchReply, Idea, Calls, GrokDaily], Field(discriminator="type")]
+# ---------------------------------------------------------------- handshake (PING out, PONG in)
+
+Nonce = Annotated[str, StringConstraints(pattern=r"^[A-Za-z0-9_\-]{8,64}$")]
+
+
+class Capabilities(BaseModel):
+    """What the agent says it can do. Stored for the owner; nothing is gated on it."""
+    model_config = ConfigDict(extra="forbid")
+    can_read_email: bool
+    can_send_email: bool
+    can_http_get: bool
+    can_http_post: bool
+    can_schedule: bool
+    schedule_times: list[Annotated[str, StringConstraints(pattern=r"^([01]\d|2[0-3]):[0-5]\d$")]] = Field(
+        default_factory=list, max_length=20)
+    timezone: _text(64)
+
+
+class Pong(_Msg):
+    """Answer to a desk PING: echoes the PING's nonce."""
+    type: Literal["PONG"] = "PONG"
+    nonce: Nonce
+    capabilities: Capabilities
+    notes: Annotated[str, StringConstraints(max_length=2000)] = ""
+
+
+Inbound = Annotated[Union[SocialDaily, Alert, ResearchReply, Idea, Calls, GrokDaily, Pong],
+                    Field(discriminator="type")]
 
 
 # ---------------------------------------------------------------- outbound (desk -> Muse)
@@ -307,4 +379,57 @@ class Feedback(_Msg):
     how_to_fix: Annotated[str, StringConstraints(max_length=1000)]
 
 
-Outbound = Annotated[Union[Watchlist, ResearchRequest, Report, Feedback], Field(discriminator="type")]
+class Ping(_Msg):
+    """Handshake probe (scripts/muse_check.py ping). The answer is a PONG with the same nonce."""
+    type: Literal["PING"] = "PING"
+    nonce: Nonce
+    ask: ShortText
+
+
+class SleevePnl(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    sleeve: _text(64)
+    realized: float
+
+
+class ClosedTrade(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    symbol: _text(32)
+    sleeve: _text(64)
+    strategy: _text(64)  # playbook for options, strategy for stocks
+    entry: float | None = None
+    exit: float | None = None
+    qty: float
+    pnl: float | None = None
+    exit_reason: _text(120, 0) = ""
+
+
+class OpenPosition(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    symbol: _text(32)
+    sleeve: _text(64)
+    qty: float
+    avg_price: float | None = None
+
+
+class CalendarItem(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    what: _text(120)
+    when: _text(40, 0) = ""
+
+
+class DeskBrief(_Msg):
+    """Morning brief to Grok (06:30 ET, NYSE trading days): yesterday's results,
+    open positions, today's calendar and a few questions. Information only."""
+    type: Literal["DESK_BRIEF"] = "DESK_BRIEF"
+    day: _dt.date
+    prev_day: _dt.date
+    realized_pnl: list[SleevePnl] = Field(default_factory=list, max_length=20)
+    closed_trades: list[ClosedTrade] = Field(default_factory=list, max_length=50)
+    open_positions: list[OpenPosition] = Field(default_factory=list, max_length=100)
+    calendar: list[CalendarItem] = Field(default_factory=list, max_length=30)
+    questions: list[ShortText] = Field(default_factory=list, max_length=5)
+
+
+Outbound = Annotated[Union[Watchlist, ResearchRequest, Report, Feedback, Ping, DeskBrief],
+                     Field(discriminator="type")]

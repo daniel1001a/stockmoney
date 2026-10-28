@@ -12,6 +12,10 @@ Thanksgiving, Christmas. A holiday on a Saturday is observed on the Friday
 and one on a Sunday on the Monday, except that NYSE does not move New Year's
 Day to the previous Friday (so 2027-12-31 trades). A few one-off closures are
 listed in ``SPECIAL_CLOSURES``; extend it when the exchange announces one.
+
+Early closes (13:00 ET) are not rule-derived: ``EARLY_CLOSES`` lists only
+the ones checked against Alpaca's market calendar (read 2026-10-12). Extend
+it from the exchange's or the broker's calendar, never by guessing.
 """
 from __future__ import annotations
 
@@ -30,6 +34,18 @@ SPECIAL_CLOSURES = frozenset(
         date(2025, 1, 9),    # Carter
     }
 )
+
+
+# Sessions that close early, ET (hour, minute). Verified against Alpaca's
+# market calendar on 2026-10-12: the only non-16:00 closes from 2026-11-20 to
+# 2027-12-31 are these three (2027-07-02 closes at 16:00, 2027-12-24 is a
+# full holiday).
+EARLY_CLOSES: dict[date, tuple[int, int]] = {
+    date(2026, 11, 27): (13, 0),   # day after Thanksgiving
+    date(2026, 12, 24): (13, 0),   # Christmas Eve
+    date(2027, 11, 26): (13, 0),   # day after Thanksgiving
+}
+REGULAR_CLOSE = (16, 0)
 
 
 def _as_date(d) -> date:
@@ -99,6 +115,12 @@ def nyse_holidays(year: int) -> frozenset[date]:
 def is_trading_day(d) -> bool:
     d = _as_date(d)
     return d.weekday() < 5 and d not in nyse_holidays(d.year)
+
+
+def close_time(d) -> tuple[int, int]:
+    """Regular-session close of ``d`` in ET (hour, minute): 13:00 on a listed
+    early close, else 16:00. Meaningless on a non-trading day."""
+    return EARLY_CLOSES.get(_as_date(d), REGULAR_CLOSE)
 
 
 def next_trading_day(d) -> date:

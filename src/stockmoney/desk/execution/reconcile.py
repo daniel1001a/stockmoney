@@ -2,6 +2,9 @@
 mismatch means the orchestrator must halt new entries and notify a human.
 Exits and protective stops keep running for every symbol that reconciles.
 
+Option positions belong to the options sleeve, which reconciles its own book
+(execution.options_risk), and are ignored here.
+
 Daily summary (``daily``): the broker's paper fills and open stop orders against
 what the desk planned (slippage vs the plan reference price, planned orders that
 did not fill, ledger stop vs the broker's stop order). It is a READ-ONLY report:
@@ -18,6 +21,7 @@ from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 from stockmoney.desk import store
+from stockmoney.desk.execution.isolation import is_option, without_options
 from stockmoney.desk.execution.ledger import Ledger, is_crypto_symbol, norm
 from stockmoney.desk.execution.types import AccountSnapshot, AssetClass, BrokerOrder, OrderType, Side
 
@@ -32,7 +36,7 @@ def mismatches(ledger: Ledger | sqlite3.Connection, snapshot: AccountSnapshot) -
     if not isinstance(ledger, Ledger):
         ledger = Ledger(ledger)
     mine = {norm(s): p for s, p in ledger.positions().items()}
-    theirs = {norm(p.symbol): p for p in snapshot.positions if abs(p.qty) > 0}
+    theirs = {norm(p.symbol): p for p in without_options(snapshot).positions if abs(p.qty) > 0}
     out: dict[str, str] = {}
     for key in sorted(set(mine) | set(theirs)):
         led, brk = mine.get(key), theirs.get(key)
@@ -162,6 +166,8 @@ def summarize(con: sqlite3.Connection, day: str, open_orders: list[BrokerOrder] 
     if open_orders is not None and "sleeve_positions" in have:
         stops_by: dict[str, list[BrokerOrder]] = defaultdict(list)
         for o in open_orders:
+            if is_option(o):
+                continue  # option orders belong to the options sleeve
             if o.side == Side.SELL and o.order_type in (OrderType.STOP, OrderType.STOP_LIMIT):
                 stops_by[norm(o.symbol)].append(o)
         for r in con.execute("SELECT symbol, qty, stop FROM sleeve_positions WHERE qty > 0"):

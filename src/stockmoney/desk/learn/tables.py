@@ -13,6 +13,8 @@ CREATE TABLE IF NOT EXISTS chains (
   chain_id TEXT PRIMARY KEY, created_at TEXT, source TEXT, trigger_text TEXT, urls_json TEXT,
   steps_json TEXT, impacts_json TEXT, checkpoints_json TEXT, confidence REAL,
   invalidations_json TEXT DEFAULT '[]', falsifiable INTEGER DEFAULT 0);
+CREATE TABLE IF NOT EXISTS chain_owners (
+  chain_id TEXT PRIMARY KEY, msg_id TEXT);
 CREATE TABLE IF NOT EXISTS chain_scores (
   chain_id TEXT, ticker TEXT, horizon INTEGER, declared INTEGER, direction TEXT, base_date TEXT,
   scored_date TEXT, excess_ret REAL, hit INTEGER, confidence REAL, scored_at TEXT,
@@ -32,11 +34,20 @@ CREATE TABLE IF NOT EXISTS learn_reports (
 CREATE TABLE IF NOT EXISTS link_checks (
   url TEXT PRIMARY KEY, msg_id TEXT, agent TEXT, domain TEXT, status TEXT, http_code INTEGER,
   detail TEXT, checked_day TEXT, checked_at TEXT);
+CREATE TABLE IF NOT EXISTS blocked_counterfactual (
+  client_order_id TEXT PRIMARY KEY, plan_date TEXT, symbol TEXT, strategy TEXT, block_class TEXT,
+  severity TEXT, note TEXT, ref_price REAL, stop REAL, entry_day TEXT, entry_px REAL,
+  ret_5 REAL, ret_20 REAL, excess_5 REAL, excess_20 REAL, stop_ret_5 REAL, stop_ret_20 REAL,
+  stop_hit INTEGER, first_block INTEGER, status TEXT, updated_at TEXT);
 """
 
 # Columns added after a table first shipped; CREATE TABLE IF NOT EXISTS will not add them.
 ADDED_COLUMNS = {
     "chains": [("invalidations_json", "TEXT DEFAULT '[]'"), ("falsifiable", "INTEGER DEFAULT 0")],
+    # 1 / 0 / NULL (inputs unavailable): Grok and Muse independently named the symbol in the 3 days before entry
+    "trade_postmortem": [("grok_muse_independent_same_symbol", "INTEGER")],
+    # 1: the stock buy was not blocked; only the pre-2026-10-21 Muse rule would have blocked it
+    "blocked_counterfactual": [("legacy_only", "INTEGER DEFAULT 0")],
 }
 
 
@@ -50,7 +61,7 @@ def _add_missing_columns(con) -> None:
 
 def ensure_schema(con) -> None:
     from stockmoney.desk import veto
-    from stockmoney.desk.learn import calls, earnings, hypotheses, prescreen
+    from stockmoney.desk.learn import calls, earnings, hypotheses, market_risk, prescreen, scoreboard
     con.executescript(SCHEMA)
     _add_missing_columns(con)
     earnings.ensure_schema(con)
@@ -58,3 +69,5 @@ def ensure_schema(con) -> None:
     prescreen.ensure_schema(con)
     veto.ensure_schema(con)
     hypotheses.ensure_schema(con)
+    market_risk.ensure_schema(con)
+    scoreboard.ensure_schema(con)

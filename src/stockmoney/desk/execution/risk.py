@@ -9,6 +9,9 @@ Design rules:
 - Anything that INCREASES exposure (a buy) must pass every rule, and is resized
   (never silently) when a cap binds. A resized order carries a reason saying
   what was cut and why.
+- Option intents and option positions are out of scope: an option intent is
+  blocked here (the options sleeve has its own OptionsRiskEngine) and option
+  positions in the snapshot are ignored (not exposure, not a held stock).
 - System equity is capital_budget + realized + unrealized P&L of the system's
   own ledger. The broker's total equity is deliberately ignored: a paper
   account may hold $100k but the system behaves as if it only has
@@ -21,6 +24,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from stockmoney.desk import store, veto
+from stockmoney.desk.execution.isolation import without_options
 from stockmoney.desk.execution.ledger import (
     Ledger, is_crypto_symbol, norm,
 )
@@ -122,7 +126,7 @@ class RiskEngine:
     # ------------------------------------------------------------ equity
     @staticmethod
     def _prices(snapshot: AccountSnapshot) -> dict[str, float]:
-        return {p.symbol: p.current_price for p in snapshot.positions}
+        return {p.symbol: p.current_price for p in without_options(snapshot).positions}
 
     def system_equity(self, snapshot: AccountSnapshot) -> float:
         """capital_budget + ledger realized + ledger unrealized. NOT broker equity."""
@@ -203,7 +207,7 @@ class RiskEngine:
         for sym, pos in self.ledger.positions().items():
             values[norm(sym)] = pos.qty * pos.avg_price
             crypto[norm(sym)] = is_crypto_symbol(sym)
-        for p in snapshot.positions:
+        for p in without_options(snapshot).positions:
             values[norm(p.symbol)] = abs(p.market_value) if p.market_value else abs(p.qty * p.current_price)
             crypto[norm(p.symbol)] = p.asset_class == AssetClass.CRYPTO
         for key, n in self._pending.items():
@@ -220,6 +224,8 @@ class RiskEngine:
         live quote; for buys it is held against the band and, when valid, it
         replaces ref_price for sizing, so caps are measured at the price the
         order will actually pay."""
+        if intent.asset_class == AssetClass.OPTION:
+            return self._block("option intents go through the options sleeve risk engine, not the stock book")
         if (intent.qty is None) == (intent.notional is None):
             return self._block("invalid intent: exactly one of qty/notional must be set")
         if (intent.qty if intent.qty is not None else intent.notional) <= 0:
@@ -256,7 +262,8 @@ class RiskEngine:
                 return self._block(f"sell blocked: invalid ref_price {ref_price} for limit-price check")
             if (v := self._band_violation("limit price", intent.limit_price, ref_price, self._band(intent))):
                 return self._block(v)
-        held = next((p.qty for p in snapshot.positions if norm(p.symbol) == norm(intent.symbol)), 0.0)
+        held = next((p.qty for p in without_options(snapshot).positions
+                     if norm(p.symbol) == norm(intent.symbol)), 0.0)
         if intent.qty is not None:
             qty = intent.qty
         else:
@@ -285,10 +292,19 @@ class RiskEngine:
             tripped, why = self.sleeve_breaker(intent.strategy, snapshot)
             if tripped:
                 return self._block(f"buy blocked: {why}")
-        vt = veto.check(self.con, intent.symbol, days=l.veto_days, min_sources=l.veto_min_sources)
+        vt = veto.check(self.con, intent.symbol, days=l.veto_days, min_sources=l.veto_min_sources,
+                        client_order_id=intent.client_order_id)
         if vt.blocked:
             veto.record(self.con, intent.symbol, vt)
             return self._block(f"buy blocked: {vt.reason}")
+        d = self._size_buy(intent, snapshot, ref_price, orders_this_run, market_price, md, md_reason)
+        if d.allow and vt.unconfirmed:  # only buys that actually pass; a later block is not "let through"
+            veto.record_unconfirmed(self.con, intent.symbol, vt, intent.client_order_id)
+        return d
+
+    def _size_buy(self, intent: OrderIntent, snapshot: AccountSnapshot, ref_price: float,
+                  orders_this_run: int, market_price: float | None, md: str, md_reason: str) -> RiskDecision:
+        l = self.limits
         owner = self.ledger.owner(intent.symbol)
         if owner is not None and intent.strategy and owner != intent.strategy:
             return self._block(f"buy blocked: {intent.symbol} is held by strategy '{owner}', "

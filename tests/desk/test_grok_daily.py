@@ -67,7 +67,8 @@ def test_duplicate_and_mismatched_subject_are_rejected(con):
     box = FakeMailbox()
     d = grok_daily()
     deliver(box, d)
-    deliver(box, d)
+    deliver(box, d)  # identical resend: dropped silently
+    deliver(box, {**d, "notes": "changed"})  # same id, different content
     box.inject(SENDER, f"[SMD/GROK_DAILY/grok-other-01] {TOKEN}", json.dumps(d))
     box.inject(SENDER, f"[SMD/CALLS/{d['msg_id']}] {TOKEN}", json.dumps(d))
     assert inbox.poll(con, box, CONFIG, now=NOW) == 1
@@ -165,7 +166,7 @@ def test_full_example_and_worst_case_validate():
 
 def test_worst_case_fits_the_inbox_limit_after_base64():
     body = json.dumps(worst_case(), ensure_ascii=False, separators=(",", ":")).encode()
-    assert len(body) < 120_000
+    assert len(body) < 125_000
     assert len(base64.encodebytes(body)) + 5_000 < inbox.MAX_RAW_BYTES  # headers budget 5 KB
     assert len(json.dumps(worst_case()).encode()) < inbox.MAX_RAW_BYTES  # all-\\u escaped ASCII, sent 7bit
 
@@ -241,7 +242,7 @@ def test_optional_fields():
     validate(d)
 
 
-@pytest.mark.parametrize("field", ["msg_id", "sent_at", "collected_at", "events", "chains", "calls", "attention",
+@pytest.mark.parametrize("field", ["msg_id", "sent_at", "collected_at", "events", "chains", "calls",
                                    "tracked_accounts"])
 def test_required_top_level_fields(field):
     d = grok_daily()
@@ -288,7 +289,7 @@ def test_tracked_accounts_limit():
 
 @pytest.mark.parametrize("path,limit", [("events.0.headline", 160), ("chains.0.trigger", 200),
                                         ("chains.0.steps.0", 120), ("chains.0.checkpoints.0.what", 100),
-                                        ("calls.0.horizon_text", 60), ("attention.0.why", 120), ("notes", 1000)])
+                                        ("calls.0.horizon_text", 60), ("attention.0.why", 120), ("notes", 2000)])
 def test_string_limits(path, limit):
     validate(patched(path, "中" * limit))
     assert rejected(patched(path, "中" * (limit + 1)))

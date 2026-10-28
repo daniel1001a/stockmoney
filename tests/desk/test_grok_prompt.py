@@ -25,7 +25,7 @@ def test_subject_example_matches_parser_and_rules_are_present():
     text = DOC.read_text()
     m = re.search(r"`(\[SMD/GROK_DAILY/grok-[^\]]+\]) <密鑰>`", text)
     assert m and SUBJECT_RE.match(m.group(1) + " " + "a" * 48)
-    for needle in ("BTC/USD", "BRK-B", "-04:00", "-05:00", "collected_at", "【給 Grok】", "200KB", "MUSE_ADDRESS"):
+    for needle in ("BTC/USD", "BRK-B", "-04:00", "-05:00", "collected_at", "【給 Grok】", "200KB", "GROK_ADDRESS", "super-pika@mail.grokbot.com"):
         assert needle in text
     assert "run_at" not in text and "BRK.B, " not in text and "TQQQ, BTC," not in text
     for needle in ("dnial1001a@gmail.com", "mckang1001@gmail.com", "grok-YYYYMMDD-HHMM", "20:00", "07:30", "08:10",

@@ -355,7 +355,7 @@ def test_veto_received_during_premarket_is_honoured(desk, monkeypatch):
         monkeypatch.setenv(k, v)
     real_now = datetime.now(timezone.utc)
     box = FakeMailbox()
-    body = ('{"msg_id":"alert0002","sent_at":"%s","type":"ALERT","ticker":"AAPL","severity":"elevated",'
+    body = ('{"msg_id":"alert0002","sent_at":"%s","type":"ALERT","ticker":"AAPL","severity":"critical",'
             '"headline":"probe","source_urls":["https://example.com/x"],"observed_at":"%s"}'
             % (real_now.isoformat(), (real_now - timedelta(hours=1)).isoformat()))
     box.inject("muse@example.com", build_subject("ALERT", "alert0002", token), body)

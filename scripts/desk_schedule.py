@@ -20,20 +20,57 @@ ROOT = Path(__file__).resolve().parents[1]
 LABEL = "com.stockmoney.desk.{}"
 WEEKDAYS = range(1, 6)  # launchd: 1=Mon .. 5=Fri
 
+
+def _ten_min_slots(start: tuple[int, int], end: tuple[int, int]) -> list[tuple[int, int]]:
+    """(hour, minute) every 10 minutes from start to end, inclusive of both ends."""
+    out = []
+    h, m = start
+    while (h, m) <= end:
+        out.append((h, m))
+        m += 10
+        if m >= 60:
+            m -= 60
+            h += 1
+    return out
+
+
+_TEN_MIN_SLOTS = _ten_min_slots((9, 45), (15, 55))
+
 JOBS = {
     "premarket": {"times": [(8, 45)], "weekdays": True},   # read Muse, submit market-on-open orders
-    "postopen": {"times": [(9, 50)], "weekdays": True},    # sync fills, place protective stops
+    # sync fills, place protective stops; the 10:00 run retries what 09:50 could not
+    # reach the broker for (opening-order retry, deferred exits) before the 10:30 cutoff
+    "postopen": {"times": [(9, 50), (10, 0)], "weekdays": True},
     "postclose": {"times": [(16, 45)], "weekdays": True},  # reconcile, trail stops, new signals, report
     "crypto": {"times": [(20, 0)], "weekdays": False},     # daily crypto sleeve, 7 days
     "learn": {"times": [(17, 15)], "weekdays": True},      # read-only: post-mortems, shadow books, chain scoring
-    "bridge": {"interval": 900},                           # poll Muse every 15 minutes
+    # started every 60s; stockmoney.desk.bridge_job polls on every start weekdays 06:00-16:30 ET
+    # and at most every 15 minutes otherwise, and skips a start while another job holds run.lock
+    "bridge": {"interval": 60},
+    "options": {"times": [(9, 0)], "weekdays": True},      # intraday options session, loops 09:20 to 16:00 ET
     # launchd replays a missed calendar job after sleep but not after a power-off;
     # at every load (boot, login, install) recover books fills and restores stops
     "recover": {"run_at_load": True},
+    # options leftover cleanup at every load: sells a paper option position a dead session left
+    # open (only while the market is open), pages unknown broker option positions
+    "options-recover": {"run_at_load": True},
+    # intraday shadow of the daily setups (stockmoney.desk.intraday): SHADOW ONLY, no
+    # order path exists in that module. Every 10 minutes 09:45-15:55 ET; `tick` refuses
+    # outside the regular session and has its own TICK_TIMEOUT_S alarm, so a hung run
+    # never overlaps the next one. Writes only intraday_shadow; no lock file is taken, so
+    # it never waits on run.lock or options.lock. If the options session holds desk.sqlite
+    # past the 30s busy timeout the slot is logged and skipped. Unlike the daily jobs a
+    # missed slot is NOT caught up: launchd coalesces missed fires into one run at wake,
+    # which evaluates only that moment (or nothing after the close). Gaps stay gaps.
+    "intraday_shadow": {"times": _TEN_MIN_SLOTS, "weekdays": True},
+    # nightly RSS/Reddit ingest + Jev shadow classification (logging only, never orders)
+    "scanshadow": {"times": [(17, 30)], "weekdays": True},
 }
 
 
-# bridge needs the Muse mailbox configured; crypto is a Phase 1 placeholder. Both are opt-in.
+# bridge needs the Muse mailbox configured; crypto is a Phase 1 placeholder; options and
+# options-recover are the intraday options sleeve (docs/desk/OPTIONS_PLAN.md); scanshadow needs
+# the claude CLI. All are opt-in (--jobs ...).
 DEFAULT_JOBS = ["premarket", "postopen", "postclose", "recover", "learn"]
 
 

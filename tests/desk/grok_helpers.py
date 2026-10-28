@@ -40,7 +40,7 @@ def worst_case() -> dict:
     return {
         "protocol": "1", "msg_id": "grok-" + "a" * 59, "sent_at": ts, "type": "GROK_DAILY", "collected_at": ts,
         "events": [{"ticker": tk, "headline": c * 160, "severity": "critical", "confirmed": False,
-                    "first_seen": ts, "urls": [url] * 3}] * 25,
+                    "first_seen": ts, "urls": [url] * 3, "basis": "inference"}] * 25,
         "chains": [{"trigger": c * 200, "urls": [url] * 3, "steps": [c * 120] * 6,
                     "impacts": [{"ticker": tk, "direction": "down", "horizon_days": 60}] * 6,
                     "checkpoints": [{"what": c * 100, "date": "2026-10-30"}] * 4,
@@ -51,7 +51,9 @@ def worst_case() -> dict:
                    "posted_at": ts, "post_url": url}] * 50,
         "attention": [{"ticker": tk, "trend": "falling", "why": c * 120}] * 20,
         "tracked_accounts": ["@" + format(i, "015d") for i in range(60)],
-        "notes": c * 1000,
+        "notes": c * 2000,
+        "link_check": {"total": 1000, "passed": 1000, "removed": 1000},
+        "market_risk": {"level": "critical", "summary": c * 300, "source_urls": [url] * 5},
     }
 
 

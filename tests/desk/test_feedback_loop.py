@@ -47,9 +47,9 @@ def pushed(monkeypatch):
 
 
 def bad_social(msg_id):
-    """Passes sender and token checks, fails the schema: a correctable reject."""
-    return {"msg_id": msg_id, "sent_at": NOW.isoformat(), "type": "SOCIAL_DAILY",
-            "collected_at": NOW.isoformat(), "items": [{"ticker": "NVDA"}]}
+    """Passes sender and token checks, fails the schema: a correctable reject.
+    A required top-level field is missing, which leniency never repairs."""
+    return {"msg_id": msg_id, "sent_at": NOW.isoformat(), "type": "SOCIAL_DAILY", "items": []}
 
 
 def deliver(box, payload, *, prefix="", subject_type=None):
@@ -174,7 +174,8 @@ def test_active_flags_does_not_rescan_old_messages(con, monkeypatch):
     ensure_schema(con)
 
     def put(i, when):
-        con.execute("INSERT INTO bridge_messages VALUES (?,?,?,?,?,?,?)",
+        con.execute("INSERT INTO bridge_messages (msg_id, type, sender, sent_at, received_at, raw_body, parsed_json) "
+                "VALUES (?,?,?,?,?,?,?)",
                     (f"al-{i:06d}", "ALERT", MUSE, when.isoformat(), when.isoformat(timespec="seconds"), "",
                      json.dumps(_alert(f"al-{i:06d}", "NVDA", when))))
 
@@ -199,3 +200,39 @@ def test_feedback_lists_the_fields_of_the_rejected_type():
         assert name in text.split("選填")[0]
     assert "window_start" not in text.split("選填")[0]
     assert len(text) < 1000  # fits the FEEDBACK how_to_fix limit
+
+
+def test_options_plan_feedback_says_where_each_wrong_field_goes():
+    # the shape of Grok's 10-15..10-21 rejects: top-level daily_ref/key_events, ticker not underlying
+    from stockmoney.desk.muse_ops import fix_for
+    reason = ("schema_invalid OPTIONS_PLAN.daily_ref:extra_forbidden; OPTIONS_PLAN.key_events:extra_forbidden; "
+              "OPTIONS_PLAN.market_context:missing; OPTIONS_PLAN.avoid:missing; "
+              "OPTIONS_PLAN.plans.0.ticker:extra_forbidden; OPTIONS_PLAN.plans.0.rvol:extra_forbidden; "
+              "OPTIONS_PLAN.plans.0.timing:extra_forbidden; OPTIONS_PLAN.plans.1.gap:extra_forbidden; "
+              "OPTIONS_PLAN.plans.1.premarket_price:extra_forbidden")
+    text = fix_for(reason)
+    for fix in ("改名為 underlying", "key_events 要放進 market_context", "每個 plans 項目的 daily_ref",
+                "avoid 必填", "min_rvol", "earliest/latest", "gap 不是欄位", "premarket_price 不是欄位"):
+        assert fix in text
+    assert len(text) <= 1000  # more errors than the 5-error cap: the field list is dropped to fit how_to_fix
+    only_ticker = fix_for("schema_invalid OPTIONS_PLAN.plans.0.ticker:extra_forbidden")
+    assert "underlying" in only_ticker and "key_events 要放進" not in only_ticker
+    assert "每個劇本必填" in only_ticker  # the 5-error cap can hide a missing bias
+    assert "每個劇本必填" not in fix_for("schema_invalid OPTIONS_PLAN.market_context:missing")
+
+
+def test_options_plan_feedback_names_unlisted_extra_plan_fields():
+    # 10-22 reject: a data-only plan with premarket_gap, which no fixed hint names
+    from stockmoney.desk.muse_ops import fix_for
+    text = fix_for("schema_invalid OPTIONS_PLAN.daily_ref:extra_forbidden; OPTIONS_PLAN.key_events:extra_forbidden; "
+                   "OPTIONS_PLAN.market_context:missing; OPTIONS_PLAN.plans.0.ticker:extra_forbidden; "
+                   "OPTIONS_PLAN.plans.0.premarket_gap:extra_forbidden")
+    assert "premarket_gap 不是劇本欄位" in text and "plans 可以是 []" in text
+    assert "ticker 不是劇本欄位" not in text  # ticker keeps its own rename hint
+    assert len(text) < 1000
+
+
+def test_options_plan_feedback_avoid_ticker_is_not_flagged():
+    from stockmoney.desk.muse_ops import fix_for
+    # an avoid item's ticker is a real field; a plain GROK_DAILY reject gets none of these
+    assert "改名" not in fix_for("schema_invalid GROK_DAILY.ticker:extra_forbidden")

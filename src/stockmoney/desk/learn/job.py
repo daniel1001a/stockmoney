@@ -5,7 +5,9 @@ learning tables and a report file. Own lock, own failure handling: a crash
 here is logged and never touches an order or the trading lock.
 
 Steps (each isolated, a failure in one does not stop the others):
-  1. post-mortem cards for closed trades
+  1. post-mortem cards for closed trades, then for closed live option positions
+  1b. counterfactual outcomes of blocked stock buys (blocked_counterfactual, read-only log)
+  1c. SPY outcome after each GROK_DAILY market_risk call (grok_market_risk, read-only log)
   2. advance shadow books
   3. score due event chains, judge due invalidation conditions, label
      Muse/Grok source independence
@@ -15,6 +17,7 @@ Steps (each isolated, a failure in one does not stop the others):
   3e. H1 / H2 shadow comparison reports; a changed verdict is logged as a DRAFT in param_changes
   3f. research flags (earnings, SEC 8-K / Form 4) for the buy-only research veto; EDGAR needs SEC_USER_AGENT
   3g. Fridays: weekly hypotheses recorded in weekly_hypotheses (record only, changes no parameter)
+  3h. per-source credibility scoreboard (source_scores, read-only; last 20 / 60 sessions and all-time)
   4. allocator recommendation (Fridays or when none logged this week)
   5. report -> data/desk/learn/<date>.md and learn_reports; Friday push summary
 """
@@ -31,8 +34,9 @@ import pandas as pd
 
 from stockmoney.desk import data, notify, store, veto
 from stockmoney.desk.indicators import compute
-from stockmoney.desk.learn import (allocator, calls, chains, corroboration, earnings, filings, h_reports, hypotheses,
-                                   invalidation, links, postmortem, prescreen, shadow, tables)
+from stockmoney.desk.learn import (allocator, calls, chains, corroboration, counterfactual, earnings, filings,
+                                   h_reports, hypotheses, invalidation, links, market_risk, options_postmortem,
+                                   postmortem, prescreen, scoreboard, shadow, tables)
 
 log = logging.getLogger(__name__)
 ET = ZoneInfo("America/New_York")
@@ -116,6 +120,18 @@ def run(con, now: datetime, bars: data.Bars | None = None, shadow_start: str | N
     con.commit()
     if pm is not None:
         parts.append(f"驗屍卡:新增 {pm['new']},更新 {pm['updated']}。")
+    opm = guarded("options_postmortem", lambda: options_postmortem.update_option_cards(con))
+    con.commit()
+    if opm is not None:
+        parts.append(f"期權驗屍卡:新增 {opm['new']},更新 {opm['updated']}。")
+    cf = guarded("counterfactual", lambda: counterfactual.refresh(con, bars, through))
+    con.commit()
+    if cf and (cf["added"] or cf["updated"]):
+        parts.append(f"被擋買單反事實:新增 {cf['added']},更新 {cf['updated']}。")
+    mr = guarded("market_risk", lambda: market_risk.refresh(con, bars, through))
+    con.commit()
+    if mr and (mr["added"] or mr["updated"]):
+        parts.append(f"Grok 大盤風險對照:新增 {mr['added']},更新 {mr['updated']}。")
     rep, hyps = guarded("symptom_report", lambda: postmortem.symptom_report(con, day)) or ("", [])
     sh = guarded("shadow", lambda: shadow.step(con, bars, ind, through, start=shadow_start))
     con.commit()
@@ -147,9 +163,13 @@ def run(con, now: datetime, bars: data.Bars | None = None, shadow_start: str | N
         parts.append(f"來源連結抽查:{lk['checked']} 筆(真實 {lk['ok']}、失效 {lk['dead']}、無法驗證 {lk['unverifiable']})。")
     ps = guarded("prescreen", lambda: prescreen.step(con))
     con.commit()
-    if ps and ps["mode"] != "off" and (ps["judged"] or ps["error"] or ps["deep_done"]):
+    if ps and ps["mode"] != "off" and (ps["judged"] or ps["error"] or ps["deep_done"]
+                                       or ps.get("dup") or ps.get("skipped")):
         parts.append(f"情報預篩({ps['mode']}):判斷 {ps['judged']} 則(通過 {ps['pass']}、保留 {ps['hold']}、"
-                     f"封存 {ps['archive']}),失敗 {ps['error']};深度分析完成 {ps['deep_done']}。")
+                     f"封存 {ps['archive']}),重複沿用 {ps.get('dup', 0)}、略過 {ps.get('skipped', 0)},"
+                     f"失敗 {ps['error']};深度分析完成 {ps['deep_done']}。")
+    guarded("scoreboard", lambda: scoreboard.refresh(con, bars, through))
+    con.commit()
 
     friday = through.weekday() == 4
     hyp_text = guarded("hypotheses", lambda: hypotheses.run(con, day, include_weekly=False)) if friday else None
@@ -172,13 +192,20 @@ def run(con, now: datetime, bars: data.Bars | None = None, shadow_start: str | N
         parts += ["", watch]
     if hyp_text:
         parts += ["", hyp_text]
+    if friday:
+        pw = guarded("prescreen_weekly", lambda: prescreen.weekly_report(con, bars, now))
+        if pw:
+            parts += ["", pw]
     parts += ["", rep, "", guarded("shadow_report", lambda: shadow.report(con)) or "", "",
               guarded("chain_report", lambda: chains.report(con)) or "", "",
               guarded("calls_report", lambda: calls.report(con)) or "", "",
               guarded("link_report", lambda: links.report(con)) or "", "",
               guarded("prescreen_report", lambda: prescreen.report(con)) or "", "",
               guarded("filings_report", lambda: filings.report(con)) or "", "",
+              guarded("counterfactual_report", lambda: counterfactual.report(con)) or "", "",
+              guarded("market_risk_report", lambda: market_risk.report(con)) or "", "",
               guarded("veto_report", lambda: veto.report(con, (through - pd.Timedelta(days=7)).date().isoformat())) or "", "",
+              guarded("scoreboard_report", lambda: scoreboard.report(con, day)) or "", "",
               guarded("h_reports", lambda: h_reports.run_all(con, bars)) or ""]
     con.commit()
     if alloc_text:

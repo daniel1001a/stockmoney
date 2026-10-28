@@ -8,14 +8,18 @@ against the broker every run.
 """
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import date, datetime
 from enum import Enum
+
+OPTION_MULTIPLIER = 100  # shares per standard US equity option contract
 
 
 class AssetClass(str, Enum):
     EQUITY = "us_equity"
     CRYPTO = "crypto"
+    OPTION = "us_option"  # single-leg US equity options; symbol is the OCC contract symbol
 
 
 class Side(str, Enum):
@@ -54,10 +58,10 @@ class OrderIntent:
     idempotent: re-running a job must never double-submit."""
 
     client_order_id: str
-    symbol: str  # equities "AAPL"; crypto "BTC/USD"
+    symbol: str  # equities "AAPL"; crypto "BTC/USD"; options the OCC symbol "SPY261013C00580000"
     asset_class: AssetClass
     side: Side
-    qty: float | None = None  # shares/coins; exactly one of qty/notional
+    qty: float | None = None  # shares/coins/whole contracts; exactly one of qty/notional
     notional: float | None = None  # USD
     order_type: OrderType = OrderType.MARKET
     tif: TIF = TIF.DAY
@@ -83,6 +87,7 @@ class BrokerOrder:
     tif: TIF
     stop_price: float | None = None
     limit_price: float | None = None
+    asset_class: AssetClass | None = None  # None when the adapter does not report it
 
 
 @dataclass
@@ -103,6 +108,46 @@ class AccountSnapshot:
     positions: list[BrokerPosition] = field(default_factory=list)
     as_of: datetime | None = None
     trading_blocked: bool = False
+
+
+@dataclass(frozen=True)
+class OptionContract:
+    """One option contract with its latest quote. Prices are per share (the
+    premium of one contract is price * multiplier). Every market field is
+    None when the data source did not provide it; nothing is guessed.
+    ``volume`` is today's traded contracts, ``open_interest`` is the latest
+    published figure (normally as of the previous session)."""
+
+    occ: str  # broker spelling of the OCC symbol, e.g. "SPY261013C00580000"
+    underlying: str
+    right: str  # "C" or "P"
+    strike: float
+    expiry: date
+    bid: float | None = None
+    ask: float | None = None
+    last: float | None = None
+    volume: int | None = None
+    open_interest: int | None = None
+    delta: float | None = None
+    iv: float | None = None
+    as_of: datetime | None = None  # time of the quote
+    multiplier: int = OPTION_MULTIPLIER
+
+    @property
+    def mid(self) -> float | None:
+        """(bid + ask) / 2 for a sane two-sided quote, else None."""
+        b, a = self.bid, self.ask
+        if b is None or a is None or not (math.isfinite(b) and math.isfinite(a)) or b < 0 or a <= 0 or b > a:
+            return None
+        return (b + a) / 2.0
+
+    @property
+    def spread_pct(self) -> float | None:
+        """(ask - bid) / mid, or None without a sane two-sided quote."""
+        m = self.mid
+        if m is None or m <= 0:
+            return None
+        return (self.ask - self.bid) / m
 
 
 @dataclass

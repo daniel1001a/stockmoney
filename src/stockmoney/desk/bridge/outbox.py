@@ -1,9 +1,11 @@
-"""Outbound side of the Muse bridge: desk -> Muse.
+"""Outbound side of the bridge: desk -> Muse, or desk -> Grok.
 
 Subject ``[SMD/<TYPE>/<msg_id>] <token>``, body is exactly one JSON object.
-Only the typed ``Outbound`` messages (WATCHLIST / RESEARCH_REQUEST / REPORT)
-can be sent. The caller is responsible for not putting anything secret in
-them: Muse is an external party.
+Only the typed ``Outbound`` messages (WATCHLIST / RESEARCH_REQUEST / REPORT /
+FEEDBACK / PING / DESK_BRIEF) can be sent. ``channel`` picks the recipient and
+its token: "muse" = MUSE_ADDRESS + MUSE_SHARED_TOKEN, "grok" = GROK_ADDRESS +
+GROK_SHARED_TOKEN. No other address is ever used. The caller is responsible
+for not putting anything secret in them: both are external parties.
 """
 from __future__ import annotations
 
@@ -29,13 +31,24 @@ def build_subject(msg_type: str, msg_id: str, token: str) -> str:
     return f"[SMD/{msg_type}/{msg_id}] {token}"
 
 
-def send(mailbox: Mailbox, msg, config: BridgeConfig | None = None) -> None:
-    """Validate ``msg`` against the Outbound schema and mail it to Muse."""
+CHANNELS = ("muse", "grok")
+
+
+def send(mailbox: Mailbox, msg, config: BridgeConfig | None = None, channel: str = "muse") -> None:
+    """Validate ``msg`` against the Outbound schema and mail it to ``channel``."""
     config = config or BridgeConfig.from_env()
-    if not config.muse_address:
-        raise ValueError("MUSE_ADDRESS is not configured")
-    if not _TOKEN_OK.match(config.shared_token):
-        raise ValueError("shared token missing or malformed")
+    if channel == "grok":
+        if not config.grok_enabled:
+            raise ValueError("GROK_ADDRESS / GROK_SHARED_TOKEN are not configured")
+        to, token = config.grok_address, config.grok_token
+    elif channel == "muse":
+        if not config.muse_address:
+            raise ValueError("MUSE_ADDRESS is not configured")
+        to, token = config.muse_address, config.shared_token
+    else:
+        raise ValueError(f"unknown channel {channel!r}")
+    if not _TOKEN_OK.match(token or ""):
+        raise ValueError(f"{channel} token missing or malformed")
     checked = _OUTBOUND.validate_python(msg, strict=True)  # reject anything not a valid Outbound message
     body = checked.model_dump_json()
-    mailbox.send(config.muse_address, build_subject(checked.type, checked.msg_id, config.shared_token), body)
+    mailbox.send(to, build_subject(checked.type, checked.msg_id, token), body)

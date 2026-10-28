@@ -23,6 +23,23 @@ Design notes:
     the rest of the system only sees the universe spelling ("BRK-B").
   * latest_price uses the market-data clients (IEX feed for equities, which a
     free data plan may query; US feed for crypto).
+  * Options (OptionsBroker + AssetClass.OPTION orders). Order rules from
+    docs.alpaca.markets "Options Trading": qty must be a whole number, no
+    notional, no extended hours, time_in_force day or gtc. This adapter is
+    stricter for the intraday sleeve: market or limit only, TIF day only, and
+    every option order carries position_intent buy_to_open (buys) or
+    sell_to_close (sells), so the broker itself rejects a sell that would open
+    a short ("position intent mismatch"). Option positions come back with
+    asset_class us_option; Alpaca's market_value already includes the
+    contract multiplier (docs example: qty 2, current_price 5.34,
+    market_value 1068).
+  * Option market data uses OptionHistoricalDataClient with raw responses,
+    because the alpaca-py OptionsSnapshot model drops the dailyBar field
+    (today's volume). The feed is "indicative" unless ALPACA_OPTION_FEED or
+    ``option_feed`` sets it ("opra" needs a subscription). Open interest comes from the trading API option contracts
+    endpoint (published once a day). Stock bars and quotes use the IEX feed
+    by default (the free plan's real-time feed; IEX volume is only IEX's
+    share of the consolidated tape).
 
 Order status mapping (Alpaca -> OrderStatus). Everything not listed maps to
 PENDING (accepted, pending_new, pending_replace, pending_review,
@@ -36,10 +53,15 @@ held); a PENDING order is still working (a stop placed after the close stays
 from __future__ import annotations
 
 import logging
+import math
 import os
+import re
 import time
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from typing import Any, Callable, TypeVar
+from zoneinfo import ZoneInfo
+
+import pandas as pd
 
 from alpaca.common.exceptions import APIError
 from alpaca.trading.client import TradingClient
@@ -48,11 +70,13 @@ from alpaca.trading.enums import (
     AssetClass as AlpacaAssetClass,
     OrderSide,
     OrderStatus as AlpacaOrderStatus,
+    PositionIntent,
     PositionSide,
     QueryOrderStatus,
     TimeInForce,
 )
 from alpaca.trading.requests import (
+    GetOptionContractsRequest,
     GetOrdersRequest,
     LimitOrderRequest,
     MarketOrderRequest,
@@ -62,10 +86,11 @@ from alpaca.trading.requests import (
 )
 from requests.exceptions import RequestException
 
-from stockmoney.desk.execution.symbols import from_broker, to_broker
+from stockmoney.desk.execution.broker import empty_bars
+from stockmoney.desk.execution.symbols import from_broker, is_occ_symbol, parse_occ, to_broker
 
 from stockmoney.desk.execution.types import (
-    TIF, AccountSnapshot, AssetClass, BrokerOrder, BrokerPosition, OrderIntent,
+    OPTION_MULTIPLIER, TIF, AccountSnapshot, AssetClass, BrokerOrder, BrokerPosition, OptionContract, OrderIntent,
     OrderStatus, OrderType, Side,
 )
 
@@ -77,6 +102,12 @@ EQUITY_TIFS = frozenset({TIF.DAY, TIF.GTC, TIF.OPG, TIF.IOC})
 CRYPTO_TIFS = frozenset({TIF.GTC, TIF.IOC})
 # alpaca.trading.enums.OrderType docstring: crypto supports market, limit, stop_limit.
 CRYPTO_ORDER_TYPES = frozenset({OrderType.MARKET, OrderType.LIMIT, OrderType.STOP_LIMIT})
+# Intraday options sleeve: stricter than what Alpaca accepts (day/gtc; market/limit/stop/stop_limit).
+OPTION_TIFS = frozenset({TIF.DAY})
+OPTION_ORDER_TYPES = frozenset({OrderType.MARKET, OrderType.LIMIT})
+OPTION_FEEDS = ("opra", "indicative")
+DEFAULT_OPTION_FEED = "indicative"  # used when neither ALPACA_OPTION_FEED nor option_feed is set
+ET = ZoneInfo("America/New_York")
 
 _STATUS_MAP = {
     AlpacaOrderStatus.NEW: OrderStatus.NEW,
@@ -93,6 +124,7 @@ _CRYPTO_QUOTES = ("USDT", "USDC", "USD")
 HTTP_TIMEOUT_S = 30.0  # per HTTP request; the job-level alarm is the outer bound
 
 T = TypeVar("T")
+_Info = tuple  # (open interest or None, contract size, underlying symbol or None)
 
 
 class LiveTradingNotEnabled(RuntimeError):
@@ -123,12 +155,52 @@ def resolve_env(environ: dict[str, str] | None = None) -> str:
     return mode
 
 
+def _validate_option(intent: OrderIntent) -> None:
+    """Option intents: one contract symbol in broker spelling, whole
+    contracts, market or limit, TIF day. Buy means buy to open and sell means
+    sell to close (enforced at the broker through position_intent)."""
+    try:
+        parse_occ(intent.symbol)
+    except ValueError:
+        raise ValueError(f"option symbol must be an OCC contract symbol, got {intent.symbol!r}") from None
+    if " " in intent.symbol:
+        raise ValueError(f"option symbol must use the unpadded broker spelling, got {intent.symbol!r}")
+    if intent.side not in (Side.BUY, Side.SELL):
+        raise ValueError(f"unsupported side {intent.side!r}")
+    if intent.tif not in OPTION_TIFS:
+        raise ValueError(f"TIF {intent.tif.value!r} not valid for options; allowed: day")
+    if intent.order_type not in OPTION_ORDER_TYPES:
+        raise ValueError(f"order type {intent.order_type.value!r} not supported for options; allowed: market, limit")
+    if intent.notional is not None:
+        raise ValueError("notional orders are not supported for options")
+    q = intent.qty
+    if q is None or not isinstance(q, (int, float)) or not math.isfinite(q) or q != int(q) or q < 1:
+        raise ValueError(f"option qty must be a whole number of contracts >= 1, got {q!r}")
+    if intent.stop_price is not None:
+        raise ValueError("stop_price not allowed on option orders")
+    if intent.order_type == OrderType.LIMIT:
+        lp = intent.limit_price
+        if lp is None:
+            raise ValueError("limit order requires limit_price")
+        if not (isinstance(lp, (int, float)) and math.isfinite(lp) and lp > 0):
+            raise ValueError(f"limit_price must be positive and finite, got {lp!r}")
+        if abs(lp * 100 - round(lp * 100)) > 1e-6:
+            raise ValueError(f"option limit_price must be in whole cents, got {lp!r}")
+    elif intent.limit_price is not None:
+        raise ValueError("limit_price not allowed on market order")
+
+
 def validate_intent(intent: OrderIntent) -> None:
     """Raise ValueError for any combination the broker would reject."""
     if not intent.client_order_id:
         raise ValueError("client_order_id is required (idempotency key)")
     if not intent.symbol:
         raise ValueError("symbol is required")
+    if intent.asset_class == AssetClass.OPTION:
+        _validate_option(intent)
+        return
+    if is_occ_symbol(intent.symbol):
+        raise ValueError(f"{intent.symbol!r} is an option contract; asset_class must be {AssetClass.OPTION.value}")
     crypto = intent.asset_class == AssetClass.CRYPTO
     if crypto and "/" not in intent.symbol:
         raise ValueError(f"crypto symbol must look like 'BTC/USD', got {intent.symbol!r}")
@@ -198,6 +270,14 @@ def build_request(intent: OrderIntent) -> OrderRequest:
         time_in_force=TimeInForce(intent.tif.value),
         client_order_id=intent.client_order_id,
     )
+    if intent.asset_class == AssetClass.OPTION:
+        common["symbol"] = intent.symbol
+        common["qty"] = int(intent.qty)
+        common["position_intent"] = (PositionIntent.BUY_TO_OPEN if intent.side == Side.BUY
+                                     else PositionIntent.SELL_TO_CLOSE)
+        if intent.order_type == OrderType.MARKET:
+            return MarketOrderRequest(**common)
+        return LimitOrderRequest(limit_price=intent.limit_price, **common)
     if intent.qty is not None:
         common["qty"] = intent.qty
     else:
@@ -213,6 +293,37 @@ def build_request(intent: OrderIntent) -> OrderRequest:
 
 def _f(x: Any) -> float | None:
     return None if x is None else float(x)
+
+
+def _num(x: Any) -> float | None:
+    """A finite float, or None for anything missing, non-numeric or NaN/inf."""
+    try:
+        v = float(x)
+    except (TypeError, ValueError):
+        return None
+    return v if math.isfinite(v) else None
+
+
+_FRACTION = re.compile(r"(\.\d{6})\d+")
+
+
+def _ts(x: Any) -> datetime | None:
+    """Parse an RFC-3339 market-data timestamp (nanosecond precision, 'Z')."""
+    if isinstance(x, datetime):
+        return x if x.tzinfo else x.replace(tzinfo=timezone.utc)
+    if not isinstance(x, str) or not x:
+        return None
+    try:
+        d = datetime.fromisoformat(_FRACTION.sub(r"\1", x.replace("Z", "+00:00")))
+    except ValueError:
+        return None
+    return d if d.tzinfo else d.replace(tzinfo=timezone.utc)
+
+
+def _asset_of(raw: Any) -> AssetClass | None:
+    v = _enum_val(raw)
+    return {AlpacaAssetClass.US_EQUITY.value: AssetClass.EQUITY, AlpacaAssetClass.CRYPTO.value: AssetClass.CRYPTO,
+            AlpacaAssetClass.US_OPTION.value: AssetClass.OPTION}.get(v)
 
 
 def _enum_val(x: Any) -> Any:
@@ -255,6 +366,10 @@ class AlpacaBroker:
         backoff_seconds: float = 1.0,
         sleep: Callable[[float], None] = time.sleep,
         data_clients: tuple[Any, Any] | None = None,
+        option_data_client: Any | None = None,
+        option_feed: str | None = None,
+        stock_feed: str = "iex",
+        now: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
     ):
         env = environ if environ is not None else os.environ
         mode = resolve_env(env)  # live guard runs first, before anything else
@@ -269,9 +384,30 @@ class AlpacaBroker:
         self._client = client
         self._keys = (env.get("ALPACA_API_KEY"), env.get("ALPACA_SECRET_KEY"))
         self._data = data_clients  # (stock, crypto) market-data clients, built lazily
+        self._opt_data = option_data_client  # raw-response option data client, built lazily
+        feed = (option_feed if option_feed is not None else env.get("ALPACA_OPTION_FEED") or "").strip().lower()
+        if feed and feed not in OPTION_FEEDS:
+            raise ValueError(f"option feed must be one of {OPTION_FEEDS}, got {feed!r}")
+        if not feed:
+            # No OPRA subscription on this account: say so explicitly instead of letting Alpaca pick.
+            feed = DEFAULT_OPTION_FEED
+            log.info("option feed not set (ALPACA_OPTION_FEED unset): using %s", feed)
+        self.option_feed = feed
+        self.stock_feed = stock_feed
+        self._now = now
+        self._oi_cache: dict[tuple[str, date], _Info] = {}
         self._max_attempts = max(1, max_attempts)
         self._backoff = backoff_seconds
         self._sleep = sleep
+
+    @property
+    def max_attempts(self) -> int:
+        """Attempts per call on a transient error (the options sleeve lowers it after its forced flat)."""
+        return self._max_attempts
+
+    @max_attempts.setter
+    def max_attempts(self, n: int) -> None:
+        self._max_attempts = max(1, int(n))
 
     @property
     def client(self) -> TradingClient:
@@ -330,27 +466,33 @@ class AlpacaBroker:
             tif=tif,
             stop_price=_f(o.stop_price),
             limit_price=_f(o.limit_price),
+            asset_class=_asset_of(o.asset_class),
         )
 
     @staticmethod
     def _map_position(p: Any) -> BrokerPosition:
-        cls = _enum_val(p.asset_class)
-        if cls == AlpacaAssetClass.US_EQUITY.value:
-            asset = AssetClass.EQUITY
-        elif cls == AlpacaAssetClass.CRYPTO.value:
-            asset = AssetClass.CRYPTO
-        else:
-            raise BrokerError(f"unsupported position asset class {cls!r} for {p.symbol}")
+        asset = _asset_of(p.asset_class)
+        if asset is None:
+            raise BrokerError(f"unsupported position asset class {_enum_val(p.asset_class)!r} for {p.symbol}")
         qty = abs(float(p.qty))
         if p.side == PositionSide.SHORT:
             qty = -qty
         avg = float(p.avg_entry_price)
         price = _f(p.current_price)
         mv = _f(p.market_value)
+        # option prices are per share; market_value is per position and already includes the multiplier
+        mult = OPTION_MULTIPLIER if asset == AssetClass.OPTION else 1
+        if asset == AssetClass.OPTION and price is None and mv is None:
+            # no mark at all: leave it None (never the entry price, which would show zero
+            # unrealized loss); the options risk engine then counts the position unmarked
+            # and refuses new buys
+            return BrokerPosition(p.symbol, asset, qty, avg, None, None)
         if price is None:
-            price = mv / qty if (mv is not None and qty) else avg
+            price = mv / (qty * mult) if (mv is not None and qty) else avg
         if mv is None:
-            mv = qty * price
+            mv = qty * price * mult
+        if asset == AssetClass.OPTION:
+            return BrokerPosition(p.symbol, asset, qty, avg, mv, price)
         return BrokerPosition(_norm_symbol(p.symbol, asset == AssetClass.CRYPTO), asset, qty, avg, mv, price)
 
     # ---- Broker protocol ------------------------------------------------
@@ -483,3 +625,196 @@ class AlpacaBroker:
         trade = self._retry(fn, "latest_trade").get(sym)
         price = _f(getattr(trade, "price", None))
         return price if price is not None and price > 0 else None
+
+    # ---- OptionsBroker ---------------------------------------------------
+
+    def _option_client(self) -> Any | None:
+        if self._opt_data is None:
+            key, secret = self._keys
+            if not key or not secret:
+                return None
+            from alpaca.data.historical.option import OptionHistoricalDataClient
+            self._opt_data = OptionHistoricalDataClient(api_key=key, secret_key=secret, raw_data=True)
+            install_timeout(self._opt_data)
+        return self._opt_data
+
+    def _feed(self) -> Any:
+        if self.option_feed is None:
+            return None
+        from alpaca.data.enums import OptionsFeed
+        return OptionsFeed(self.option_feed)
+
+    def _today_et(self) -> date:
+        return self._now().astimezone(ET).date()
+
+    def _contract_info(self, underlying: str, expiry_min: date, expiry_max: date) -> dict[str, _Info]:
+        """{occ: (open interest or None, contract size)} from the trading API
+        contracts endpoint. A failure is logged and yields {}: open interest
+        is then unknown, which the options risk layer treats as failing its
+        liquidity filter (entries blocked, exits unaffected)."""
+        out: dict[str, _Info] = {}
+        token: str | None = None
+        try:
+            for _ in range(50):  # page cap: 50 x 10000 contracts is far beyond any chain
+                req = GetOptionContractsRequest(underlying_symbols=[underlying], expiration_date_gte=expiry_min,
+                                                expiration_date_lte=expiry_max, limit=10_000, page_token=token)
+                resp = self._retry(lambda: self._client.get_option_contracts(req), "get_option_contracts")
+                for c in resp.option_contracts or []:
+                    out[c.symbol] = _info(c)
+                token = resp.next_page_token
+                if not token:
+                    break
+        except Exception as e:  # BaseException (JobTimeout) still propagates
+            log.warning("option contracts for %s unavailable (open interest unknown): %s", underlying, e)
+            return {}
+        return out
+
+    def _single_info(self, occ: str) -> _Info | None:
+        key = (occ, self._today_et())
+        if key not in self._oi_cache:
+            try:
+                c = self._retry(lambda: self._client.get_option_contract(occ), "get_option_contract")
+            except Exception as e:
+                log.warning("option contract %s unavailable (open interest unknown): %s", occ, e)
+                return None
+            self._oi_cache[key] = _info(c)
+        return self._oi_cache[key]
+
+    def _to_contract(self, occ: str, snap: dict, info: _Info | None) -> OptionContract | None:
+        try:
+            parts = parse_occ(occ)
+        except ValueError:
+            log.warning("skipping unparseable option symbol %r", occ)
+            return None
+        snap = snap or {}
+        q = snap.get("latestQuote") or {}
+        t = snap.get("latestTrade") or {}
+        g = snap.get("greeks") or {}
+        bar = snap.get("dailyBar") or None
+        bid = _num(q.get("bp"))
+        ask = _num(q.get("ap"))
+        last = _num(t.get("p"))
+        iv = _num(snap.get("impliedVolatility"))
+        volume: int | None = None
+        if bar:
+            v = _num(bar.get("v"))
+            bar_day = _ts(bar.get("t"))
+            # the daily bar of the last session the contract traded in: older than today means 0 today
+            if v is not None and bar_day is not None:
+                volume = int(v) if bar_day.astimezone(ET).date() == self._today_et() else 0
+        oi, size, und = info if info is not None else (None, OPTION_MULTIPLIER, None)
+        return OptionContract(
+            occ=occ, underlying=from_broker(und) if und else parts.root, right=parts.right, strike=parts.strike, expiry=parts.expiry,
+            bid=bid if bid is not None and bid >= 0 else None,
+            ask=ask if ask is not None and ask > 0 else None,
+            last=last if last is not None and last > 0 else None,
+            volume=volume, open_interest=oi,
+            delta=_num(g.get("delta")),
+            iv=iv if iv is not None and iv > 0 else None,
+            as_of=_ts(q.get("t")), multiplier=size)
+
+    def option_chain(self, underlying: str, expiry_min: date, expiry_max: date) -> list[OptionContract]:
+        client = self._option_client()
+        if client is None or expiry_max < expiry_min:
+            return []
+        from alpaca.data.requests import OptionChainRequest
+        u = to_broker(underlying.upper())
+        req = OptionChainRequest(underlying_symbol=u, feed=self._feed(),
+                                 expiration_date_gte=expiry_min, expiration_date_lte=expiry_max)
+        raw = self._retry(lambda: client.get_option_chain(req), "option_chain") or {}
+        info = self._contract_info(u, expiry_min, expiry_max)
+        out = [c for occ, snap in raw.items() if (c := self._to_contract(occ, snap, info.get(occ))) is not None]
+        out = [c for c in out if expiry_min <= c.expiry <= expiry_max]
+        return sorted(out, key=lambda c: (c.expiry, c.right, c.strike))
+
+    def option_quote(self, occ: str) -> OptionContract | None:
+        parse_occ(occ)  # ValueError for a malformed symbol: a caller bug, not missing data
+        client = self._option_client()
+        if client is None:
+            return None
+        from alpaca.data.requests import OptionSnapshotRequest
+        req = OptionSnapshotRequest(symbol_or_symbols=occ, feed=self._feed())
+        raw = self._retry(lambda: client.get_option_snapshot(req), "option_snapshot") or {}
+        snap = raw.get(occ)
+        if not snap:
+            return None
+        return self._to_contract(occ, snap, self._single_info(occ))
+
+    def _forbidden_is_empty(self, fn: Callable[[], Any], what: str) -> Any:
+        """HTTP 403 from the data API means this account may not read that
+        data (2026-10-12 on the paper keys: option bars answer "OPRA agreement
+        is not signed"; recent SIP stock data needs a subscription). That is
+        "unavailable", not a transient failure: logged, and None returned."""
+        try:
+            return self._retry(fn, what)
+        except APIError as e:
+            if _api_status(e) != 403:
+                raise
+            log.warning("alpaca %s not permitted for this account: %s", what, e)
+            return None
+
+    def minute_bars(self, symbol: str, start: datetime, end: datetime) -> pd.DataFrame:
+        """See OptionsBroker.minute_bars. Data the account may not read
+        (HTTP 403) yields an empty frame and a warning."""
+        from alpaca.data.timeframe import TimeFrame
+        rows: list[dict] = []
+        if is_occ_symbol(symbol):
+            client = self._option_client()
+            if client is None:
+                return empty_bars()
+            from alpaca.data.requests import OptionBarsRequest
+            req = OptionBarsRequest(symbol_or_symbols=symbol, timeframe=TimeFrame.Minute, start=start, end=end)
+            raw = self._forbidden_is_empty(lambda: client.get_option_bars(req), "option_bars") or {}
+            for b in raw.get(symbol) or []:
+                rows.append(dict(t=_ts(b.get("t")), open=_num(b.get("o")), high=_num(b.get("h")),
+                                 low=_num(b.get("l")), close=_num(b.get("c")), volume=_num(b.get("v")),
+                                 vwap=_num(b.get("vw"))))
+        else:
+            clients = self._data_clients()
+            if clients is None:
+                return empty_bars()
+            from alpaca.data.enums import DataFeed
+            from alpaca.data.requests import StockBarsRequest
+            sym = to_broker(symbol)
+            req = StockBarsRequest(symbol_or_symbols=sym, timeframe=TimeFrame.Minute, start=start, end=end,
+                                   feed=DataFeed(self.stock_feed))
+            barset = self._forbidden_is_empty(lambda: clients[0].get_stock_bars(req), "stock_bars")
+            for b in (getattr(barset, "data", None) or {}).get(sym, []):
+                rows.append(dict(t=_ts(b.timestamp), open=_num(b.open), high=_num(b.high), low=_num(b.low),
+                                 close=_num(b.close), volume=_num(b.volume), vwap=_num(b.vwap)))
+        rows = [r for r in rows if r["t"] is not None]
+        if not rows:
+            return empty_bars()
+        df = pd.DataFrame(rows).set_index("t").sort_index()
+        df.index = pd.DatetimeIndex(df.index).tz_convert("UTC")
+        df.index.name = None
+        df = df[(df.index >= pd.Timestamp(start)) & (df.index <= pd.Timestamp(end))]
+        if df["vwap"].isna().all():
+            df = df.drop(columns="vwap")
+        return df.astype(float)
+
+    def stock_quote(self, symbol: str) -> tuple[float, float] | None:
+        clients = self._data_clients()
+        if clients is None:
+            return None
+        from alpaca.data.enums import DataFeed
+        from alpaca.data.requests import StockLatestQuoteRequest
+        sym = to_broker(symbol)
+        req = StockLatestQuoteRequest(symbol_or_symbols=sym, feed=DataFeed(self.stock_feed))
+        q = (self._retry(lambda: clients[0].get_stock_latest_quote(req), "stock_latest_quote") or {}).get(sym)
+        bid, ask = _num(getattr(q, "bid_price", None)), _num(getattr(q, "ask_price", None))
+        if bid is None or ask is None or bid <= 0 or ask <= 0 or bid > ask:
+            return None
+        return bid, ask
+
+
+def _info(c: Any) -> _Info:
+    """(open interest or None, contract size, underlying symbol or None) of an
+    alpaca-py OptionContract. For an adjusted contract the underlying differs
+    from the OCC root and the size may differ from 100."""
+    oi = _num(getattr(c, "open_interest", None))
+    size = _num(getattr(c, "size", None))
+    und = getattr(c, "underlying_symbol", None)
+    return (int(oi) if oi is not None and oi >= 0 else None,
+            int(size) if size is not None and size > 0 else OPTION_MULTIPLIER,
+            und if isinstance(und, str) and und else None)
