@@ -602,3 +602,85 @@ def test_calls_module_is_inside_the_learn_boundary():
     src = pathlib.Path("src/stockmoney/desk/learn/calls.py").read_text()
     for banned in ("execution", "broker", "risk", "RiskEngine", ".submit(", "make_broker"):
         assert banned not in src, banned
+
+
+def _losing_trade(con, bars, e, x, sym="AAPL", entry_mult=1.0):
+    px = float(bars.open.at[e, sym]) * entry_mult
+    fill(con, "b1", sym, "buy", 10, px, f"{e.date()}T14:35:00+00:00")
+    fill(con, "s1", sym, "sell", 10, px * 0.95, f"{x.date()}T14:35:00+00:00", pnl=-px * 0.5)
+    return px
+
+
+def test_postmortem_s10_when_an_up_chain_before_entry_did_not_pay(con):
+    bars = make_bars()
+    ind = compute(bars)
+    d = bars.dates
+    e, x = d[300], d[305]
+    created = datetime(d[297].year, d[297].month, d[297].day, 21, 0, tzinfo=timezone.utc)
+    chains.add_chain(con, chains.Chain(trigger="t", steps=["s"], confidence=0.5,
+                                       impacts=[{"ticker": "AAPL", "direction": "up", "horizon_days": 5}]), created)
+    late = datetime(d[302].year, d[302].month, d[302].day, 21, 0, tzinfo=timezone.utc)  # after the entry: ignored
+    chains.add_chain(con, chains.Chain(trigger="late", steps=["s"], confidence=0.5,
+                                       impacts=[{"ticker": "MSFT", "direction": "up", "horizon_days": 5}]), late)
+    _losing_trade(con, bars, e, x)
+    postmortem.update_cards(con, bars, ind)
+    row = con.execute("SELECT symptoms, facts_json FROM trade_postmortem").fetchone()
+    f = json.loads(row["facts_json"])
+    assert len(f["up_chains_before_entry"]) == 1
+    assert ("S10" in row["symptoms"].split(",")) == (f["excess_vs_spy"] <= 0)
+
+
+def test_postmortem_no_s10_when_entry_is_past_the_impact_horizon(con):
+    bars = make_bars()
+    ind = compute(bars)
+    d = bars.dates
+    e, x = d[300], d[305]
+    created = datetime(d[280].year, d[280].month, d[280].day, 21, 0, tzinfo=timezone.utc)
+    chains.add_chain(con, chains.Chain(trigger="t", steps=["s"], confidence=0.5,
+                                       impacts=[{"ticker": "AAPL", "direction": "up", "horizon_days": 5}]), created)
+    _losing_trade(con, bars, e, x)
+    postmortem.update_cards(con, bars, ind)
+    row = con.execute("SELECT symptoms, facts_json FROM trade_postmortem").fetchone()
+    assert json.loads(row["facts_json"])["up_chains_before_entry"] == []
+    assert "S10" not in row["symptoms"].split(",")
+
+
+def test_postmortem_s11_on_entry_slippage_in_r(con):
+    bars = make_bars()
+    ind = compute(bars)
+    d = bars.dates
+    e, x = d[300], d[305]
+    px = _losing_trade(con, bars, e, x, entry_mult=1.003)  # 0.3% over the open, under the S8 0.5%
+    stop = px - px * 0.003 / 0.3  # risk such that slippage is about 0.3R (computed against the open)
+    t = closed_trades(con)[0]
+    t.initial_stop = stop
+    card = postmortem.build_card(con, t, bars, ind)
+    assert card["facts"]["slip_entry_r"] == pytest.approx((px - float(bars.open.at[e, "AAPL"])) / (px - stop))
+    assert "S11" in card["symptoms"] and card["facts"]["slip_entry"] < 0.005  # S8 would not catch it
+    t.initial_stop = px * 0.9  # same slippage is now tiny in R
+    assert "S11" not in postmortem.build_card(con, t, bars, ind)["symptoms"]
+
+
+def test_postmortem_card_records_wind_known_before_entry_and_exit(con):
+    from stockmoney.desk import wind
+    bars = make_bars()
+    ind = compute(bars)
+    d = bars.dates
+    e, x = d[300], d[305]
+    wind.ensure_schema(con)
+    for day, state in ((d[299], "tailwind"), (d[300], "headwind"), (d[304], "neutral")):
+        con.execute("INSERT INTO wind_daily (date, state) VALUES (?,?)", (str(day.date()), state))
+    _losing_trade(con, bars, e, x)
+    postmortem.update_cards(con, bars, ind)
+    f = json.loads(con.execute("SELECT facts_json FROM trade_postmortem").fetchone()[0])
+    assert (f["wind_entry"], f["wind_exit"]) == ("tailwind", "neutral")
+
+
+def test_postmortem_wind_is_null_without_a_log(con):
+    bars = make_bars()
+    ind = compute(bars)
+    d = bars.dates
+    _losing_trade(con, bars, d[300], d[305])
+    postmortem.update_cards(con, bars, ind)
+    f = json.loads(con.execute("SELECT facts_json FROM trade_postmortem").fetchone()[0])
+    assert f["wind_entry"] is None and f["wind_exit"] is None

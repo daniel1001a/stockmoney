@@ -164,3 +164,20 @@ def test_cli_hypotheses_command_records_and_lists(tmp_path, monkeypatch, capsys)
     monkeypatch.setattr(sys, "argv", ["desk_learn.py", "hypotheses", "--list"])
     assert cli.main() == 0
     assert "2026-W13 S2 被洗出場 [candidate]" in capsys.readouterr().out
+
+
+def test_hypothesis_text_has_the_four_parts(con):
+    _two_weeks_of_s2(con)
+    text = hypotheses.build(con, TODAY)[0]["text"]
+    assert text.startswith("我認為") and "因為 S2 被洗出場" in text and "驗證:" in text and "失敗條件:" in text
+
+
+def test_at_most_three_hypotheses_across_books_largest_loss_first(con):
+    from stockmoney.desk.learn import postmortem
+    for wk in ("2026-03-27", "2026-03-20"):
+        for code, pnl in (("S3", -400.0), ("S5", -100.0), ("O2", -300.0), ("O7", -200.0)):
+            tid = ("opt:" if code[0] == "O" else "") + f"{code}{wk}"
+            _loss(con, tid, wk, code, pnl)
+    text, hyp = postmortem.symptom_report(con, TODAY)
+    assert len(hyp) == postmortem.MAX_HYPOTHESES == 3
+    assert [h.split("因為 ")[1].split(" ")[0] for h in hyp] == ["S3", "O2", "O7"]

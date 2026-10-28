@@ -15,8 +15,19 @@ Symptom rules (all computed from bars known at the time, or after exit for S2):
   S7 獲利回吐    best excursion >= 2R but closed below 0.5R
   S8 執行異常    entry or exit fill more than 0.5% away from that session's open
   S9 消息面     a Muse/Grok ALERT for the ticker arrived while held
+  S10 催化未兌現 a loss although a chain written before the entry called the symbol up, with the
+                 entry inside that impact's horizon, and the symbol did not beat SPY over the hold
+                 (fill-to-fill return minus SPY entry-session open to exit-session close)
+  S11 成本超支   entry filled >= 0.25R above the plan reference price (the entry-session open when
+                 the plan has none); R = entry minus initial stop. Exits are not counted: stop
+                 exits fill at the stop and gaps through it are S1
   S0 正常虧損    a loss with none of the above (expected for a trend system)
 Winners are carded too (symptoms may be empty) so wins and losses are compared.
+Every card also records the logged wind state (wind.py) known before the entry
+and before the exit session (facts wind_entry / wind_exit; NULL without a log).
+
+Weekly hypotheses: at most MAX_HYPOTHESES, ranked by combined two-week loss, each
+written as 我認為 X 因為 Y；驗證 Z；失敗條件 W.
 
 grok_muse_independent_same_symbol (every card, stock and option): 1 when a Grok
 item (grok_verified messages with a URL only; grok_legacy never counts) and a Muse flag on the same symbol, both received in the 3 days before the
@@ -39,23 +50,54 @@ from datetime import datetime, timedelta, timezone
 
 import pandas as pd
 
-from stockmoney.desk import store, veto
+from stockmoney.desk import store, veto, wind
 from stockmoney.desk.data import Bars
 from stockmoney.desk.indicators import Ind, market_state, sector_ranking
 from stockmoney.desk.learn import corroboration
 from stockmoney.desk.learn.trades import ClosedTrade, _table_exists, closed_trades
 from stockmoney.desk.options.config import FEED_CAVEAT
-from stockmoney.desk.universe import sector_of
+from stockmoney.desk.universe import MARKET, sector_of
 
 WHIPSAW_SESSIONS = 10
 GM_WINDOW_DAYS = 3  # Grok and Muse must both name the symbol within this many days before the entry
 OPTION_PREFIX = "opt:"
 FINAL_AFTER = WHIPSAW_SESSIONS  # a card is provisional until S2 can be decided
+SLIP_R = 0.25  # S11: adverse entry slippage, in R
+MAX_HYPOTHESES = 3
 
 LABEL = {
     "S1": "跳空穿停損", "S2": "被洗出場", "S3": "追高", "S4": "大盤翻轉", "S5": "板塊退潮",
-    "S6": "事件跳空", "S7": "獲利回吐", "S8": "執行異常", "S9": "消息面", "S0": "正常虧損",
+    "S6": "事件跳空", "S7": "獲利回吐", "S8": "執行異常", "S9": "消息面", "S10": "催化未兌現",
+    "S11": "成本超支", "S0": "正常虧損",
 }
+
+# (X: the rule idea, Z: how it is tested, W: what kills it) per stock code; Y is the loss evidence.
+_ACCEPT = "兩個子區間每筆 95% 下界都高於現行且最大回撤不更深(EDGE_PLAN 2.4)"
+HYPOTHESIS = {
+    "S1": ("財報或已知事件前一天減半或不持有隔夜能減少跳空穿停損的虧損",
+           "歷史重播比較事件前減碼與現行", "減碼版未達 " + _ACCEPT),
+    "S2": ("停損太緊,放寬移動停損或給更長持有能少被洗出場",
+           "歷史重播比較較寬停損(如 3.5 ATR)與現行,影子帳戶跟進", "放寬版未達 " + _ACCEPT),
+    "S3": ("訊號日離 20 日均線超過 2.5 ATR 時不進場或減碼能少虧",
+           "歷史重播加上延伸過濾與現行比較", "過濾版未達 " + _ACCEPT + ",或過濾掉的單整體是賺的"),
+    "S4": ("大盤從 risk_on 轉弱時提早出場能少虧",
+           "歷史重播加上 regime 轉弱出場與現行比較", "提早出場版未達 " + _ACCEPT),
+    "S5": ("持有中板塊掉出領先時出場能少虧",
+           "歷史重播加上板塊退潮出場與現行比較", "退潮出場版未達 " + _ACCEPT),
+    "S6": ("財報日落在持有期間時進場前避開能少虧",
+           "歷史重播排除財報跨期的進場與現行比較", "避開版未達 " + _ACCEPT),
+    "S7": ("到 2R 後收緊移動停損能保住獲利",
+           "歷史重播加上 2R 後收緊停損與現行比較", "收緊版未達 " + _ACCEPT),
+    "S8": ("下單方式(限價、時間)造成的滑價可以壓低",
+           "比對成交價與開盤價,紙上帳戶試限價單至少 30 筆", "限價版的未成交損失大於省下的滑價"),
+    "S9": ("持有中收到同代號 ALERT 時減碼能少虧",
+           "影子帳戶在 ALERT 後減碼與現行比較至少 30 筆", "減碼版每筆 95% 下界未高於現行"),
+    "S10": ("連鎖推論喊漲的標的在推論未兌現前不該加分或加碼",
+            "chains 計分表看喊漲 impact 的超額報酬命中率,至少 50 筆", "喊漲 impact 對 SPY 的超額報酬命中率 Wilson 下界高於 50%"),
+    "S11": ("進場價離計畫價超過 0.25R 時放棄這筆能少虧",
+            "影子帳戶套用滑價上限與現行比較至少 30 筆", "放棄的單整體是賺的,或上限版每筆 95% 下界未高於現行"),
+}
+_GENERIC = ("針對這個症狀調整進場或出場規則能少虧", "回測加影子帳戶至少 30 筆", "調整版每筆 95% 下界未高於現行")
 
 
 def _num(x) -> float | None:
@@ -126,6 +168,41 @@ def _alerts(con, sym: str, entry_at: str, exit_at: str) -> list[str]:
     return out
 
 
+def _wind(con, day: str) -> str | None:
+    return wind.state_before(con, day) if _table_exists(con, "wind_daily") else None
+
+
+def _up_chains(con, sym: str, entry_at: str, entry_day: pd.Timestamp, idx: pd.DatetimeIndex) -> list[str]:
+    """Chain ids written before the entry that call ``sym`` up, with the entry
+    session no later than horizon_days sessions after the chain's base close."""
+    if not _table_exists(con, "chains") or not entry_at:
+        return []
+    from stockmoney.desk.learn.chains import base_session
+    entry = corroboration._when(entry_at)
+    if entry is None:
+        return []
+    entry = _aware(entry)
+    pos = idx.get_loc(entry_day)
+    out = []
+    for r in con.execute("SELECT chain_id, created_at, impacts_json FROM chains").fetchall():
+        try:
+            created = _aware(datetime.fromisoformat(r["created_at"]))
+            impacts = json.loads(r["impacts_json"])
+        except (TypeError, ValueError):
+            continue
+        if created > entry:
+            continue
+        base = base_session(created.isoformat(), idx)
+        if base is None:
+            continue
+        for imp in impacts:
+            if (str(imp.get("ticker", "")).replace(".", "-") == sym.replace(".", "-") and imp.get("direction") == "up"
+                    and pos - idx.get_loc(base) <= int(imp.get("horizon_days", 0))):
+                out.append(r["chain_id"])
+                break
+    return out
+
+
 def build_card(con, t: ClosedTrade, bars: Bars, ind: Ind) -> dict | None:
     idx = bars.dates
     entry_day, exit_day = pd.Timestamp(t.entry_day), pd.Timestamp(t.exit_day)
@@ -189,6 +266,16 @@ def build_card(con, t: ClosedTrade, bars: Bars, ind: Ind) -> dict | None:
     slip_in = abs(t.entry_px / open_in - 1) if open_in else None
     slip_out = abs(t.exit_px / open_out - 1) if open_out else None
 
+    slip_r = None
+    ref = t.plan_ref_price or open_in
+    if ref and risk:
+        slip_r = (t.entry_px - ref) / risk
+    catalyst = _up_chains(con, sym, t.entry_at, entry_day, idx)
+    excess = None
+    spy_in, spy_out = _at(bars.open, entry_day, MARKET), _at(bars.close, exit_day, MARKET)
+    if spy_in and spy_out:
+        excess = t.ret - (spy_out / spy_in - 1)
+
     alerts = _alerts(con, sym, t.entry_at, t.exit_at)
     flags_in_hold = veto.flags_between(con, sym, t.entry_at, t.exit_at)
     vetoes_in_hold = veto.blocks_between(con, sym, t.entry_at, t.exit_at)
@@ -217,6 +304,10 @@ def build_card(con, t: ClosedTrade, bars: Bars, ind: Ind) -> dict | None:
         s.append("S8")
     if alerts:
         s.append("S9")
+    if t.pnl <= 0 and catalyst and excess is not None and excess <= 0:
+        s.append("S10")
+    if slip_r is not None and slip_r >= SLIP_R:
+        s.append("S11")
     if t.pnl <= 0 and not s:
         s.append("S0")
 
@@ -228,6 +319,8 @@ def build_card(con, t: ClosedTrade, bars: Bars, ind: Ind) -> dict | None:
         "slip_entry": slip_in, "slip_exit": slip_out, "hold_sessions": len(held) - 1,
         "alerts": alerts, "research_flags_in_hold": flags_in_hold, "veto_blocks_in_hold": vetoes_in_hold,
         "signal_id": t.signal_id, "initial_stop": t.initial_stop,
+        "up_chains_before_entry": catalyst, "excess_vs_spy": excess, "slip_entry_r": slip_r,
+        "wind_entry": _wind(con, t.entry_day), "wind_exit": _wind(con, t.exit_day),
     }
     return {"symptoms": s, "facts": facts, "r_multiple": r_mult, "status": "final" if complete else "provisional"}
 
@@ -296,12 +389,17 @@ def week_stats(con, today: str, weeks: int = 4, book: str = "stock") -> list[dic
 
 
 def candidate_symptoms(stats: list[dict]) -> list[str]:
-    """Symptoms other than S0 / O0 in the top two by loss in both of the two newest weeks."""
+    """Symptoms other than S0 / O0 in the top two by loss in both of the two
+    newest weeks, largest combined loss first."""
     if len(stats) < 2:
         return []
     tops = [set(sorted((c for c in w["loss"] if c not in ("S0", "O0")), key=lambda c: w["loss"][c])[:2])
             for w in stats[:2]]
-    return sorted(tops[0] & tops[1])
+    return sorted(tops[0] & tops[1], key=lambda c: (_combined(stats, c), c))
+
+
+def _combined(stats: list[dict], code: str) -> float:
+    return stats[0]["loss"].get(code, 0.0) + stats[1]["loss"].get(code, 0.0)
 
 
 def _label(code: str) -> str:
@@ -310,7 +408,9 @@ def _label(code: str) -> str:
 
 
 def hypothesis_text(code: str) -> str:
-    return f"{code} {_label(code)} 連續兩週排在虧損前兩名:提出規則假設,走回測 + 影子帳戶驗證,不直接改規則。"
+    x, z, w = HYPOTHESIS.get(code, _GENERIC)
+    return (f"我認為{x},因為 {code} {_label(code)} 連續兩週排在虧損前兩名;驗證:{z};失敗條件:{w}。"
+            "只是假設,不直接改規則。")
 
 
 def _week_lines(stats: list[dict]) -> list[str]:
@@ -326,17 +426,18 @@ def _week_lines(stats: list[dict]) -> list[str]:
 def symptom_report(con, today: str, weeks: int = 4) -> tuple[str, list[str]]:
     """Per-week symptom counts and loss totals; returns (text, hypotheses).
     A hypothesis is proposed only when a symptom (other than S0) is in the top
-    two by loss for two consecutive weeks. Option cards get their own
+    two by loss for two consecutive weeks; at most MAX_HYPOTHESES across both books. Option cards get their own
     section and their own candidates (never mixed with the stock counts)."""
     if con.execute("SELECT 1 FROM trade_postmortem LIMIT 1").fetchone() is None:
         return "尚無平倉交易,沒有驗屍卡。", []
     stats = week_stats(con, today, weeks)
     lines = [f"## 驗屍卡週報(截至 {today})", "", *_week_lines(stats)]
-    hyp = [hypothesis_text(c) for c in candidate_symptoms(stats)]
+    ranked = [(_combined(stats, c), c) for c in candidate_symptoms(stats)]
     if con.execute("SELECT 1 FROM trade_postmortem WHERE trade_id LIKE ? LIMIT 1", (OPTION_PREFIX + "%",)).fetchone():
         ostats = week_stats(con, today, weeks, book="options")
         lines += ["", "### 期權驗屍卡(實盤紙上)", f"> {FEED_CAVEAT}", *_week_lines(ostats)]
-        hyp += [hypothesis_text(c) for c in candidate_symptoms(ostats)]
+        ranked += [(_combined(ostats, c), c) for c in candidate_symptoms(ostats)]
+    hyp = [hypothesis_text(c) for _, c in sorted(ranked)[:MAX_HYPOTHESES]]
     if hyp:
         lines += ["", "### 候選假設", *[f"- {h}" for h in hyp]]
     return "\n".join(lines), hyp
