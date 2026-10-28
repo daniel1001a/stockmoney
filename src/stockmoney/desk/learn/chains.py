@@ -257,9 +257,11 @@ def base_session(created_at: str, sessions: pd.DatetimeIndex) -> pd.Timestamp | 
 
 
 def score_due(con, bars: Bars, through: pd.Timestamp) -> int:
-    """Score every impact whose horizon has fully elapsed; returns rows added.
-    Idempotent. A scored row whose sector columns are still NULL gets them
-    filled once the sector ETF close is available."""
+    """Score every impact whose horizon has fully elapsed; returns rows added
+    plus rows whose sector columns were filled. Idempotent. A scored row whose
+    sector columns are still NULL gets them filled once the sector ETF close is
+    available; its SPY excess and hit are recomputed from the same bars in the
+    same write, so both comparisons share one price basis."""
     n = 0
     sessions = bars.dates[bars.dates <= through]
     spy = bars.close[MARKET]
@@ -290,16 +292,19 @@ def score_due(con, bars: Bars, through: pd.Timestamp) -> int:
                         ex_sec = ret - float(e1 / e0 - 1)
                         hit_sec = int((ex_sec > 0) == up)
                 key = (r["chain_id"], imp["ticker"], h)
-                old = con.execute("SELECT excess_sector FROM chain_scores WHERE chain_id=? AND ticker=? AND horizon=?",
-                                  key).fetchone()
-                if old:
-                    # rows scored before the sector columns existed, or while the ETF close was missing
-                    if old["excess_sector"] is None and ex_sec is not None:
-                        con.execute("UPDATE chain_scores SET sector_etf=?, excess_sector=?, hit_sector=? "
-                                    "WHERE chain_id=? AND ticker=? AND horizon=?", (etf, ex_sec, hit_sec, *key))
-                    continue
                 ex = ret - float(s1 / s0 - 1)
                 hit = int((ex > 0) == up)
+                old = con.execute("SELECT excess_sector, base_date, scored_date FROM chain_scores "
+                                  "WHERE chain_id=? AND ticker=? AND horizon=?", key).fetchone()
+                if old:
+                    # rows scored before the sector columns existed, or while the ETF close was missing
+                    if (old["excess_sector"] is None and ex_sec is not None
+                            and (old["base_date"], old["scored_date"]) == (str(base.date()), str(t.date()))):
+                        con.execute("UPDATE chain_scores SET excess_ret=?, hit=?, sector_etf=?, excess_sector=?, "
+                                    "hit_sector=? WHERE chain_id=? AND ticker=? AND horizon=?",
+                                    (ex, hit, etf, ex_sec, hit_sec, *key))
+                        n += 1
+                    continue
                 con.execute("INSERT INTO chain_scores (chain_id, ticker, horizon, declared, direction, base_date, "
                             "scored_date, excess_ret, hit, confidence, scored_at, order_n, sector_etf, excess_sector, "
                             "hit_sector) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
@@ -350,10 +355,14 @@ def by_order(con) -> dict[int, dict]:
     return out
 
 
+def _in_universe(ticker: str) -> bool:
+    """score_due prices from the desk bars, which hold exactly ALL_SYMBOLS."""
+    return _sym(ticker) in set(ALL_SYMBOLS)
+
+
 def unscorable(con) -> int:
     """Impacts whose ticker has no price series in the desk universe."""
-    universe = set(ALL_SYMBOLS)
-    return sum(_sym(i["ticker"]) not in universe
+    return sum(not _in_universe(i["ticker"])
                for (raw,) in con.execute("SELECT impacts_json FROM chains WHERE impacts_json IS NOT NULL")
                for i in json.loads(raw))
 
@@ -390,9 +399,11 @@ def report(con) -> str:
         lines.append(f"另有 {outside} 個 impact 的代號不在追蹤股票池內,無法評分(第 2 層的供應商、客戶常在池外)。")
     from stockmoney.desk.learn import corroboration, invalidation
     lines += [x for x in (invalidation.report(con), corroboration.report(con)) if x]
-    pending = con.execute(
-        "SELECT chain_id, trigger_text FROM chains c WHERE NOT EXISTS (SELECT 1 FROM chain_scores s "
-        "WHERE s.chain_id=c.chain_id AND s.declared=1) ORDER BY created_at DESC LIMIT 5").fetchall()
+    # a chain whose every impact is outside the universe can never be scored: not "waiting"
+    pending = [p for p in con.execute(
+        "SELECT chain_id, trigger_text, impacts_json FROM chains c WHERE NOT EXISTS (SELECT 1 FROM chain_scores s "
+        "WHERE s.chain_id=c.chain_id AND s.declared=1) ORDER BY created_at DESC").fetchall()
+        if any(_in_universe(i["ticker"]) for i in json.loads(p["impacts_json"] or "[]"))][:5]
     if pending:
         lines += ["", "等待驗證:"] + [f"- {p['trigger_text'][:60]}" for p in pending]
     return "\n".join(lines)
