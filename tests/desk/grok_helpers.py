@@ -42,7 +42,8 @@ def worst_case() -> dict:
         "events": [{"ticker": tk, "headline": c * 160, "severity": "critical", "confirmed": False,
                     "first_seen": ts, "urls": [url] * 3, "basis": "inference"}] * 25,
         "chains": [{"trigger": c * 200, "urls": [url] * 3, "steps": [c * 120] * 6,
-                    "impacts": [{"ticker": tk, "direction": "down", "horizon_days": 60}] * 6,
+                    "impacts": [{"ticker": t, "direction": "down", "horizon_days": 60, "order": 2}
+                                for t in (tk, "BRK-B", "GOOGL", "TQQQ", "NVDA", "QQQ")],  # one per ticker
                     "checkpoints": [{"what": c * 100, "date": "2026-10-30"}] * 4,
                     "invalidations": [{"kind": "data_not_by", "description": c * 100, "by_date": "2026-10-30"}] * 3,
                     "confidence": 0.123456789}] * 6,

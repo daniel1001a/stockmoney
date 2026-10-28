@@ -207,6 +207,41 @@ def test_chain_impact_order_is_1_or_2():
         GrokImpact(ticker="MU", direction="down", horizon_days=20, order=0)
 
 
+def test_chain_rejects_a_repeated_ticker():
+    imp = dict(direction="up", horizon_days=5)
+    with pytest.raises(Exception):
+        chains.Chain(trigger="t", steps=["s"], confidence=0.5, impacts=[
+            chains.Impact(ticker="BRK.B", **imp), chains.Impact(ticker="BRK-B", order=2, **imp)])
+    from stockmoney.desk.bridge.schema import GrokChain
+    g = dict(trigger="t", urls=["https://x.com/a/status/1"], steps=["s"], confidence=0.5)
+    with pytest.raises(Exception):
+        GrokChain(**g, impacts=[{"ticker": "MU", **imp}, {"ticker": "MU", "order": 2, **imp}])
+
+
+def test_chain_sector_columns_backfill_on_a_later_pass(con):
+    bars = make_bars()
+    d = bars.dates
+    created = datetime(d[300].year, d[300].month, d[300].day, 15, 0, tzinfo=timezone.utc)
+    cid = chains.add_chain(con, _chain("up", 5), created)
+    chains.score_due(con, bars, d[-1])
+    con.execute("UPDATE chain_scores SET sector_etf=NULL, excess_sector=NULL, hit_sector=NULL")  # as scored before
+    assert chains.score_due(con, bars, d[-1]) == 0  # no new rows
+    r = con.execute("SELECT * FROM chain_scores WHERE chain_id=? AND horizon=5", (cid,)).fetchone()
+    assert r["sector_etf"] == "XLK" and r["excess_sector"] is not None and r["hit_sector"] in (0, 1)
+
+
+def test_chain_report_counts_impacts_outside_the_universe(con):
+    bars = make_bars()
+    d = bars.dates
+    created = datetime(d[300].year, d[300].month, d[300].day, 15, 0, tzinfo=timezone.utc)
+    chains.add_chain(con, chains.Chain(trigger="t3", steps=["s"], confidence=0.5, source="owner", impacts=[
+        chains.Impact(ticker="AAPL", direction="up", horizon_days=5),
+        chains.Impact(ticker="ZZZQ", direction="down", horizon_days=5, order=2)]), created)
+    chains.score_due(con, bars, d[-1])
+    assert chains.unscorable(con) == 1
+    assert "1 個 impact 的代號不在追蹤股票池內" in chains.report(con)
+
+
 def test_chain_after_close_uses_same_day_close(con):
     bars = make_bars()
     d = bars.dates

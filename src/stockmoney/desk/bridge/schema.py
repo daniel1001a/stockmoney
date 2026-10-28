@@ -187,6 +187,15 @@ class GrokImpact(BaseModel):
     horizon_days: Literal[5, 20, 60]
     order: Literal[1, 2] = 1  # 1: directly hit by the trigger; 2: supplier / customer / competitor / substitute
 
+    @model_validator(mode="before")
+    @classmethod
+    def _order_or_drop(cls, data):
+        # a bad order must drop the whole impact (lenient pruning removes the
+        # item at this level), never fall back to the default and count as 1st order
+        if isinstance(data, dict) and "order" in data and (type(data["order"]) is not int or data["order"] not in (1, 2)):
+            raise ValueError("order must be 1 or 2")
+        return data
+
 
 class GrokCheckpoint(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -229,6 +238,14 @@ class GrokChain(BaseModel):
     checkpoints: list[GrokCheckpoint] = Field(max_length=4)
     invalidations: list[GrokInvalidation] = Field(default_factory=list, max_length=3)
     confidence: float = Field(ge=0, le=1)
+
+    @model_validator(mode="after")
+    def _one_impact_per_ticker(self):
+        # chain_scores keys on (chain_id, ticker, horizon): a repeated ticker could not be scored apart
+        tickers = [i.ticker.replace(".", "-") for i in self.impacts]
+        if len(set(tickers)) != len(tickers):
+            raise ValueError("each ticker may appear once in impacts")
+        return self
 
 
 class GrokCall(Call):

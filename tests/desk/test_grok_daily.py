@@ -272,13 +272,14 @@ def test_list_limits(path, limit):
     *head, last = path.split(".")
     for p in head:
         node = node[int(p)] if p.isdigit() else node[p]
-    node[last] = list(node[last])[:1] * limit
+    if last != "impacts":  # worst_case already has 6 impacts, one per ticker (repeats are rejected)
+        node[last] = list(node[last])[:1] * limit
     validate(base)
     over = copy.deepcopy(base)
     node = over
     for p in head:
         node = node[int(p)] if p.isdigit() else node[p]
-    node[last] = node[last] + node[last][:1]
+    node[last] = node[last] + [{**node[last][0], "ticker": "SPY"} if last == "impacts" else node[last][0]]
     assert rejected(over)
 
 

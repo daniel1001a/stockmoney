@@ -223,6 +223,19 @@ def test_pruning_never_empties_a_list_that_had_items():
     assert inbox.lenient_validate(json.dumps(r), "RESEARCH_REPLY") == (None, [])
 
 
+def test_bad_impact_order_drops_the_impact_not_the_field():
+    """An order outside 1|2 must not fall back to the default and count as a
+    first-order impact; the impact itself is pruned."""
+    d = grok_daily()
+    d["chains"][0]["impacts"][1]["order"] = 3
+    msg, dropped = inbox.lenient_validate(json.dumps(d), "GROK_DAILY")
+    assert msg is not None and dropped
+    assert [i.ticker for i in msg.chains[0].impacts] == ["NVDA"]
+    d["chains"][0]["impacts"][1]["order"] = 2
+    msg, _ = inbox.lenient_validate(json.dumps(d), "GROK_DAILY")
+    assert msg is None or msg.chains[0].impacts[1].order == 2
+
+
 def test_pruning_a_side_section_to_empty_keeps_the_digest():
     """One bad item that is the only one in an optional section (in_play,
     tracked_accounts) is dropped; the events in the same digest are kept."""
