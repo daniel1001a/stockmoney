@@ -43,6 +43,7 @@ class Counting:
 
 
 def full_universe(tmp_path, con, **kw):
+    kw.setdefault("live_sources", ("gap_go", "orb15", "grok_plan"))  # the fixture day is an orb15 breakout
     cfg = OptionsConfig(halt_file=tmp_path / "H", lock_path=tmp_path / "l", report_dir=tmp_path / "r", **kw)
     clock = Clock(et(9, 20))
     day = with_history(orb_breakout_day())

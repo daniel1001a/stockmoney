@@ -46,7 +46,7 @@ from stockmoney.desk.options import plan as oplan
 from stockmoney.desk.options import report as oreport
 from stockmoney.desk.options import store as ostore
 from stockmoney.desk.options.config import OptionsConfig
-from stockmoney.desk.options.engine import PENDING, Engine
+from stockmoney.desk.options.engine import ENTERED, PENDING, Engine
 
 log = logging.getLogger("desk.options.run")
 ET = ZoneInfo("America/New_York")
@@ -129,6 +129,7 @@ def session(cfg: OptionsConfig | None = None, db_path: Path = store.DEFAULT_PATH
             sleep(min(30.0, max((start - clock()).total_seconds(), 0.5)))
         with store.connect(db_path) as con:
             ostore.ensure_schema(con)
+            ostore.record_param_changes(con)
             eng, mode = engine_factory(con, cfg, clock)
             end = eng.session_end(clock())  # the close: 13:00 ET on an early-close day
             ap = oplan.active_plan(con, day)
@@ -145,13 +146,16 @@ def session(cfg: OptionsConfig | None = None, db_path: Path = store.DEFAULT_PATH
             con.commit()
             failures = 0
             last_full = None
-            fast = False
+            fast = pos_only = False
             try:
                 while clock() <= end:
                     try:
-                        if not fast:
-                            last_full = clock()
-                        eng.tick(fast=fast)
+                        if pos_only:
+                            eng.tick(fast=False, positions_only=True)
+                        else:
+                            if not fast:
+                                last_full = clock()
+                            eng.tick(fast=fast)
                         failures = 0
                     except Exception as e:  # the loop must survive; exits retry next tick
                         failures += 1
@@ -166,12 +170,20 @@ def session(cfg: OptionsConfig | None = None, db_path: Path = store.DEFAULT_PATH
                     exiting = con.execute("SELECT COUNT(*) FROM options_orders WHERE kind='exit' AND status IN "
                                           "('pending_submit','submitted','new','partially_filled','pending',"
                                           "'pending_cancel')").fetchone()[0]
-                    # 2-second polls only resolve live orders / positions; a full tick (scans,
-                    # shadow) still runs at least every poll_seconds
+                    holding = con.execute("SELECT COUNT(*) FROM options_positions WHERE day<=? AND mode='live' "
+                                          "AND state=?", (str(day), ENTERED)).fetchone()[0]
+                    # 2-second polls only resolve live orders / positions; while a live position
+                    # is open (and no order works) it gets a positions-only tick (exit decision on
+                    # a fresh quote) every poll_seconds_in_position; a full tick (scans, shadow)
+                    # still runs at least every poll_seconds
                     busy = bool(working or exiting)
-                    fast = busy and last_full is not None and \
-                        (clock() + timedelta(seconds=FAST_POLL_S) - last_full).total_seconds() < cfg.poll_seconds
-                    sleep(FAST_POLL_S if busy else cfg.poll_seconds)
+                    interval = FAST_POLL_S if busy else \
+                        (cfg.poll_seconds_in_position if holding else cfg.poll_seconds)
+                    due_full = last_full is None or \
+                        (clock() + timedelta(seconds=interval) - last_full).total_seconds() >= cfg.poll_seconds
+                    fast = busy and not due_full
+                    pos_only = bool(holding) and not busy and not due_full
+                    sleep(interval)
             finally:
                 flat = _finish(eng, cfg, con, day)
         return 0 if flat else 1

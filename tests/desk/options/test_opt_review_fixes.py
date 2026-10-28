@@ -580,15 +580,15 @@ def test_n3_flatten_now_does_not_double_sell_and_flat_replaces_limit(tmp_path, c
     r.broker.fill = "never"
     r.run(et(15, 45, 1), step=1)
     ex = exits(con, lp["position_id"])
-    assert len(ex) == 1 and ex[0]["order_type"] == "limit"
+    assert len(ex) == 1 and ex[0]["order_type"] == "market"  # 2026-10-27 audit: the flat sells at market
     n = len(r.broker.submit_calls)
     r.eng.flatten_now("session_end")
-    # (Grok round-3 H4) the working limit is canceled, confirmed, then replaced in the same call:
-    # one replacement, never two sells working at once
-    assert len(r.broker.submit_calls) == n + 1
+    # a market exit still inside exit_timeout_s is left to work: never two sells working at once
+    # (the limit-at-the-flat replacement is covered in test_opt_audit_1027)
+    assert len(r.broker.submit_calls) == n
     sells_ = [o for o in r.broker.orders.values() if o.side == Side.SELL]
     assert sum(o.status == OrderStatus.NEW for o in sells_) == 1
-    r.run(et(15, 45, 8), step=2)
+    r.run(et(15, 45, 30), step=2)
     ex = exits(con, lp["position_id"])
-    assert r.broker.orders[ex[0]["client_order_id"]].status == OrderStatus.CANCELED  # limit replaced at once
+    assert r.broker.orders[ex[0]["client_order_id"]].status == OrderStatus.CANCELED  # stale market replaced
     assert ex[-1]["order_type"] == "market" and len(ex) == 2

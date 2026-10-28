@@ -16,8 +16,11 @@ INDEX = ("SPY", "QQQ", "TQQQ")
 MEGA_CAP = ("NVDA", "TSLA", "AMD", "AAPL", "MSFT", "META", "AMZN", "GOOGL", "AVGO", "PLTR", "MU", "NFLX")
 HIGH_VOL = ("COIN", "SMCI")
 
-RULE_PLAYBOOKS = ("gap_go", "gap_fade", "orb15", "vwap_reclaim")
+RULE_PLAYBOOKS = ("gap_go", "gap_fade", "orb15", "orb15_5m", "vwap_reclaim")
 GROK = "grok_plan"
+# never live, even if listed in live_sources: orb15_5m is orb15's trigger with
+# a 5-minute close invalidation, recorded in shadow to compare (2026-10-27 audit)
+SHADOW_ONLY_SOURCES = ("orb15_5m",)
 # printed on every options report (daily report, weekly option cards); decided by the account owner 2026-10-21
 FEED_CAVEAT = "報價為 indicative,滑價量測僅供參考"
 # orb15 benchmark: QQQ for tech / growth names, SPY for everything else
@@ -69,6 +72,13 @@ class OptionsConfig:
     not_flat_alert_min: int = 10             # page (CRITICAL) if not flat this long before the close (15:50 ET)
     min_live_minutes_before_flat: int = 90   # no live entry with less time than this left before forced flat
     poll_seconds: float = 20.0               # section 8: 15 to 30 s
+    # while a live position is open: its exits are decided this often (a
+    # positions-only tick; scans and shadow still run every poll_seconds).
+    # Budget, 3 open positions: (1 option quote + 1 stock quote) x 12 / min
+    # x 3 = 72 live calls / min, plus bars at most once a minute per
+    # underlying (3): about 75, under max_data_calls_per_min (110) and well
+    # under Alpaca's 200 / min per feed; scans and shadow get what is left.
+    poll_seconds_in_position: float = 5.0
     tick_deadline_s: float = 40.0            # a tick running longer skips scans and shadow work (live first)
 
     # --- exits (section 5, fixed, not tuned yet). Every entry is recorded
@@ -87,12 +97,18 @@ class OptionsConfig:
     trail_atr_mult: float = 0.4              # variant B
     atr_period: int = 14                     # variant B, 1-minute underlying bars
     time_stop_minutes: int = 180
+    # close-invalidation bar length per source, in minutes (default 1): the
+    # last COMPLETED bar of this length (anchored at the open) closing back
+    # inside decides
+    close_inv_minutes: tuple[tuple[str, int], ...] = (("orb15_5m", 5),)
 
     # --- orders
     entry_limit_offset: float = 0.0          # added to the ask for the entry limit
     entry_timeout_s: float = 20.0            # cancel an unfilled entry after this
     exit_timeout_s: float = 20.0             # reprice an unfilled exit after this
-    exit_max_limit_attempts: int = 3         # then a market sell
+    # only take_profit sells by limit (bid minus one tick); every stop-type
+    # exit is a market sell. After this many unfilled limits: market.
+    exit_max_limit_attempts: int = 1
     cancel_max_failures: int = 3             # failed cancels of one order before the owner is paged
     cancel_page_every_min: float = 5.0       # a working exit that cannot be canceled is re-paged this often
     order_status_max_failures: int = 5       # failed get_order reads of an exit before a fresh market sell
@@ -186,8 +202,9 @@ class OptionsConfig:
     fee_per_contract: float = 0.03           # regulatory fees; Alpaca charges no commission
 
     # --- live eligibility: only these sources may send a (paper) order;
-    # vwap_reclaim and gap_fade are shadow only
-    live_sources: tuple[str, ...] = ("gap_go", "orb15", GROK)
+    # vwap_reclaim, gap_fade, orb15 and orb15_5m are shadow only (orb15
+    # moved to shadow by the 2026-10-27 audit: 14 live trades, net -1,164)
+    live_sources: tuple[str, ...] = ("gap_go", GROK)
     paper_only: bool = True
 
     # --- paths
