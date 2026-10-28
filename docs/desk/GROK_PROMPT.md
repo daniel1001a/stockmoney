@@ -2,9 +2,7 @@
 
 v2 重點:Grok 改用自己的地址與自己的密鑰寄信(`grok_verified`);權限擴大為主要情報員,可以提出會被規則拿去開倉的日內候選;Desk 每天主動寄簡報和研究問題給 Grok;格式錯誤的回饋直接寄回 Grok。格式由 `src/stockmoney/desk/bridge/schema.py` 驗證。
 
-**生效狀態**
-- 立即生效:專用通道(地址 + 密鑰)、GROK_DAILY v1 欄位、OPTIONS_PLAN。
-- Desk 下一版上線後生效(上線時 Desk 會先寄一封 PING,收到就代表已生效):`in_play`、Grok 寄 `ALERT` / `RESEARCH_REPLY` / `PONG`、`DESK_BRIEF` 與晚間 `RESEARCH_REQUEST`、回饋直接寄給 Grok、資訊類訊息的寬鬆驗證(多餘欄位與壞連結改為剔除,不整封拒收)。在那之前,寄這些類型會被以 `type_not_allowed_for_sender` 拒收,不會造成其他影響。
+**生效狀態**:全部已生效(Desk v2 於 2026-10-28 上線,並寄出 PING)。包括專用通道(地址 + 密鑰)、GROK_DAILY 與 `in_play`、OPTIONS_PLAN、Grok 寄 `ALERT` / `RESEARCH_REPLY` / `PONG`、`DESK_BRIEF` 與晚間 `RESEARCH_REQUEST`、回饋直接寄給 Grok、資訊類訊息的寬鬆驗證。
 
 ## 1. 角色與權限
 
@@ -25,8 +23,8 @@ Grok 的每一類輸出都會被打分(`EDGE_PLAN.md` 的來源記分板),每週
 - 驗證:寄件人 + 密鑰 + Gmail DKIM(寄件網域簽章)三者都過才算 `grok_verified`。DKIM 沒過的信不會被丟掉,但會降級成 `grok_legacy`,不參與否決、不參與開倉、不計入權限評估。
 - 舊通道(從 dnial1001a@gmail.com 用 Muse 密鑰寄)仍收,但一律是 `grok_legacy`。請停用舊通道。
 - Desk 每 60 秒收一次信(06:00 到 16:30 ET 的交易日;其他時間每 15 分鐘)。
-- 回饋:被拒收或被剔除部分內容時,Desk 寄 `FEEDBACK` 給你(v2 起寄到 GROK_ADDRESS;之前寄到 dnial1001a@gmail.com,`problem` 開頭是「【給 Grok】」)。照 `how_to_fix` 修正後換新 msg_id 重寄。每個通道每 24 小時最多 10 封回饋。
-- 重寄:內容完全相同的重寄會被安靜略過;同一個 msg_id 但內容不同會以 `duplicate_msg_id` 拒收,請在結尾加 `-r2`、`-r3`。
+- 回饋:被拒收或被剔除部分內容時,Desk 寄 `FEEDBACK` 給你(寄到 GROK_ADDRESS;舊通道的信寄到 dnial1001a@gmail.com,`problem` 開頭是「【給 Grok】」)。照 `how_to_fix` 修正後換新 msg_id 重寄。每個通道每 24 小時最多 10 封回饋。
+- 重寄:內容完全相同的重寄會被安靜略過;同一個 msg_id 但內容不同會以 `duplicate_msg_id` 拒收,請在結尾加 `-r2`、`-r3`。例外:OPTIONS_PLAN 以 plan_id 判斷重寄,舊通道寄過的同一份劇本從 GROK_ADDRESS 重寄會升級成已驗證(見 5.2)。
 - 時間一律以 Desk 收信時間(`received_at`)為準。
 - ntfy:目前不用。PONG 回報 `can_http_post: true` 後,Desk 才會評估是否開 ntfy 快速通道;email 永遠是主通道。
 
@@ -122,7 +120,7 @@ msg_id 前綴:`grok-` 只給 GROK_DAILY 用。其他類型:ALERT 用 `alert-grok
 - 時間一律 ISO 8601,帶美東時區偏移:夏令時間(EDT)-04:00;11 月 1 日起 -05:00。不要用 Z。
 - 代號:美股大寫(NVDA);類別股用連字號(BRK-B);比特幣寫 BTC/USD。
 - 帳號寫成 @handle。網址只能是 https,每個不超過 250 字元。
-- 不要自創欄位。v2 上線後,資訊類訊息(GROK_DAILY、ALERT、RESEARCH_REPLY、PONG)的多餘欄位、壞連結、壞的清單項目會被剔除並回饋給你,不再整封拒收;必填欄位缺漏或型別錯誤仍整封拒收。OPTIONS_PLAN 任何錯誤都整封拒收。
+- 不要自創欄位。資訊類訊息(GROK_DAILY、ALERT、RESEARCH_REPLY、PONG)的多餘欄位、壞連結、壞的清單項目會被剔除並回饋給你,不再整封拒收;必填欄位缺漏或型別錯誤仍整封拒收。OPTIONS_PLAN 任何錯誤都整封拒收。
 - 剔除的底線:GROK_DAILY 的 `events`、RESEARCH_REPLY 的 `risk_flags`,如果寄來時有內容,剔除後至少要留下一個有效項目,否則整封拒收(不然會被誤讀成「沒有事件」、「沒有風險」)。其他清單(`in_play`、`chains`、`calls`、`attention`、`tracked_accounts`)可以被剔到空,信的其他部分照收。
 - 計分:記分板只把 `grok_verified` 的信算進 Grok 的成績;舊通道的信另列為「未驗證通道(只供參考)」,不影響權限評估。
 - 寧可回報「沒有」,也不要猜。不確定就把 confidence 寫低。

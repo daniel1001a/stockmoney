@@ -16,7 +16,7 @@ Muse 是 Meta 的個人 AI agent(2026-09 推出):能在背景持續工作、能�
 - Muse 恢復的條件:用來源記分板(`EDGE_PLAN.md`)把 Muse 過去的 SOCIAL_DAILY、CALLS、ALERT、擋單結果打分,證明有價值才恢復,且只恢復有分數的那一項。暫停期間 Muse 寄來的信照收照存,規則不變。
 - 暫停期間 Muse 可選擇做的唯一工作:把 Desk 寄到你 Gmail 的 `REPORT` 摘要轉告你。不需要也可以不做。
 - 推播:Desk 對你的推播照舊走 ntfy(`NTFY_TOPIC`)。agent 通道一律是 email:Muse 的環境連不到 ntfy.sh(見 `MUSE_PROMPT.md`);Grok 能不能用 HTTP POST 由 PING / PONG 握手回報,確認可以之後才評估 ntfy 快速通道,email 永遠保留。
-- Desk 主動寄給 Grok:06:30 ET `DESK_BRIEF`(昨日績效、持倉、問題)、17:45 ET `RESEARCH_REQUEST`(虧損交易與大幅波動的原因),Grok 用早報 notes 與 `RESEARCH_REPLY` 回答。Desk 收信改為交易日 06:00 到 16:30 ET 每 60 秒一次,其他時間每 15 分鐘。這幾項在 Desk 下一版上線後生效。
+- Desk 主動寄給 Grok:06:30 ET `DESK_BRIEF`(昨日績效、持倉、問題)、17:45 ET `RESEARCH_REQUEST`(虧損交易與大幅波動的原因),Grok 用早報 notes 與 `RESEARCH_REPLY` 回答。Desk 收信改為交易日 06:00 到 16:30 ET 每 60 秒一次,其他時間每 15 分鐘。這幾項已於 2026-10-28 上線。
 
 ## 1. 通道
 
