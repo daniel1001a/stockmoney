@@ -1,6 +1,7 @@
-"""Pre-registered hypothesis reports H1, H2, H5 and H5b (docs/desk/EDGE_PLAN.md 2.1(a), 2.5).
+"""Pre-registered hypothesis reports H1, H1b, H2, H5 and H5b (docs/desk/EDGE_PLAN.md 2.1(a), 2.5).
 
   H1  shadow:combined_t35   vs shadow:combined   (wider trailing stop, 3.5 ATR)
+  H1b shadow:combined_hold60 vs shadow:combined (pullback hold cap 40 -> 60 days)
   H2  shadow:combined_earn7 vs shadow:combined   (no new entries within 7 days of earnings)
   H5  shadow:combined_wind  vs shadow:combined   (new entries only in a tailwind, desk/wind.py)
 
@@ -35,6 +36,8 @@ BASELINE = "shadow:combined"
 HYPOTHESES = {
     "H1": {"candidate": "shadow:combined_t35", "param": "DRAFT:trail_atr", "old": 3.0, "new": 3.5,
            "title": "H1 出場放寬(移動停損 3.0 改 3.5 ATR)"},
+    "H1b": {"candidate": "shadow:combined_hold60", "param": "DRAFT:pullback.max_hold_days", "old": 40, "new": 60,
+            "title": "H1b 回檔策略持有上限 40 改 60 天"},
     "H2": {"candidate": "shadow:combined_earn7", "param": "DRAFT:earnings_entry_block_days", "old": 0, "new": 7,
            "title": "H2 財報前 7 天不開新倉"},
     "H5": {"candidate": "shadow:combined_wind", "param": "DRAFT:wind_entry_gate", "old": "off", "new": "tailwind",

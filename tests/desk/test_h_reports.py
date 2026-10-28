@@ -135,3 +135,12 @@ def test_shadow_step_advances_earn7_book_daily(con):
     assert kind == "shadow" and last == str(nxt.date())
     eq = shadow.equity_table(con)
     assert eq["shadow:combined_earn7"].dropna().index[-1] == str(nxt.date())
+
+
+def test_h1b_registered():
+    from stockmoney.desk.learn import shadow
+    from stockmoney.desk.learn.h_reports import HYPOTHESES
+    assert HYPOTHESES["H1b"]["candidate"] == "shadow:combined_hold60"
+    book = shadow.VARIANTS["shadow:combined_hold60"]("2026-10-28", None)
+    assert book["pullback"].params["max_hold_days"] == 60
+    assert book["breakout"].params["trail_atr"] == 3.0

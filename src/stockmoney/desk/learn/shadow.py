@@ -126,6 +126,8 @@ VARIANTS: dict[str, Callable] = {
     "shadow:combined_earn7": _guarded_book(7),
     # H1 in docs/desk/EDGE_PLAN.md: wider trailing stop on the two stop-driven strategies
     "shadow:combined_t35": _book(breakout={"trail_atr": 3.5}, pullback={"trail_atr": 3.5}),
+    # H1b: pullback hold cap 40 -> 60 alone (scripts/desk_h1_replay.py, 2026-10-28)
+    "shadow:combined_hold60": _book(pullback={"max_hold_days": 60}),
     # control for the 2026-10-21 Muse downgrade: entries filtered by the old Muse rule
     "shadow:combined_muse_strict": _muse_strict_book,
     # H5 in docs/desk/EDGE_PLAN.md: entries only in a tailwind / never in a headwind (desk/wind.py)
@@ -218,7 +220,7 @@ def report(con) -> str:
     lines = [f"## 影子帳戶({first} 到 {last},{len(eq)} 個交易日)", "",
              "| 帳戶 | 累計報酬 | 最大回撤 |", "|---|---|---|"]
     for c in [c for c in eq.columns if c.startswith("bench:") or c in
-              ("shadow:combined", "shadow:combined_t35", "shadow:combined_earn7", "shadow:combined_muse_strict",
+              ("shadow:combined", "shadow:combined_t35", "shadow:combined_hold60", "shadow:combined_earn7", "shadow:combined_muse_strict",
                "shadow:combined_wind", "shadow:combined_nohead", "shadow:breakout", "shadow:pullback", "shadow:rotation")]:
         lines.append(f"| {c} | {ret[c]:+.2%} | {dd[c]:.2%} |")
     for label, cols in (("隨機進場(多頭排列)", rnd_t), ("隨機進場(不限)", rnd_a)):

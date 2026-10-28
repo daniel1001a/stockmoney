@@ -91,6 +91,7 @@ BOOK_LABEL = {
     "bench:ew_gate": "清單等權 x 大盤濾網",
     "shadow:combined": "現行規則(影子)",
     "shadow:combined_t35": "寬停損 3.5 ATR",
+    "shadow:combined_hold60": "回檔持有 60 天(H1b)",
     "shadow:combined_earn7": "財報前 7 天不進場",
     "shadow:combined_muse_strict": "舊 Muse 規則擋單(對照)",
     "shadow:combined_wind": "只在順風進場(H5)",
