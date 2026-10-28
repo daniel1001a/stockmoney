@@ -332,30 +332,41 @@ def build_card(con, t: ClosedTrade, bars: Bars, ind: Ind) -> dict | None:
 CARD_V = 2  # S10/S11 and the wind facts
 
 
-def _final_is_current(con, old, t: ClosedTrade) -> bool:
+def _chains_seen(con) -> int:
+    """Chain-table watermark stored on each card: any chain added since the
+    card was built (even one committed by a run whose card pass failed) makes
+    it stale, so S10 is never frozen on an old view."""
+    if not _table_exists(con, "chains"):
+        return 0
+    return con.execute("SELECT COUNT(*) FROM chains").fetchone()[0]
+
+
+def _final_is_current(con, old, t: ClosedTrade, seen: int) -> bool:
     f = json.loads(old["facts_json"] or "{}")
-    if f.get("card_v") != CARD_V:
+    if f.get("card_v") != CARD_V or f.get("chains_seen") != seen:
         return False
     return not (f.get("wind_entry") is None and _wind(con, t.entry_day) is not None)
 
 
-def update_cards(con, bars: Bars, ind: Ind, *, inputs_ok: bool = True, rebuild_finals: bool = False) -> dict:
+def update_cards(con, bars: Bars, ind: Ind, *, inputs_ok: bool = True) -> dict:
     """Insert missing cards and refresh provisional ones. A final card is
     rebuilt until it carries ``card_v`` (stamped only when ``inputs_ok``: this
-    run's chain ingest and wind backfill finished), when its entry wind was
-    null and the log now has it, and on every run with ``rebuild_finals`` (new
-    chains were ingested, S10 may change). Lessons the owner wrote are never
-    overwritten."""
+    run's chain ingest and wind backfill finished), when the chain table has
+    changed since it was built (``chains_seen``, S10 may change), and when its
+    entry wind was null and the log now has it. Lessons the owner wrote are
+    never overwritten."""
     new = upd = 0
     gm = gm_inputs(con)
+    seen = _chains_seen(con)
     for t in closed_trades(con):
         old = con.execute("SELECT status, facts_json FROM trade_postmortem WHERE trade_id=?",
                           (t.trade_id,)).fetchone()
-        if old is not None and old["status"] == "final" and not rebuild_finals and _final_is_current(con, old, t):
+        if old is not None and old["status"] == "final" and _final_is_current(con, old, t, seen):
             continue
         card = build_card(con, t, bars, ind)
         if card is None:
             continue
+        card["facts"]["chains_seen"] = seen
         if inputs_ok:
             card["facts"]["card_v"] = CARD_V
         now = store.now()

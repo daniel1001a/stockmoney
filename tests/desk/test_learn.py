@@ -674,7 +674,14 @@ def test_postmortem_final_card_is_not_stamped_when_inputs_failed(con):
     assert f["wind_entry"] == "tailwind"
     con.execute("UPDATE trade_postmortem SET status='final'")
     assert postmortem.update_cards(con, bars, ind)["updated"] == 0
-    assert postmortem.update_cards(con, bars, ind, rebuild_finals=True)["updated"] == 1
+    # a chain committed by an earlier run whose card pass failed still rebuilds the stamped final
+    chains.add_chain(con, chains.Chain(trigger="t2", steps=["s"], confidence=0.5,
+                                       impacts=[{"ticker": "AAPL", "direction": "up", "horizon_days": 5}]), created)
+    assert postmortem.update_cards(con, bars, ind)["updated"] == 1
+    f = json.loads(con.execute("SELECT facts_json FROM trade_postmortem").fetchone()[0])
+    assert len(f["up_chains_before_entry"]) == 2
+    con.execute("UPDATE trade_postmortem SET status='final'")
+    assert postmortem.update_cards(con, bars, ind)["updated"] == 0
 
 
 def test_postmortem_no_s10_when_entry_is_past_the_impact_horizon(con):
