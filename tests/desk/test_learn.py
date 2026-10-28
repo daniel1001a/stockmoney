@@ -628,6 +628,23 @@ def test_postmortem_s10_when_an_up_chain_before_entry_did_not_pay(con):
     f = json.loads(row["facts_json"])
     assert len(f["up_chains_before_entry"]) == 1
     assert ("S10" in row["symptoms"].split(",")) == (f["excess_vs_spy"] <= 0)
+    sym_ret = bars.close.at[x, "AAPL"] / bars.open.at[e, "AAPL"] - 1
+    spy_ret = bars.close.at[x, "SPY"] / bars.open.at[e, "SPY"] - 1
+    assert f["excess_vs_spy"] == pytest.approx(sym_ret - spy_ret)  # open-to-close on both legs, not the fills
+
+
+def test_postmortem_final_card_without_wind_facts_is_rebuilt_once(con):
+    bars = make_bars()
+    ind = compute(bars)
+    d = bars.dates
+    _losing_trade(con, bars, d[300], d[305])
+    postmortem.update_cards(con, bars, ind)
+    con.execute("UPDATE trade_postmortem SET status='final', facts_json='{}', symptoms='S0', lesson='keep me'")
+    assert postmortem.update_cards(con, bars, ind)["updated"] == 1
+    row = con.execute("SELECT facts_json, lesson FROM trade_postmortem").fetchone()
+    assert "wind_entry" in json.loads(row["facts_json"]) and row["lesson"] == "keep me"
+    con.execute("UPDATE trade_postmortem SET status='final'")
+    assert postmortem.update_cards(con, bars, ind)["updated"] == 0
 
 
 def test_postmortem_no_s10_when_entry_is_past_the_impact_horizon(con):

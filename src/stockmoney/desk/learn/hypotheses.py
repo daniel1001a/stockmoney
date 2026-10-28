@@ -1,15 +1,17 @@
 """Weekly hypothesis pipeline: post-mortem symptoms -> recorded candidate hypotheses.
 
-``postmortem.symptom_report`` already decides what is a candidate (a non-S0
-symptom in the top two by loss for two consecutive weeks). This module persists
-those candidates in ``weekly_hypotheses`` so they can be queried, and renders the
+``postmortem.top_candidates`` decides what is a candidate (a non-S0/O0 symptom
+in the top two by loss for two consecutive weeks, stock and option books ranked
+together, at most three); the weekly symptom report shows the same list. This
+module persists those candidates in ``weekly_hypotheses`` so they can be queried, and renders the
 weekly markdown. It only RECORDS: no rule, parameter or setting is changed.
 A candidate stays 'candidate' until the owner takes it through the normal path
 (backtest -> shadow -> owner approval, docs/desk/EDGE_PLAN.md 2.2).
 
 Runs automatically in the Friday learn job and on demand:
 ``scripts/desk_learn.py hypotheses [--date YYYY-MM-DD] [--no-record] [--list]``.
-Re-running inside the same ISO week updates that week's rows instead of adding more.
+Re-running inside the same ISO week updates that week's rows instead of adding
+more, and drops that week's still-'candidate' rows that fell out of the list.
 """
 from __future__ import annotations
 
@@ -36,21 +38,27 @@ def iso_week(day: str) -> str:
 
 def build(con, today: str) -> list[dict]:
     """Candidate hypotheses as of ``today`` (pure read)."""
-    stats = postmortem.week_stats(con, today, 2)
     out = []
-    for code in postmortem.candidate_symptoms(stats)[:postmortem.MAX_HYPOTHESES]:
-        out.append({"week": iso_week(today), "symptom": code, "label": postmortem.LABEL[code], "week_end": today,
+    for code, stats in postmortem.top_candidates(con, today):
+        out.append({"week": iso_week(today), "symptom": code, "label": postmortem._label(code), "week_end": today,
                     "loss_this": stats[0]["loss"][code], "loss_prev": stats[1]["loss"][code],
                     "n_this": stats[0]["cnt"][code], "n_prev": stats[1]["cnt"][code],
                     "text": postmortem.hypothesis_text(code)})
     return out
 
 
-def record(con, rows: list[dict]) -> dict:
-    """Upsert by (week, symptom); a repeat run keeps created_at and status. Does not commit."""
+def record(con, rows: list[dict], week: str | None = None) -> dict:
+    """Upsert by (week, symptom); a repeat run keeps created_at and status. Rows
+    of ``week`` still in status 'candidate' and not in ``rows`` are deleted (a
+    code that fell out of the top three). Does not commit."""
     ensure_schema(con)
     new = upd = 0
     now = store.now()
+    if week is not None:
+        keep = [r["symptom"] for r in rows]
+        marks = ",".join("?" * len(keep)) or "''"
+        con.execute(f"DELETE FROM weekly_hypotheses WHERE week=? AND status='candidate' AND symptom NOT IN ({marks})",
+                    (week, *keep))
     for r in rows:
         old = con.execute("SELECT 1 FROM weekly_hypotheses WHERE week=? AND symptom=?", (r["week"], r["symptom"])).fetchone()
         if old is None:
@@ -94,5 +102,5 @@ def run(con, today: str, record_rows: bool = True, include_weekly: bool = True) 
     """Build, optionally persist (caller commits), and render the weekly report."""
     rows = build(con, today)
     if record_rows:
-        record(con, rows)
+        record(con, rows, iso_week(today))
     return render(con, today, rows, include_weekly)

@@ -17,7 +17,10 @@ Symptom rules (all computed from bars known at the time, or after exit for S2):
   S9 消息面     a Muse/Grok ALERT for the ticker arrived while held
   S10 催化未兌現 a loss although a chain written before the entry called the symbol up, with the
                  entry inside that impact's horizon, and the symbol did not beat SPY over the hold
-                 (fill-to-fill return minus SPY entry-session open to exit-session close)
+                 sessions (both legs entry-session open to exit-session close, so fills and slippage
+                 do not count; S11 covers those). It says the hold lagged while an up call was
+                 live, not that the call failed: the chain may still pay inside its horizon, and
+                 chain_scores judges the call itself
   S11 成本超支   entry filled >= 0.25R above the plan reference price (the entry-session open when
                  the plan has none); R = entry minus initial stop. Exits are not counted: stop
                  exits fill at the stop and gaps through it are S1
@@ -273,8 +276,9 @@ def build_card(con, t: ClosedTrade, bars: Bars, ind: Ind) -> dict | None:
     catalyst = _up_chains(con, sym, t.entry_at, entry_day, idx)
     excess = None
     spy_in, spy_out = _at(bars.open, entry_day, MARKET), _at(bars.close, exit_day, MARKET)
-    if spy_in and spy_out:
-        excess = t.ret - (spy_out / spy_in - 1)
+    sym_out = _at(bars.close, exit_day, sym)
+    if spy_in and spy_out and open_in and sym_out:
+        excess = (sym_out / open_in - 1) - (spy_out / spy_in - 1)
 
     alerts = _alerts(con, sym, t.entry_at, t.exit_at)
     flags_in_hold = veto.flags_between(con, sym, t.entry_at, t.exit_at)
@@ -326,13 +330,15 @@ def build_card(con, t: ClosedTrade, bars: Bars, ind: Ind) -> dict | None:
 
 
 def update_cards(con, bars: Bars, ind: Ind) -> dict:
-    """Insert missing cards and refresh provisional ones. Lessons the owner
+    """Insert missing cards and refresh provisional ones. A final card built
+    before S10/S11 and the wind facts existed is rebuilt once. Lessons the owner
     wrote are never overwritten."""
     new = upd = 0
     gm = gm_inputs(con)
     for t in closed_trades(con):
-        old = con.execute("SELECT status FROM trade_postmortem WHERE trade_id=?", (t.trade_id,)).fetchone()
-        if old is not None and old["status"] == "final":
+        old = con.execute("SELECT status, facts_json FROM trade_postmortem WHERE trade_id=?",
+                          (t.trade_id,)).fetchone()
+        if old is not None and old["status"] == "final" and "wind_entry" in json.loads(old["facts_json"] or "{}"):
             continue
         card = build_card(con, t, bars, ind)
         if card is None:
@@ -407,6 +413,18 @@ def _label(code: str) -> str:
     return LABEL.get(code) or OPTION_LABEL.get(code, code)
 
 
+def top_candidates(con, today: str) -> list[tuple[str, list[dict]]]:
+    """The weekly hypothesis candidates: stock and option candidates ranked
+    together by two-week loss (largest first), at most MAX_HYPOTHESES, each with
+    its own book's week stats (newest first). The report and the recorded
+    weekly_hypotheses both use this one list."""
+    out = []
+    for book in ("stock", "options"):
+        stats = week_stats(con, today, 2, book=book)
+        out += [(_combined(stats, c), c, stats) for c in candidate_symptoms(stats)]
+    return [(c, st) for _, c, st in sorted(out, key=lambda x: (x[0], x[1]))[:MAX_HYPOTHESES]]
+
+
 def hypothesis_text(code: str) -> str:
     x, z, w = HYPOTHESIS.get(code, _GENERIC)
     return (f"我認為{x},因為 {code} {_label(code)} 連續兩週排在虧損前兩名;驗證:{z};失敗條件:{w}。"
@@ -432,12 +450,10 @@ def symptom_report(con, today: str, weeks: int = 4) -> tuple[str, list[str]]:
         return "尚無平倉交易,沒有驗屍卡。", []
     stats = week_stats(con, today, weeks)
     lines = [f"## 驗屍卡週報(截至 {today})", "", *_week_lines(stats)]
-    ranked = [(_combined(stats, c), c) for c in candidate_symptoms(stats)]
     if con.execute("SELECT 1 FROM trade_postmortem WHERE trade_id LIKE ? LIMIT 1", (OPTION_PREFIX + "%",)).fetchone():
         ostats = week_stats(con, today, weeks, book="options")
         lines += ["", "### 期權驗屍卡(實盤紙上)", f"> {FEED_CAVEAT}", *_week_lines(ostats)]
-        ranked += [(_combined(ostats, c), c) for c in candidate_symptoms(ostats)]
-    hyp = [hypothesis_text(c) for _, c in sorted(ranked)[:MAX_HYPOTHESES]]
+    hyp = [hypothesis_text(c) for c, _ in top_candidates(con, today)]
     if hyp:
         lines += ["", "### 候選假設", *[f"- {h}" for h in hyp]]
     return "\n".join(lines), hyp

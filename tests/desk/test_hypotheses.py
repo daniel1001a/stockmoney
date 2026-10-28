@@ -181,3 +181,8 @@ def test_at_most_three_hypotheses_across_books_largest_loss_first(con):
     text, hyp = postmortem.symptom_report(con, TODAY)
     assert len(hyp) == postmortem.MAX_HYPOTHESES == 3
     assert [h.split("因為 ")[1].split(" ")[0] for h in hyp] == ["S3", "O2", "O7"]
+    rows = hypotheses.build(con, TODAY)
+    assert [r["symptom"] for r in rows] == ["S3", "O2", "O7"]  # the recorded list is the report's list
+    hypotheses.record(con, rows + [dict(rows[0], symptom="S5", label="板塊退潮")], hypotheses.iso_week(TODAY))
+    hypotheses.record(con, rows, hypotheses.iso_week(TODAY))  # S5 fell out of the top three this week
+    assert sorted(h["symptom"] for h in hypotheses.history(con)) == ["O2", "O7", "S3"]
