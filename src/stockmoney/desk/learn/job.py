@@ -117,7 +117,18 @@ def run(con, now: datetime, bars: data.Bars | None = None, shadow_start: str | N
     if fl is not None:
         parts.append(f"研究旗標:財報 {fl['earnings']} 筆,SEC {fl['filings']} 筆(掃描 {fl['scanned']} 檔,失敗 {fl['failed']})"
                      + (f";略過 EDGAR:{fl['skipped_edgar']}" if fl["skipped_edgar"] else "") + "。")
-    pm = guarded("postmortem", lambda: postmortem.update_cards(con, bars, ind))
+    # chains and wind first: the cards read both (S10, wind facts)
+    ig = guarded("grok_ingest", lambda: chains.ingest_grok(con))
+    con.commit()
+    if ig and (ig["added"] or ig["skipped"]):
+        parts.append(f"Grok 事件鏈:新增 {ig['added']},略過 {ig['skipped']}。")
+    wd = guarded("wind", lambda: wind.backfill(con, ind, through, store.now()))
+    con.commit()
+    if wd:
+        parts.append(f"風向:{wd.line()}")
+    # a card is stamped current only when both inputs above finished this run
+    pm = guarded("postmortem", lambda: postmortem.update_cards(
+        con, bars, ind, inputs_ok=ig is not None and wd is not None))
     con.commit()
     if pm is not None:
         parts.append(f"驗屍卡:新增 {pm['new']},更新 {pm['updated']}。")
@@ -136,10 +147,6 @@ def run(con, now: datetime, bars: data.Bars | None = None, shadow_start: str | N
     rep, hyps = guarded("symptom_report", lambda: postmortem.symptom_report(con, day)) or ("", [])
     sh = guarded("shadow", lambda: shadow.step(con, bars, ind, through, start=shadow_start))
     con.commit()
-    ig = guarded("grok_ingest", lambda: chains.ingest_grok(con))
-    con.commit()
-    if ig and (ig["added"] or ig["skipped"]):
-        parts.append(f"Grok 事件鏈:新增 {ig['added']},略過 {ig['skipped']}。")
     sc = guarded("chains", lambda: chains.score_due(con, bars, through))
     con.commit()
     if sc:
@@ -171,10 +178,6 @@ def run(con, now: datetime, bars: data.Bars | None = None, shadow_start: str | N
                      f"失敗 {ps['error']};深度分析完成 {ps['deep_done']}。")
     guarded("scoreboard", lambda: scoreboard.refresh(con, bars, through))
     con.commit()
-    wd = guarded("wind", lambda: wind.backfill(con, ind, through, store.now()))
-    con.commit()
-    if wd:
-        parts.append(f"風向:{wd.line()}")
 
     friday = through.weekday() == 4
     hyp_text = guarded("hypotheses", lambda: hypotheses.run(con, day, include_weekly=False)) if friday else None
