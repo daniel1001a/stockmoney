@@ -1,5 +1,7 @@
-"""OPTIONS_PLAN delivered by email through the Muse bridge: same strict
-validator and the same ingest as the CLI, no policy effect, no stock-side rows.
+"""OPTIONS_PLAN delivered by email through the bridge: same strict validator
+and the same ingest as the CLI, no policy effect, no stock-side rows. Only a
+grok_verified plan (GROK_ADDRESS + GROK_SHARED_TOKEN + DKIM pass) can become the
+active plan; Muse and grok_legacy plans are stored for audit only.
 Fully offline (FakeMailbox, no real mail, no broker)."""
 import json
 from datetime import datetime, timezone
@@ -17,7 +19,13 @@ from test_opt_engine import Rig, _plan
 
 TOKEN = "s3cret-shared-token-abcdef"
 SENDER = "owner@example.com"
-CONFIG = BridgeConfig(desk_address="desk@example.com", app_password="x", muse_address=SENDER, shared_token=TOKEN)
+MUSE = "owner@example.com"
+GROK = "pika@mail.grokbot.com"
+GTOKEN = "g" * 40
+GOOD_AR = ("mx.google.com; dkim=pass header.i=@mail.grokbot.com header.s=k7abc header.b=AbC; "
+           "spf=pass smtp.mailfrom=x@amazonses.com; dmarc=pass header.from=mail.grokbot.com")
+CONFIG = BridgeConfig(desk_address="desk@example.com", app_password="x", muse_address=MUSE, shared_token=TOKEN,
+                      grok_address=GROK, grok_token=GTOKEN)
 PID = "gp-20261013-0800"
 EARLY = et(8, 30)  # received before 09:20 ET: live-eligible
 LATE = et(9, 25)
@@ -33,7 +41,8 @@ def con(tmp_path):
 def pushes(monkeypatch):
     out = []
     for k, v in (("DESK_MAIL_ADDRESS", "desk@example.com"), ("DESK_MAIL_APP_PASSWORD", "x"),
-                 ("MUSE_ADDRESS", SENDER), ("MUSE_SHARED_TOKEN", TOKEN)):
+                 ("MUSE_ADDRESS", MUSE), ("MUSE_SHARED_TOKEN", TOKEN),
+                 ("GROK_ADDRESS", GROK), ("GROK_SHARED_TOKEN", GTOKEN)):
         monkeypatch.setenv(k, v)
     monkeypatch.setattr(notify, "send", lambda title, msg, prio=notify.INFO, tags=None: out.append((title, msg)) or True)
     return out
@@ -46,7 +55,9 @@ def plan(**over) -> dict:
 
 
 def mail(mb, d: dict | None = None, *, body: str | None = None, subject_id: str | None = None,
-         sender: str = SENDER, token: str = TOKEN, **kw):
+         sender: str = GROK, token: str = GTOKEN, **kw):
+    if sender == GROK:
+        kw.setdefault("auth_results", GOOD_AR)
     d = d if d is not None else plan()
     sid = subject_id or d.get("plan_id", PID)
     return mb.inject(sender, f"[SMD/OPTIONS_PLAN/{sid}] {token}",
@@ -128,7 +139,8 @@ def test_schema_violation_gives_feedback_and_stores_nothing(con, name, mutate):
     out = FakeMailbox()
     assert muse_ops.send_feedback(con, out, EARLY) == 1
     body = json.loads(out.sent[0][2])
-    assert body["type"] == "FEEDBACK" and body["problem"].startswith("【給 Grok】")
+    assert out.sent[0][0] == GROK  # straight to Grok's own channel, no relay prefix
+    assert body["type"] == "FEEDBACK" and not body["problem"].startswith("【給 Grok】")
     assert body["about_msg_id"] == PID and "OPTIONS_PLAN" in body["problem"]
     assert "OPTIONS_PLAN" in body["how_to_fix"]
 
@@ -172,7 +184,7 @@ def test_same_id_different_content_rejected_with_feedback(con):
     out = FakeMailbox()
     assert muse_ops.send_feedback(con, out, EARLY) == 1
     body = json.loads(out.sent[0][2])
-    assert body["problem"].startswith("【給 Grok】") and "plan_id" in body["how_to_fix"]
+    assert out.sent[0][0] == GROK and "plan_id" in body["how_to_fix"]
     assert oplan.active_plan(con, DAY).plan.notes == ""  # the first plan stays in force
 
 
@@ -286,3 +298,119 @@ def test_plan_stamped_with_elapsed_poll_time_not_frozen_job_now(monkeypatch):
     inbox.poll(con, _MB(), cfg, now=now)
     assert seen and seen[0] == now + timedelta(seconds=45)
     assert seen[0].astimezone(ZoneInfo("America/New_York")).time() > datetime(2026, 10, 15, 9, 20).time()
+
+
+@pytest.mark.parametrize("channel", ["muse", "grok_dkim_fail"])
+def test_unverified_plan_is_stored_but_never_active_or_live(tmp_path, con, pushes, channel):
+    """CLAUDE.md section 0: only grok_verified may propose live candidates. A
+    plan from Muse, or from GROK_ADDRESS with DKIM failing, is kept for audit
+    (shadow_only, source tagged) but active_plan() never returns it, so no
+    grok_plan setup (live or shadow) and no prior-added rule setups exist."""
+    mb = FakeMailbox()
+    if channel == "muse":
+        mail(mb, sender=MUSE, token=TOKEN)
+        want = "grok_legacy"  # a Grok type relayed by Muse
+    else:
+        mail(mb, auth_results=GOOD_AR.replace("dkim=pass", "dkim=fail"))
+        want = "grok_legacy"
+    assert poll(con, mb) == 1
+    row = con.execute("SELECT status, shadow_only, source FROM options_plans").fetchone()
+    assert tuple(row) == ("accepted", 1, want)
+    assert oplan.active_plan(con, DAY) is None
+    assert "未驗證來源" in pushes[-1][1]
+    r = Rig(tmp_path, con)
+    r.run(et(10, 30))
+    assert [s for s in ostore.setups(con, str(DAY)) if s["source"] == "grok_plan"] == []
+    assert [o for o in r.orders() if "grok" in (o.get("client_order_id") or "")] == []
+
+
+def test_verified_plan_supersedes_only_trusted_plans(con):
+    """A later unverified plan cannot replace the verified one in force."""
+    mb = FakeMailbox()
+    mail(mb)
+    mail(mb, json.loads(_plan(level=601.5, plan_id="gp-20261013-0810")), sender=MUSE, token=TOKEN)
+    assert poll(con, mb) == 2
+    assert oplan.active_plan(con, DAY).plan.plan_id == PID
+
+
+@pytest.mark.parametrize("now, shadow", [(EARLY, 0), (LATE, 1)])
+def test_verified_resend_upgrades_an_unverified_plan(con, now, shadow):
+    """The same plan first arrives with DKIM failing, then over the verified
+    channel: it becomes trusted as of the resend (the shadow cutoff is judged
+    on the resend's receipt), and the bridge row is upgraded too."""
+    mb = FakeMailbox()
+    mail(mb, auth_results=GOOD_AR.replace("dkim=pass", "dkim=fail"))
+    assert poll(con, mb, now=et(8, 0)) == 1
+    assert oplan.active_plan(con, DAY) is None
+    mail(mb)
+    assert poll(con, mb, now=now) == 1
+    row = con.execute("SELECT source, shadow_only, received_at FROM options_plans WHERE status='accepted'").fetchall()
+    assert len(row) == 1 and row[0]["source"] == "grok_verified" and row[0]["shadow_only"] == shadow
+    ap = oplan.active_plan(con, DAY)
+    assert ap.plan.plan_id == PID and ap.shadow_only == bool(shadow) and ap.received_at > et(8, 0)
+    b = con.execute("SELECT source, source_reason FROM bridge_messages WHERE msg_id=?", (PID,)).fetchone()
+    assert b["source"] == "grok_verified" and b["source_reason"].startswith("verified_by_resend")
+    assert rejects(con) == []
+
+
+def test_verified_resend_reserialized_still_upgrades(con):
+    """Key order and spacing do not make a resend a different plan."""
+    mb = FakeMailbox()
+    mail(mb, auth_results=GOOD_AR.replace("dkim=pass", "dkim=fail"))
+    assert poll(con, mb, now=et(8, 0)) == 1
+    d = plan()
+    mail(mb, body=json.dumps(dict(reversed(list(d.items()))), indent=2, ensure_ascii=False))
+    assert poll(con, mb, now=EARLY) == 1
+    assert oplan.active_plan(con, DAY).plan.plan_id == PID
+    assert rejects(con) == []
+
+
+def test_verified_resend_of_an_old_plan_never_displaces_a_newer_trusted_plan(con):
+    """A (unverified, 08:00), B (verified, 08:10), A resent verified (08:20):
+    A becomes trusted but keeps its receipt time, so B stays in force."""
+    mb = FakeMailbox()
+    mail(mb, auth_results=GOOD_AR.replace("dkim=pass", "dkim=fail"))
+    assert poll(con, mb, now=et(8, 0)) == 1
+    pid_b = "gp-20261013-0810"
+    mail(mb, json.loads(_plan(level=601.5, plan_id=pid_b)))
+    assert poll(con, mb, now=et(8, 10)) == 1
+    mail(mb)
+    assert poll(con, mb, now=et(8, 20)) == 1
+    a = con.execute("SELECT source, received_at FROM options_plans WHERE plan_id=?", (PID,)).fetchone()
+    assert a["source"] == "grok_verified" and datetime.fromisoformat(a["received_at"]) == et(8, 0)
+    assert oplan.active_plan(con, DAY).plan.plan_id == pid_b
+
+
+def test_unverified_resend_never_downgrades_or_upgrades(con):
+    mb = FakeMailbox()
+    mail(mb)
+    mail(mb, sender=MUSE, token=TOKEN)
+    assert poll(con, mb) == 1
+    assert con.execute("SELECT source FROM options_plans").fetchone()[0] == "grok_verified"
+    assert oplan.active_plan(con, DAY).plan.plan_id == PID
+
+
+def test_plan_row_without_source_is_untrusted(con):
+    """A NULL source is unknown, never owner."""
+    oplan.ingest(con, json.dumps(plan(), ensure_ascii=False), EARLY)
+    con.execute("UPDATE options_plans SET source=NULL")
+    assert oplan.active_plan(con, DAY) is None
+
+
+def test_pre_column_plans_are_backfilled_by_channel(con):
+    """Plans stored before the source column existed: a bridge plan becomes
+    grok_legacy (untrusted), a CLI plan becomes owner (still in force)."""
+    mb = FakeMailbox()
+    mail(mb, sender=MUSE, token=TOKEN)
+    assert poll(con, mb) == 1
+    oplan.ingest(con, _plan(level=601.5, plan_id="gp-20261013-0810"), et(8, 40))
+    # rebuild the table without the column, as an old database had it
+    con.executescript("""
+        CREATE TABLE old AS SELECT id, plan_id, for_date, received_at, status, shadow_only, error, sha, raw
+          FROM options_plans;
+        DROP TABLE options_plans;
+        ALTER TABLE old RENAME TO options_plans;""")
+    ostore.ensure_schema(con)
+    got = dict(con.execute("SELECT plan_id, source FROM options_plans").fetchall())
+    assert got == {PID: "grok_legacy", "gp-20261013-0810": "owner"}
+    assert oplan.active_plan(con, DAY).plan.plan_id == "gp-20261013-0810"

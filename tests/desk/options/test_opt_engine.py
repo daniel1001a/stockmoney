@@ -122,7 +122,7 @@ def test_premium_stop(tmp_path, con):
 def test_premium_stop_differs_by_exit_variant(tmp_path, con):
     r = Rig(tmp_path, con)
     r.run(et(9, 52))
-    r.broker.mult[C601] = 0.68  # mid 0.646: below B's -30% (0.679), above A's -35% (0.6305)
+    r.broker.mult[C601] = 0.70  # mid 0.665, bid ~0.645 (stops use the bid): below B's -30% (0.679), above A's -35% (0.6305)
     r.run(et(9, 54))
     st = {p["exit_variant"]: (p["state"], p["exit_reason"]) for p in r.pos("shadow") if p["occ"] == C601}
     assert st == {"A": ("ENTERED", None), "B": ("EXITED", "premium_stop")}

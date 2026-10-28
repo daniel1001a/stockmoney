@@ -210,7 +210,7 @@ def _short(e: ValidationError) -> str:
 
 @dataclass(frozen=True)
 class IngestResult:
-    status: str  # accepted | rejected | duplicate
+    status: str  # accepted | rejected | duplicate | upgraded (a trusted resend of an untrusted plan)
     plan_id: str
     for_date: str
     shadow_only: bool
@@ -222,9 +222,17 @@ def is_shadow_only(for_date: _dt.date, received_at: datetime, cfg: OptionsConfig
     return received_at.astimezone(ET) > cutoff
 
 
-def ingest(con, text: str, received_at: datetime, cfg: OptionsConfig | None = None) -> IngestResult:
+# plan sources active_plan() reads; anything else (Muse, grok_legacy) is stored for audit only
+TRUSTED_SOURCES = ("owner", "grok_verified")
+
+
+def ingest(con, text: str, received_at: datetime, cfg: OptionsConfig | None = None,
+           source: str = "owner") -> IngestResult:
     """Validate and store. Idempotent: the same text twice is reported as a
-    duplicate of the first; a DIFFERENT plan reusing a plan_id is rejected."""
+    duplicate of the first; a DIFFERENT plan reusing a plan_id is rejected.
+    A plan from an untrusted ``source`` is stored shadow_only and is never
+    returned by active_plan() (CLAUDE.md section 0: only grok_verified may
+    propose live candidates)."""
     cfg = cfg or OptionsConfig()
     ostore.ensure_schema(con)
     # never raises on hostile text: a lone surrogate cannot be UTF-8 encoded (hash and store a
@@ -241,22 +249,44 @@ def ingest(con, text: str, received_at: datetime, cfg: OptionsConfig | None = No
                                                  text[:MAX_PLAN_BYTES]))
         con.commit()
         return IngestResult("rejected", _peek_id(text), "", True, str(e))
-    prior = con.execute("SELECT sha, shadow_only FROM options_plans WHERE plan_id=? AND status='accepted'",
-                        (p.plan_id,)).fetchone()
+    prior = con.execute("SELECT id, sha, shadow_only, source, received_at, raw FROM options_plans "
+                        "WHERE plan_id=? AND status='accepted'", (p.plan_id,)).fetchone()
     if prior is not None:
-        if prior["sha"] == sha:
+        # the same plan re-serialized (key order, spacing) is the same plan
+        if prior["sha"] == sha or _canonical(prior["raw"]) == _canonical(text):
+            if source in TRUSTED_SOURCES and prior["source"] not in TRUSTED_SOURCES:
+                # the same plan resent over a trusted channel: it becomes trusted
+                # (the shadow cutoff is judged on the resend). It moves to the
+                # resend clock only if no trusted plan for that day arrived after
+                # it, so an old plan cannot displace a newer trusted one.
+                shadow = is_shadow_only(p.for_date, received_at, cfg)
+                newer = con.execute("SELECT 1 FROM options_plans WHERE for_date=? AND status='accepted' AND id<>? "
+                                    "AND source IN (?, ?) AND received_at > ? LIMIT 1",
+                                    (str(p.for_date), prior["id"], *TRUSTED_SOURCES,
+                                     prior["received_at"])).fetchone()
+                con.execute("UPDATE options_plans SET source=?, shadow_only=?, received_at=? WHERE id=?",
+                            (source, int(shadow), prior["received_at"] if newer else at, prior["id"]))
+                con.commit()
+                return IngestResult("upgraded", p.plan_id, str(p.for_date), shadow)
             return IngestResult("duplicate", p.plan_id, str(p.for_date), bool(prior["shadow_only"]))
         err = "plan_id already used by a different accepted plan"
         con.execute("INSERT INTO options_plans (plan_id, for_date, received_at, status, shadow_only, error, sha, raw) "
                     "VALUES (?,?,?,?,?,?,?,?)", (p.plan_id, str(p.for_date), at, "rejected", 1, err, sha, text))
         con.commit()
         return IngestResult("rejected", p.plan_id, str(p.for_date), True, err)
-    shadow = is_shadow_only(p.for_date, received_at, cfg)
-    con.execute("INSERT INTO options_plans (plan_id, for_date, received_at, status, shadow_only, error, sha, raw) "
-                "VALUES (?,?,?,?,?,?,?,?)", (p.plan_id, str(p.for_date), at, "accepted", int(shadow), "", sha,
-                                             text.strip()))
+    shadow = is_shadow_only(p.for_date, received_at, cfg) or source not in TRUSTED_SOURCES
+    con.execute("INSERT INTO options_plans (plan_id, for_date, received_at, status, shadow_only, error, sha, raw, "
+                "source) VALUES (?,?,?,?,?,?,?,?,?)", (p.plan_id, str(p.for_date), at, "accepted", int(shadow), "",
+                                                       sha, text.strip(), source))
     con.commit()
     return IngestResult("accepted", p.plan_id, str(p.for_date), shadow)
+
+
+def _canonical(text: str) -> str | None:
+    try:
+        return json.dumps(json.loads(text), sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    except (ValueError, RecursionError):
+        return None
 
 
 def _peek_id(text: str) -> str:
@@ -277,10 +307,13 @@ class ActivePlan:
 def active_plan(con, day: _dt.date) -> ActivePlan | None:
     """The plan in force for ``day``: the most recently RECEIVED accepted plan
     (a later plan supersedes an earlier one instead of doubling it). Re-parsed
-    from the stored text, so the same strict schema applies on every read."""
+    from the stored text, so the same strict schema applies on every read.
+    Only trusted sources count; a row stored before the source column existed
+    (NULL) is unknown and therefore untrusted."""
     ostore.ensure_schema(con)
     r = con.execute("SELECT raw, received_at, shadow_only FROM options_plans WHERE for_date=? AND status='accepted' "
-                    "ORDER BY received_at DESC, id DESC LIMIT 1", (str(day),)).fetchone()
+                    "AND source IN (?, ?) ORDER BY received_at DESC, id DESC LIMIT 1",
+                    (str(day), *TRUSTED_SOURCES)).fetchone()
     if r is None:
         return None
     return ActivePlan(parse(r["raw"]), datetime.fromisoformat(r["received_at"]), bool(r["shadow_only"]))

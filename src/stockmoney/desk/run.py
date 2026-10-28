@@ -93,6 +93,13 @@ LOCK_PATH = Path("data/desk/run.lock")
 LOCK_WAIT_S = JOB_TIMEOUT_S + 60.0  # longer than any job may hold the lock, then give up
 HALT_SOURCE_KEY = "halt_source"  # who set halt_new_entries: reconcile | sync | manual ('' = unknown, sticky)
 PLAN_THROUGH_KEY = "last_postclose_through"  # session date the newest valid plans were made from
+# Owner decision 2026-10-27 ("中長期只給建議"): the stock sleeves (breakout, pullback, rotation)
+# no longer open positions. postclose still sizes their signals, but writes them as 'advisory'
+# planned_orders rows that no job sends; held positions keep their stops and exit rules.
+STOCK_ENTRIES_KEY = "stock_entries_enabled"  # '1' = postclose plans buys that premarket sends
+STOCK_ENTRIES_DEFAULT = False  # when the setting was never written
+ADVISORY = "advisory"  # planned_orders status of a would-be entry that is never sent
+STOCK_ENTRIES_REASON = "2026-10-27 擁有者決定:中長期只給建議,股票策略不再自動進場;既有持倉停損與出場照常"
 MAX_EXIT_ATTEMPTS = 3    # a failing exit is retried this many times per day, then left for a human
 PENDING_SUBMIT = "pending_submit"  # written before broker.submit; resolved by sync_fills
 NOT_SENT = "not_sent"    # a pending_submit row the broker never received
@@ -142,6 +149,22 @@ CREATE TABLE IF NOT EXISTS plan_attempts (key TEXT PRIMARY KEY, n INTEGER);
 
 def ensure_schema(con) -> None:
     con.executescript(SCHEMA)
+
+
+def stock_entries_enabled(con) -> bool:
+    """Whether stock-sleeve buys are planned and sent. The first time the
+    setting is read with no row, the default is written and, when that turns
+    entries off, the switch is logged in param_changes (strategy 'desk')."""
+    v = store.get_setting(con, STOCK_ENTRIES_KEY, "")
+    if v in ("0", "1"):
+        return v == "1"
+    store.set_setting(con, STOCK_ENTRIES_KEY, "1" if STOCK_ENTRIES_DEFAULT else "0")
+    if not STOCK_ENTRIES_DEFAULT:
+        con.execute("INSERT INTO param_changes (strategy, param, old, new, reason, changed_at) VALUES (?,?,?,?,?,?)",
+                    ("desk", STOCK_ENTRIES_KEY, json.dumps(True), json.dumps(False), STOCK_ENTRIES_REASON,
+                     store.now()))
+    con.commit()
+    return STOCK_ENTRIES_DEFAULT
 
 
 # ---------------------------------------------------------------- helpers
@@ -729,6 +752,8 @@ def postclose(con, broker: Broker, now: datetime, bars: data.Bars | None = None,
 
     # new entries for the next open; a failure here must not undo the stop bookkeeping above
     planned: list[dict] = []
+    advisory: list[dict] = []
+    entries_on = stock_entries_enabled(con)
     if bad:
         events.append("對帳不一致,今天不規劃新進場")
     else:
@@ -736,11 +761,14 @@ def postclose(con, broker: Broker, now: datetime, bars: data.Bars | None = None,
             signals = engine.scan(strats, ctx)
             for s in signals:
                 store.save_signal(con, engine.signal_id(s), s)
-            planned = _plan_entries(con, day, ledger, risk, snap, ctx, signals, set(exits))
+            if entries_on:
+                planned = _plan_entries(con, day, ledger, risk, snap, ctx, signals, set(exits))
+            else:  # sized exactly like a real plan, written as advisory, never sent
+                advisory = _plan_entries(con, day, ledger, risk, snap, ctx, signals, set(exits), status=ADVISORY)
             con.commit()
         except Exception as e:
             con.rollback()
-            planned = []
+            planned, advisory = [], []
             log.exception("planning failed")
             why = f"規劃新進場失敗:{type(e).__name__}: {e}"
             events.append(why)
@@ -755,14 +783,15 @@ def postclose(con, broker: Broker, now: datetime, bars: data.Bars | None = None,
         (day, sys_eq, snap.equity, mode, len(ledger.positions()), store.now()))
     store.set_setting(con, PLAN_THROUGH_KEY, day)
 
-    report = head + _report(day, ctx, sys_eq, limits.capital_budget, mode, why, ledger, events, planned, exits)
+    report = head + _report(day, ctx, sys_eq, limits.capital_budget, mode, why, ledger, events, planned, exits,
+                            advisory=advisory, entries_on=entries_on)
     report += _reconcile_summary(con, broker, day)
     con.execute(
         "INSERT INTO journal (date, auto_summary, updated_at) VALUES (?,?,?) "
         "ON CONFLICT(date) DO UPDATE SET auto_summary=excluded.auto_summary, updated_at=excluded.updated_at",
         (day, report, store.now()))
     con.commit()
-    _bridge_outbound(con, ledger, planned, report, now)
+    _bridge_outbound(con, ledger, planned, report, now, advisory)
     notify.send(f"Desk 盤後 {day}", report[:3500], notify.INFO)
     return report
 
@@ -788,16 +817,33 @@ def _reconcile_summary(con, broker: Broker, day: str) -> str:
         return f"\n\n(券商對帳摘要失敗:{type(e).__name__}: {e})"
 
 
-def _plan(con, day, sym, side: Side, qty, strategy, stop, ref, reason, signal_id) -> str:
+def _plan(con, day, sym, side: Side, qty, strategy, stop, ref, reason, signal_id, status: str = "planned") -> str:
     cid = _cid(day, "b" if side == Side.BUY else "x", sym, strategy)
     con.execute(
         "INSERT OR IGNORE INTO planned_orders VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (cid, day, sym, (AssetClass.CRYPTO if "/" in sym else AssetClass.EQUITY).value, side.value,
-         qty, strategy, stop, ref, reason, signal_id, "planned", "", store.now()))
+         qty, strategy, stop, ref, reason, signal_id, status, "", store.now()))
     return cid
 
 
-def _plan_entries(con, day, ledger: Ledger, risk: RiskEngine, snap, ctx, signals, exiting: set[str]) -> list[dict]:
+def _plan_buy(con, day, sym, qty, strategy, stop, ref, reason, signal_id, status: str) -> bool:
+    """Write a buy row of ``status``. The cid has no status in it, so a row of
+    the other unsent status (planned <-> ADVISORY, after STOCK_ENTRIES was
+    switched) is converted in place with the fresh sizing. True when the row
+    now has ``status``; a submitted/filled/cancelled row is never touched."""
+    cid = _plan(con, day, sym, Side.BUY, qty, strategy, stop, ref, reason, signal_id, status)
+    r = con.execute("SELECT status FROM planned_orders WHERE client_order_id=?", (cid,)).fetchone()
+    if r["status"] == status:
+        return True
+    if {r["status"], status} != {"planned", ADVISORY}:
+        return False
+    con.execute("UPDATE planned_orders SET status=?, qty=?, stop=?, ref_price=?, reason=?, signal_id=?, note='' "
+                "WHERE client_order_id=? AND status=?", (status, qty, stop, ref, reason, signal_id, cid, r["status"]))
+    return True
+
+
+def _plan_entries(con, day, ledger: Ledger, risk: RiskEngine, snap, ctx, signals, exiting: set[str],
+                  status: str = "planned") -> list[dict]:
     """Size the next session's buys with the same rules as the backtest
     Account: risk per trade (or target weight), capped at MAX_POSITION_PCT of
     equity, the market exposure cap and available system cash. Signals are
@@ -808,15 +854,19 @@ def _plan_entries(con, day, ledger: Ledger, risk: RiskEngine, snap, ctx, signals
     even when they are no longer signalled, and they use up slots, sector
     room, exposure and cash first, so a rerun never plans beyond the caps.
     Buys for ``day`` already submitted whose order is not booked yet (a rerun
-    after premarket) use up the caps the same way."""
+    after premarket) use up the caps the same way.
+
+    ``status`` is the status new rows get: 'planned' (sent by premarket) or
+    ADVISORY (a would-be entry for the report, never sent). Rows of that
+    status already written for ``day`` are the ones a rerun keeps."""
     positions = ledger.positions()
     held = {s for s in positions if "/" not in s} - exiting
     existing = [r for r in con.execute(
-        "SELECT * FROM planned_orders p WHERE plan_date=? AND side='buy' AND (status='planned' OR "
+        "SELECT * FROM planned_orders p WHERE plan_date=? AND side='buy' AND (status=? OR "
         "(status='submitted' AND EXISTS (SELECT 1 FROM submitted s WHERE s.client_order_id=p.client_order_id "
-        "AND s.recorded=0))) ORDER BY created_at, client_order_id", (day,)).fetchall() if r["symbol"] not in held]
+        "AND s.recorded=0))) ORDER BY created_at, client_order_id", (day, status)).fetchall() if r["symbol"] not in held]
     out = [{"symbol": r["symbol"], "strategy": r["strategy"], "qty": r["qty"], "ref": r["ref_price"],
-            "stop": r["stop"]} for r in existing if r["status"] == "planned"]
+            "stop": r["stop"], "reason": r["reason"]} for r in existing if r["status"] == status]
     if ctx.market.exposure_cap <= 0 or not signals:
         return out
     equity = risk.system_equity(snap)
@@ -853,8 +903,8 @@ def _plan_entries(con, day, ledger: Ledger, risk: RiskEngine, snap, ctx, signals
             continue
         cid = _cid(day, "b", s.symbol, s.strategy)
         if con.execute("SELECT 1 FROM planned_orders WHERE plan_date=? AND symbol=? AND side='buy' "
-                       "AND client_order_id<>? AND status IN ('planned','submitted')",
-                       (day, s.symbol, cid)).fetchone():
+                       "AND client_order_id<>? AND status IN ('planned','submitted',?)",
+                       (day, s.symbol, cid, status)).fetchone():
             continue  # already planned for this session under another strategy or id
         sec = sector_of(s.symbol)
         if per_sector.get(sec, 0) >= MAX_PER_SECTOR:
@@ -872,13 +922,16 @@ def _plan_entries(con, day, ledger: Ledger, risk: RiskEngine, snap, ctx, signals
         qty = floor(dollars / s.ref_price)
         if qty <= 0:
             continue
+        if not _plan_buy(con, day, s.symbol, qty, s.strategy, round(s.stop, 2), s.ref_price, s.thesis,
+                         engine.signal_id(s), status):
+            continue  # this cid was already sent today; it is not a new entry
         invested += qty * s.ref_price
         cash -= qty * s.ref_price
         slots -= 1
         per_sector[sec] = per_sector.get(sec, 0) + 1
         planned_syms.add(s.symbol)
-        _plan(con, day, s.symbol, Side.BUY, qty, s.strategy, round(s.stop, 2), s.ref_price, s.thesis, engine.signal_id(s))
-        out.append({"symbol": s.symbol, "strategy": s.strategy, "qty": qty, "ref": s.ref_price, "stop": s.stop})
+        out.append({"symbol": s.symbol, "strategy": s.strategy, "qty": qty, "ref": s.ref_price, "stop": s.stop,
+                    "reason": s.thesis})
     return out
 
 
@@ -942,8 +995,14 @@ def premarket(con, broker: Broker, now: datetime, limits: Limits | None = None, 
     # replacement that postclose could not finish (unconfirmed cancel) or a stop
     # lost to a failure is restored here, before any new money goes in.
     st.lines += _premarket_stops(con, broker, risk, today, bad, st)
+    entries_on = stock_entries_enabled(con)
     for p in plans:
         if p["side"] != Side.BUY.value:
+            continue
+        if not entries_on:  # a buy planned before the switch becomes advice, never sent
+            _mark(con, p, ADVISORY, "股票策略改為只給建議(2026-10-27),未送出")
+            con.commit()
+            st.lines.append(f"未送出 {p['symbol']}:股票策略只給建議,不自動下單")
             continue
         try:
             _premarket_one(con, broker, risk, ledger, snap, p, st, **kw)
@@ -1463,7 +1522,10 @@ def postopen(con, broker: Broker, now: datetime, limits: Limits | None = None, m
         events.append("市場未開,出場計畫留待下一次執行:" + "、".join(r["symbol"] for r in sells))
     events += _expire_unretried_opg(con, broker, now)
     retries = _opg_retry_candidates(con, today)
-    if retries and broker.is_equity_market_open():
+    if retries and not stock_entries_enabled(con):
+        # no remainder is bought; _expire_unretried_opg closes the window after 10:30 ET
+        events.append("股票策略只給建議,開盤單剩餘股數不補單:" + "、".join(r["symbol"] for r in retries))
+    elif retries and broker.is_equity_market_open():
         flags = _bridge_flags(con, ledger, now, mailbox)  # Muse flags as of now, not as of premarket
         n_lines = len(st.lines)
         _retry_opg_entries(con, broker, risk, snap, retries, st, bad=bad, flags=flags,
@@ -1510,7 +1572,20 @@ def crypto(con, broker: Broker, now: datetime) -> str:
     return "加密貨幣策略於第 1 階段上線。" + ("\n" + "\n".join(events) if events else "")
 
 
-def bridge(con, now: datetime, mailbox=None) -> str:
+def _grok_outbound(con, now: datetime, box, config) -> list[str]:
+    """DESK_BRIEF / RESEARCH_REQUEST to Grok; a failure is logged, never fatal."""
+    from stockmoney.desk import grok_outbound
+    try:
+        return grok_outbound.run(con, box, now, config)
+    except Exception as e:
+        log.warning("grok outbound failed: %s", e)
+        return [f"寄給 Grok 失敗:{type(e).__name__}"]
+
+
+def bridge(con, now: datetime, mailbox=None, grok_config=None) -> str:
+    """Poll the inbox, run the bridge checks, then send what Grok is due. With an
+    injected ``mailbox`` (tests) the Grok outbound runs only when ``grok_config``
+    is given, so a test never picks up the real environment."""
     from stockmoney.desk import muse_ops
     from stockmoney.desk.bridge import inbox, mailbox as mb
     from stockmoney.desk.bridge.policy import active_flags
@@ -1525,9 +1600,13 @@ def bridge(con, now: datetime, mailbox=None) -> str:
         with mb.ImapSmtpMailbox(mb.BridgeConfig.from_env()) as box:
             n = inbox.poll(con, box, now=now)
             ops = muse_ops.run_checks(con, now, box)
+            sent = _grok_outbound(con, now, box, grok_config)
     else:
         n = inbox.poll(con, mailbox, now=now)
         ops = muse_ops.run_checks(con, now, mailbox)
+        sent = _grok_outbound(con, now, mailbox, grok_config) if grok_config is not None else []
+    if sent:
+        ops = "\n".join([ops, *sent]) if ops else "\n".join(sent)
     held = set(Ledger(con).positions())
     for note in active_flags(con, now, held).notify:
         _notify_once(con, f"muse:{note[:100]}", "Muse 警報", note, notify.WARN, _today(now))
@@ -1552,7 +1631,8 @@ def _bridge_flags(con, ledger: Ledger, now: datetime, mailbox=None):
         return BridgeFlags(blocked={}, no_add={}, notify=[])
 
 
-def _bridge_outbound(con, ledger: Ledger, planned: list[dict], report: str, now: datetime) -> None:
+def _bridge_outbound(con, ledger: Ledger, planned: list[dict], report: str, now: datetime,
+                     advisory: list[dict] | None = None) -> None:
     from stockmoney.desk.bridge import mailbox as mb, outbox
     from stockmoney.desk.bridge.schema import Report, ResearchRequest, WatchItem, Watchlist
     try:
@@ -1560,6 +1640,8 @@ def _bridge_outbound(con, ledger: Ledger, planned: list[dict], report: str, now:
             return
         items = [WatchItem(ticker=s, status="held") for s in ledger.positions()]
         items += [WatchItem(ticker=p["symbol"], status="candidate", note=p["strategy"]) for p in planned]
+        items += [WatchItem(ticker=p["symbol"], status="watch", note=f"advisory {p['strategy']}")
+                  for p in advisory or [] if p["symbol"] not in {i.ticker for i in items}]
         deadline = (now.astimezone(ET) + timedelta(days=1)).replace(hour=8, minute=30, second=0, microsecond=0)
         from stockmoney.desk import muse_ops
         muse_ops.ensure_schema(con)
@@ -1610,7 +1692,8 @@ def _opens_today(broker: Broker, now: datetime) -> bool:
     return clock.next_open.astimezone(ET).date() == now.astimezone(ET).date()
 
 
-def _report(day, ctx, sys_eq, budget, mode, why, ledger: Ledger, events, planned, exits) -> str:
+def _report(day, ctx, sys_eq, budget, mode, why, ledger: Ledger, events, planned, exits,
+            advisory: list[dict] | None = None, entries_on: bool = True) -> str:
     lines = [f"## {day} 盤後報告", "",
              f"**系統淨值** {sys_eq:,.0f}({sys_eq / budget - 1:+.2%}),狀態 {mode}:{why}", "",
              f"**大盤**:{REGIME_LABEL[ctx.market.regime]};{ctx.market.note}",
@@ -1624,7 +1707,13 @@ def _report(day, ctx, sys_eq, budget, mode, why, ledger: Ledger, events, planned
                               for s, p in pos.items()], ""]
     if exits:
         lines.append("**明天開盤出場**:" + "、".join(exits))
-    lines.append("**明天開盤進場計畫**:" + ("、".join(f"{p['symbol']} {p['qty']} 股({p['strategy']})" for p in planned) or "無"))
+    if entries_on:
+        lines.append("**明天開盤進場計畫**:" + ("、".join(f"{p['symbol']} {p['qty']} 股({p['strategy']})" for p in planned) or "無"))
+        return "\n".join(lines)
+    lines.append("**明天開盤進場計畫**:無(股票策略只給建議,不自動下單)")
+    lines += ["", "**中長期建議(不自動下單)**"]
+    lines += [f"- {p['symbol']} {p['qty']:g} 股 參考價 {p['ref']:.2f} 停損 {p['stop']:.2f}({p['strategy']})"
+              + (f":{str(p['reason'])[:120]}" if p.get("reason") else "") for p in advisory or []] or ["- 無"]
     return "\n".join(lines)
 
 

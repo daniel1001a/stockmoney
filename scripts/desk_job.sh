@@ -17,6 +17,16 @@ if [[ -f .env ]]; then set -a; source .env; set +a; fi
 export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
 # Options jobs default to shadow-only (no paper orders) until the owner sets DESK_OPTIONS_ORDERS=paper in .env.
 if [[ "$1" == options* ]]; then export DESK_OPTIONS_ORDERS="${DESK_OPTIONS_ORDERS:-off}"; fi
+# "bridge" starts every 60s (stockmoney.desk.bridge_job decides whether a poll is due) and
+# logs only when it printed something, so the idle starts leave no trace in the dated log.
+if [[ "$1" == "bridge" ]]; then
+  OUT="$(.venv/bin/python -m stockmoney.desk.bridge_job 2>&1)"
+  STATUS=$?
+  if [[ -n "$OUT" || $STATUS -ne 0 ]]; then
+    { echo "=== $(date '+%F %T %Z') job=bridge ==="; print -r -- "$OUT"; echo "=== exit $STATUS ==="; } >> "$LOG"
+  fi
+  exit $STATUS
+fi
 echo "=== $(date '+%F %T %Z') job=$1 ===" >> "$LOG"
 if [[ "$1" == "learn" ]]; then
   .venv/bin/python -m stockmoney.desk.learn.job >> "$LOG" 2>&1

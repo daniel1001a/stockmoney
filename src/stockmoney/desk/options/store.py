@@ -68,7 +68,13 @@ _ADDED = (("options_setups", "rvol", "REAL"), ("options_setups", "regime_json", 
           ("options_setups", "grok_stance", "TEXT"), ("options_setups", "grok_stance_late", "INTEGER DEFAULT 0"),
           # the quote an order was sent against (arrival price), and the quote time on each fill
           ("options_orders", "ref_bid", "REAL"), ("options_orders", "ref_ask", "REAL"),
-          ("options_orders", "ref_quote_at", "TEXT"), ("options_fills", "quote_at", "TEXT"))
+          ("options_orders", "ref_quote_at", "TEXT"), ("options_fills", "quote_at", "TEXT"),
+          # who sent the plan: NULL/owner (CLI) or a bridge source; only owner and
+          # grok_verified plans are ever read back by active_plan()
+          ("options_plans", "source", "TEXT"),
+          # a live exit that triggered and is not filled yet (JSON: reason, qty, open_at, at): the
+          # engine keeps exiting it every poll until filled, even if the trigger flickers off
+          ("options_positions", "pending_exit", "TEXT"))
 
 PENDING_SUBMIT = "pending_submit"
 
@@ -79,6 +85,18 @@ def ensure_schema(con) -> None:
         have = {r[1] for r in con.execute(f"PRAGMA table_info({table})")}
         if col not in have:
             con.execute(f"ALTER TABLE {table} ADD COLUMN {col} {typ}")
+            if (table, col) == ("options_plans", "source"):
+                _backfill_plan_source(con)
+
+
+def _backfill_plan_source(con) -> None:
+    """Label the plans stored before the source column existed: a plan that came
+    in over the mail bridge is grok_legacy (untrusted), the rest were ingested
+    from the owner's CLI."""
+    if con.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='bridge_messages'").fetchone():
+        con.execute("UPDATE options_plans SET source='grok_legacy' WHERE source IS NULL AND plan_id IN "
+                    "(SELECT msg_id FROM bridge_messages WHERE type='OPTIONS_PLAN')")
+    con.execute("UPDATE options_plans SET source='owner' WHERE source IS NULL")
 
 
 def iso(t: datetime) -> str:
@@ -249,3 +267,36 @@ def profile(con, day: str, symbol: str) -> tuple[dict, str] | None:
 
 def universe(con, day: str) -> list[dict]:
     return [dict(r) for r in con.execute("SELECT * FROM options_universe WHERE day=? ORDER BY rowid", (day,))]
+
+
+# ------------------------------------------------------------------ parameter changes
+# The options config is code (config.py), so its changes are logged here, once,
+# in the desk's param_changes (strategy 'options'): (param, old, new, reason).
+AUDIT_20261027 = "2026-10-27 audit: stop-the-bleeding step 1"
+PARAM_CHANGES = (
+    ("live_sources", ["gap_go", "orb15", "grok_plan"], ["gap_go", "grok_plan"], AUDIT_20261027),
+    ("rule_playbooks", ["gap_go", "gap_fade", "orb15", "vwap_reclaim"],
+     ["gap_go", "gap_fade", "orb15", "orb15_5m", "vwap_reclaim"], AUDIT_20261027),
+    ("close_inv_minutes", None, {"orb15_5m": 5}, AUDIT_20261027),
+    ("exit_trigger_price", "mid", "bid (mid only when the bid is missing or zero)", AUDIT_20261027),
+    ("exit_order_type", "limit at the bid, repriced, market after 3 unfilled",
+     "stops: market; take_profit: one limit at bid - 1 tick, then market", AUDIT_20261027),
+    ("exit_max_limit_attempts", 3, 1, AUDIT_20261027),
+    ("exit_latch", False, True, AUDIT_20261027),
+    ("poll_seconds_in_position", None, 5.0, AUDIT_20261027),
+)
+
+
+def record_param_changes(con) -> int:
+    """Insert each PARAM_CHANGES row unless the same (param, new, reason) is
+    already logged (the session calls this at every start); returns how many
+    were inserted."""
+    n = 0
+    for param, old, new, reason in PARAM_CHANGES:
+        if con.execute("SELECT 1 FROM param_changes WHERE strategy='options' AND param=? AND new=? AND reason=?",
+                       (param, json.dumps(new), reason)).fetchone():
+            continue
+        con.execute("INSERT INTO param_changes (strategy, param, old, new, reason, changed_at) VALUES (?,?,?,?,?,?)",
+                    ("options", param, json.dumps(old), json.dumps(new), reason, store.now()))
+        n += 1
+    return n

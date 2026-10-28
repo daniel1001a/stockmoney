@@ -101,7 +101,7 @@ from stockmoney.desk.options import universe as uni
 from stockmoney.desk.options._iface import (
     OPTIONS_HALT_SETTING, TIF, AssetClass, OptionContract, OptionsBook, OrderIntent, OrderStatus, OrderType, RiskDecision, RiskGate, Side,
 )
-from stockmoney.desk.options.config import GROK, RULE_PLAYBOOKS, OptionsConfig
+from stockmoney.desk.options.config import GROK, RULE_PLAYBOOKS, SHADOW_ONLY_SOURCES, OptionsConfig
 
 log = logging.getLogger("desk.options")
 ET = ZoneInfo("America/New_York")
@@ -239,11 +239,14 @@ class Engine:
         return self._tick_t0 is not None and \
             (self.clock() - self._tick_t0).total_seconds() > self.cfg.tick_deadline_s
 
-    def tick(self, fast: bool = False) -> dict:
+    def tick(self, fast: bool = False, positions_only: bool = False) -> dict:
         """One pass. ``fast`` (the session's 2-second polls while a live order
         works): only live orders are resolved (entries, working exits; no
         market data); scans, exit decisions and shadow positions wait for the
-        next full tick, which the session runs at least every poll_seconds."""
+        next full tick, which the session runs at least every poll_seconds.
+        ``positions_only`` (the poll_seconds_in_position polls while a live
+        position is open): live positions get their full exit decision; no
+        scans, no shadow, no broker check."""
         now = self.clock()
         self._begin(now)
         self._tick_t0 = now
@@ -256,14 +259,15 @@ class Engine:
             self._notify("期權軌道:HALT 生效", "data/desk/HALT 存在:新進場全擋(影子照記),出場照常。", notify.WARN)
         self._plan_missing_alert(now)
         self._start_of_day(now)
-        if not fast and (self._broker_check_at is None
+        if not fast and not positions_only and (self._broker_check_at is None
                          or (now - self._broker_check_at).total_seconds() >= BROKER_CHECK_EVERY_S):
             self._check_broker(now)  # also during the session: contracts reappearing or bought by hand
         # resolve working orders and exits before any new entry, so the risk
         # gate sees a book that already includes this tick's fills
         self._manage_pending(now)
-        self._manage_open(now, fast)
+        self._manage_open(now, fast, live_only=positions_only)
         self._flat_alert(self.clock())
+        fast = fast or positions_only  # from here on a positions-only tick is a fast one
         late = self._late()
         if late and not fast:
             log.warning("options tick running late (%.0f s > %.0f s): scans and shadow work skipped",
@@ -369,7 +373,15 @@ class Engine:
         active = self._active
         if not ostore.universe(self.con, self._dstr):
             return  # before ~09:25: the universe build adds the plan's names
-        if active is not None and active.plan.plan_id != self._plan_seen:
+        if active is None:
+            # no trusted plan in force (e.g. a restart after the trust rule
+            # changed): setups of an earlier plan must not stay armed
+            cur = self.con.execute("UPDATE options_setups SET state=?, live_note=? WHERE day=? AND source=? "
+                                   "AND state=?", (SUPERSEDED, "no trusted plan in force", self._dstr, GROK,
+                                                   WAITING))
+            if cur.rowcount:
+                self.con.commit()
+        elif active.plan.plan_id != self._plan_seen:
             self._add_plan(active, now)
             self.con.commit()
         self._plan_seen = active.plan.plan_id if active else None
@@ -505,11 +517,18 @@ class Engine:
             "spec_json": json.dumps(spec or {}, ensure_ascii=False), "signal_json": None,
             "live_eligible": int(note == ""), "live_note": note, "created_at": ostore.iso(now),
             "updated_at": ostore.iso(now)})
+        if source == GROK:  # the plan is in force again (e.g. a verified resend): re-arm its disarmed setups
+            self.con.execute("UPDATE options_setups SET state=?, spec_json=?, live_eligible=?, live_note=?, "
+                             "updated_at=? WHERE setup_id=? AND state=?",
+                             (WAITING, json.dumps(spec or {}, ensure_ascii=False), int(note == ""), note,
+                              ostore.iso(now), setup_id, SUPERSEDED))
 
     def _live_note(self, source: str, sym: str, plan_shadow_only: bool, avoid: set[str]) -> str:
         """'' when the setup may send a real (paper) order, else why not."""
         if not self.live:
             return "session is shadow-only"
+        if source in SHADOW_ONLY_SOURCES:
+            return "shadow-only variant"
         if source not in self.cfg.live_sources:
             return "source not live-eligible"
         if source == GROK and plan_shadow_only:
@@ -623,11 +642,22 @@ class Engine:
         """'' when this trigger may send its live order, else why not
         (signal-level rules; the setup-level ones are in _live_note)."""
         cfg, src, m = self.cfg, s["source"], sig.meta
+        # live_eligible is frozen on the setup row; a restart after a config
+        # change must not keep a source live that is no longer live
+        if src in SHADOW_ONLY_SOURCES:
+            return "shadow-only variant"
+        if src not in cfg.live_sources:
+            return "source not live-eligible"
         if src == "gap_go" and m.get("rvol5") is None:
             return "rvol_unknown"
         if src == "orb15" and m.get("day_rvol") is None:
             return "rvol_unknown"
         if src == GROK:
+            # live_eligible was frozen at insert: re-check that this setup's plan
+            # is still the trusted plan in force and was received before the cutoff
+            a = self._active
+            if a is None or a.plan.plan_id != s["plan_id"] or a.shadow_only:
+                return "plan_not_in_force"
             item = spec["item"]
             if item["playbook"] not in cfg.grok_live_playbooks:
                 return "grok_playbook_shadow_only"
@@ -1032,7 +1062,7 @@ class Engine:
             self._cancel(ecid, "entry timeout")
 
     # ================================================================ exits
-    def _manage_open(self, now: datetime, fast: bool = False) -> None:
+    def _manage_open(self, now: datetime, fast: bool = False, live_only: bool = False) -> None:
         rows = ostore.leftovers(self.con, self._dstr, "live", (ENTERED,)) + ostore.positions(self.con, self._dstr, None,
                                                                                                (ENTERED,))
         # live first: if the data budget runs short, shadow bookkeeping is what waits
@@ -1041,11 +1071,18 @@ class Engine:
                 if p["mode"] == "live":
                     working = [o for o in ostore.orders_for(self.con, p["position_id"])
                                if o["kind"] == "exit" and o["status"] not in _TERMINAL_ORDER]
-                    if working:
-                        try:
+                    try:
+                        if working:
                             self._resolve_exit(p, working[-1], now)
-                        except Exception as e:
-                            self._error("exit", f"{p['position_id']}: {type(e).__name__}: {e}")
+                        elif p["pending_exit"]:  # a latched exit whose last order ended unfilled: send again now
+                            self._prio = PRIO_LIVE
+                            self._manage_one(p, now)
+                    except Exception as e:
+                        self._error("exit", f"{p['position_id']}: {type(e).__name__}: {e}")
+                    finally:
+                        self._prio = PRIO_SCAN
+                continue
+            if p["mode"] != "live" and live_only:
                 continue
             if p["mode"] != "live" and self._late():
                 continue  # running late: shadow bookkeeping waits for the next tick
@@ -1116,6 +1153,8 @@ class Engine:
                 if p["state"] != ENTERED:
                     return
         reason, qty = self._exit_decision(p, q if fresh else None, now)
+        if p["mode"] == "live":
+            reason, qty = self._latch_exit(p, reason, qty, now)
         if not reason:
             return
         if p["mode"] == "shadow":
@@ -1127,6 +1166,30 @@ class Engine:
                             "" if fresh else "stale quote: last known bid")
         else:  # a leftover always goes out at market
             self._send_exit(p, qty, reason, None if reason == "carry_over" else (q if fresh else None), now)
+
+    def _latch_exit(self, p: dict, reason: str, qty: float, now: datetime) -> tuple[str, float]:
+        """A live exit, once triggered, is latched in pending_exit (reason,
+        qty, qty_open at the trigger) and sent again every poll until that
+        qty is sold, even if the trigger flickers off (2026-10-27: a SOFI
+        take_profit flickered off after three unfilled limits and nothing
+        went out for 25 minutes). A stop-type trigger replaces a latched
+        take_profit: the whole position goes."""
+        held = json.loads(p["pending_exit"]) if p["pending_exit"] else None
+        open_ = p["qty_open"] or 0
+        left = 0.0
+        if held is not None:
+            left = min(held["qty"] - (held["open_at"] - open_), open_)
+            if left <= 1e-9:  # already sold (normally cleared by _book_exit)
+                held = None
+        if reason and (held is None or (held["reason"] == "take_profit" and reason != "take_profit")):
+            held = {"reason": reason, "qty": qty, "open_at": open_, "at": ostore.iso(now)}
+            ostore.update_position(self.con, p["position_id"], pending_exit=json.dumps(held))
+            return reason, qty
+        if held is None:
+            if p["pending_exit"]:
+                ostore.update_position(self.con, p["position_id"], pending_exit=None)
+            return "", 0
+        return held["reason"], left
 
     def _exit_decision(self, p: dict, q: OptionContract | None, now: datetime) -> tuple[str, float]:
         cfg = self.cfg
@@ -1142,7 +1205,10 @@ class Engine:
             return "time_stop", qty
         b = p["exit_variant"] == "B"
         if q is not None:
-            m, e = sel.mid(q), p["entry_price"]
+            # on the BID, what a sell gets: on the mid a -35% stop filled at -46% (SPY) and a
+            # take_profit fired with nothing at the bid (SOFI, 2026-10-27 audit). The mid only
+            # when the bid is missing or zero.
+            m, e = (q.bid if q.bid and q.bid > 0 else sel.mid(q)), p["entry_price"]
             if not p["tp_done"]:
                 if m <= e * (1 - (cfg.premium_stop_pct_b if b else cfg.premium_stop_pct)):
                     return "premium_stop", qty
@@ -1178,11 +1244,26 @@ class Engine:
 
     def _close_invalidated(self, p: dict, now: datetime) -> bool:
         """Close-based invalidation: the last completed 1-minute close (after
-        the entry) beyond ``inv_close``, or back across session VWAP."""
+        the entry) beyond ``inv_close``, or back across session VWAP. A source
+        in config close_inv_minutes uses the last completed bar of that many
+        minutes instead (anchored at the open; its close is the close of its
+        last 1-minute bar)."""
         if p["inv_close"] is None and not p["inv_vwap"]:
             return False
         rth = self._rth_now(p["underlying"], now)
-        if rth is None or (rth.index[-1] + pb.ONE_MIN).to_pydatetime() <= datetime.fromisoformat(p["entry_time"]):
+        if rth is None:
+            return False
+        n = dict(self.cfg.close_inv_minutes).get(p["source"], 1)
+        if n > 1:
+            size, open_ = pd.Timedelta(minutes=n), pd.Timestamp(_at(self._day, self.cfg.open_time))
+            ends = open_ + ((rth.index - open_) // size + 1) * size
+            done = ends <= pd.Timestamp(now)
+            if not done.any():
+                return False
+            rth, end = rth[done], ends[done][-1].to_pydatetime()
+        else:
+            end = (rth.index[-1] + pb.ONE_MIN).to_pydatetime()
+        if end <= datetime.fromisoformat(p["entry_time"]):
             return False
         c, long_ = float(rth["close"].iloc[-1]), p["direction"] == "long"
         if p["inv_close"] is not None and (c < p["inv_close"] if long_ else c > p["inv_close"]):
@@ -1240,6 +1321,9 @@ class Engine:
                   "spread_cost_usd": (p["spread_cost_usd"] or 0) + sh.half_spread_cost(bid, ask, qty, cfg)}
         if reason == "take_profit" and left > 0:
             fields.update(tp_done=1, stop_price=p["entry_price"], trail_ref=self._spot(p["underlying"], now))
+        held = json.loads(p["pending_exit"]) if p.get("pending_exit") else None
+        if held is not None and (left <= 1e-9 or held["qty"] - (held["open_at"] - left) <= 1e-9):
+            fields["pending_exit"] = None  # the latched exit is sold
         if left <= 1e-9:
             fields.update(exit_time=ostore.iso(now), exit_reason=reason)
             if p["state"] != PENDING:  # a partly filled entry still working stays PENDING until it ends
@@ -1263,8 +1347,13 @@ class Engine:
             streak += 1
         if exits and now >= self._flat():  # at/after the forced flat a repeat attempt is a market sell
             force_market = True
-        if not force_market and q is not None and q.bid and streak < cfg.exit_max_limit_attempts:
-            otype, limit = OrderType.LIMIT, sh.round_tick(q.bid, sh.option_tick(p["underlying"], q.bid), up=False)
+        # only take_profit sells by limit: one tick under the bid (a limit AT an indicative bid
+        # did not fill three times on SOFI, 2026-10-27), market after exit_max_limit_attempts
+        # unfilled. Every stop-type exit is a market sell from the first order.
+        if not force_market and reason == "take_profit" and q is not None and q.bid \
+                and streak < cfg.exit_max_limit_attempts:
+            tick = sh.option_tick(p["underlying"], q.bid)
+            otype, limit = OrderType.LIMIT, max(sh.round_tick(q.bid - tick, tick, up=False), tick)
         else:
             otype, limit = OrderType.MARKET, None
         # size the sell to what the broker holds minus its working sells (never more than asked)

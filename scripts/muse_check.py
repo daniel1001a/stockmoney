@@ -5,6 +5,8 @@
     .venv/bin/python scripts/muse_check.py stage 2      # turn on delivery checks for stage 2 (see MUSE_ONBOARDING.md)
     .venv/bin/python scripts/muse_check.py drill        # stage 3: send Muse a test research request (ticker DRILL)
     .venv/bin/python scripts/muse_check.py grok on      # Grok GROK_DAILY lateness check on (off: grok off)
+    .venv/bin/python scripts/muse_check.py ping grok    # send a PING handshake (or: ping muse)
+    .venv/bin/python scripts/muse_check.py pings        # PINGs sent, and the PONG that answered each
 
 Load .env first (scripts/desk_job.sh does this for scheduled jobs):
     set -a; source .env; set +a
@@ -89,6 +91,35 @@ def cmd_drill() -> int:
     return 0
 
 
+def cmd_ping(channel: str) -> int:
+    from stockmoney.desk.bridge.mailbox import BridgeConfig, ImapSmtpMailbox
+    cfg = BridgeConfig.from_env()
+    if channel == "grok" and not cfg.grok_enabled:
+        print("Grok 通道未設定(GROK_ADDRESS / GROK_SHARED_TOKEN),未寄出。")
+        return 2
+    now = datetime.now(timezone.utc)
+    with store.connect() as con, ImapSmtpMailbox(cfg) as box:
+        msg = muse_ops.send_ping(con, box, channel, now, cfg)
+    print(f"已寄出 PING {msg.msg_id}(nonce {msg.nonce})給 {channel}。對方回 PONG 後用 pings 查看。")
+    return 0
+
+
+def cmd_pings() -> int:
+    with store.connect() as con:
+        rows = muse_ops.ping_results(con)
+    if not rows:
+        print("尚未寄出任何 PING。")
+    for r in rows:
+        if r["answered"]:
+            print(f"  {r['sent_at']}  {r['channel']}  {r['nonce']}  PONG {r['rtt_s']} 秒後({r['source']})")
+            print(f"    能力:{json.dumps(r['capabilities'], ensure_ascii=False)}")
+            if r["notes"]:
+                print(f"    備註:{r['notes'][:300]}")
+        else:
+            print(f"  {r['sent_at']}  {r['channel']}  {r['nonce']}  尚未回覆")
+    return 0
+
+
 def main(argv: list[str]) -> int:
     if len(argv) < 2:
         print(__doc__)
@@ -104,6 +135,10 @@ def main(argv: list[str]) -> int:
         return cmd_drill()
     if cmd == "grok" and len(argv) == 3 and argv[2] in ("on", "off"):
         return cmd_grok(argv[2])
+    if cmd == "ping" and len(argv) == 3 and argv[2] in ("grok", "muse"):
+        return cmd_ping(argv[2])
+    if cmd == "pings":
+        return cmd_pings()
     print(__doc__)
     return 2
 

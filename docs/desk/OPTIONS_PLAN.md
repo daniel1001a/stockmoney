@@ -252,3 +252,12 @@
 
 - 報價來源:帳戶沒有 OPRA 訂閱。`ALPACA_OPTION_FEED` 未設時,`AlpacaBroker` 明確使用 `indicative`(`src/stockmoney/desk/execution/alpaca.py`,`DEFAULT_OPTION_FEED`)並寫入 log,不再交給 Alpaca 自選。每份期權報告(期權日報、學習日報的期權驗屍卡週報段落)都帶一行「報價為 indicative,滑價量測僅供參考」(`FEED_CAVEAT`,`options/config.py`),測試核對。
 - 出場追價對照(只讀,實盤出場規則不變):`src/stockmoney/desk/options/exit_shadow.py` 把每筆紙上出場的委託串成一段(到成交為止),以首張委託記錄的買價(`ref_bid`,舊資料用首張限價)為決策價,計算追價成本;再用同一批記錄報價模擬對照規則「停損類出場首張限價掛在買價下 max(1 tick, 半個價差),停利維持買價」:首張就成交記為相同,被改價的看下一個記錄買價是否不低於對照限價,否則記為無法判定。結果列在期權日報「出場追價」一節,依劇本分組。每個劇本未滿 30 筆前只是線索,不據此改出場規則。
+
+## 15. 止血第一步(2026-10-27 稽核,帳戶所有人核准)
+
+- orb15 退出紙上實單:`live_sources` 改為 gap_go 與 grok_plan。新增只進影子的 `orb15_5m`(觸發同 orb15,收盤推翻改用 5 分鐘收盤),列在 `SHADOW_ONLY_SOURCES`,即使寫進 `live_sources` 也不會下單。
+- 停損與停利改用買價判斷(買價缺失或為 0 才用中價)。原因:用中價判斷時 SPY 的 -35% 停損實際成交在 -46%,SOFI 的停利在買價根本不到時觸發。
+- 出場鎖定(`pending_exit`):實單出場一旦觸發就鎖住,觸發條件閃掉也照送,直到該口數賣完。停損類出場第一張就是市價單;停利只掛一張「買價減一個 tick」的限價,未成交就改市價(`exit_max_limit_attempts=1`)。
+- 持倉期間輪詢縮短為每 5 秒一次只看部位的 tick(`poll_seconds_in_position`),掃描與影子仍是每 20 秒,資料額度約每分鐘 75 次,上限 110。
+- 期權日報新增「紙上成交滑價」一節(只讀):每筆成交對比送單當下報價中價,並依劇本列出來回成本佔進場權利金的比例。
+- 以上變更寫入 `param_changes`,原因欄為 `2026-10-27 audit: stop-the-bleeding step 1`(`options/store.py` 的 `record_param_changes`,每次 session 開始寫一次,重複執行不會重複寫)。測試:`tests/desk/options/test_opt_audit_1027.py`。

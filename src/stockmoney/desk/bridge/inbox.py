@@ -12,13 +12,24 @@ OPTIONS_PLAN is the one exception to "Inbound schema": its body is the options
 sleeve's OptionsPlan, whose plan_id plays the msg_id role (see _process_plan).
 
 Senders: MUSE_ADDRESS (Muse types, and Grok types on the legacy channel) and,
-when GROK_ADDRESS + GROK_SHARED_TOKEN are both set, GROK_ADDRESS (GROK_DAILY and
-OPTIONS_PLAN only). Each stored row carries ``source``: ``muse``,
-``grok_verified`` (Grok type over Grok's own channel, Grok's token, and a
-Gmail-written dkim=pass for the GROK_ADDRESS domain) or ``grok_legacy`` (Grok
-type over the Muse channel, or Grok's channel without that DKIM pass; the
-reason is in ``source_reason``). Only grok_verified may count as an
-independent source in veto.py / postmortem.
+when GROK_ADDRESS + GROK_SHARED_TOKEN are both set, GROK_ADDRESS
+(GROK_SENDER_TYPES: GROK_DAILY, OPTIONS_PLAN, ALERT, RESEARCH_REPLY, PONG). Each
+stored row carries ``source``: ``muse``, ``grok_verified`` (mail over Grok's own
+channel, Grok's token, and a Gmail-written dkim=pass for the GROK_ADDRESS
+domain) or ``grok_legacy`` (Grok type over the Muse channel, or Grok's channel
+without that DKIM pass; the reason is in ``source_reason``). Only grok_verified
+may count as an independent source in veto.py / postmortem. msg_id prefix
+convention for Grok: ``grok-`` is reserved for GROK_DAILY; ALERT uses
+``alert-grok-``, RESEARCH_REPLY ``rr-grok-``, PONG ``pong-grok-`` (convention
+only; the source comes from the channel, never from the id).
+
+Leniency (2026-10-27): an information type (INFO_TYPES) that fails strict
+validation is pruned instead of rejected when the problem is confined to
+optional parts: unknown fields are removed, a bad item is removed from a list
+whose minimum still holds, an optional field with a bad value is removed, an
+over-long list is cut. A missing required field, or a bad required field,
+still rejects. What was removed is stored in ``dropped_json`` and the sender
+gets a non-fatal FEEDBACK. OPTIONS_PLAN is never pruned.
 
 Accepted messages are stored; everything else goes to ``bridge_rejects`` with a
 reason. ``poll`` never raises on bad mail. Free text inside messages is stored
@@ -53,16 +64,23 @@ EXCERPT_CHARS = 2000
 SUBJECT_RE = re.compile(r"^((?:(?i:re|fw|fwd)\s*:\s*)*)\[SMD/([A-Z_]{1,32})/([A-Za-z0-9_\-]{6,64})\] (\S{1,256})\s*$")
 # Types only the desk sends. Mail carrying one is an echo of our own mail (a reply
 # or forward whose client stripped the prefix) and is never correctable.
-OUTBOUND_ONLY_TYPES = frozenset({"WATCHLIST", "RESEARCH_REQUEST", "REPORT", "FEEDBACK"})
+OUTBOUND_ONLY_TYPES = frozenset({"WATCHLIST", "RESEARCH_REQUEST", "REPORT", "FEEDBACK", "PING", "DESK_BRIEF"})
 _INBOUND = TypeAdapter(Inbound)
 
 SOURCE_MUSE, SOURCE_GROK_VERIFIED, SOURCE_GROK_LEGACY = "muse", "grok_verified", "grok_legacy"
-GROK_TYPES = frozenset({"GROK_DAILY", "OPTIONS_PLAN"})
+GROK_TYPES = frozenset({"GROK_DAILY", "OPTIONS_PLAN"})  # Grok-only types (source_of fallback)
+# everything GROK_ADDRESS may send; ALERT / RESEARCH_REPLY / PONG are shared with Muse
+GROK_SENDER_TYPES = GROK_TYPES | {"ALERT", "RESEARCH_REPLY", "PONG"}
+# information-only types: stored, never an order input; these may be pruned (see above)
+INFO_TYPES = frozenset({"GROK_DAILY", "SOCIAL_DAILY", "CALLS", "ALERT", "RESEARCH_REPLY", "IDEA", "PONG"})
+# top-level lists that pruning may not empty when they arrived with items
+_KEEP_NONEMPTY = {"GROK_DAILY": ("events",), "RESEARCH_REPLY": ("risk_flags",),
+                  "SOCIAL_DAILY": ("items",), "CALLS": ("calls",)}
 
 BRIDGE_SCHEMA = """
 CREATE TABLE IF NOT EXISTS bridge_messages (
   msg_id TEXT PRIMARY KEY, type TEXT NOT NULL, sender TEXT, sent_at TEXT, received_at TEXT NOT NULL,
-  raw_body TEXT NOT NULL, parsed_json TEXT NOT NULL, source TEXT, source_reason TEXT);
+  raw_body TEXT NOT NULL, parsed_json TEXT NOT NULL, source TEXT, source_reason TEXT, dropped_json TEXT);
 CREATE INDEX IF NOT EXISTS idx_bridge_messages_received ON bridge_messages (received_at);
 CREATE TABLE IF NOT EXISTS bridge_rejects (
   id INTEGER PRIMARY KEY AUTOINCREMENT, received_at TEXT NOT NULL, sender TEXT, subject TEXT,
@@ -72,7 +90,7 @@ CREATE INDEX IF NOT EXISTS idx_bridge_rejects_received ON bridge_rejects (receiv
 
 
 # Columns added after the first release; ensure_schema adds them to old databases.
-ADDED_COLUMNS = {"bridge_messages": {"source": "TEXT", "source_reason": "TEXT"}}
+ADDED_COLUMNS = {"bridge_messages": {"source": "TEXT", "source_reason": "TEXT", "dropped_json": "TEXT"}}
 
 
 def ensure_schema(con) -> None:
@@ -244,7 +262,7 @@ def _process(con, mail: RawMail, config: BridgeConfig, received_at: datetime) ->
         # because is_echo_subject() recognises the stored subject.
         _reject(con, received_at, mail, "schema_invalid outbound_only_type", config, subj_id)
         return False
-    if from_grok and subj_type not in GROK_TYPES:
+    if from_grok and subj_type not in GROK_SENDER_TYPES:
         # not in muse_ops.FIXES: never answered with feedback
         _reject(con, received_at, mail, "type_not_allowed_for_sender", config, subj_id)
         return False
@@ -272,10 +290,13 @@ def _process(con, mail: RawMail, config: BridgeConfig, received_at: datetime) ->
         return fail("oversized")
     if subj_type == "OPTIONS_PLAN":
         return _process_plan(con, mail, config, received_at, subj_id, fail, source, source_reason)
+    dropped: list[dict] = []
     try:
         msg = _INBOUND.validate_json(repair_string_newlines(extract_json(mail.body)), strict=True)
     except ValidationError as e:
-        return fail(_validation_reason(e))
+        msg, dropped = lenient_validate(repair_string_newlines(extract_json(mail.body)), subj_type)
+        if msg is None:
+            return fail(_validation_reason(e))
     except ValueError:  # not JSON at all / lone surrogates etc.
         return fail("body_not_json")
     if msg.type != subj_type:
@@ -299,13 +320,134 @@ def _process(con, mail: RawMail, config: BridgeConfig, received_at: datetime) ->
             log.info("bridge: identical resend of %s ignored", msg.msg_id)
             return False
         return fail("duplicate_msg_id")
+    if dropped and replied:
+        # a pruned Re:/Fwd: mail is still stored, but never answered (see fail())
+        log.info("bridge: %s accepted with %d drops (reply prefix, no feedback)", msg.msg_id, len(dropped))
     con.execute(
         "INSERT INTO bridge_messages (msg_id, type, sender, sent_at, received_at, raw_body, parsed_json, source, "
-        "source_reason) VALUES (?,?,?,?,?,?,?,?,?)",
+        "source_reason, dropped_json) VALUES (?,?,?,?,?,?,?,?,?,?)",
         (msg.msg_id, msg.type, mail.sender, _iso(msg.sent_at), _iso(received_at), mail.body, msg.model_dump_json(),
-         source, source_reason),
+         source, source_reason,
+         json.dumps({"dropped": dropped, "feedback": not replied}) if dropped else None),
     )
     return True
+
+
+# ---------------------------------------------------------------- leniency
+
+_MAX_PRUNE_STEPS = 200
+_MAX_DROPS_LISTED = 50
+
+
+def _model_for(msg_type: str):
+    from stockmoney.desk.bridge import schema as S
+    return {"GROK_DAILY": S.GrokDaily, "SOCIAL_DAILY": S.SocialDaily, "CALLS": S.Calls, "ALERT": S.Alert,
+            "RESEARCH_REPLY": S.ResearchReply, "IDEA": S.Idea, "PONG": S.Pong}.get(msg_type)
+
+
+def _get(obj, path):
+    for p in path:
+        obj = obj[p]
+    return obj
+
+
+def _still_bad(model, data, kind: str, loc: tuple) -> bool:
+    """After a removal: does strict validation now report ``kind`` at ``loc``?"""
+    try:
+        model.model_validate_json(json.dumps(data), strict=True)
+    except ValidationError as e:
+        return any(err["type"] == kind and tuple(err["loc"]) == loc for err in e.errors())
+    return False
+
+
+def _try_remove(model, data, loc: list) -> str:
+    """Remove the deepest removable thing on ``loc`` (a list element or a dict
+    key), trying the deepest first. A removal is undone, and the next level up
+    tried, when strict validation then reports the key as missing (it was
+    required) or its list as too short. Returns the removed path, "" if none."""
+    for depth in range(len(loc), 0, -1):
+        path, last = tuple(loc[:depth - 1]), loc[depth - 1]
+        try:
+            parent = _get(data, path)
+        except (KeyError, IndexError, TypeError):
+            continue
+        if isinstance(parent, list) and isinstance(last, int) and 0 <= last < len(parent):
+            item = parent.pop(last)
+            if not _still_bad(model, data, "too_short", path):
+                return ".".join(map(str, loc[:depth]))
+            parent.insert(last, item)
+        elif isinstance(parent, dict) and isinstance(last, str) and last in parent:
+            if depth == 1 and last in ("type", "msg_id", "protocol", "sent_at"):
+                return ""
+            value = parent.pop(last)
+            if not _still_bad(model, data, "missing", tuple(loc[:depth])):
+                return ".".join(map(str, loc[:depth]))
+            parent[last] = value
+    return ""
+
+
+def lenient_validate(text: str, subj_type: str):
+    """(msg, dropped) after pruning an information-type body, or (None, [])
+    when it cannot be made valid without touching a required field. The final
+    check is the same strict validation as the normal path."""
+    if subj_type not in INFO_TYPES:
+        return None, []
+    model = _model_for(subj_type)
+    try:
+        data = json.loads(text)
+    except (ValueError, RecursionError):
+        return None, []
+    if not isinstance(data, dict) or data.get("type") != subj_type or model is None:
+        return None, []
+    dropped: list[dict] = []
+    # a list whose emptiness means something must keep at least one item:
+    # pruning GROK_DAILY.events to nothing would read as an intentional empty
+    # digest. A side section (in_play, chains, tracked_accounts ...) may go empty.
+    filled = [k for k in _KEEP_NONEMPTY.get(subj_type, ()) if isinstance(data.get(k), list) and data[k]]
+    for _ in range(_MAX_PRUNE_STEPS):
+        try:
+            msg = _INBOUND.validate_json(json.dumps(data), strict=True)
+            if any(not data.get(k) for k in filled):
+                return None, []
+            return msg, dropped
+        except ValidationError as e:
+            errors = e.errors()
+        except ValueError:
+            return None, []
+        # union errors carry the tag first ("ALERT.ticker"): strip it
+        progressed = False
+        for err in sorted(errors, key=lambda er: [str(x) for x in er["loc"]], reverse=True):
+            loc = tuple(err["loc"])
+            if loc and loc[0] == subj_type:
+                loc = loc[1:]
+            if not loc:
+                return None, []  # model-level rule (e.g. a consistency check): not prunable
+            if err["type"] == "too_long":
+                try:
+                    target = _get(data, loc)
+                except (KeyError, IndexError, TypeError):
+                    return None, []
+                limit = (err.get("ctx") or {}).get("max_length")
+                if isinstance(target, list) and isinstance(limit, int):
+                    dropped.append({"path": ".".join(map(str, loc)), "why": f"too_long: cut to {limit}"})
+                    del target[limit:]
+                    progressed = True
+                    break
+            path = _try_remove(model, data, list(loc))
+            if path:
+                dropped.append({"path": path, "why": err["type"]})
+                progressed = True
+                break
+        if not progressed:
+            return None, []
+    return None, []
+
+
+def drop_summary(dropped: list[dict]) -> str:
+    """Short, input-free description of what was pruned (paths + error codes)."""
+    parts = [f"{d['path']}:{d['why']}" for d in dropped[:_MAX_DROPS_LISTED]]
+    more = f"; +{len(dropped) - _MAX_DROPS_LISTED} more" if len(dropped) > _MAX_DROPS_LISTED else ""
+    return "; ".join(parts) + more
 
 
 def _process_plan(con, mail: RawMail, config: BridgeConfig, received_at: datetime, subj_id: str, fail,
@@ -332,7 +474,7 @@ def _process_plan(con, mail: RawMail, config: BridgeConfig, received_at: datetim
     other = con.execute("SELECT type FROM bridge_messages WHERE msg_id=?", (p.plan_id,)).fetchone()
     if other is not None and other[0] != "OPTIONS_PLAN":
         return fail("duplicate_msg_id")
-    res = oplan.ingest(con, text, received_at, OptionsConfig())
+    res = oplan.ingest(con, text, received_at, OptionsConfig(), source=source)
     if res.status == "rejected":  # parse passed above, so: the id belongs to a different accepted plan
         return fail("plan_id_reused")
     con.execute(
@@ -343,7 +485,18 @@ def _process_plan(con, mail: RawMail, config: BridgeConfig, received_at: datetim
     )
     if res.status == "duplicate":
         return False
-    note = " (shadow_only: 09:20 ET 後收到,當天只進影子帳戶)" if res.shadow_only else ""
+    if res.status == "upgraded":
+        # the same plan resent over Grok's verified channel (see the identical-resend
+        # upgrade in process_mail); the plan row was upgraded by ingest
+        con.execute("UPDATE bridge_messages SET source=?, source_reason=?, sender=? WHERE msg_id=?",
+                    (source, f"verified_by_resend {_iso(received_at)}", mail.sender, p.plan_id))
+        log.info("bridge: verified resend of OPTIONS_PLAN %s upgraded it", p.plan_id)
+    if source != SOURCE_GROK_VERIFIED:
+        note = f" (未驗證來源 {source}:只存檔,不進交易)"
+    elif res.shadow_only:
+        note = " (shadow_only: 09:20 ET 後收到,當天只進影子帳戶)"
+    else:
+        note = ""
     try:
         notify.send("OPTIONS_PLAN 已收到", f"OPTIONS_PLAN 已收到: {len(p.plans)} 個劇本{note}", notify.INFO)
     except Exception:  # a notification failure never undoes a stored plan

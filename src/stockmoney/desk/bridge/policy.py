@@ -20,6 +20,10 @@ SOCIAL_DAILY, CALLS, GROK_DAILY and OPTIONS_PLAN produce no flags (incubator / f
 data; GROK_DAILY stays store-only until Grok has its own token; an OPTIONS_PLAN's only
 effect is the plan the options engine reads from options_plans).
 
+Grok ALERT / RESEARCH_REPLY (2026-10-27, sent from GROK_ADDRESS): the same
+risk-reducing rules apply, labelled "Grok" instead of "Muse" so the owner sees
+who raised it. A Grok ALERT counts as a cross-source vote only in ``veto``.
+
 Timing uses ``received_at`` (set by our inbox), never Muse's own timestamps, so
 a message can neither back-date nor extend its own effect. Whether a ticker is
 held comes from the caller, never from Muse.
@@ -33,7 +37,8 @@ from typing import Collection
 
 from pydantic import TypeAdapter, ValidationError
 
-from stockmoney.desk.bridge.inbox import _clean, ensure_schema
+from stockmoney.desk.bridge.inbox import (SOURCE_GROK_VERIFIED, SOURCE_MUSE, _clean, ensure_schema,
+                                         has_source_column, source_of)
 from stockmoney.desk.bridge.schema import Alert, Inbound, ResearchReply, Severity
 
 FLAG_DAYS = 3
@@ -80,12 +85,13 @@ def active_flags(con, now: datetime, held: Collection[str] = ()) -> BridgeFlags:
     notify: list[str] = []
 
     scan_from = now - max(timedelta(days=FLAG_DAYS), timedelta(hours=NOTIFY_HOURS)) - _SCAN_MARGIN
+    src = "source" if has_source_column(con) else "NULL"
     rows = con.execute(
-        "SELECT type, received_at, parsed_json FROM bridge_messages "
+        f"SELECT type, received_at, parsed_json, {src} FROM bridge_messages "
         "WHERE type IN ('ALERT','RESEARCH_REPLY') AND received_at >= ? ORDER BY received_at",
         (scan_from.isoformat(timespec="seconds"),),
     ).fetchall()
-    for typ, received_at, parsed in rows:
+    for typ, received_at, parsed, source in rows:
         try:
             when = _parse_ts(received_at)
             msg = _INBOUND.validate_json(parsed)
@@ -95,23 +101,29 @@ def active_flags(con, now: datetime, held: Collection[str] = ()) -> BridgeFlags:
             continue
         ticker = msg.ticker.upper()
         is_held = ticker in held_set
+        label = source_of(source, typ)
+        who = "Muse" if label == SOURCE_MUSE else "Grok"
         if isinstance(msg, Alert):
             headline = _clean(msg.headline, 140)
+            # a Grok critical hard-blocks only from the verified channel and when
+            # Grok marks it confirmed; otherwise it stays a soft flag + notice
+            hard = msg.severity is Severity.critical and (
+                label == SOURCE_MUSE or (label == SOURCE_GROK_VERIFIED and msg.confirmed is True))
             if when >= flag_cutoff:
                 if not is_held:
-                    reason = f"Muse ALERT {msg.severity.value}: {headline}"
+                    reason = f"{who} ALERT {msg.severity.value}: {headline}"
                     _add(legacy, ticker, reason)
-                    if msg.severity is Severity.critical:
+                    if hard:
                         _add(blocked, ticker, reason)
-                elif msg.severity is Severity.critical:
-                    _add(no_add, ticker, f"Muse critical ALERT: {headline}")
+                elif hard:
+                    _add(no_add, ticker, f"{who} critical ALERT: {headline}")
             if when >= notify_cutoff and msg.severity in (Severity.critical, Severity.elevated):
                 role = "held" if is_held else "candidate"
-                notify.append(f"Muse ALERT {msg.severity.value} {ticker} ({role}): {headline}")
+                notify.append(f"{who} ALERT {msg.severity.value} {ticker} ({role}): {headline}")
         elif isinstance(msg, ResearchReply):
             if when >= flag_cutoff and msg.risk_flags and not is_held:
                 flags = _clean("; ".join(msg.risk_flags), 200)
-                _add(legacy, ticker, f"Muse risk flags: {flags}")
+                _add(legacy, ticker, f"{who} risk flags: {flags}")
 
     rejects = con.execute(
         "SELECT reason FROM bridge_rejects WHERE received_at >= ?",
@@ -120,7 +132,7 @@ def active_flags(con, now: datetime, held: Collection[str] = ()) -> BridgeFlags:
     counts = Counter(r[0].split(" ")[0] for r in rejects if not r[0].startswith(_QUIET_REJECTS))
     if counts:
         detail = ", ".join(f"{k}={v}" for k, v in sorted(counts.items()))
-        notify.append(f"Muse bridge rejected {sum(counts.values())} message(s) in the last {NOTIFY_HOURS}h ({detail})")
+        notify.append(f"Bridge rejected {sum(counts.values())} message(s) in the last {NOTIFY_HOURS}h ({detail})")
     return BridgeFlags(blocked=blocked, no_add=no_add, notify=notify, legacy_blocked=legacy)
 
 

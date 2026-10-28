@@ -142,6 +142,7 @@ class FakeOptionsBroker:
         self.volume = 1_000
         self.oi = 5_000
         self.fill = "immediate"                     # immediate | never
+        self.stuck: set[str] = set()                # client_order_ids that never fill
         self.fail_submit_once = False
         self.submit_calls: list[str] = []
         self.orders: dict[str, BrokerOrder] = {}
@@ -204,7 +205,7 @@ class FakeOptionsBroker:
         return replace(o)
 
     def _try_fill(self, o: BrokerOrder) -> None:
-        if self.fill != "immediate" or o.status != OrderStatus.NEW:
+        if self.fill != "immediate" or o.status != OrderStatus.NEW or o.client_order_id in self.stuck:
             return
         q = self.option_quote(o.symbol)
         px = q.ask if o.side == Side.BUY else q.bid
@@ -281,8 +282,12 @@ def allow_gate(calls: list | None = None) -> FnGate:
 
 
 def spy_cfg(tmp_path, **kw) -> OptionsConfig:
-    """Universe = SPY only, files under tmp_path."""
+    """Universe = SPY only, files under tmp_path. The fixture day is an orb15
+    breakout, so orb15 stays live here to exercise the order path (production
+    took it out of live_sources in the 2026-10-27 audit; test_opt_audit_1027
+    checks the production default)."""
     base = dict(index=("SPY",), mega_cap=(), high_vol=(), halt_file=tmp_path / "HALT",
-                lock_path=tmp_path / "options.lock", report_dir=tmp_path / "reports")
+                lock_path=tmp_path / "options.lock", report_dir=tmp_path / "reports",
+                live_sources=("gap_go", "orb15", "grok_plan"))
     base.update(kw)
     return OptionsConfig(**base)
