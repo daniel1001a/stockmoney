@@ -188,7 +188,8 @@ def open_new(con, data, now: datetime, cfg: OptionsConfig) -> list[str]:
     done = {r[0] for r in con.execute("SELECT underlying FROM options_spreads_shadow WHERE day = ?",
                                       (day.isoformat(),))}
     held = {r[0] for r in con.execute("SELECT underlying FROM options_spreads_shadow WHERE status = 'OPEN'")}
-    last_slot = et.time() >= (datetime.combine(day, ENTRY_WINDOW[1]) - timedelta(minutes=10)).time()
+    # the 10:55 slot only: a 10:45 run delayed by the intraday tick's alarm must not write skips
+    last_slot = et.time() >= (datetime.combine(day, ENTRY_WINDOW[1]) - timedelta(minutes=5)).time()
     picks = []  # network first: no write (and so no lock) is held while chains download
     for und, source in candidates(con, day, cfg):
         if und in done or und in held:
@@ -208,7 +209,8 @@ def open_new(con, data, now: datetime, cfg: OptionsConfig) -> list[str]:
             continue
         qty = contracts_for(p.debit, cfg)
         if qty == 0:
-            _skip(con, day.isoformat(), und, source, state, "too_expensive")
+            if last_slot:  # a cheaper quote may come later in the window
+                _skip(con, day.isoformat(), und, source, state, "too_expensive")
             continue
         con.execute(
             "INSERT OR IGNORE INTO options_spreads_shadow (day, underlying, source, wind, status, expiry, long_occ,"

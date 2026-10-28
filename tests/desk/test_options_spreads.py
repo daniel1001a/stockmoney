@@ -171,6 +171,22 @@ def test_stale_legs_retry_until_the_last_slot(con):
     assert tuple(row) == ("SKIPPED", "stale_quotes")
 
 
+def test_too_expensive_and_delayed_runs_do_not_skip_early(con):
+    set_wind(con, "2026-10-27", "tailwind")
+    now = et(DAY, 10, 0)
+    dear = chain(now)
+    dear[1].bid, dear[1].ask = 13.0, 13.1  # debit about 11.97: below a 15 width, above the $1000 cap
+    dear[2].strike, dear[3].strike = 115, 120
+    spreads.open_new(con, FakeData({"SPY": dear}), now, CFG)
+    q = "SELECT status, skip_reason FROM options_spreads_shadow WHERE underlying = 'SPY'"
+    assert con.execute(q).fetchone() is None
+    late_run = et(DAY, 10, 50)  # the 10:45 slot pushed back by a slow intraday tick
+    spreads.open_new(con, FakeData({"SPY": [], "QQQ": []}), late_run, CFG)
+    assert con.execute("SELECT COUNT(*) FROM options_spreads_shadow").fetchone()[0] == 0
+    last = et(DAY, 10, 55)
+    assert spreads.open_new(con, FakeData({"SPY": chain(last)}), last, CFG) == ["SPY"]
+
+
 def test_candidates_are_capped(con):
     set_wind(con, "2026-10-27", "tailwind")
     syms = ["NVDA", "AMD", "AAPL", "MSFT", "META", "AMZN", "GOOGL"]
