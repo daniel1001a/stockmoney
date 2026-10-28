@@ -517,6 +517,11 @@ class Engine:
             "spec_json": json.dumps(spec or {}, ensure_ascii=False), "signal_json": None,
             "live_eligible": int(note == ""), "live_note": note, "created_at": ostore.iso(now),
             "updated_at": ostore.iso(now)})
+        if source == GROK:  # the plan is in force again (e.g. a verified resend): re-arm its disarmed setups
+            self.con.execute("UPDATE options_setups SET state=?, spec_json=?, live_eligible=?, live_note=?, "
+                             "updated_at=? WHERE setup_id=? AND state=?",
+                             (WAITING, json.dumps(spec or {}, ensure_ascii=False), int(note == ""), note,
+                              ostore.iso(now), setup_id, SUPERSEDED))
 
     def _live_note(self, source: str, sym: str, plan_shadow_only: bool, avoid: set[str]) -> str:
         """'' when the setup may send a real (paper) order, else why not."""

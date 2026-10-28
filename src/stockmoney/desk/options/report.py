@@ -98,29 +98,39 @@ def slippage(con, day: str, mult: int) -> tuple[list[dict], dict[str, dict]]:
     """Paper fills against the quote they were sent on (options_orders ref_bid /
     ref_ask, read only). Per filled order: slip = fill - mid on a buy, mid - fill
     on a sell (positive = paid away), as % of the mid and in dollars (x mult x
-    filled qty). Per playbook: the summed slip of every measured fill of its
-    positions over their entry premium (entry_price x mult x qty_initial).
-    Orders sent without a quote (ref_bid/ref_ask NULL) are counted, not measured."""
+    filled qty). Per playbook: the summed slip of the positions whose every fill
+    was measured, over their entry premium (entry_price x mult x qty_initial).
+    Orders sent without a quote (ref_bid/ref_ask NULL) are counted, not measured;
+    a position with any such fill stays out of the cost ratio (``partial``), since
+    its round trip would be half counted."""
     q = con.execute(
         "SELECT o.client_order_id, o.kind, o.side, o.order_type, o.reason, o.filled_qty, o.avg_price, o.ref_bid,"
         " o.ref_ask, p.position_id, p.underlying, p.source, p.entry_price, p.qty_initial FROM options_orders o"
         " JOIN options_positions p ON p.position_id = o.position_id WHERE p.day=? AND p.mode='live'"
         " AND o.filled_qty > 0 AND o.avg_price IS NOT NULL ORDER BY o.submitted_at, o.client_order_id", (day,))
-    rows, by_pb, premium = [], {}, {}
+    rows, by_pb, pos = [], {}, {}
     for r in map(dict, q):
-        g = by_pb.setdefault(r["source"], {"fills": 0, "unmeasured": 0, "slip_usd": 0.0, "premium_usd": 0.0})
+        g = by_pb.setdefault(r["source"], {"fills": 0, "unmeasured": 0, "partial": 0, "slip_usd": 0.0,
+                                           "premium_usd": 0.0})
         g["fills"] += 1
+        pp = pos.setdefault(r["position_id"], {"source": r["source"], "slip": 0.0, "whole": True,
+                                               "premium": (r["entry_price"] or 0) * mult * (r["qty_initial"] or 0)})
         if not (r["ref_bid"] and r["ref_ask"] and r["ref_bid"] > 0 and r["ref_ask"] > 0):
             g["unmeasured"] += 1
+            pp["whole"] = False
             continue
         mid = (r["ref_bid"] + r["ref_ask"]) / 2
         slip = (r["avg_price"] - mid) if r["side"] == "buy" else (mid - r["avg_price"])
         r.update(mid=mid, slip_pct=slip / mid, slip_usd=slip * mult * r["filled_qty"])
         rows.append(r)
-        g["slip_usd"] += r["slip_usd"]
-        if r["position_id"] not in premium and r["entry_price"]:
-            premium[r["position_id"]] = r["entry_price"] * mult * (r["qty_initial"] or 0)
-            g["premium_usd"] += premium[r["position_id"]]
+        pp["slip"] += r["slip_usd"]
+    for pp in pos.values():
+        g = by_pb[pp["source"]]
+        if not pp["whole"]:
+            g["partial"] += 1
+        elif pp["premium"]:
+            g["slip_usd"] += pp["slip"]
+            g["premium_usd"] += pp["premium"]
     for g in by_pb.values():
         g["cost_pct"] = g["slip_usd"] / g["premium_usd"] if g["premium_usd"] else None
     return rows, by_pb
@@ -139,11 +149,11 @@ def _slippage_section(con, day: str, mult: int) -> list[str]:
                 f"{r['filled_qty']:g} | {r['avg_price']:.2f} | {r['mid']:.3f} | {r['slip_pct']:+.1%} | "
                 f"{r['slip_usd']:+.0f} |" for r in rows]
         out.append("")
-    out += ["### 依劇本:來回成本佔進場權利金", "", "| 劇本 | 成交筆數 | 無報價未計 | 滑價合計 $ | 進場權利金 $ | 成本/權利金 |",
-            "|---|---|---|---|---|---|"]
+    out += ["### 依劇本:來回成本佔進場權利金", "", "| 劇本 | 成交筆數 | 無報價未計 | 缺報價部位(不計比率) | 滑價合計 $ | 進場權利金 $ | 成本/權利金 |",
+            "|---|---|---|---|---|---|---|"]
     for k, g in sorted(by_pb.items()):
         pct = f"{g['cost_pct']:+.1%}" if g["cost_pct"] is not None else "-"
-        out.append(f"| {k} | {g['fills']} | {g['unmeasured']} | {g['slip_usd']:+.0f} | {g['premium_usd']:.0f} | {pct} |")
+        out.append(f"| {k} | {g['fills']} | {g['unmeasured']} | {g['partial']} | {g['slip_usd']:+.0f} | {g['premium_usd']:.0f} | {pct} |")
     return out + [""]
 
 
