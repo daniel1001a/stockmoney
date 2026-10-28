@@ -185,6 +185,7 @@ class GrokImpact(BaseModel):
     ticker: GrokTicker
     direction: Literal["up", "down"]
     horizon_days: Literal[5, 20, 60]
+    order: Literal[1, 2] = 1  # 1: directly hit by the trigger; 2: supplier / customer / competitor / substitute
 
 
 class GrokCheckpoint(BaseModel):

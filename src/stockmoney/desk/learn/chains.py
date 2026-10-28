@@ -2,10 +2,13 @@
 reason from events to unpriced consequences becomes a measured number.
 
 A chain = trigger event -> first/second-order steps -> impacts (ticker,
-direction, horizon in {5,20,60} sessions) -> checkpoints -> confidence.
-Scoring: excess return vs SPY from the last close known when the chain was
-written; hit = direction matched the sign. Brier uses ``confidence`` as the
-probability the declared direction is right, only at the declared horizon.
+direction, horizon in {5,20,60} sessions, order 1 or 2) -> checkpoints ->
+confidence. Scoring: excess return vs SPY from the last close known when the
+chain was written; hit = direction matched the sign. Brier uses ``confidence``
+as the probability the declared direction is right, only at the declared
+horizon. The excess vs the stock's sector ETF is recorded beside it
+(``excess_sector`` / ``hit_sector``, NULL for ETFs and names without a
+sector) so a call that only rode its sector can be told apart.
 
 Authority: none. Chains are logged and scored. They do not touch orders. The
 permission ladder in docs/desk/EDGE_PLAN.md 2.3 is reported by ``authority``;
@@ -25,7 +28,7 @@ from pydantic import BaseModel, ConfigDict, Field, StringConstraints, TypeAdapte
 
 from stockmoney.desk import store
 from stockmoney.desk.data import Bars
-from stockmoney.desk.universe import MARKET
+from stockmoney.desk.universe import MARKET, sector_of
 
 ET = ZoneInfo("America/New_York")
 HORIZONS = (5, 20, 60)
@@ -39,6 +42,7 @@ class Impact(BaseModel):
     ticker: Ticker
     direction: Literal["up", "down"]
     horizon_days: Literal[5, 20, 60]
+    order: Literal[1, 2] = 1  # 1: directly hit by the trigger; 2: second-order (supplier, customer, competitor)
 
 
 class Checkpoint(BaseModel):
@@ -269,11 +273,23 @@ def score_due(con, bars: Bars, through: pd.Timestamp) -> int:
                 s0, s1 = spy.at[base], spy.at[t]
                 if any(pd.isna(x) for x in (px0, px1, s0, s1)):
                     continue
-                ex = float(px1 / px0 - 1) - float(s1 / s0 - 1)
-                hit = int((ex > 0) == (imp["direction"] == "up"))
-                con.execute("INSERT INTO chain_scores VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                up = imp["direction"] == "up"
+                ret = float(px1 / px0 - 1)
+                ex = ret - float(s1 / s0 - 1)
+                hit = int((ex > 0) == up)
+                etf = sector_of(sym)
+                ex_sec = hit_sec = None
+                if etf in bars.close.columns:
+                    e0, e1 = bars.close.at[base, etf], bars.close.at[t, etf]
+                    if not (pd.isna(e0) or pd.isna(e1)):
+                        ex_sec = ret - float(e1 / e0 - 1)
+                        hit_sec = int((ex_sec > 0) == up)
+                con.execute("INSERT INTO chain_scores (chain_id, ticker, horizon, declared, direction, base_date, "
+                            "scored_date, excess_ret, hit, confidence, scored_at, order_n, sector_etf, excess_sector, "
+                            "hit_sector) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                             (r["chain_id"], imp["ticker"], h, int(h == imp["horizon_days"]), imp["direction"],
-                             str(base.date()), str(t.date()), ex, hit, r["confidence"], store.now()))
+                             str(base.date()), str(t.date()), ex, hit, r["confidence"], store.now(),
+                             int(imp.get("order", 1)), etf if ex_sec is not None else None, ex_sec, hit_sec))
                 n += 1
     return n
 
@@ -305,6 +321,19 @@ def summary(con) -> dict:
             "hit_lo": _wilson_lo(hits, n), "brier": brier, "brier_coin": 0.25}
 
 
+def by_order(con) -> dict[int, dict]:
+    """Declared-horizon scores of falsifiable chains split by impact order, with
+    the sector-relative hit rate where a sector ETF applies. Report only."""
+    out: dict[int, dict] = {}
+    for r in con.execute("SELECT COALESCE(s.order_n, 1) AS o, COUNT(*) AS n, SUM(s.hit) AS hits, "
+                         "COUNT(s.hit_sector) AS sn, SUM(s.hit_sector) AS shits FROM chain_scores s "
+                         "JOIN chains c ON c.chain_id=s.chain_id WHERE s.declared=1 AND c.falsifiable=1 "
+                         "GROUP BY o ORDER BY o").fetchall():
+        out[r["o"]] = {"n": r["n"], "hit_rate": r["hits"] / r["n"], "sector_n": r["sn"],
+                       "sector_hit_rate": (r["shits"] / r["sn"]) if r["sn"] else None}
+    return out
+
+
 def authority(con) -> tuple[str, str]:
     """Where the permission ladder stands. Never grants anything by itself."""
     s = summary(con)
@@ -326,6 +355,12 @@ def report(con) -> str:
              f"權限階段:{level}。{why}"]
     if s["scored_unfalsifiable"]:
         lines.append(f"另有 {s['scored_unfalsifiable']} 筆來自不可證偽事件鏈的評分,只記錄,不列入命中率與 Brier。")
+    split = by_order(con)
+    if split:
+        lines.append("依傳導層級(宣告時間窗,可列入證據):" + ";".join(
+            f"第 {o} 層 {d['n']} 筆,對 SPY 命中 {d['hit_rate']:.0%}"
+            + (f",對板塊 ETF 命中 {d['sector_hit_rate']:.0%}({d['sector_n']} 筆)" if d["sector_n"] else "")
+            for o, d in split.items()) + "。少於 30 筆不下結論。")
     from stockmoney.desk.learn import corroboration, invalidation
     lines += [x for x in (invalidation.report(con), corroboration.report(con)) if x]
     pending = con.execute(

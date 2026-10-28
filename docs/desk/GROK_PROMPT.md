@@ -64,7 +64,7 @@ msg_id 前綴:`grok-` 只給 GROK_DAILY 用。其他類型:ALERT 用 `alert-grok
 
 - 信件層級:msg_id 格式 `grok-YYYYMMDD-HHMM`;collected_at(實際搜尋時間,必須在 sent_at 之前 6 小時內);events、chains、calls、tracked_accounts 四個陣列必填(沒有就 []);attention、market_risk、link_check、notes(最多 2000 字)、in_play 可省略。
 - events 最多 25 件:ticker、headline(最多 160 字)、severity(info / elevated / critical)、confirmed(true/false)、first_seen、urls(1 到 3 個)、basis(可省略:post 或 inference)。
-- chains 最多 6 條:trigger(最多 200 字)、urls(1 到 3)、steps(1 到 6 步,每步最多 120 字)、impacts(1 到 6 個:ticker、direction up/down、horizon_days 5/20/60)、checkpoints(最多 4:what 最多 100 字、date YYYY-MM-DD)、invalidations(最多 3)、confidence(0 到 1)。
+- chains 最多 6 條:trigger(最多 200 字)、urls(1 到 3)、steps(1 到 6 步,每步最多 120 字)、impacts(1 到 6 個:ticker、direction up/down、horizon_days 5/20/60、order 1 或 2,可省略,預設 1;1 = 事件直接打到的公司,2 = 第二層的供應商、客戶、競爭者、替代品)、checkpoints(最多 4:what 最多 100 字、date YYYY-MM-DD)、invalidations(最多 3)、confidence(0 到 1)。
   - invalidations 只能是三種:`{"kind":"close_below","symbol":"NVDA","level":100,"by_date":"2026-10-20"}`、`{"kind":"close_above",...}`、`{"kind":"data_not_by","description":"最多 100 字","by_date":"..."}`。至少放一個價格條件,否則這條鏈被標為「不可證偽」,不計成績。BTC/USD 沒有價格序列,價格條件會被丟棄。
 - calls 最多 50 則:author(@handle)、platform "x"、followers(整數或 null)、ticker、direction(long / short / exit)、target_price(大於 0 或 null)、horizon_text(最多 60 字,沒有填 "")、posted_at、post_url。
 - attention 最多 20 個:ticker、trend(rising / falling)、why(最多 120 字)。
@@ -138,7 +138,7 @@ SPY, QQQ, TQQQ, BTC/USD, NVDA, AVGO, AMD, TSM, MU, QCOM, AMAT, LRCX, KLAC, MRVL,
 
 【要做的事】
 1. events:可能影響股價的事件(財報意外、指引調整、監管、訴訟、併購、高層異動、做空報告、產品出事、供應鏈、政策)。每件附你實際看過的連結 1 到 3 個;標明是否已被官方或主流媒體證實;寫第一次看到的時間;severity 填 info / elevated / critical。利多事件也要列,而且 headline 要寫清楚是利多(例如「財報優於預期並上調指引」),以免被當成風險。
-2. chains:挑最重要的 1 到 3 個事件推導傳導鏈:事件 -> 直接受影響公司 -> 第二層(供應商、客戶、競爭者、替代品)-> 方向與時間窗(5、20 或 60 個交易日)-> 證明或推翻的數據與日期 -> 信心。每條附至少一個價格型 invalidation(close_below / close_above)。
+2. chains:挑最重要的 1 到 3 個事件推導傳導鏈:事件 -> 直接受影響公司 -> 第二層(供應商、客戶、競爭者、替代品)-> 方向與時間窗(5、20 或 60 個交易日)-> 證明或推翻的數據與日期 -> 信心。impacts 用 order 標出第 1 層或第 2 層。評分:對 SPY 的超額報酬決定命中;另記錄對該股所屬板塊 ETF 的超額報酬,用來分辨「只是跟著板塊動」,並依層級分開統計(第 2 層是市場較晚反應的地方,也是最想驗證的)。每條附至少一個價格型 invalidation(close_below / close_above)。
 3. calls:固定追蹤清單(20 個英文、20 個中文的美股影響力帳號,放 tracked_accounts,之後沿用,更動寫在 notes)。記錄過去 24 小時的明確喊單(含 2 到 3 句以上實際分析的才算),照實記錄作者的看法,不評論。
 4. in_play(只在早報做):今天開盤最可能大幅單向走的標的,最多 15 個,條件見協定 5.1。沒有就 []。
 5. attention(可省略):熱度明顯升降的標的,rising / falling 加一句原因。不要編造數字。
@@ -153,7 +153,7 @@ SPY, QQQ, TQQQ, BTC/USD, NVDA, AVGO, AMD, TSM, MU, QCOM, AMAT, LRCX, KLAC, MRVL,
 範例(早報,壓成單行;主旨 `[SMD/GROK_DAILY/grok-20261028-0730] <密鑰>`):
 
 ```json
-{"protocol":"1","msg_id":"grok-20261028-0730","sent_at":"2026-10-28T07:30:00-04:00","type":"GROK_DAILY","collected_at":"2026-10-28T07:05:00-04:00","events":[{"ticker":"NVDA","headline":"傳美國將擴大對中國的 AI 晶片出口限制","severity":"elevated","confirmed":false,"first_seen":"2026-10-28T06:10:00-04:00","urls":["https://x.com/example/status/1844000000000000000"],"basis":"post"}],"chains":[{"trigger":"AI 晶片出口限制擴大","urls":["https://x.com/example/status/1844000000000000000"],"steps":["第一層:中國資料中心 GPU 銷售下降","第二層:專供中國版本的封測與記憶體訂單減少"],"impacts":[{"ticker":"NVDA","direction":"down","horizon_days":5},{"ticker":"MU","direction":"down","horizon_days":20}],"checkpoints":[{"what":"商務部正式規則文字","date":"2026-11-05"}],"invalidations":[{"kind":"close_above","symbol":"NVDA","level":150,"by_date":"2026-11-05"}],"confidence":0.4}],"calls":[],"tracked_accounts":["@example_trader","@example_zh"],"in_play":[{"ticker":"SOFI","direction":"up","catalyst":"第三季財報營收與會員數優於預期,上調全年指引","catalyst_kind":"earnings","catalyst_time":"2026-10-28T07:00:00-04:00","confirmed":true,"urls":["https://example.com/sofi-q3"],"confidence":0.6}],"market_risk":{"level":"elevated","summary":"出口限制傳聞讓半導體轉空","source_urls":["https://x.com/example/status/1844000000000000000"]},"notes":"DESK_BRIEF Q1:AMD 昨天 -4% 是因為同業財報指引保守,連結 https://example.com/x"}
+{"protocol":"1","msg_id":"grok-20261028-0730","sent_at":"2026-10-28T07:30:00-04:00","type":"GROK_DAILY","collected_at":"2026-10-28T07:05:00-04:00","events":[{"ticker":"NVDA","headline":"傳美國將擴大對中國的 AI 晶片出口限制","severity":"elevated","confirmed":false,"first_seen":"2026-10-28T06:10:00-04:00","urls":["https://x.com/example/status/1844000000000000000"],"basis":"post"}],"chains":[{"trigger":"AI 晶片出口限制擴大","urls":["https://x.com/example/status/1844000000000000000"],"steps":["第一層:中國資料中心 GPU 銷售下降","第二層:專供中國版本的封測與記憶體訂單減少"],"impacts":[{"ticker":"NVDA","direction":"down","horizon_days":5},{"ticker":"MU","direction":"down","horizon_days":20,"order":2}],"checkpoints":[{"what":"商務部正式規則文字","date":"2026-11-05"}],"invalidations":[{"kind":"close_above","symbol":"NVDA","level":150,"by_date":"2026-11-05"}],"confidence":0.4}],"calls":[],"tracked_accounts":["@example_trader","@example_zh"],"in_play":[{"ticker":"SOFI","direction":"up","catalyst":"第三季財報營收與會員數優於預期,上調全年指引","catalyst_kind":"earnings","catalyst_time":"2026-10-28T07:00:00-04:00","confirmed":true,"urls":["https://example.com/sofi-q3"],"confidence":0.6}],"market_risk":{"level":"elevated","summary":"出口限制傳聞讓半導體轉空","source_urls":["https://x.com/example/status/1844000000000000000"]},"notes":"DESK_BRIEF Q1:AMD 昨天 -4% 是因為同業財報指引保守,連結 https://example.com/x"}
 ```
 
 ---
