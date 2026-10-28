@@ -44,7 +44,9 @@ JOBS = {
     "postclose": {"times": [(16, 45)], "weekdays": True},  # reconcile, trail stops, new signals, report
     "crypto": {"times": [(20, 0)], "weekdays": False},     # daily crypto sleeve, 7 days
     "learn": {"times": [(17, 15)], "weekdays": True},      # read-only: post-mortems, shadow books, chain scoring
-    "bridge": {"interval": 900},                           # poll Muse every 15 minutes
+    # started every 60s; stockmoney.desk.bridge_job polls on every start weekdays 06:00-16:30 ET
+    # and at most every 15 minutes otherwise, and skips a start while another job holds run.lock
+    "bridge": {"interval": 60},
     "options": {"times": [(9, 0)], "weekdays": True},      # intraday options session, loops 09:20 to 16:00 ET
     # launchd replays a missed calendar job after sleep but not after a power-off;
     # at every load (boot, login, install) recover books fills and restores stops

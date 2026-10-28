@@ -12,6 +12,11 @@ Sources (one vote each, however many items they contributed):
             account) never votes either; when counting it would have blocked a buy,
             check() sets VetoResult.unconfirmed (never a block) and the risk engine
             writes veto_unconfirmed only if the rest of the buy check allows the order.
+            Since 2026-10-27 a Grok ALERT (sent from GROK_ADDRESS) counts the same
+            way: grok_verified, severity elevated / critical, at least one source URL,
+            and confirmed: true to vote (missing or false: unconfirmed). A Grok
+            RESEARCH_REPLY with risk_flags and URLs is unconfirmed only. grok_legacy
+            ALERT / RESEARCH_REPLY rows never vote.
   filings   research_flags rows (8-K items, late-filing notices) written by learn/filings.py
   insider   research_flags rows (Form 4 discretionary sell cluster)
   earnings  research_flags rows (earnings inside the next days). Beyond the four
@@ -103,7 +108,7 @@ def _bridge_items(con, sym: str, since: str) -> dict[str, list[dict]]:
     out: dict[str, list[dict]] = {"muse": [], "grok": [], "grok_unconfirmed": []}
     if not _has(con, "bridge_messages"):
         return out
-    from stockmoney.desk.bridge.inbox import SOURCE_GROK_VERIFIED, has_source_column, source_of
+    from stockmoney.desk.bridge.inbox import SOURCE_GROK_VERIFIED, SOURCE_MUSE, has_source_column, source_of
     src = "source" if has_source_column(con) else "NULL"
     for r in con.execute(f"SELECT msg_id, type, received_at, parsed_json, {src} AS source FROM bridge_messages "
                          "WHERE type IN ('ALERT','RESEARCH_REPLY','GROK_DAILY') AND received_at>=?", (since,)).fetchall():
@@ -131,6 +136,24 @@ def _bridge_items(con, sym: str, since: str) -> dict[str, list[dict]]:
             if norm(m["ticker"]) != sym:
                 continue
         except (KeyError, TypeError, AttributeError):
+            continue
+        source = source_of(r["source"], r["type"])
+        if source != SOURCE_MUSE:  # an ALERT / RESEARCH_REPLY sent from GROK_ADDRESS
+            if source != SOURCE_GROK_VERIFIED:
+                continue
+            urls = [str(u) for u in (m.get("source_urls") or [])]
+            if not urls:
+                continue
+            if r["type"] == "ALERT" and m.get("severity") in FLAGGED:
+                bucket = "grok" if m.get("confirmed") is True else "grok_unconfirmed"
+                detail = f"{m['severity']}: {str(m.get('headline', ''))[:60]}"
+            elif r["type"] == "RESEARCH_REPLY" and m.get("risk_flags"):
+                bucket = "grok_unconfirmed"
+                detail = f"risk_flags: {'; '.join(str(f) for f in m['risk_flags'])[:60]}"
+            else:
+                continue
+            out[bucket].append({"ref": r["msg_id"], "type": r["type"], "urls": urls, "detail": detail,
+                                "at": r["received_at"]})
             continue
         if r["type"] == "ALERT" and m.get("severity") in FLAGGED:
             detail = f"{m['severity']}: {str(m.get('headline', ''))[:60]}"

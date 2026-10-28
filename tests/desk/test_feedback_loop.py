@@ -47,9 +47,9 @@ def pushed(monkeypatch):
 
 
 def bad_social(msg_id):
-    """Passes sender and token checks, fails the schema: a correctable reject."""
-    return {"msg_id": msg_id, "sent_at": NOW.isoformat(), "type": "SOCIAL_DAILY",
-            "collected_at": NOW.isoformat(), "items": [{"ticker": "NVDA"}]}
+    """Passes sender and token checks, fails the schema: a correctable reject.
+    A required top-level field is missing, which leniency never repairs."""
+    return {"msg_id": msg_id, "sent_at": NOW.isoformat(), "type": "SOCIAL_DAILY", "items": []}
 
 
 def deliver(box, payload, *, prefix="", subject_type=None):

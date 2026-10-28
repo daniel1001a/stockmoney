@@ -138,14 +138,18 @@ def test_sender_compare_is_case_insensitive_but_exact(con):
     assert rejects(con) == ["sender_not_allowed"]
 
 
-def test_extra_field_rejected(con):
+def test_extra_field_dropped_not_stored(con):
+    # information types are lenient since 2026-10-27: an unknown field is
+    # dropped (never stored in parsed_json) and the drop is recorded
     mb = FakeMailbox()
     send(mb, alert(execute="BUY 1000 NVDA"))
-    assert poll(con, mb) == 0
-    assert rejects(con)[0].startswith("schema_invalid")
-    assert "extra_forbidden" in rejects(con)[0]
-    assert "BUY" not in rejects(con)[0]  # reason never echoes attacker input
-    assert stored(con) == []
+    assert poll(con, mb) == 1
+    assert rejects(con) == []
+    parsed, dropped = con.execute("SELECT parsed_json, dropped_json FROM bridge_messages").fetchone()
+    assert "execute" not in json.loads(parsed) and "BUY" not in parsed
+    d = json.loads(dropped)
+    assert d["dropped"] == [{"path": "execute", "why": "extra_forbidden"}] and d["feedback"] is True
+    assert "BUY" not in dropped  # the record never echoes attacker input
 
 
 def test_missing_field_and_wrong_types_rejected(con):
