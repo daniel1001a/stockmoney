@@ -353,6 +353,18 @@ def test_verified_resend_upgrades_an_unverified_plan(con, now, shadow):
     assert rejects(con) == []
 
 
+def test_verified_resend_reserialized_still_upgrades(con):
+    """Key order and spacing do not make a resend a different plan."""
+    mb = FakeMailbox()
+    mail(mb, auth_results=GOOD_AR.replace("dkim=pass", "dkim=fail"))
+    assert poll(con, mb, now=et(8, 0)) == 1
+    d = plan()
+    mail(mb, body=json.dumps(dict(reversed(list(d.items()))), indent=2, ensure_ascii=False))
+    assert poll(con, mb, now=EARLY) == 1
+    assert oplan.active_plan(con, DAY).plan.plan_id == PID
+    assert rejects(con) == []
+
+
 def test_verified_resend_of_an_old_plan_never_displaces_a_newer_trusted_plan(con):
     """A (unverified, 08:00), B (verified, 08:10), A resent verified (08:20):
     A becomes trusted but keeps its receipt time, so B stays in force."""

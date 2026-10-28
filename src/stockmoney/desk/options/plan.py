@@ -249,10 +249,11 @@ def ingest(con, text: str, received_at: datetime, cfg: OptionsConfig | None = No
                                                  text[:MAX_PLAN_BYTES]))
         con.commit()
         return IngestResult("rejected", _peek_id(text), "", True, str(e))
-    prior = con.execute("SELECT id, sha, shadow_only, source, received_at FROM options_plans "
+    prior = con.execute("SELECT id, sha, shadow_only, source, received_at, raw FROM options_plans "
                         "WHERE plan_id=? AND status='accepted'", (p.plan_id,)).fetchone()
     if prior is not None:
-        if prior["sha"] == sha:
+        # the same plan re-serialized (key order, spacing) is the same plan
+        if prior["sha"] == sha or _canonical(prior["raw"]) == _canonical(text):
             if source in TRUSTED_SOURCES and prior["source"] not in TRUSTED_SOURCES:
                 # the same plan resent over a trusted channel: it becomes trusted
                 # (the shadow cutoff is judged on the resend). It moves to the
@@ -279,6 +280,13 @@ def ingest(con, text: str, received_at: datetime, cfg: OptionsConfig | None = No
                                                        sha, text.strip(), source))
     con.commit()
     return IngestResult("accepted", p.plan_id, str(p.for_date), shadow)
+
+
+def _canonical(text: str) -> str | None:
+    try:
+        return json.dumps(json.loads(text), sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    except (ValueError, RecursionError):
+        return None
 
 
 def _peek_id(text: str) -> str:
