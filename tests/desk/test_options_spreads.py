@@ -213,16 +213,32 @@ def test_alarm_mid_run_keeps_names_already_decided(con):
     assert [tuple(r) for r in rows] == [("QQQ", "SKIPPED", "no_expiry")]
 
 
-def test_first_fire_after_the_window_records_missed_names(con):
+def test_fires_after_the_window_record_missed_names_before_marking(con):
     set_wind(con, "2026-10-27", "tailwind")
-    data = FakeData({"SPY": chain(et(DAY, 11, 5))})
-    assert spreads.open_new(con, data, et(DAY, 11, 5), CFG) == []
+
+    class Down(FakeData):
+        def option_quote(self, occ):
+            raise RuntimeError("quotes down")
+
+    con.execute("INSERT INTO options_spreads_shadow (day, underlying, source, status, expiry, long_occ, short_occ,"
+                " long_strike, short_strike, width, qty, entry_debit, fees_usd) VALUES"
+                " ('2026-10-27', 'AMD', 'x', 'OPEN', ?, 'a', 'b', 100, 105, 5, 1, 2.0, 0)", (EXP.isoformat(),))
+    con.commit()
+    data = Down()
+    with pytest.raises(RuntimeError):
+        spreads.tick(con, data, et(DAY, 11, 5), CFG)
     assert data.chain_calls == []
-    rows = con.execute("SELECT underlying, status, skip_reason FROM options_spreads_shadow"
-                       " ORDER BY underlying").fetchall()
-    assert [tuple(r) for r in rows] == [("QQQ", "SKIPPED", "missed_slot"), ("SPY", "SKIPPED", "missed_slot")]
-    assert spreads.open_new(con, data, et(DAY, 11, 15), CFG) == []
-    assert con.execute("SELECT COUNT(*) FROM options_spreads_shadow").fetchone()[0] == 2
+    rows = con.execute("SELECT underlying, skip_reason FROM options_spreads_shadow WHERE day = ?"
+                       " ORDER BY underlying", (DAY.isoformat(),)).fetchall()
+    assert [tuple(r) for r in rows] == [("QQQ", "missed_slot"), ("SPY", "missed_slot")]
+    assert spreads.record_missed(con, et(DAY, 14, 0), CFG) == 0  # a later fire finds nothing left
+
+
+def test_record_missed_waits_for_the_window_to_end(con):
+    set_wind(con, "2026-10-27", "tailwind")
+    assert spreads.record_missed(con, et(DAY, 10, 55), CFG) == 0
+    assert spreads.record_missed(con, et(DAY, 11, 0), CFG, slot=et(DAY, 10, 55)) == 0
+    assert spreads.record_missed(con, et(DAY, 15, 45), CFG) == 2
 
 
 def test_main_passes_the_slot_and_ignores_an_implausible_one(tmp_path, monkeypatch):

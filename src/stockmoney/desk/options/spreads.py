@@ -77,7 +77,6 @@ MIN_SAMPLES = 30
 MAX_CANDIDATES = 6  # index ETFs plus the top-scored signals: bounds chain downloads per slot
 EXPIRY_SETTLE = time(15, 30)
 MAX_SLOT_LAG_S = 600  # the intraday tick ahead of this one has a 300s alarm
-MISSED_GRACE_MIN = 10  # the first fire after the window records names the last slot never decided
 TICK_TIMEOUT_S = 240
 
 SCHEMA = """
@@ -186,9 +185,7 @@ def open_new(con, data, now: datetime, cfg: OptionsConfig, slot: datetime | None
     as soon as it is decided, so an alarm mid-run keeps what was written."""
     et = (slot or now).astimezone(ET)
     day = et.date()
-    window_end = datetime.combine(day, ENTRY_WINDOW[1])
-    missed = ENTRY_WINDOW[1] <= et.time() < (window_end + timedelta(minutes=MISSED_GRACE_MIN)).time()
-    if not (ENTRY_WINDOW[0] <= et.time() < ENTRY_WINDOW[1] or missed):
+    if not ENTRY_WINDOW[0] <= et.time() < ENTRY_WINDOW[1]:
         return []
     state = wind.state_before(con, day.isoformat())
     if state != "tailwind":
@@ -197,13 +194,8 @@ def open_new(con, data, now: datetime, cfg: OptionsConfig, slot: datetime | None
                                       (day.isoformat(),))}
     held = {r[0] for r in con.execute("SELECT underlying FROM options_spreads_shadow WHERE status = 'OPEN'")}
     todo = [(u, s) for u, s in candidates(con, day, cfg) if u not in done and u not in held]
-    if missed:  # the last slot died before deciding these: record the gap, never open late
-        for und, source in todo:
-            _skip(con, day.isoformat(), und, source, state, "missed_slot")
-        con.commit()
-        return []
     # the 10:55 slot only
-    last_slot = et.time() >= (window_end - timedelta(minutes=5)).time()
+    last_slot = et.time() >= (datetime.combine(day, ENTRY_WINDOW[1]) - timedelta(minutes=5)).time()
     opened = []
     for und, source in todo:
         try:  # network outside any write: no lock is held while a chain downloads
@@ -233,6 +225,27 @@ def open_new(con, data, now: datetime, cfg: OptionsConfig, slot: datetime | None
         con.commit()
         opened.append(und)
     return opened
+
+
+def record_missed(con, now: datetime, cfg: OptionsConfig, slot: datetime | None = None) -> int:
+    """After the entry window, mark today's candidates the last slot never
+    decided (it died mid-run) as SKIPPED missed_slot. Database only, no
+    network, so every later fire retries it until each name has a row."""
+    et = (slot or now).astimezone(ET)
+    day = et.date()
+    if et.time() < ENTRY_WINDOW[1]:
+        return 0
+    state = wind.state_before(con, day.isoformat())
+    if state != "tailwind":
+        return 0
+    done = {r[0] for r in con.execute("SELECT underlying FROM options_spreads_shadow WHERE day = ?",
+                                      (day.isoformat(),))}
+    held = {r[0] for r in con.execute("SELECT underlying FROM options_spreads_shadow WHERE status = 'OPEN'")}
+    todo = [(u, s) for u, s in candidates(con, day, cfg) if u not in done and u not in held]
+    for und, source in todo:
+        _skip(con, day.isoformat(), und, source, state, "missed_slot")
+    con.commit()
+    return len(todo)
 
 
 def _close(con, row, now: datetime, value: float, reason: str, cfg: OptionsConfig) -> None:
@@ -304,6 +317,7 @@ def tick(con, data, now: datetime, cfg: OptionsConfig | None = None,
     cfg = cfg or OptionsConfig()
     ensure_schema(con)
     wind.ensure_schema(con)
+    record_missed(con, now, cfg, slot)  # before any quote, so a failing mark cannot skip it
     closed = mark_and_exit(con, data, now, cfg)
     con.commit()
     opened = open_new(con, data, now, cfg, slot)
