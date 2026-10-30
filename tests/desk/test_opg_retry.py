@@ -68,6 +68,19 @@ def test_shrink_filter_does_not_compound_on_retry(desk):
         assert desk.broker.positions["AAPL"].qty == 25
 
 
+def test_new_shrink_blocks_remaining_without_quote_or_exception(desk, monkeypatch):
+    import json
+    rule = {"name": "late_shrink", "sleeve": "stocks", "strategies": [],
+            "when": {"field": "minutes_since_open", "op": ">=", "value": 15}, "action": "shrink:0.25"}
+    with store.connect(desk.path) as con:
+        cid = opening_short(con, desk.broker, desk.limits, 0.4, qty=50)
+        con.execute("INSERT INTO rule_filters (json,status) VALUES (?, 'active')", (json.dumps(rule),))
+        monkeypatch.setattr(desk.broker, "latest_price", lambda symbol: None)
+        run.postopen(con, desk.broker, POSTOPEN, desk.limits)
+        assert not retries(desk.broker)
+        assert "late_shrink" in plan_status(con, cid)["note"]
+
+
 def test_unfilled_opening_order_retries_the_full_qty(desk):
     b = desk.broker
     with store.connect(desk.path) as con:

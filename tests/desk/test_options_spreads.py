@@ -172,6 +172,21 @@ def test_spread_rule_filters(con, action, qty):
         assert row["status"] == "SKIPPED" and "spread_filter" in row["skip_reason"]
 
 
+def test_spread_filter_matches_underlying_strategy_name(con):
+    import json
+    from stockmoney.desk import store
+    con.executescript(store.SCHEMA)
+    con.execute("INSERT INTO signals VALUES ('s', '2026-10-27', 'pullback', 'NVDA', 1)")
+    rule = {"name": "pullback_filter", "sleeve": "spreads", "strategies": ["pullback"],
+            "when": {"field": "wind", "op": "==", "value": "tailwind"}, "action": "skip"}
+    con.execute("INSERT INTO rule_filters (json,status) VALUES (?, 'active')", (json.dumps(rule),))
+    set_wind(con, "2026-10-27", "tailwind")
+    now = et(DAY, 10, 0)
+    spreads.open_new(con, FakeData({"NVDA": chain(now)}), now, CFG)
+    row = con.execute("SELECT status,skip_reason FROM options_spreads_shadow WHERE underlying='NVDA'").fetchone()
+    assert tuple(row) == ("SKIPPED", "rule_filter:pullback_filter")
+
+
 def test_stale_legs_retry_until_the_last_slot(con):
     set_wind(con, "2026-10-27", "tailwind")
     now = et(DAY, 10, 0)

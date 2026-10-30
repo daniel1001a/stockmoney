@@ -28,7 +28,10 @@ OPS = {"==": operator.eq, "!=": operator.ne, "<": operator.lt, "<=": operator.le
 
 def _typed(value, kind) -> bool:
     if kind is float:
-        return isinstance(value, Real) and not isinstance(value, bool) and math.isfinite(value)
+        try:
+            return isinstance(value, Real) and not isinstance(value, bool) and math.isfinite(value)
+        except OverflowError:
+            return False
     return type(value) is kind
 
 
@@ -165,7 +168,8 @@ def context(con, symbol: str, now, plan_id: str = "") -> dict:
     if _has_table(con, "wind_daily"):
         row = con.execute("SELECT state,regime FROM wind_daily WHERE date<? ORDER BY date DESC LIMIT 1", (day,)).fetchone()
         if row:
-            out.update(wind=row[0], regime=row[1])
+            out["wind"] = row[0]
+            out.setdefault("regime", row[1])  # a saved plan has the newer, actual signal context
     if _has_table(con, "earnings"):
         # first_seen is compared as an instant, not lexically across offsets.
         row = con.execute("SELECT date FROM earnings WHERE symbol=? AND date>=? AND removed_at IS NULL "

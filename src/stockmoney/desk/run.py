@@ -1476,7 +1476,9 @@ def _retry_opg_one(con, broker: Broker, risk: RiskEngine, snap: AccountSnapshot,
     allowed = floor(allowed * filtered.size_factor)
     qty = min(rest, floor(allowed - filled + 1e-9))
     if qty <= 0:
-        return stop_here("blocked", f"以即時價 {px:g} 重算後股數為 0")
+        if filtered.names:
+            return stop_here("blocked", f"rule filter: {', '.join(filtered.names)}; no remaining shares")
+        return stop_here("blocked", "重算後股數為 0")
     intent = OrderIntent(rcid, sym, AssetClass(p["asset_class"]), Side.BUY, qty=qty,
                          order_type=OrderType.MARKET, tif=TIF.DAY, strategy=p["strategy"], reason=p["reason"])
     d = risk.check(intent, snap, ref_price=p["ref_price"], orders_this_run=st.n, market_price=px)

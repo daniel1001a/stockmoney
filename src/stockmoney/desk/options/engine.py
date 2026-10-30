@@ -717,7 +717,7 @@ class Engine:
                "plan_shadow_only": bool(spec.get("shadow_only", False)), "received_at": spec.get("received_at")}
         from stockmoney.desk.learn import filters
         filter_context = filters.context(self.con, sym, et)
-        filter_context.update(vol_ratio=sig.meta.get("day_rvol"), gap_pct=sig.meta.get("gap_pct"),
+        filter_context.update(vol_ratio=sig.meta.get("day_rvol"), gap_pct=sig.meta.get("gap"),
                               grok_verdict=stance)
         filtered = filters.active(self.con, "options", s["source"], filter_context,
                                   paper=getattr(self.broker, "is_paper", False) is True)
@@ -791,7 +791,8 @@ class Engine:
         qty = int(sh.contracts_for(price, cfg) * ctx.get("rule_filter_size_factor", 1.0))
         pid = f"{s['setup_id']}:shadow:{ch.dte_label}:{ev}"
         if qty < 1:
-            ostore.filtered(self.con, self._dstr, now, "contract", s["underlying"], "premium_above_cap", s["setup_id"],
+            reason = "rule_filter:" + ",".join(ctx["rule_filters"]) if ctx.get("rule_filters") else "premium_above_cap"
+            ostore.filtered(self.con, self._dstr, now, "contract", s["underlying"], reason, s["setup_id"],
                             f"{ch.dte_label}|{ev}", {"ask": c.ask})
             return 0
         row = self._position_row(s, sig, ch, pid, "shadow", ev, max_hold, ctx)
@@ -845,7 +846,8 @@ class Engine:
         limit = sh.round_tick(c.ask + cfg.entry_limit_offset, sh.option_tick(sym, c.ask), up=True)
         qty = int(sh.contracts_for(limit, cfg) * ctx.get("rule_filter_size_factor", 1.0))
         if qty < 1:
-            return block("premium_above_cap", {"limit": limit})
+            reason = "rule_filter:" + ",".join(ctx["rule_filters"]) if ctx.get("rule_filters") else "premium_above_cap"
+            return block(reason, {"limit": limit})
         pid = f"{sid}:live:{ch.dte_label}:{cfg.live_exit}"
         intent = OrderIntent(ostore.cid(pid, "e"), c.occ, AssetClass.OPTION, Side.BUY, qty=qty,
                              order_type=OrderType.LIMIT, tif=TIF.DAY, limit_price=limit,
