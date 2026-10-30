@@ -201,6 +201,11 @@ class OptionsConfig:
     shadow_slippage_pct: float = 0.0         # extra, on top of buying the ask / selling the bid
     fee_per_contract: float = 0.03           # regulatory fees; Alpaca charges no commission
 
+    # --- defined-risk spread shadow exits (same defaults as the original H6)
+    spread_take_profit_frac: float = 0.5
+    spread_stop_frac: float = 0.5
+    spread_time_exit_dte: int = 2
+
     # --- live eligibility: only these sources may send a (paper) order;
     # vwap_reclaim, gap_fade, orb15 and orb15_5m are shadow only (orb15
     # moved to shadow by the 2026-10-27 audit: 14 live trades, net -1,164)

@@ -78,6 +78,17 @@ def test_trigger_opens_shadow_variants_and_one_live_order(tmp_path, con):
     assert r.gate.booked[0]["side"] == Side.BUY and r.gate.booked[0]["qty"] == 10
 
 
+def test_paper_engine_loads_registry_override_but_nonpaper_does_not(tmp_path, con):
+    from stockmoney.desk.learn import registry
+
+    registry.change(con, "options.orb_min_day_rvol", 1.75, "test proposal", account_kind="paper")
+    r = Rig(tmp_path, con)
+    assert r.eng.cfg.orb_min_day_rvol == 1.75
+    assert r.cfg.orb_min_day_rvol != 1.75  # caller's frozen config is untouched
+    r.broker.is_paper = False
+    assert r.new_engine().cfg.orb_min_day_rvol == r.cfg.orb_min_day_rvol
+
+
 def test_shadow_buys_ask_sells_bid_take_profit_then_breakeven(tmp_path, con):
     r = Rig(tmp_path, con)
     r.run(et(9, 52))

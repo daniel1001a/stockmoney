@@ -179,7 +179,9 @@ class Engine:
                  notifier: Callable[..., object] | None = None):
         self.con = con
         self.broker = broker
-        self.cfg = cfg or OptionsConfig()
+        from stockmoney.desk.learn.registry import options_config
+
+        self.cfg = options_config(con, cfg or OptionsConfig(), paper=getattr(broker, "is_paper", False) is True)
         self.clock = clock
         self.risk_gate = risk_gate
         paper_ok = bool(getattr(broker, "is_paper", False)) or not self.cfg.paper_only
