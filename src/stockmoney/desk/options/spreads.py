@@ -209,7 +209,13 @@ def open_new(con, data, now: datetime, cfg: OptionsConfig, slot: datetime | None
                 _skip(con, day.isoformat(), und, source, state, reason)
                 con.commit()
             continue
-        qty = contracts_for(p.debit, cfg)
+        from stockmoney.desk.learn import filters
+        filtered = filters.active(con, "spreads", source, filters.context(con, und, et), paper=True)
+        if filtered.skip:
+            _skip(con, day.isoformat(), und, source, state, "rule_filter:" + ",".join(filtered.names))
+            con.commit()
+            continue
+        qty = int(contracts_for(p.debit, cfg) * filtered.size_factor)
         if qty == 0:
             if last_slot:  # a cheaper quote may come later in the window
                 _skip(con, day.isoformat(), und, source, state, "too_expensive")

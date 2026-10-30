@@ -155,6 +155,23 @@ def test_open_records_row_and_sizes_within_premium_cap(con):
     assert tuple(con.execute(q).fetchone()) == ("SKIPPED", "no_expiry")
 
 
+@pytest.mark.parametrize("action,qty", [("skip", None), ("shrink:0.5", 2)])
+def test_spread_rule_filters(con, action, qty):
+    import json
+    from stockmoney.desk import store
+    con.executescript(store.SCHEMA)
+    rule = {"name": "spread_filter", "sleeve": "spreads", "strategies": ["wind"],
+            "when": {"field": "wind", "op": "==", "value": "tailwind"}, "action": action}
+    con.execute("INSERT INTO rule_filters (json,status) VALUES (?, 'active')", (json.dumps(rule),))
+    set_wind(con, "2026-10-27", "tailwind")
+    now = et(DAY, 10, 0)
+    spreads.open_new(con, FakeData({"SPY": chain(now)}), now, CFG)
+    row = con.execute("SELECT * FROM options_spreads_shadow WHERE underlying='SPY'").fetchone()
+    assert row["qty"] == qty
+    if qty is None:
+        assert row["status"] == "SKIPPED" and "spread_filter" in row["skip_reason"]
+
+
 def test_stale_legs_retry_until_the_last_slot(con):
     set_wind(con, "2026-10-27", "tailwind")
     now = et(DAY, 10, 0)

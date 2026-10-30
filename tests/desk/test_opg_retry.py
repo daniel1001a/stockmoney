@@ -56,6 +56,18 @@ def test_partial_fill_retries_only_the_remainder_once(desk):
         assert row["status"] == "submitted" and "20/50" in row["note"] and f"{cid}-rt" in row["note"]
 
 
+def test_shrink_filter_does_not_compound_on_retry(desk):
+    import json
+    rule = {"name": "half_size", "sleeve": "stocks", "strategies": [],
+            "when": {"field": "sector", "op": "==", "value": "XLK"}, "action": "shrink:0.5"}
+    with store.connect(desk.path) as con:
+        con.execute("INSERT INTO rule_filters (json,status) VALUES (?, 'active')", (json.dumps(rule),))
+        opening_short(con, desk.broker, desk.limits, 0.4, qty=50, sent=25)
+        run.postopen(con, desk.broker, POSTOPEN, desk.limits)
+        assert [o.qty for o in retries(desk.broker)] == [15]
+        assert desk.broker.positions["AAPL"].qty == 25
+
+
 def test_unfilled_opening_order_retries_the_full_qty(desk):
     b = desk.broker
     with store.connect(desk.path) as con:
