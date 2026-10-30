@@ -176,12 +176,15 @@ class Engine:
     def __init__(self, con, broker, cfg: OptionsConfig | None = None, *, clock: Callable[[], datetime],
                  risk_gate: RiskGate, live: bool = False,
                  flags_fn: Callable[[datetime], dict[str, str]] | None = None,
-                 notifier: Callable[..., object] | None = None):
+                 notifier: Callable[..., object] | None = None, config_resolved: bool = False):
         self.con = con
         self.broker = broker
-        from stockmoney.desk.learn.registry import options_config
+        from stockmoney.desk.learn.registry import safe_options_config
 
-        self.cfg = options_config(con, cfg or OptionsConfig(), paper=getattr(broker, "is_paper", False) is True)
+        self.cfg = cfg or OptionsConfig()
+        if not config_resolved:
+            self.cfg = safe_options_config(con, self.cfg, paper=getattr(broker, "is_paper", False) is True,
+                                           on_error=notifier or notify.send)
         self.clock = clock
         self.risk_gate = risk_gate
         paper_ok = bool(getattr(broker, "is_paper", False)) or not self.cfg.paper_only

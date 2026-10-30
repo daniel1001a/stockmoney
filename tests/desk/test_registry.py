@@ -105,3 +105,18 @@ def test_switch_states_follow_runtime_defaults(con, monkeypatch):
     assert r.current(con, "DESK_OPTIONS_ORDERS") == "off"
     monkeypatch.setenv("ALPACA_LIVE_ENABLED", "not-the-confirmation")
     assert r.current(con, "ALPACA_LIVE_ENABLED") is False
+
+
+@pytest.mark.parametrize("blob", ['[]', '{', '{"options.max_premium_per_trade":9999}',
+                                  '{"options.orb_min_day_rvol":0.5}', '{"spreads.stop_frac":"bad"}'])
+def test_invalid_shared_document_refused_by_writer_but_exits_can_load(con, blob):
+    store.set_setting(con, "options_params", blob)
+    with pytest.raises((ValueError, TypeError)):
+        r.change(con, "options.orb_min_day_rvol", 1.75, "test", account_kind="paper")
+    assert store.get_setting(con, "options_params") == blob
+    assert con.execute("SELECT count(*) FROM param_changes").fetchone()[0] == 0
+    reports = []
+    cfg = OptionsConfig()
+    for _ in range(2):
+        assert r.safe_options_config(con, cfg, paper=True, on_error=lambda *a: reports.append(a)) is cfg
+    assert len(reports) == 1

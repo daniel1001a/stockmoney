@@ -311,10 +311,11 @@ def regular_hours(now: datetime) -> bool:
 
 def tick(con, data, now: datetime, cfg: OptionsConfig | None = None,
          slot: datetime | None = None) -> tuple[list[str], list[tuple[str, str]]]:
-    from stockmoney.desk.learn.registry import options_config
+    from stockmoney.desk.learn.registry import safe_options_config
+    from stockmoney.desk import notify
 
     # This module has no broker/order path: all spread books are simulated.
-    cfg = options_config(con, cfg or OptionsConfig(), paper=True, sleeve="spreads")
+    cfg = safe_options_config(con, cfg or OptionsConfig(), paper=True, sleeve="spreads", on_error=notify.send)
     ensure_schema(con)
     wind.ensure_schema(con)
     record_missed(con, now, cfg, slot)  # before any quote, so a failing mark cannot skip it

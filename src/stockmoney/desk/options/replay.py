@@ -318,8 +318,11 @@ def run(day: date, cfg: OptionsConfig, cache_dir: Path, out_dir: Path, feed: str
             rec = plan_received_at or datetime.combine(day, time(8, 0), ET)
             res = oplan.ingest(con, plan_file.read_text(encoding="utf-8"), rec, cfg)
             ostore.event(con, str(day), clock.now, "info", "plan", f"replay plan ingest: {res}")
+        from stockmoney.desk.learn.registry import safe_options_config
+        cfg = safe_options_config(con, cfg, paper=True, on_error=lambda *a: sent.append(a))
         gate = _iface.make_risk_gate(con, broker, cfg)
-        eng = Engine(con, broker, cfg, clock=clock, risk_gate=gate, live=True, notifier=lambda *a: sent.append(a))
+        eng = Engine(con, broker, cfg, clock=clock, risk_gate=gate, live=True, notifier=lambda *a: sent.append(a),
+                     config_resolved=True)
         end = eng.session_end(clock.now)  # the close (early-close aware)
         while clock.now <= end:
             eng.tick()

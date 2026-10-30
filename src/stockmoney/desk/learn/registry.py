@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import math
+import logging
 from dataclasses import dataclass, fields, replace
 from numbers import Real
 
@@ -73,13 +74,17 @@ def _build() -> dict[str, Tunable]:
 
 
 REGISTRY = _build()
+log = logging.getLogger(__name__)
 
 
 def _settings(con) -> dict:
     # Standalone shadow/replay databases may not have the desk settings table.
     if not con.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='settings'").fetchone():
         return {}
-    return json.loads(store.get_setting(con, "options_params", "{}"))
+    values = json.loads(store.get_setting(con, "options_params", "{}"))
+    if not isinstance(values, dict):
+        raise ValueError("options overrides must be an object")
+    return values
 
 
 def _attr(key: str) -> str:
@@ -109,7 +114,11 @@ def current(con, key: str):
 
 
 def _number(item: Tunable, value):
-    if (isinstance(value, bool) or not isinstance(value, Real) or not math.isfinite(value)
+    try:
+        finite = isinstance(value, Real) and math.isfinite(value)
+    except OverflowError:
+        finite = False
+    if (isinstance(value, bool) or not finite
             or not item.bound.contains(value) or (item.bound.integer and value != int(value))):
         raise ValueError(f"{item.key}: expected finite number in {item.bound.describe()}")
     return int(value) if item.bound.integer else float(value)
@@ -139,6 +148,7 @@ def change(con, key: str, value, reason: str, *, account_kind: str) -> None:
     con.execute("SAVEPOINT registry_change")
     try:
         con.execute("UPDATE settings SET value=value WHERE key='options_params'")
+        _checked_settings(con)  # refuse a corrupt shared document without an audit/write
         value = validate(con, key, value)
         item = REGISTRY[key]
         if item.location == "strategy_params":
@@ -164,14 +174,40 @@ def options_config(con, cfg: OptionsConfig, *, paper: bool, sleeve: str = "optio
     if not paper:
         return cfg
     updates = {}
-    for key, value in _settings(con).items():
-        item = REGISTRY.get(key)
-        if item is None or not item.ai_tunable or item.location != "options_params":
-            raise ValueError("invalid stored options override")
+    for key, value in _checked_settings(con).items():
+        item = REGISTRY[key]
         if item.sleeve != sleeve:
             continue
-        value = _number(item, value)
         if key.split(".")[1] in CLOCK_KNOBS:
             value = divmod(value, 60)
         updates[_attr(key)] = value
     return replace(cfg, **updates) if updates else cfg
+
+
+def _checked_settings(con) -> dict:
+    checked = {}
+    for key, value in _settings(con).items():
+        item = REGISTRY.get(key)
+        if item is None or not item.ai_tunable or item.location != "options_params":
+            raise ValueError("invalid stored options override")
+        checked[key] = _number(item, value)
+    return checked
+
+
+def safe_options_config(con, cfg: OptionsConfig, *, paper: bool, sleeve: str = "options", on_error=None):
+    """Invalid research settings must never disable exit/flatten processing."""
+    try:
+        result = options_config(con, cfg, paper=paper, sleeve=sleeve)
+    except (ValueError, TypeError):
+        log.error("Invalid paper overrides ignored; continuing with caller config for exits")
+        if on_error is not None and store.get_setting(con, "registry_override_alert", "0") != "1":
+            try:
+                on_error("Desk paper overrides invalid", "Using code configuration; exit handling remains enabled.")
+                store.set_setting(con, "registry_override_alert", "1")
+            except Exception:
+                log.warning("Could not report invalid paper overrides")
+        return cfg
+    if paper and con.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='settings'").fetchone():
+        if store.get_setting(con, "registry_override_alert", "0") == "1":
+            store.set_setting(con, "registry_override_alert", "0")
+    return result
