@@ -13,7 +13,7 @@ sleeve's OptionsPlan, whose plan_id plays the msg_id role (see _process_plan).
 
 Senders: MUSE_ADDRESS (Muse types, and Grok types on the legacy channel) and,
 when GROK_ADDRESS + GROK_SHARED_TOKEN are both set, GROK_ADDRESS
-(GROK_SENDER_TYPES: GROK_DAILY, OPTIONS_PLAN, ALERT, RESEARCH_REPLY, PONG). Each
+(GROK_SENDER_TYPES: GROK_DAILY, OPTIONS_PLAN, ALERT, RESEARCH_REPLY, PONG, NOTICE_ACK). Each
 stored row carries ``source``: ``muse``, ``grok_verified`` (mail over Grok's own
 channel, Grok's token, and a Gmail-written dkim=pass for the GROK_ADDRESS
 domain) or ``grok_legacy`` (Grok type over the Muse channel, or Grok's channel
