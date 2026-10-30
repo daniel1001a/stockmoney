@@ -27,7 +27,10 @@ def new_msg_id(prefix: str = "desk") -> str:
     return f"{clean}-{uuid.uuid4().hex[:16]}"
 
 
-def build_subject(msg_type: str, msg_id: str, token: str) -> str:
+def build_subject(msg_type: str, msg_id: str, token: str = "") -> str:
+    # Reliability messages never disclose the inbound authentication token.
+    if msg_type in {"GROK_NOTICE", "PLAN_REMINDER"} or not token:
+        return f"[SMD/{msg_type}/{msg_id}]"
     return f"[SMD/{msg_type}/{msg_id}] {token}"
 
 
@@ -50,5 +53,7 @@ def send(mailbox: Mailbox, msg, config: BridgeConfig | None = None, channel: str
     if not _TOKEN_OK.match(token or ""):
         raise ValueError(f"{channel} token missing or malformed")
     checked = _OUTBOUND.validate_python(msg, strict=True)  # reject anything not a valid Outbound message
+    if checked.type in {"GROK_NOTICE", "PLAN_REMINDER"} and channel != "grok":
+        raise ValueError("Grok reliability messages require the grok channel")
     body = checked.model_dump_json()
     mailbox.send(to, build_subject(checked.type, checked.msg_id, token), body)

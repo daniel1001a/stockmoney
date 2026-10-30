@@ -64,11 +64,12 @@ EXCERPT_CHARS = 2000
 SUBJECT_RE = re.compile(r"^((?:(?i:re|fw|fwd)\s*:\s*)*)\[SMD/([A-Z_]{1,32})/([A-Za-z0-9_\-]{6,64})\] (\S{1,256})\s*$")
 # Types only the desk sends. Mail carrying one is an echo of our own mail (a reply
 # or forward whose client stripped the prefix) and is never correctable.
-OUTBOUND_ONLY_TYPES = frozenset({"WATCHLIST", "RESEARCH_REQUEST", "REPORT", "FEEDBACK", "PING", "DESK_BRIEF"})
+OUTBOUND_ONLY_TYPES = frozenset({"WATCHLIST", "RESEARCH_REQUEST", "REPORT", "FEEDBACK", "PING", "DESK_BRIEF",
+                               "GROK_NOTICE", "PLAN_REMINDER"})
 _INBOUND = TypeAdapter(Inbound)
 
 SOURCE_MUSE, SOURCE_GROK_VERIFIED, SOURCE_GROK_LEGACY = "muse", "grok_verified", "grok_legacy"
-GROK_TYPES = frozenset({"GROK_DAILY", "OPTIONS_PLAN"})  # Grok-only types (source_of fallback)
+GROK_TYPES = frozenset({"GROK_DAILY", "OPTIONS_PLAN", "NOTICE_ACK"})  # Grok-only types (source_of fallback)
 # everything GROK_ADDRESS may send; ALERT / RESEARCH_REPLY / PONG are shared with Muse
 GROK_SENDER_TYPES = GROK_TYPES | {"ALERT", "RESEARCH_REPLY", "PONG"}
 # information-only types: stored, never an order input; these may be pruned (see above)
@@ -262,7 +263,7 @@ def _process(con, mail: RawMail, config: BridgeConfig, received_at: datetime) ->
         # because is_echo_subject() recognises the stored subject.
         _reject(con, received_at, mail, "schema_invalid outbound_only_type", config, subj_id)
         return False
-    if from_grok and subj_type not in GROK_SENDER_TYPES:
+    if (from_grok and subj_type not in GROK_SENDER_TYPES) or (subj_type == "NOTICE_ACK" and not from_grok):
         # not in muse_ops.FIXES: never answered with feedback
         _reject(con, received_at, mail, "type_not_allowed_for_sender", config, subj_id)
         return False
