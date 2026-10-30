@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import numpy as np
 import pandas as pd
+from datetime import datetime, time
+from zoneinfo import ZoneInfo
 
 from stockmoney.desk import engine
 from stockmoney.desk.broker import Account
@@ -18,13 +20,14 @@ from stockmoney.models.metrics import bootstrap_mean_ci
 
 
 def run(bars: Bars, start: str, end: str | None = None, capital: float = 25_000,
-        strategy_sets: dict[str, list[str]] | None = None) -> dict:
+        strategy_sets: dict[str, list[str]] | None = None, *, params: dict | None = None,
+        slippage: float = 0.0005) -> dict:
     ind = compute(bars)
     strategy_sets = strategy_sets or {**{n: [n] for n in REGISTRY}, "combined": list(REGISTRY)}
-    strats = {n: REGISTRY[n]() for n in REGISTRY}
-    accts = {k: Account(k, capital, capital) for k in strategy_sets}
+    strats = {n: REGISTRY[n](**(params or {}).get(n, {})) for n in REGISTRY}
+    accts = {k: Account(k, capital, capital, slippage=slippage) for k in strategy_sets}
     dates = bars.dates[(bars.dates >= start) & (bars.dates <= (end or bars.dates[-1]))]
-    regimes = []
+    regimes, decisions = [], []
     for t in dates:
         if pd.isna(ind.sma200.at[t, MARKET]):
             continue
@@ -34,8 +37,15 @@ def run(bars: Bars, start: str, end: str | None = None, capital: float = 25_000,
         for k, acct in accts.items():
             engine.morning(acct, bars, t)
             sub = {n: strats[n] for n in strategy_sets[k]}
-            engine.evening(acct, sub, ctx, [s for s in signals if s.strategy in sub])
-    return {"accounts": accts, "regimes": pd.DataFrame(regimes).set_index("date")}
+            orders = engine.evening(acct, sub, ctx, [s for s in signals if s.strategy in sub])
+            # Daily bars are labelled at midnight. Decisions are after the
+            # completed session, and fills are on the following session open.
+            for order in orders:
+                decisions.append({"account": k, "at": datetime.combine(t.date(), time(16, 1), ZoneInfo("America/New_York")).isoformat(),
+                                  "symbol": order.symbol, "side": order.side, "shares": order.shares,
+                                  "strategy": order.strategy})
+    return {"accounts": accts, "regimes": pd.DataFrame(regimes, columns=["date", "regime"]).set_index("date"),
+            "decisions": decisions}
 
 
 def curve_stats(eq: pd.Series) -> dict:
