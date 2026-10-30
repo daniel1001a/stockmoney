@@ -96,3 +96,12 @@ def test_audit_failure_rolls_back_setting(con):
     with pytest.raises(sqlite3.IntegrityError):
         r.change(con, "options.orb_min_day_rvol", 1.75, "test", account_kind="paper")
     assert r.current(con, "options.orb_min_day_rvol") == 1.5
+
+
+def test_switch_states_follow_runtime_defaults(con, monkeypatch):
+    monkeypatch.delenv("DESK_OPTIONS_ORDERS", raising=False)
+    assert r.current(con, "DESK_OPTIONS_ORDERS") == "paper"
+    monkeypatch.setenv("DESK_OPTIONS_ORDERS", "off")
+    assert r.current(con, "DESK_OPTIONS_ORDERS") == "off"
+    monkeypatch.setenv("ALPACA_LIVE_ENABLED", "not-the-confirmation")
+    assert r.current(con, "ALPACA_LIVE_ENABLED") is False

@@ -96,6 +96,8 @@ def make_session_engine(con, cfg: OptionsConfig, clock=_now) -> tuple[Engine, st
     Engine itself also refuses to trade through a non-paper broker while
     ``cfg.paper_only`` is set."""
     broker = _iface.make_trading_broker()
+    from stockmoney.desk.learn.registry import options_config
+    cfg = options_config(con, cfg, paper=getattr(broker, "is_paper", False) is True)
     live = os.environ.get("DESK_OPTIONS_ORDERS", "paper").strip().lower() != "off"
     gate = _iface.make_risk_gate(con, broker, cfg) if live else _iface.make_shadow_gate(con, broker, cfg)
     eng = Engine(con, broker, cfg, clock=clock, risk_gate=gate, live=live, flags_fn=_muse_flags(con))
@@ -185,7 +187,7 @@ def session(cfg: OptionsConfig | None = None, db_path: Path = store.DEFAULT_PATH
                     pos_only = bool(holding) and not busy and not due_full
                     sleep(interval)
             finally:
-                flat = _finish(eng, cfg, con, day)
+                flat = _finish(eng, getattr(eng, "cfg", cfg), con, day)
         return 0 if flat else 1
     finally:
         fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
@@ -366,6 +368,8 @@ def main(argv: list[str]) -> int:
     if a.cmd == "report":
         day = str(a.day or _now().astimezone(ET).date())
         with store.connect() as con:
+            from stockmoney.desk.learn.registry import options_config
+            cfg = options_config(con, cfg, paper=(os.environ.get("ALPACA_ENV") or "paper").strip().lower() == "paper")
             path = write_report(con, day, cfg)
         print(path.read_text(encoding="utf-8"))
         return 0

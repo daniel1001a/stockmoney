@@ -8,12 +8,10 @@ from __future__ import annotations
 
 import json
 import math
-import os
 from dataclasses import dataclass, fields, replace
 from numbers import Real
 
-from stockmoney.desk import profiles, store
-from stockmoney.desk.execution.risk import Limits
+from stockmoney.desk import parameter_state, profiles, store
 from stockmoney.desk.options.config import OptionsConfig
 from stockmoney.desk.strategies import REGISTRY as STRATEGIES, Bound
 
@@ -106,11 +104,8 @@ def current(con, key: str):
     if key == "risk.halt_new_entries":
         return store.get_setting(con, "halt_new_entries", "0")
     if key.startswith("risk."):
-        return str(getattr(Limits(), key.split(".")[1]))
-    # Report activation, never the contents of an environment confirmation.
-    if key == "ALPACA_ENV":
-        return os.environ.get(key, "paper")
-    return bool(os.environ.get(key))
+        return parameter_state.risk_default(key.split(".")[1])
+    return parameter_state.switch_state(key)
 
 
 def _number(item: Tunable, value):
@@ -139,22 +134,24 @@ def change(con, key: str, value, reason: str, *, account_kind: str) -> None:
         raise ValueError("registry changes are paper-only")
     if not reason.strip():
         raise ValueError("a change reason is required")
-    value = validate(con, key, value)
-    item = REGISTRY[key]
-    if item.location == "strategy_params":
-        strategy, param = key.split(".")
-        store.change_param(con, strategy, param, value, reason)
-        return
-    old = current(con, key)
-    values = _settings(con)
-    values[key] = value
-    # SAVEPOINT keeps value and audit atomic, including in autocommit mode.
+    # Acquire the SQLite write lock before reading the current value/document.
+    # SAVEPOINT also works inside the caller's existing transaction.
     con.execute("SAVEPOINT registry_change")
     try:
-        store.set_setting(con, "options_params", json.dumps(values))
-        sleeve, param = key.split(".")
-        con.execute("INSERT INTO param_changes (strategy,param,old,new,reason,changed_at) VALUES (?,?,?,?,?,?)",
-                    (sleeve, param, json.dumps(old), json.dumps(value), reason, store.now()))
+        con.execute("UPDATE settings SET value=value WHERE key='options_params'")
+        value = validate(con, key, value)
+        item = REGISTRY[key]
+        if item.location == "strategy_params":
+            strategy, param = key.split(".")
+            store.change_param(con, strategy, param, value, reason)
+        else:
+            old = current(con, key)
+            values = _settings(con)
+            values[key] = value
+            store.set_setting(con, "options_params", json.dumps(values))
+            sleeve, param = key.split(".")
+            con.execute("INSERT INTO param_changes (strategy,param,old,new,reason,changed_at) VALUES (?,?,?,?,?,?)",
+                        (sleeve, param, json.dumps(old), json.dumps(value), reason, store.now()))
         con.execute("RELEASE registry_change")
     except Exception:
         con.execute("ROLLBACK TO registry_change")
