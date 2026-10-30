@@ -94,6 +94,33 @@ def test_plan_entries_never_plans_one_symbol_twice(desk):
         assert n == 1
 
 
+@pytest.mark.parametrize("status", ["planned", run.ADVISORY])
+def test_slot_skips_unique_per_symbol_session_and_report_week(desk, monkeypatch, status):
+    monkeypatch.setattr(run, "MAX_POSITIONS", 1)
+    with store.connect(desk.path) as con:
+        run.ensure_schema(con)
+        risk = RiskEngine(desk.limits, con)
+        ctx = SimpleNamespace(market=SimpleNamespace(exposure_cap=1.0))
+        signals = [sig("AAPL", "breakout", 3), sig("NVDA", "breakout", 2),
+                   sig("NVDA", "pullback", 1), sig("MSFT", "breakout", 0, stop=math.nan)]
+        for _ in range(2):
+            out = run._plan_entries(con, PLAN_DAY, risk.ledger, risk, desk.broker.account(), ctx,
+                                    signals, set(), status=status)
+            assert [p["symbol"] for p in out] == ["AAPL"]
+        assert con.execute("SELECT symbol FROM slot_skips").fetchall()[0][0] == "NVDA"
+        assert "skipped for slots: 1 this week" in run._slot_skip_report(con, PLAN_DAY, status)
+        con.executemany("INSERT INTO slot_skips VALUES (?,?,?,?)", [
+            ("2026-09-07", "AMD", run._PROFILE.name, status),
+            ("2026-09-04", "AMD", run._PROFILE.name, status),  # prior week
+            ("2026-09-09", "AMD", run._PROFILE.name, status),  # future
+            (PLAN_DAY, "AMD", "paper_wide", status),  # other profile
+            (PLAN_DAY, "AMD", run._PROFILE.name, "other"),  # other mode
+        ])
+        assert "skipped for slots: 2 this week" in run._slot_skip_report(con, PLAN_DAY, status)
+        assert "skipped for slots: 0 this week" in run._slot_skip_report(con, "2026-09-14", status)
+        assert not desk.broker.orders
+
+
 def test_premarket_refuses_second_buy_for_same_symbol(desk):
     with store.connect(desk.path) as con:
         plan(con, "NVDA", "breakout")
