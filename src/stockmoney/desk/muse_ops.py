@@ -78,10 +78,10 @@ def fields_hint(reason: str) -> str:
     list that type's required and optional top-level fields from the real
     model, so the sender can fix a missing or misplaced field without guessing."""
     import re
-    from stockmoney.desk.bridge.schema import Alert, Calls, GrokDaily, Idea, Pong, ResearchReply, SocialDaily
+    from stockmoney.desk.bridge.schema import Alert, Calls, GrokDaily, Idea, NoticeAck, Pong, ResearchReply, SocialDaily
     from stockmoney.desk.options.plan import OptionsPlan
     models = {"OPTIONS_PLAN": OptionsPlan, "SOCIAL_DAILY": SocialDaily, "CALLS": Calls, "ALERT": Alert,
-              "RESEARCH_REPLY": ResearchReply, "IDEA": Idea, "GROK_DAILY": GrokDaily, "PONG": Pong}
+              "RESEARCH_REPLY": ResearchReply, "IDEA": Idea, "GROK_DAILY": GrokDaily, "PONG": Pong, "NOTICE_ACK": NoticeAck}
     m = re.match(r"schema_invalid\s+([A-Z_]+)\.", reason)
     model = models.get(m.group(1)) if m else None
     if model is None:
@@ -153,6 +153,8 @@ def fix_for(reason: str) -> str:
     if "json_invalid" in reason:
         return JSON_INVALID_FIX
     base = FIXES[reason.split(" ")[0]]
+    if reason == "msg_id_mismatch OPTIONS_PLAN":
+        return PLAN_RULES
     hint = fields_hint(reason)
     text = f"{hint} {base}" if hint else base
     if "OPTIONS_PLAN" in reason:

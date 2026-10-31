@@ -128,6 +128,75 @@ def test_grok_sender_still_may_not_send_muse_only_types(con):
     assert rejects(con)
 
 
+def notice_ack(**changes):
+    body = {"protocol": "1", "msg_id": "ack-grok-20261027-0800", "sent_at": NOW.isoformat(),
+            "type": "NOTICE_ACK", "notice_id": "notice-desk-20261027", "status": "done",
+            "schedule_times": ["07:20", "08:15", "08:50", "20:00"], "timezone": "America/New_York",
+            "questions": [], "notes": "Applied"}
+    return {**body, **changes}
+
+
+def test_notice_ack_only_from_grok_with_its_token(con):
+    box = FakeMailbox()
+    send(box, notice_ack())
+    assert inbox.poll(con, box, CONFIG, now=NOW) == 1
+    row = stored(con)["ack-grok-20261027-0800"]
+    assert row["source"] == "grok_verified" and row["type"] == "NOTICE_ACK"
+    for sender, token in ((SENDER, TOKEN), (GROK, TOKEN), ("unknown@example.com", GTOKEN)):
+        box = FakeMailbox()
+        send(box, notice_ack(msg_id="ack-invalid-20261027"), sender=sender, token=token)
+        assert inbox.poll(con, box, CONFIG, now=NOW) == 0
+    assert len(stored(con)) == 1
+
+
+@pytest.mark.parametrize("changes", [
+    {"status": "approved"}, {"status": "partial", "notes": ""},
+    {"schedule_times": ["24:00"]}, {"schedule_times": ["8:50"]},
+    {"notes": "x" * 2001}, {"sent_at": "2026-10-27T08:00:00"},
+])
+def test_notice_ack_strict_schema(changes):
+    with pytest.raises(ValidationError):
+        INBOUND.validate_json(json.dumps(notice_ack(**changes)), strict=True)
+
+
+def desk_notice(**changes):
+    return {"protocol": "1", "msg_id": "notice-desk-20261027", "sent_at": NOW.isoformat(),
+            "type": "GROK_NOTICE", "notice_id": "notice-desk-20261027", "title": "Schedule update",
+            "body": "Check the mailbox at 08:50 ET.", "actions": ["Confirm your schedule"], **changes}
+
+
+def plan_reminder(**changes):
+    return {"protocol": "1", "msg_id": "planrm-desk-20261027", "sent_at": NOW.isoformat(),
+            "type": "PLAN_REMINDER", "for_date": "2026-10-27", "missing": ["OPTIONS_PLAN", "GROK_DAILY"],
+            "live_cutoff": "09:20:00", "note": "Send an empty plan when there are no candidates.", **changes}
+
+
+@pytest.mark.parametrize("payload", [desk_notice(), plan_reminder()])
+def test_reliability_outbound_roundtrip_has_no_token(payload):
+    from stockmoney.desk.bridge import outbox
+    msg = OUTBOUND.validate_json(json.dumps(payload), strict=True)
+    box = FakeMailbox()
+    outbox.send(box, msg, CONFIG, channel="grok")
+    recipient, subj, body = box.sent[0]
+    assert recipient == GROK
+    assert subj == outbox.build_subject(msg.type, msg.msg_id) == f"[SMD/{msg.type}/{msg.msg_id}]"
+    assert GTOKEN not in subj and GTOKEN not in body
+    assert OUTBOUND.validate_json(body, strict=True) == msg
+    with pytest.raises(ValueError, match="grok channel"):
+        outbox.send(FakeMailbox(), msg, CONFIG, channel="muse")
+
+
+@pytest.mark.parametrize("payload", [
+    desk_notice(notice_id="different-notice"), desk_notice(title="x" * 121),
+    desk_notice(body="x" * 4001), desk_notice(actions=["a"] * 11), desk_notice(actions=["a" * 281]),
+    plan_reminder(missing=["ALERT"]), plan_reminder(missing=["OPTIONS_PLAN", "OPTIONS_PLAN"]),
+    plan_reminder(live_cutoff="09:21"), plan_reminder(note="x" * 501),
+])
+def test_reliability_outbound_bounds(payload):
+    with pytest.raises(ValidationError):
+        OUTBOUND.validate_json(json.dumps(payload), strict=True)
+
+
 def test_outbound_only_types_are_not_accepted_inbound(con):
     box = FakeMailbox()
     ping = {"protocol": "1", "msg_id": "ping-grok-0001", "sent_at": "2026-10-27T07:30:00-04:00", "type": "PING",
@@ -561,3 +630,171 @@ def test_policy_names_grok_for_a_grok_alert(con):
     notes = active_flags(con, NOW + timedelta(minutes=1), held={"NVDA", "AMD"}).notify
     assert any(n.startswith("Grok ALERT") and "NVDA" in n for n in notes)
     assert any(n.startswith("Muse ALERT") and "AMD" in n for n in notes)
+
+
+# ---------------------------------------------------------------- 08:45 plan reminder (spec B.2)
+
+def _briefed(con, d="2026-10-27"):
+    con.execute("INSERT INTO bridge_ops VALUES (?, 'x')", (f"brief:{d}",))
+
+
+def _plan_row(con, status="accepted", source="grok_verified", for_date="2026-10-27"):
+    con.execute("INSERT INTO options_plans (plan_id, for_date, received_at, status, shadow_only, error, sha, raw, "
+                "source) VALUES (?,?,?,?,?,?,?,?,?)", ("p-20261027", for_date, et(8, 10).isoformat(), status, 0, "",
+                                                     "s", "{}", source))
+
+
+def _daily_row(con, at, source="grok_verified", msg_id="grok-20261027-0730", collected=None):
+    collected = (collected or at).astimezone(muse_ops.ET).isoformat()
+    con.execute("INSERT INTO bridge_messages (msg_id, type, sender, received_at, raw_body, parsed_json, source) "
+                "VALUES (?,?,?,?,?,?,?)", (msg_id, "GROK_DAILY", GROK, muse_ops._iso(at), "{}",
+                                           json.dumps({"collected_at": collected}), source))
+
+
+def test_plan_reminder_sent_at_0845(desk, pages):
+    _briefed(desk)
+    _daily_row(desk, et(7, 30))
+    box = FakeMailbox()
+    assert grok_outbound.run(desk, box, et(8, 44), CONFIG, returns) == []
+    lines = grok_outbound.run(desk, box, et(8, 45), CONFIG, returns)
+    assert len(lines) == 1 and "PLAN_REMINDER" in lines[0]
+    (body,) = _bodies(box, "PLAN_REMINDER")
+    assert body["for_date"] == "2026-10-27" and body["missing"] == ["OPTIONS_PLAN"]
+    assert body["live_cutoff"] == "09:20:00" and body["msg_id"].startswith("planrm-")
+    assert OUTBOUND.validate_python(body).type == "PLAN_REMINDER"
+    assert all(to == GROK for to, _, _ in box.sent)
+    assert desk.execute("SELECT channel FROM bridge_outbox WHERE type='PLAN_REMINDER'").fetchone()[0] == "grok"
+    assert grok_outbound._done(desk, "planrm:2026-10-27")
+    assert [p[1] for p in pages] == ["Grok plan missing at 08:45, reminder sent"]
+    # never twice
+    assert grok_outbound.run(desk, box, et(9, 0), CONFIG, returns) == []
+    assert len(_bodies(box, "PLAN_REMINDER")) == 1 and len(pages) == 1
+
+
+@pytest.mark.parametrize("status", ["accepted", "rejected"])
+def test_no_reminder_when_a_verified_plan_exists(desk, pages, status):
+    _briefed(desk)
+    _plan_row(desk, status=status)
+    box = FakeMailbox()
+    assert grok_outbound.run(desk, box, et(8, 50), CONFIG, returns) == []
+    assert box.sent == [] and pages == []
+    assert not grok_outbound._done(desk, "planrm:2026-10-27")
+
+
+def test_unverified_or_other_day_plan_does_not_stop_the_reminder(desk, pages):
+    _briefed(desk)
+    _plan_row(desk, source="grok_legacy")
+    desk.execute("UPDATE options_plans SET plan_id='p-old'")
+    _plan_row(desk, for_date="2026-10-26")
+    box = FakeMailbox()
+    assert len(grok_outbound.run(desk, box, et(8, 50), CONFIG, returns)) == 1
+    assert len(_bodies(box, "PLAN_REMINDER")) == 1
+
+
+def test_grok_daily_listed_only_when_absent_at_0830(desk, pages):
+    _briefed(desk)
+    _daily_row(desk, et(8, 31))  # late daily
+    _daily_row(desk, et(7, 0), source="grok_legacy", msg_id="grok-20261027-0700")  # unverified
+    _daily_row(desk, et(7, 0, PREV), msg_id="grok-20261026-0700")  # yesterday's
+    box = FakeMailbox()
+    grok_outbound.run(desk, box, et(8, 45), CONFIG, returns)
+    assert _bodies(box, "PLAN_REMINDER")[0]["missing"] == ["OPTIONS_PLAN", "GROK_DAILY"]
+
+    desk.execute("DELETE FROM bridge_ops WHERE key='planrm:2026-10-27'")
+    _daily_row(desk, et(8, 30), msg_id="grok-20261027-0830")  # exactly 08:30 is on time
+    box = FakeMailbox()
+    grok_outbound.run(desk, box, et(8, 46), CONFIG, returns)
+    assert _bodies(box, "PLAN_REMINDER")[0]["missing"] == ["OPTIONS_PLAN"]
+
+
+def test_first_poll_after_0920_skips_late(desk, pages):
+    _briefed(desk)
+    box = FakeMailbox()
+    assert grok_outbound.run(desk, box, et(9, 20), CONFIG, returns) == []
+    assert box.sent == [] and pages == []
+    assert desk.execute("SELECT at FROM bridge_ops WHERE key='planrm:2026-10-27'").fetchone()[0] == "skipped_late"
+    assert grok_outbound.run(desk, box, et(9, 25), CONFIG, returns) == [] and box.sent == []
+
+
+def test_no_reminder_on_holiday_or_without_grok(desk, pages):
+    box = FakeMailbox()
+    assert grok_outbound.run(desk, box, et(8, 50, date(2026, 11, 26)), CONFIG, returns) == []
+    assert grok_outbound.run(desk, box, et(8, 50, date(2026, 10, 31)), CONFIG, returns) == []  # Saturday
+    assert grok_outbound.run(desk, box, et(8, 50), MUSE_ONLY, returns) == []
+    assert box.sent == [] and pages == []
+    assert desk.execute("SELECT COUNT(*) FROM bridge_ops WHERE key LIKE 'planrm:%'").fetchone()[0] == 0
+
+
+def test_failed_reminder_send_is_retried(desk, pages):
+    _briefed(desk)
+
+    class Broken(FakeMailbox):
+        def send(self, *a, **k):
+            raise OSError("smtp down")
+    with pytest.raises(OSError):
+        grok_outbound.run(desk, Broken(), et(8, 45), CONFIG, returns)
+    assert not grok_outbound._done(desk, "planrm:2026-10-27") and pages == []
+    box = FakeMailbox()
+    assert len(grok_outbound.run(desk, box, et(8, 50), CONFIG, returns)) == 1
+
+
+def test_failed_owner_push_does_not_resend(desk, monkeypatch):
+    _briefed(desk)
+
+    def boom(*a, **k):
+        raise RuntimeError("ntfy down")
+    monkeypatch.setattr(muse_ops.notify, "send", boom)
+    box = FakeMailbox()
+    assert len(grok_outbound.run(desk, box, et(8, 45), CONFIG, returns)) == 1
+    assert grok_outbound.run(desk, box, et(8, 50), CONFIG, returns) == []
+    assert len(_bodies(box, "PLAN_REMINDER")) == 1
+
+
+def test_last_nights_digest_polled_this_morning_is_not_the_morning_daily(desk, pages):
+    _briefed(desk)
+    _daily_row(desk, et(6, 0), collected=et(20, 0, PREV))  # desk asleep at 20:00, mail polled at 06:00
+    box = FakeMailbox()
+    grok_outbound.run(desk, box, et(8, 45), CONFIG, returns)
+    assert _bodies(box, "PLAN_REMINDER")[0]["missing"] == ["OPTIONS_PLAN", "GROK_DAILY"]
+
+
+def test_reminder_marker_survives_a_later_rollback(desk, pages):
+    """bridge() may raise after grok_outbound.run (an owner push); the job then
+    never commits. The marker is already committed, so no second reminder."""
+    _briefed(desk)
+    box = FakeMailbox()
+    assert len(grok_outbound.run(desk, box, et(8, 45), CONFIG, returns)) == 1
+    desk.rollback()
+    assert grok_outbound.run(desk, box, et(8, 46), CONFIG, returns) == []
+    assert len(_bodies(box, "PLAN_REMINDER")) == 1
+
+
+def test_skipped_late_survives_a_later_rollback(desk, pages):
+    _briefed(desk)
+    grok_outbound.run(desk, FakeMailbox(), et(9, 20), CONFIG, returns)
+    desk.rollback()
+    assert grok_outbound._done(desk, "planrm:2026-10-27")
+
+
+def _grok_plan_text(notes=""):
+    return json.dumps({
+        "protocol": "1", "type": "OPTIONS_PLAN", "plan_id": "gp-20261027-0800", "for_date": "2026-10-27",
+        "generated_at": "2026-10-27T07:45:00-04:00",
+        "market_context": {"summary": "", "risk_tone": "mixed", "key_events": []},
+        "plans": [{"underlying": "SPY", "bias": "long", "playbook": "orb", "thesis": "t", "catalyst": "",
+                   "trigger": {"kind": "break_above", "level": 601.5, "confirm_closes": 1, "earliest": "09:35",
+                               "latest": "11:00"},
+                   "invalidation": {"kind": "below", "underlying_level": 599.0}, "target_underlying_pct": 1,
+                   "max_hold_minutes": 45, "preferred_dte": "0dte", "confidence": 0.5, "evidence_urls": []}],
+        "avoid": [], "notes": notes})
+
+
+def test_a_verified_plan_rejected_for_a_reused_id_stops_the_reminder(desk, pages):
+    from stockmoney.desk.options import plan as oplan
+    _briefed(desk)
+    assert oplan.ingest(desk, _grok_plan_text(), et(8, 0), source="owner").status == "accepted"
+    r = oplan.ingest(desk, _grok_plan_text(notes="changed"), et(8, 10), source="grok_verified")
+    assert r.status == "rejected"
+    box = FakeMailbox()
+    assert grok_outbound.run(desk, box, et(8, 50), CONFIG, returns) == []
+    assert box.sent == [] and pages == []

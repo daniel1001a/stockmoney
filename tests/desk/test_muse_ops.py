@@ -91,3 +91,11 @@ def test_overdue_research_reply_reported(con):
     assert muse_ops.check_deliveries(con, now + timedelta(hours=10)) == []
     misses = muse_ops.check_deliveries(con, now + timedelta(hours=12))
     assert misses and "XOM" in misses[0]
+
+
+def test_reliability_feedback_names_correct_identity_and_ack_fields():
+    correction = muse_ops.fix_for("msg_id_mismatch OPTIONS_PLAN")
+    assert correction == muse_ops.PLAN_RULES
+    hint = muse_ops.fields_hint("schema_invalid NOTICE_ACK.schedule_times.0:string_pattern_mismatch")
+    assert "notice_id" in hint
+    assert "schedule_times" in hint

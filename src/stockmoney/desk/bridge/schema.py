@@ -354,7 +354,25 @@ class Pong(_Msg):
     notes: Annotated[str, StringConstraints(max_length=2000)] = ""
 
 
-Inbound = Annotated[Union[SocialDaily, Alert, ResearchReply, Idea, Calls, GrokDaily, Pong],
+class NoticeAck(_Msg):
+    """Grok's report of notice completion, stored as data only."""
+    type: Literal["NOTICE_ACK"] = "NOTICE_ACK"
+    sent_at: AwareDatetime
+    notice_id: Annotated[str, StringConstraints(pattern=r"^[A-Za-z0-9_\-]{6,64}$")]
+    status: Literal["done", "partial", "cannot"]
+    schedule_times: list[Annotated[str, StringConstraints(pattern=r"^([01]\d|2[0-3]):[0-5]\d$")]] = Field(max_length=20)
+    timezone: Literal["America/New_York"] = "America/New_York"
+    questions: list[ShortText] = Field(default_factory=list, max_length=10)
+    notes: Annotated[str, StringConstraints(max_length=2000)] = ""
+
+    @model_validator(mode="after")
+    def _explain_incomplete(self):
+        if self.status != "done" and not self.notes.strip():
+            raise ValueError("partial/cannot acknowledgements must explain in notes")
+        return self
+
+
+Inbound = Annotated[Union[SocialDaily, Alert, ResearchReply, Idea, Calls, GrokDaily, Pong, NoticeAck],
                     Field(discriminator="type")]
 
 
@@ -449,5 +467,41 @@ class DeskBrief(_Msg):
     questions: list[ShortText] = Field(default_factory=list, max_length=5)
 
 
-Outbound = Annotated[Union[Watchlist, ResearchRequest, Report, Feedback, Ping, DeskBrief],
+class GrokNotice(_Msg):
+    type: Literal["GROK_NOTICE"] = "GROK_NOTICE"
+    sent_at: AwareDatetime
+    notice_id: Annotated[str, StringConstraints(pattern=r"^[A-Za-z0-9_\-]{6,64}$")]
+    title: Annotated[str, StringConstraints(max_length=120)]
+    body: Annotated[str, StringConstraints(max_length=4000)]
+    actions: list[ShortText] = Field(default_factory=list, max_length=10)
+    ack_required: bool = True
+    spec_ref: str | None = None
+
+    @model_validator(mode="after")
+    def _same_notice_id(self):
+        if self.notice_id != self.msg_id:
+            raise ValueError("notice_id must equal msg_id")
+        return self
+
+
+class PlanReminder(_Msg):
+    type: Literal["PLAN_REMINDER"] = "PLAN_REMINDER"
+    sent_at: AwareDatetime
+    for_date: _dt.date
+    missing: list[Literal["OPTIONS_PLAN", "GROK_DAILY"]] = Field(max_length=2)
+    live_cutoff: _dt.time = _dt.time(9, 20)  # ET, independent of DST offset
+    note: Annotated[str, StringConstraints(max_length=500)]
+
+    @model_validator(mode="after")
+    def _cutoff_and_missing(self):
+        if len(set(self.missing)) != len(self.missing):
+            raise ValueError("missing types must be unique")
+        if (self.live_cutoff.hour, self.live_cutoff.minute, self.live_cutoff.second, self.live_cutoff.microsecond) != (9, 20, 0, 0):
+            raise ValueError("live_cutoff must be 09:20 ET")
+        if self.live_cutoff.tzinfo is not None:
+            raise ValueError("live_cutoff is an ET wall clock, without an offset")
+        return self
+
+
+Outbound = Annotated[Union[Watchlist, ResearchRequest, Report, Feedback, Ping, DeskBrief, GrokNotice, PlanReminder],
                      Field(discriminator="type")]

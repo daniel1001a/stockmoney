@@ -36,7 +36,7 @@ from __future__ import annotations
 import itertools
 import json
 import math
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -298,6 +298,7 @@ class ReplayResult:
     report: str
     quote_sources: dict
     notifications: list
+    shadow_equity: list[float] = field(default_factory=list)
 
 
 def run(day: date, cfg: OptionsConfig, cache_dir: Path, out_dir: Path, feed: str = "iex", step_s: float = 20.0,
@@ -315,6 +316,7 @@ def run(day: date, cfg: OptionsConfig, cache_dir: Path, out_dir: Path, feed: str
     clock = SimClock(datetime.combine(day, time(*cfg.session_start), ET).astimezone(timezone.utc))
     broker = ReplayBroker(market, clock)
     sent: list = []
+    equity = [25_000.0]
     with store.connect(db) as con:
         ostore.ensure_schema(con)
         if plan_file is not None:
@@ -329,6 +331,16 @@ def run(day: date, cfg: OptionsConfig, cache_dir: Path, out_dir: Path, feed: str
         end = eng.session_end(clock.now)  # the close (early-close aware)
         while clock.now <= end:
             eng.tick()
+            # Mark one DTE/exit arm per rule using the same liquidation costs
+            # as shadow fills. Do not pool the experimental duplicate orb arm.
+            rows = con.execute("SELECT realized_usd,fees_usd,qty_open,last_bid,entry_price FROM options_positions "
+                               "WHERE mode='shadow' AND dte_label=? AND exit_variant=? "
+                               "AND source NOT IN ('grok_plan','orb15_5m')",
+                               (cfg.live_dte, cfg.live_exit)).fetchall()
+            pnl = sum((r[0] or 0) - (r[1] or 0) + (r[2] or 0) * (
+                ((r[3] or 0) * (1 - cfg.shadow_slippage_pct) - (r[4] or 0)) * cfg.contract_multiplier
+                - cfg.fee_per_contract) for r in rows)
+            equity.append(25_000.0 + pnl)
             clock.advance(step_s)
         eng.finish()
         header = (f"> 重播模式:{day},標的 K 線為真實資料(Alpaca {feed.upper()})。期權報價是**合成模型**:沒有歷史買賣價;"
@@ -338,7 +350,7 @@ def run(day: date, cfg: OptionsConfig, cache_dir: Path, out_dir: Path, feed: str
                   f"影子損益只能檢查引擎機制與觸發邏輯,不能當作期望值證據。"
                   f"風控為 A 線正式風控(OptionsRiskEngine),但合成報價沒有成交量,成交量門檻在重播中關閉。報價來源次數:{json.dumps(broker.sources)}")
         rep = oreport.build(con, str(day), cfg, header=header)
-    return ReplayResult(db, rep, dict(broker.sources), sent)
+    return ReplayResult(db, rep, dict(broker.sources), sent, equity)
 
 
 # ------------------------------------------------------------------ synthetic day (selftest and tests)
