@@ -257,14 +257,20 @@ def _grok_plan_received(con, day: date) -> bool:
 
 
 def _morning_daily(con, day: date) -> bool:
-    """A verified GROK_DAILY received on ``day`` (ET) at or before 08:30 ET."""
+    """A verified GROK_DAILY received on ``day`` (ET) at or before 08:30 ET and
+    collected that morning. The collected_at test is the GROK_AM rule: last
+    night's 20:00 digest polled at 06:00 is not this morning's daily."""
     if not _has(con, "bridge_messages"):
         return False
+    e = muse_ops.EXPECTATIONS["GROK_AM"]
     start = datetime.combine(day, time(0, 0), ET)
     by = datetime.combine(day, DAILY_BY, ET)
     return con.execute("SELECT 1 FROM bridge_messages WHERE type='GROK_DAILY' AND source='grok_verified' "
-                       "AND received_at>=? AND received_at<=? LIMIT 1",
-                       (muse_ops._iso(start), muse_ops._iso(by))).fetchone() is not None
+                       "AND received_at>=? AND received_at<=? "
+                       "AND substr(json_extract(parsed_json,'$.collected_at'),1,10)=? "
+                       "AND substr(json_extract(parsed_json,'$.collected_at'),12,5)<? LIMIT 1",
+                       (muse_ops._iso(start), muse_ops._iso(by), day.isoformat(),
+                        f"{e.collected_before:%H:%M}")).fetchone() is not None
 
 
 def build_reminder(con, now: datetime):
@@ -289,11 +295,15 @@ def _remind(con, box, now: datetime, config) -> str | None:
     if local.time() >= LIVE_CUTOFF:
         # desk was asleep through the window: record it for the scoreboard, send nothing
         con.execute("INSERT INTO bridge_ops (key, at) VALUES (?,?)", (key, "skipped_late"))
+        con.commit()
         return None
     msg = build_reminder(con, now)
     outbox.send(box, msg, config, channel="grok")
     muse_ops.log_outbound(con, msg, "grok")
     muse_ops._once(con, key)
+    # commit now: a later failure in the same bridge run must not roll the
+    # marker back, or the next poll inside the window sends a second reminder
+    con.commit()
     try:
         notify.send("Grok plan missing", "Grok plan missing at 08:45, reminder sent", notify.WARN)
     except Exception:  # a failed push never re-sends the reminder

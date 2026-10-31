@@ -270,8 +270,9 @@ def ingest(con, text: str, received_at: datetime, cfg: OptionsConfig | None = No
                 return IngestResult("upgraded", p.plan_id, str(p.for_date), shadow)
             return IngestResult("duplicate", p.plan_id, str(p.for_date), bool(prior["shadow_only"]))
         err = "plan_id already used by a different accepted plan"
-        con.execute("INSERT INTO options_plans (plan_id, for_date, received_at, status, shadow_only, error, sha, raw) "
-                    "VALUES (?,?,?,?,?,?,?,?)", (p.plan_id, str(p.for_date), at, "rejected", 1, err, sha, text))
+        con.execute("INSERT INTO options_plans (plan_id, for_date, received_at, status, shadow_only, error, sha, raw, "
+                    "source) VALUES (?,?,?,?,?,?,?,?,?)",
+                    (p.plan_id, str(p.for_date), at, "rejected", 1, err, sha, text, source))
         con.commit()
         return IngestResult("rejected", p.plan_id, str(p.for_date), True, err)
     shadow = is_shadow_only(p.for_date, received_at, cfg) or source not in TRUSTED_SOURCES
