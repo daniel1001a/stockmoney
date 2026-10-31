@@ -442,3 +442,15 @@ def test_postclose_after_midnight_still_manages_the_last_session(desk):
         out = run.postclose(con, b, _at(nxt, 0, 30), bars=bars, limits=desk.limits)
         assert "跳過" not in out
         assert con.execute("SELECT 1 FROM equity_history WHERE date=?", (str(t.date()),)).fetchone()
+
+
+def test_bad_paper_settings_retain_plan_until_repaired(desk):
+    with store.connect(desk.path) as con:
+        plan(con, "AAPL")
+        store.set_setting(con, "paper_strategy_params", "[]")
+        run.premarket(con, desk.broker, WED, desk.limits)
+        assert not market_orders(desk.broker, "AAPL", Side.BUY)
+        assert con.execute("SELECT status FROM planned_orders").fetchone()[0] == "planned"
+        store.set_setting(con, "paper_strategy_params", "{}")
+        run.premarket(con, desk.broker, WED + timedelta(minutes=1), desk.limits)
+        assert len(market_orders(desk.broker, "AAPL", Side.BUY)) == 1

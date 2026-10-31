@@ -1013,7 +1013,8 @@ def premarket(con, broker: Broker, now: datetime, limits: Limits | None = None, 
     # replacement that postclose could not finish (unconfirmed cancel) or a stop
     # lost to a failure is restored here, before any new money goes in.
     st.lines += _premarket_stops(con, broker, risk, today, bad, st)
-    entries_on = stock_entries_enabled(con) and _paper_params_valid(con, broker)
+    entries_on = stock_entries_enabled(con)
+    paper_params_valid = _paper_params_valid(con, broker)
     for p in plans:
         if p["side"] != Side.BUY.value:
             continue
@@ -1021,6 +1022,9 @@ def premarket(con, broker: Broker, now: datetime, limits: Limits | None = None, 
             _mark(con, p, ADVISORY, "股票策略改為只給建議(2026-10-27),未送出")
             con.commit()
             st.lines.append(f"未送出 {p['symbol']}:股票策略只給建議,不自動下單")
+            continue
+        if not paper_params_valid:
+            st.lines.append(f"未送出 {p['symbol']}:invalid paper overrides; plan retained for retry")
             continue
         try:
             _premarket_one(con, broker, risk, ledger, snap, p, st, **kw)

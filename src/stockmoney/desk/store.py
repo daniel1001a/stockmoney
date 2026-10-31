@@ -107,8 +107,8 @@ def strategy_params(con, *, paper: bool = False) -> dict[str, dict]:
     return params
 
 
-def change_param(con, strategy: str, param: str, new, reason: str, *, paper: bool = False) -> None:
-    key = "paper_strategy_params" if paper else "strategy_params"
+def change_param(con, strategy: str, param: str, new, reason: str) -> None:
+    key = "strategy_params"
     params = json.loads(get_setting(con, key, "{}"))
     old = params.get(strategy, {}).get(param)
     params.setdefault(strategy, {})[param] = new

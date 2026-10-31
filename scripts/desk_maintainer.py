@@ -14,6 +14,10 @@ def main(argv=None) -> None:
     parser.add_argument("--db", type=Path, default=store.DEFAULT_PATH)
     args = parser.parse_args(argv)
     with store.connect(args.db) as con:
+        try:
+            store.strategy_params(con, paper=True)
+        except (ValueError, TypeError):
+            print("# Invalid paper stock overrides: showing owner/default values; new paper stock entries disabled.")
         if not options_settings_valid(con):
             print("# Invalid options overrides: showing code defaults; new paper options/spread entries disabled.")
         print("key\tsleeve\tcurrent\tbound\tmax_step\tai_tunable")

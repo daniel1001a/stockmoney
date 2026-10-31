@@ -160,6 +160,18 @@ def test_bad_paper_overlay_preserves_owner_exits_and_blocks_entries(con, blob, m
     monkeypatch.setattr(run, "_notify_once", lambda *a, **kw: None)
     store.change_param(con, "pullback", "trail_atr", 3.25, "owner")
     store.set_setting(con, "paper_strategy_params", blob)
+    assert r.current(con, "pullback.trail_atr") == 3.25
     assert run._strategies(con, paper=True)["pullback"].params["trail_atr"] == 3.25
     assert not run._paper_params_valid(con, SimpleNamespace(is_paper=True))
     assert run._paper_params_valid(con, SimpleNamespace(is_paper=False))
+
+
+def test_cli_warns_for_bad_paper_overlay(tmp_path, capsys):
+    from scripts.desk_maintainer import main
+    path = tmp_path / "bad-paper.sqlite"
+    with store.connect(path) as con:
+        store.set_setting(con, "paper_strategy_params", "[]")
+    main(["--registry", "--db", str(path)])
+    output = capsys.readouterr().out
+    assert "Invalid paper stock overrides" in output
+    assert "pullback.trail_atr" in output

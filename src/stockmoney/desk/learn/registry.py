@@ -96,7 +96,11 @@ def current(con, key: str):
     item = REGISTRY[key]
     if item.location == "strategy_params":
         strategy, param = key.split(".")
-        return store.strategy_params(con, paper=True).get(strategy, {}).get(param, STRATEGIES[strategy].params[param])
+        try:
+            params = store.strategy_params(con, paper=True)
+        except (ValueError, TypeError):
+            params = store.strategy_params(con)
+        return params.get(strategy, {}).get(param, STRATEGIES[strategy].params[param])
     if item.location == "options_params":
         default = getattr(OptionsConfig(), _attr(key))
         if key.split(".")[1] in CLOCK_KNOBS:
