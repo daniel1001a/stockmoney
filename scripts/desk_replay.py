@@ -20,7 +20,7 @@ def main(argv=None):
     parser.add_argument("--feed", choices=("iex", "sip"), default="iex")
     args = parser.parse_args(argv)
     variant = "incumbent" if args.variant == "incumbent" else json.loads(Path(args.variant).read_text())
-    bars = data.to_bars(data.load()) if args.sleeve == "stocks" else None
+    bars = data.to_bars(data.load()) if args.sleeve in ("stocks", "spreads") else None
     result = replay.run(args.sleeve, args.start, args.end, variant, bars=bars, cache_path=args.cache,
                         options_cache=args.options_cache, stock_bps=args.stock_bps, feed=args.feed)
     args.out.parent.mkdir(parents=True, exist_ok=True)

@@ -10,7 +10,7 @@ import json
 import math
 import sqlite3
 from dataclasses import replace
-from datetime import date, timedelta
+from datetime import date, datetime, time, timedelta
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -113,6 +113,115 @@ def _options(start, end, cfg, cache_dir, feed):
     return trades, equity, decisions
 
 
+SPREAD_EXCLUDED = ("expiry_late", "expiry_unpriced")  # excluded from the H6 statistics, as in spreads.report
+
+
+def _spread_slots(day):
+    """The live schedule: every 10 minutes 09:45 to 15:55 ET (scripts/desk_job.sh)."""
+    from stockmoney.desk.options import spreads
+    t = datetime.combine(day, time(9, 45), spreads.ET)
+    while t.time() <= time(15, 55):
+        yield t
+        t += timedelta(minutes=10)
+
+
+def _wind_states(bars, start, end):
+    """{session: wind state} from causal daily indicators (row t uses rows <= t),
+    for every session from a little before ``start`` (state_before reads the
+    last session strictly before the replayed day) through ``end``."""
+    import pandas as pd
+
+    from stockmoney.desk import indicators, wind
+    ind = indicators.compute(bars.upto(pd.Timestamp(end)))
+    frame = wind.series(ind, str(date.fromisoformat(start) - timedelta(days=10)), end)
+    return {} if frame.empty else {str(d): str(s) for d, s in frame["state"].items()}
+
+
+class _SpreadData:
+    """ReplayBroker seen as the spreads data source. The live chain carries the
+    provider's delta; the synthetic quote has none, so the delta is the
+    Black-Scholes delta of the IV implied by the synthetic mid."""
+
+    def __init__(self, broker):
+        self.b = broker
+
+    def option_chain(self, underlying, expiry_min, expiry_max):
+        from stockmoney.desk.options import select as sel
+        now = self.b.clock.now
+        spot = self.b.m.spot(underlying, now)
+        out = []
+        for c in self.b.option_chain(underlying, expiry_min, expiry_max):
+            d = sel.contract_delta(c, spot, now)[0] if spot else None
+            out.append(replace(c, delta=d))
+        return out
+
+    def option_quote(self, occ):
+        return self.b.option_quote(occ)
+
+    def stock_quote(self, symbol):
+        return self.b.stock_quote(symbol)
+
+
+def _spreads(start, end, cfg, cache_dir, feed, states):
+    """Replay the H6 spread shadow day by day through ``spreads.tick`` (same
+    entry, leg, fill and exit rules), quoting each leg from the options replay
+    model: buys at the ask, sells at the bid, plus SLIP or shadow_slippage_pct."""
+    from stockmoney.desk import store, wind
+    from stockmoney.desk.options import replay as options_replay
+    from stockmoney.desk.options import spreads
+    trades, decisions, equity, missing = [], [], [25_000.0], []
+    mult = cfg.contract_multiplier
+    with TemporaryDirectory(prefix="stockmoney-spreads-") as work, store.connect(Path(work) / "spreads.sqlite") as con:
+        spreads.ensure_schema(con)
+        wind.ensure_schema(con)
+        con.executemany("INSERT INTO wind_daily (date, state, recorded_at) VALUES (?,?, 'replay:daily_bars')",
+                        sorted(states.items()))
+        day = date.fromisoformat(start)
+        while day <= date.fromisoformat(end):
+            if is_trading_day(day):
+                if not (cache_dir / str(day)).is_dir():
+                    missing.append(str(day))
+                else:
+                    market = options_replay.ReplayMarket(cache_dir / str(day), feed, cfg)
+                    clock = options_replay.SimClock(next(_spread_slots(day)))
+                    data = _SpreadData(options_replay.ReplayBroker(market, clock))
+                    for slot in _spread_slots(day):
+                        clock.now = slot
+                        spreads.tick(con, data, slot, cfg, slot)
+                        realized = con.execute("SELECT COALESCE(SUM(pnl_usd),0) FROM options_spreads_shadow "
+                                               "WHERE status='CLOSED'").fetchone()[0]
+                        held = sum((((r["last_value"] if r["last_value"] is not None else r["entry_debit"])
+                                     - r["entry_debit"]) * mult - 2 * cfg.fee_per_contract) * r["qty"]
+                                   - r["fees_usd"] for r in con.execute(
+                                       "SELECT * FROM options_spreads_shadow WHERE status='OPEN'"))
+                        equity.append(25_000.0 + realized + held)
+            day += timedelta(days=1)
+        rows = con.execute("SELECT * FROM options_spreads_shadow ORDER BY day, underlying").fetchall()
+    excluded = still_open = 0
+    for r in rows:
+        decisions.append({k: r[k] for k in ("day", "underlying", "source", "wind", "status", "skip_reason",
+                                            "expiry", "long_strike", "short_strike", "entry_debit", "qty",
+                                            "exit_reason")})
+        if r["status"] == "OPEN":
+            still_open += 1
+        elif r["status"] == "CLOSED" and r["exit_reason"] in SPREAD_EXCLUDED:
+            excluded += 1
+        elif r["status"] == "CLOSED":
+            trades.append({"symbol": r["underlying"], "strategy": f"spread:{r['source']}",
+                           "entry_date": r["entry_time"], "exit_date": r["exit_time"], "pnl": r["pnl_usd"],
+                           "r_multiple": r["pnl_usd"] / (r["entry_debit"] * mult * r["qty"]),
+                           "fees": r["fees_usd"], "exit_reason": r["exit_reason"]})
+    trades.sort(key=lambda t: (t["exit_date"], t["symbol"]))
+    caveats = []
+    if missing:
+        caveats.append("missing_cache_days")
+    if excluded:
+        caveats.append("expiry_settlements_excluded")
+    if still_open:
+        caveats.append("open_spreads_marked_in_drawdown_only")
+    return trades, equity, decisions, caveats
+
+
 def run(sleeve: str, start: str, end: str, variant="incumbent", *, bars=None,
         cache_path: Path = Path("data/desk/replay.sqlite"),
         options_cache: Path = OptionsConfig().replay_cache, feed: str = "iex", stock_bps: float = 5.0,
@@ -142,12 +251,16 @@ def run(sleeve: str, start: str, end: str, variant="incumbent", *, bars=None,
                    "cancel_max_failures", "cancel_page_every_min", "order_status_max_failures",
                    "flatten_budget_s", "flat_broker_max_attempts", "min_live_minutes_before_flat", "not_flat_alert_min"}
         fingerprint.update(options_config={k: v for k, v in asdict(cfg).items() if k not in ignored}, feed=feed)
+    if sleeve == "spreads":
+        from stockmoney.desk.options import spreads
+        fingerprint.update(spread_rules={k: getattr(spreads, k) for k in (
+            "SLIP", "DTE_MIN", "DTE_MAX", "DTE_TARGET", "LONG_DELTA", "LONG_BAND", "SHORT_DELTA", "SHORT_BAND",
+            "TAKE_PROFIT_FRAC", "STOP_FRAC", "TIME_EXIT_DTE", "ENTRY_WINDOW", "WIND_SYMBOLS", "EXPIRY_SETTLE")},
+            wind_source="daily_bars")
     digest = hashlib.sha256(json.dumps(fingerprint, sort_keys=True, default=str).encode()).hexdigest()
     caveats = ["earnings_calendar_not_pit", "grok_plan_not_replayable", "grok_in_play_not_replayable"]
-    if not_replayable or sleeve == "spreads":
+    if not_replayable:
         caveats.append("not_replayable")
-        if sleeve == "spreads":
-            caveats.append("spreads_replay_pending_issue_37")
         # A refusal is not evidence. Do not freeze it across later implementations.
         return _result(sleeve, start, end, digest, [], [], caveats, costs, status="not_replayable")
     cache_path = Path(cache_path)
@@ -170,6 +283,15 @@ def run(sleeve: str, start: str, end: str, variant="incumbent", *, bars=None,
                         "trade_stats_closed_only_open_positions_marked_in_drawdown"]
             result = _result(sleeve, start, end, digest, account.trades,
                              [p["equity"] for p in account.equity_curve], caveats, costs, replay["decisions"])
+        elif sleeve == "spreads":
+            if bars is None:
+                raise ValueError("spreads replay requires locally cached daily bars (the wind state)")
+            trades, equity, decisions, extra = _spreads(start, end, cfg, Path(options_cache), feed,
+                                                        _wind_states(bars, start, end))
+            caveats += extra + ["synthetic_quotes", "snapshot_iv_not_pit", "replay_delta_from_synthetic_mid",
+                                "wind_from_adjusted_daily_bars", "signal_candidates_not_replayed",
+                                "r_is_return_on_debit"]
+            result = _result(sleeve, start, end, digest, trades, equity, caveats, costs, decisions)
         else:
             trades, equity, decisions = _options(start, end, cfg, Path(options_cache), feed)
             caveats += ["synthetic_quotes", "snapshot_iv_not_pit", "contract_volume_filter_disabled",
