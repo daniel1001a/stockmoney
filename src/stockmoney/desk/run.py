@@ -144,6 +144,9 @@ CREATE TABLE IF NOT EXISTS equity_history (
   recorded_at TEXT);
 CREATE TABLE IF NOT EXISTS notified (key TEXT PRIMARY KEY, at TEXT);
 CREATE TABLE IF NOT EXISTS plan_attempts (key TEXT PRIMARY KEY, n INTEGER);
+CREATE TABLE IF NOT EXISTS slot_skips (
+  day TEXT, symbol TEXT, profile TEXT, plan_status TEXT,
+  PRIMARY KEY(day, symbol, profile, plan_status));
 """
 
 
@@ -159,6 +162,35 @@ def _paper_params_valid(con, broker) -> bool:
         return True
     except (ValueError, TypeError):
         return False
+
+
+def record_profile(con) -> None:
+    """Audit the effective process profile once per transition, before job work.
+
+    A missing observation is recorded as null, not an assumed prior profile.
+    The runner lock serializes observations; commit before any job can fail.
+    """
+    old = store.get_setting(con, "last_desk_profile") or None
+    if old != _PROFILE.name:
+        con.execute(
+            "INSERT INTO param_changes (strategy, param, old, new, reason, changed_at) VALUES (?,?,?,?,?,?)",
+            ("desk", "profile", json.dumps(old), json.dumps(_PROFILE.name),
+             "observed owner DESK_PROFILE selection", store.now()))
+        store.set_setting(con, "last_desk_profile", _PROFILE.name)
+        con.commit()
+
+
+def _slot_skip_report(con, day: str, status: str) -> str:
+    """Count unique symbol/session rejections this calendar week through day.
+
+    Separate advisory plans and profiles so changing either does not pool arms.
+    """
+    end = datetime.fromisoformat(day).date()
+    start = end - timedelta(days=end.weekday())
+    n = con.execute(
+        "SELECT COUNT(*) FROM slot_skips WHERE day>=? AND day<=? AND profile=? AND plan_status=?",
+        (start.isoformat(), day, _PROFILE.name, status)).fetchone()[0]
+    return f"\nskipped for slots: {n} this week (profile: {_PROFILE.name}, {status})"
 
 
 def stock_entries_enabled(con) -> bool:
@@ -803,6 +835,7 @@ def postclose(con, broker: Broker, now: datetime, bars: data.Bars | None = None,
 
     report = head + _report(day, ctx, sys_eq, limits.capital_budget, mode, why, ledger, events, planned, exits,
                             advisory=advisory, entries_on=entries_on)
+    report += _slot_skip_report(con, day, "planned" if entries_on else ADVISORY)
     report += _reconcile_summary(con, broker, day)
     con.execute(
         "INSERT INTO journal (date, auto_summary, updated_at) VALUES (?,?,?) "
@@ -912,8 +945,6 @@ def _plan_entries(con, day, ledger: Ledger, risk: RiskEngine, snap, ctx, signals
         per_sector[sector_of(r["symbol"])] = per_sector.get(sector_of(r["symbol"]), 0) + 1
         planned_syms.add(r["symbol"])
     for s in engine.rank_signals(signals):
-        if slots <= 0:
-            break
         if s.symbol in held or s.symbol in planned_syms or ledger.position(s.symbol) is not None:
             continue
         if not (_finite(s.ref_price) and s.ref_price > 0 and _finite(s.stop) and s.stop > 0):
@@ -939,6 +970,10 @@ def _plan_entries(con, day, ledger: Ledger, risk: RiskEngine, snap, ctx, signals
             continue
         qty = floor(dollars / s.ref_price)
         if qty <= 0:
+            continue
+        if slots <= 0:
+            con.execute("INSERT OR IGNORE INTO slot_skips VALUES (?,?,?,?)",
+                        (day, s.symbol, _PROFILE.name, status))
             continue
         if not _plan_buy(con, day, s.symbol, qty, s.strategy, round(s.stop, 2), s.ref_price, s.thesis,
                          engine.signal_id(s), status):
@@ -1792,6 +1827,7 @@ def main(argv: list[str]) -> int:
         signal.alarm(JOB_TIMEOUT_S)
         now = datetime.now(timezone.utc)  # after the lock: a job that waited must not act on a stale clock
         with store.connect() as con:
+            record_profile(con)
             if job == "bridge":
                 out = bridge(con, now)
             elif job == "postclose":
