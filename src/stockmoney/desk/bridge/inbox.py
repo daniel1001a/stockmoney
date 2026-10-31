@@ -317,6 +317,9 @@ def _process(con, mail: RawMail, config: BridgeConfig, received_at: datetime) ->
                 con.execute("UPDATE bridge_messages SET source=?, source_reason=?, sender=? WHERE msg_id=?",
                             (source, f"verified_by_resend {_iso(received_at)}", mail.sender, msg.msg_id))
                 log.info("bridge: verified resend of %s upgraded it from grok_legacy", msg.msg_id)
+                if msg.type == "NOTICE_ACK":
+                    from stockmoney.desk import grok_notice  # lazy: grok_notice imports the bridge
+                    grok_notice.record_ack(con, msg, source)
                 return False
             log.info("bridge: identical resend of %s ignored", msg.msg_id)
             return False

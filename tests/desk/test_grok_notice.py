@@ -46,11 +46,11 @@ def _script():
     return main
 
 
-def _ack(status="done", msg_id="ack-grok-20261031-1700", notice_id=NID):
+def _ack(status="done", msg_id="ack-grok-20261031-1700", notice_id=NID, questions=()):
     return {"protocol": "1", "msg_id": msg_id, "sent_at": (NOW + timedelta(hours=1)).isoformat(),
             "type": "NOTICE_ACK", "notice_id": notice_id, "status": status,
             "schedule_times": ["07:20", "08:15", "08:50", "20:00"], "timezone": "America/New_York",
-            "questions": [], "notes": "" if status == "done" else "One cron could not be changed"}
+            "questions": list(questions), "notes": "" if status == "done" else "One cron could not be changed"}
 
 
 def _deliver(con, payload, auth=GOOD_AR):
@@ -147,3 +147,50 @@ def test_no_ack_required_never_pushes(con, pushes, tmp_path):
     grok_notice.send(con, FakeMailbox(), grok_notice.load(path, NOW), CONFIG)
     assert grok_notice.ack_status(con, "notice-desk-20261031-info") == "not_required"
     assert grok_notice.check_acks(con, NOW + timedelta(days=3)) == [] and pushes == []
+
+
+def test_verified_resend_of_an_unverified_ack_marks_it_done(con, pushes):
+    grok_notice.send(con, FakeMailbox(), grok_notice.load(NOTICE, NOW), CONFIG)
+    _deliver(con, _ack(), auth="mx.google.com; dkim=fail")
+    assert grok_notice.ack_status(con, NID) == "done unverified"
+    assert _deliver(con, _ack()) == 0  # identical body, now DKIM pass: an upgrade, not a new message
+    assert grok_notice.ack_status(con, NID) == "done"
+    assert grok_notice.check_acks(con, NOW + timedelta(hours=30)) == [] and pushes == []
+
+
+def test_unverified_ack_keeps_a_not_required_opt_out(con, pushes, tmp_path):
+    data = json.loads(NOTICE.read_text())
+    data.update(ack_required=False)
+    path = tmp_path / "n.json"
+    path.write_text(json.dumps(data))
+    grok_notice.send(con, FakeMailbox(), grok_notice.load(path, NOW), CONFIG)
+    _deliver(con, _ack("cannot"), auth="mx.google.com; dkim=fail")
+    assert grok_notice.ack_status(con, NID) == "not_required"
+    assert grok_notice.check_acks(con, NOW + timedelta(days=2)) == [] and pushes == []
+
+
+def test_ack_and_message_commit_together(con, pushes):
+    grok_notice.send(con, FakeMailbox(), grok_notice.load(NOTICE, NOW), CONFIG)
+    con.commit()
+    con.execute("INSERT INTO bridge_messages (msg_id, type, sender, received_at, raw_body, parsed_json, source) "
+                "VALUES ('x','NOTICE_ACK','g','t','{}','{}','grok_verified')")
+    grok_notice.record_ack(con, inbox._INBOUND.validate_json(json.dumps(_ack())), "grok_verified")
+    con.rollback()  # record_ack did not commit the open transaction
+    assert grok_notice.ack_status(con, NID) is None
+    assert con.execute("SELECT COUNT(*) FROM bridge_messages WHERE msg_id='x'").fetchone()[0] == 0
+
+
+@pytest.mark.parametrize("status,questions", [("partial", ()), ("cannot", ()), ("done", ("Which cron?",))])
+def test_verified_ack_needing_the_owner_pushes_once(con, pushes, status, questions):
+    grok_notice.send(con, FakeMailbox(), grok_notice.load(NOTICE, NOW), CONFIG)
+    _deliver(con, _ack(status, questions=questions))
+    assert grok_notice.ack_status(con, NID) == status
+    lines = grok_notice.check_acks(con, NOW + timedelta(hours=2))
+    assert len(lines) == 1 and NID in lines[0] and [t for t, _ in pushes] == ["Grok notice 需處理"]
+    assert grok_notice.check_acks(con, NOW + timedelta(hours=30)) == [] and len(pushes) == 1
+
+
+def test_clean_done_ack_never_pushes(con, pushes):
+    grok_notice.send(con, FakeMailbox(), grok_notice.load(NOTICE, NOW), CONFIG)
+    _deliver(con, _ack())
+    assert grok_notice.check_acks(con, NOW + timedelta(hours=30)) == [] and pushes == []

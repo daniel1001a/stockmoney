@@ -11,6 +11,8 @@ bridge_ops keys:
   " unverified" appended when the ack was not grok_verified), or
   ``not_required`` for a notice sent with ack_required false.
 - ``noticenoack:<id>``: the owner was pushed once about a missing ack.
+- ``noticeattn:<id>``: a verified ack that needs the owner (partial, cannot,
+  or questions); value is the push line. ``noticeattnsent:<id>`` once pushed.
 
 An ack is a report only: it never changes rules, parameters or authority.
 """
@@ -47,8 +49,13 @@ def render(notice: GrokNotice) -> tuple[str, str]:
     return outbox.build_subject(checked.type, checked.msg_id), checked.model_dump_json()
 
 
+def _has_ops(con) -> bool:
+    return con.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='bridge_ops'").fetchone() is not None
+
+
 def sent_at(con, notice_id: str) -> str | None:
-    muse_ops.ensure_schema(con)
+    if not _has_ops(con):  # no table yet: nothing was ever sent
+        return None
     row = con.execute("SELECT at FROM bridge_ops WHERE key=?", (f"notice:{notice_id}",)).fetchone()
     return row[0] if row else None
 
@@ -72,15 +79,22 @@ def record_ack(con, ack, source: str) -> bool:
     The latest ack wins, except that an unverified ack never replaces a
     verified one. An ack for a notice that was never sent is stored by the
     inbox as data but marks nothing."""
-    muse_ops.ensure_schema(con)
+    # no ensure_schema here: its executescript would commit the inbox's open
+    # transaction; a notice that was sent already created bridge_ops
     if not sent_at(con, ack.notice_id):
         return False
     verified = source == "grok_verified"
     prior = ack_status(con, ack.notice_id)
-    if not verified and prior is not None and not _unverified(prior) and prior != "not_required":
-        return False
+    if not verified and prior is not None and not _unverified(prior):
+        return False  # never replaces a verified ack or a not_required opt-out
     status = ack.status if verified else f"{ack.status} unverified"
     con.execute("INSERT OR REPLACE INTO bridge_ops VALUES (?,?)", (f"noticeack:{ack.notice_id}", status))
+    questions = [q for q in (getattr(ack, "questions", None) or []) if str(q).strip()]
+    if verified and (ack.status != "done" or questions):
+        line = f"Grok NOTICE_ACK {ack.notice_id}:{ack.status}"
+        if questions:
+            line += f",{len(questions)} 個問題"
+        con.execute("INSERT OR REPLACE INTO bridge_ops VALUES (?,?)", (f"noticeattn:{ack.notice_id}", line))
     return True
 
 
@@ -116,5 +130,14 @@ def check_acks(con, now: datetime) -> list[str]:
         with con:  # record before the push, so a crash cannot push twice
             con.execute("INSERT INTO bridge_ops VALUES (?,?)", (f"noticenoack:{notice_id}", muse_ops._iso(now)))
         notify.send("Grok notice 未確認", line, notify.WARN)
+        lines.append(line)
+    for key, line in con.execute("SELECT key, at FROM bridge_ops WHERE key LIKE 'noticeattn:%'").fetchall():
+        notice_id = key.split(":", 1)[1]
+        done = f"noticeattnsent:{notice_id}"
+        if con.execute("SELECT 1 FROM bridge_ops WHERE key=?", (done,)).fetchone():
+            continue
+        with con:
+            con.execute("INSERT INTO bridge_ops VALUES (?,?)", (done, muse_ops._iso(now)))
+        notify.send("Grok notice 需處理", line, notify.WARN)
         lines.append(line)
     return lines
