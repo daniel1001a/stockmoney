@@ -198,6 +198,14 @@ def open_new(con, data, now: datetime, cfg: OptionsConfig, slot: datetime | None
     last_slot = et.time() >= (datetime.combine(day, ENTRY_WINDOW[1]) - timedelta(minutes=5)).time()
     opened = []
     for und, source in todo:
+        from stockmoney.desk.learn import filters
+        strategy = source.removeprefix("signal:")
+        filtered = filters.active(con, "spreads", strategy, filters.context(con, und, et), paper=True)
+        if filtered.skip:
+            if last_slot:
+                _skip(con, day.isoformat(), und, source, state, "rule_filter:" + ",".join(filtered.names))
+                con.commit()
+            continue
         try:  # network outside any write: no lock is held while a chain downloads
             chain = data.option_chain(und, day + timedelta(days=DTE_MIN), day + timedelta(days=DTE_MAX))
             p, reason = pick(chain, day, now, cfg)
@@ -209,17 +217,11 @@ def open_new(con, data, now: datetime, cfg: OptionsConfig, slot: datetime | None
                 _skip(con, day.isoformat(), und, source, state, reason)
                 con.commit()
             continue
-        from stockmoney.desk.learn import filters
-        strategy = source.removeprefix("signal:")
-        filtered = filters.active(con, "spreads", strategy, filters.context(con, und, et), paper=True)
-        if filtered.skip:
-            _skip(con, day.isoformat(), und, source, state, "rule_filter:" + ",".join(filtered.names))
-            con.commit()
-            continue
         qty = int(contracts_for(p.debit, cfg) * filtered.size_factor)
         if qty == 0 and filtered.names:
-            _skip(con, day.isoformat(), und, source, state, "rule_filter:" + ",".join(filtered.names))
-            con.commit()
+            if last_slot:
+                _skip(con, day.isoformat(), und, source, state, "rule_filter:" + ",".join(filtered.names))
+                con.commit()
             continue
         if qty == 0:
             if last_slot:  # a cheaper quote may come later in the window

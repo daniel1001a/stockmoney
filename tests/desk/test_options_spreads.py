@@ -164,7 +164,7 @@ def test_spread_rule_filters(con, action, qty):
             "when": {"field": "wind", "op": "==", "value": "tailwind"}, "action": action}
     con.execute("INSERT INTO rule_filters (json,status) VALUES (?, 'active')", (json.dumps(rule),))
     set_wind(con, "2026-10-27", "tailwind")
-    now = et(DAY, 10, 0)
+    now = et(DAY, 10, 55)
     spreads.open_new(con, FakeData({"SPY": chain(now)}), now, CFG)
     row = con.execute("SELECT * FROM options_spreads_shadow WHERE underlying='SPY'").fetchone()
     assert row["qty"] == qty
@@ -181,10 +181,35 @@ def test_spread_filter_matches_underlying_strategy_name(con):
             "when": {"field": "wind", "op": "==", "value": "tailwind"}, "action": "skip"}
     con.execute("INSERT INTO rule_filters (json,status) VALUES (?, 'active')", (json.dumps(rule),))
     set_wind(con, "2026-10-27", "tailwind")
-    now = et(DAY, 10, 0)
+    now = et(DAY, 10, 55)
     spreads.open_new(con, FakeData({"NVDA": chain(now)}), now, CFG)
     row = con.execute("SELECT status,skip_reason FROM options_spreads_shadow WHERE underlying='NVDA'").fetchone()
     assert tuple(row) == ("SKIPPED", "rule_filter:pullback_filter")
+
+
+@pytest.mark.parametrize("action", ["shrink:0.5", "skip"])
+def test_transient_filter_retried_within_spread_window(con, action):
+    import json
+    from dataclasses import replace
+    from stockmoney.desk import store
+    con.executescript(store.SCHEMA)
+    condition = ({"field": "minutes_since_open", "op": "<", "value": 45} if action == "skip"
+                 else {"field": "wind", "op": "==", "value": "tailwind"})
+    rule = {"name": "retry_filter", "sleeve": "spreads", "strategies": ["wind"],
+            "when": condition, "action": action}
+    con.execute("INSERT INTO rule_filters (json,status) VALUES (?, 'active')", (json.dumps(rule),))
+    set_wind(con, "2026-10-27", "tailwind")
+    cfg = replace(CFG, max_premium_per_trade=200)
+    early = et(DAY, 10, 0)
+    data = FakeData({"SPY": chain(early)})
+    assert spreads.open_new(con, data, early, cfg) == []
+    assert con.execute("SELECT count(*) FROM options_spreads_shadow").fetchone()[0] == 0
+    if action == "skip":
+        assert data.chain_calls == []
+    later = et(DAY, 10, 30)
+    cheaper = chain(later)
+    cheaper[1].bid, cheaper[1].ask = 1.9, 2.0
+    assert spreads.open_new(con, FakeData({"SPY": cheaper}), later, cfg) == ["SPY"]
 
 
 def test_stale_legs_retry_until_the_last_slot(con):

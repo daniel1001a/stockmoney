@@ -717,7 +717,11 @@ class Engine:
                "plan_shadow_only": bool(spec.get("shadow_only", False)), "received_at": spec.get("received_at")}
         from stockmoney.desk.learn import filters
         filter_context = filters.context(self.con, sym, et)
-        filter_context.update(vol_ratio=sig.meta.get("day_rvol"), gap_pct=sig.meta.get("gap"),
+        universe_row = next((u for u in ostore.universe(self.con, d) if u["symbol"] == sym), {})
+        gap = sig.meta.get("gap")
+        if gap is None:
+            gap = pb._gap(rth, universe_row.get("prev_close"), cfg)
+        filter_context.update(vol_ratio=sig.meta.get("day_rvol"), gap_pct=gap,
                               grok_verdict=stance)
         filtered = filters.active(self.con, "options", s["source"], filter_context,
                                   paper=getattr(self.broker, "is_paper", False) is True)
