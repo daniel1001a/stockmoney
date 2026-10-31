@@ -114,7 +114,7 @@ def test_subject_plan_id_mismatch_rejected(con):
     mb = FakeMailbox()
     mail(mb, subject_id="gp-20261013-0801")
     assert poll(con, mb) == 0
-    assert rejects(con) == ["msg_id_mismatch"]
+    assert rejects(con) == ["msg_id_mismatch OPTIONS_PLAN"]
     assert plans_rows(con) == []
 
 

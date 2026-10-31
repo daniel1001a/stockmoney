@@ -469,7 +469,7 @@ def _process_plan(con, mail: RawMail, config: BridgeConfig, received_at: datetim
     except (ValueError, RecursionError):
         return fail("body_not_json")
     if p.plan_id != subj_id:
-        return fail("msg_id_mismatch")
+        return fail("msg_id_mismatch OPTIONS_PLAN")
     if p.plan_id.lower().startswith("grok-"):
         return fail("schema_invalid OPTIONS_PLAN.plan_id:reserved_prefix_grok-")
     other = con.execute("SELECT type FROM bridge_messages WHERE msg_id=?", (p.plan_id,)).fetchone()
