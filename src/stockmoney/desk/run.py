@@ -151,6 +151,16 @@ def ensure_schema(con) -> None:
     con.executescript(SCHEMA)
 
 
+def _paper_params_valid(con, broker) -> bool:
+    if getattr(broker, "is_paper", False) is not True:
+        return True
+    try:
+        store.strategy_params(con, paper=True)
+        return True
+    except (ValueError, TypeError):
+        return False
+
+
 def stock_entries_enabled(con) -> bool:
     """Whether stock-sleeve buys are planned and sent. The first time the
     setting is read with no row, the default is written and, when that turns
@@ -247,7 +257,15 @@ def _strategies(con, day: str | None = None, *, paper: bool = False) -> dict[str
     the strategy rejects (stale or hand-edited setting) must not crash every
     job: that strategy falls back to its defaults and the owner is warned once
     per day."""
-    params = store.strategy_params(con, paper=paper)
+    try:
+        params = store.strategy_params(con, paper=paper)
+    except (ValueError, TypeError):
+        if not paper:
+            raise
+        params = store.strategy_params(con)
+        _notify_once(con, "badpaperparams", "Invalid paper strategy overrides",
+                     "Using owner parameters for exits; new stock entries are disabled until repaired.",
+                     notify.WARN, day or _today(datetime.now(timezone.utc)))
     disabled = set(json.loads(store.get_setting(con, "disabled_strategies", "[]")))
     day = day or _today(datetime.now(timezone.utc))
     out: dict[str, Strategy] = {}
@@ -753,7 +771,7 @@ def postclose(con, broker: Broker, now: datetime, bars: data.Bars | None = None,
     # new entries for the next open; a failure here must not undo the stop bookkeeping above
     planned: list[dict] = []
     advisory: list[dict] = []
-    entries_on = stock_entries_enabled(con)
+    entries_on = stock_entries_enabled(con) and _paper_params_valid(con, broker)
     if bad:
         events.append("對帳不一致,今天不規劃新進場")
     else:
@@ -995,7 +1013,7 @@ def premarket(con, broker: Broker, now: datetime, limits: Limits | None = None, 
     # replacement that postclose could not finish (unconfirmed cancel) or a stop
     # lost to a failure is restored here, before any new money goes in.
     st.lines += _premarket_stops(con, broker, risk, today, bad, st)
-    entries_on = stock_entries_enabled(con)
+    entries_on = stock_entries_enabled(con) and _paper_params_valid(con, broker)
     for p in plans:
         if p["side"] != Side.BUY.value:
             continue
@@ -1522,7 +1540,7 @@ def postopen(con, broker: Broker, now: datetime, limits: Limits | None = None, m
         events.append("市場未開,出場計畫留待下一次執行:" + "、".join(r["symbol"] for r in sells))
     events += _expire_unretried_opg(con, broker, now)
     retries = _opg_retry_candidates(con, today)
-    if retries and not stock_entries_enabled(con):
+    if retries and not (stock_entries_enabled(con) and _paper_params_valid(con, broker)):
         # no remainder is bought; _expire_unretried_opg closes the window after 10:30 ET
         events.append("股票策略只給建議,開盤單剩餘股數不補單:" + "、".join(r["symbol"] for r in retries))
     elif retries and broker.is_equity_market_open():

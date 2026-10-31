@@ -150,3 +150,16 @@ def test_change_remains_in_callers_transaction(con):
     assert con.in_transaction
     con.rollback()
     assert r.current(con, "options.orb_min_day_rvol") == 1.5
+
+
+@pytest.mark.parametrize("blob", ['[]', 'null', '{', '{"pullback":[]}',
+                                  '{"pullback":{"trail_atr":-1}}'])
+def test_bad_paper_overlay_preserves_owner_exits_and_blocks_entries(con, blob, monkeypatch):
+    from types import SimpleNamespace
+    from stockmoney.desk import run
+    monkeypatch.setattr(run, "_notify_once", lambda *a, **kw: None)
+    store.change_param(con, "pullback", "trail_atr", 3.25, "owner")
+    store.set_setting(con, "paper_strategy_params", blob)
+    assert run._strategies(con, paper=True)["pullback"].params["trail_atr"] == 3.25
+    assert not run._paper_params_valid(con, SimpleNamespace(is_paper=True))
+    assert run._paper_params_valid(con, SimpleNamespace(is_paper=False))

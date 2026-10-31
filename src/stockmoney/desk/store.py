@@ -95,8 +95,15 @@ def set_setting(con, key: str, value: str) -> None:
 def strategy_params(con, *, paper: bool = False) -> dict[str, dict]:
     params = json.loads(get_setting(con, "strategy_params", "{}"))
     if paper:
-        for name, values in json.loads(get_setting(con, "paper_strategy_params", "{}")).items():
+        from stockmoney.desk.strategies import REGISTRY
+        overlay = json.loads(get_setting(con, "paper_strategy_params", "{}"))
+        if not isinstance(overlay, dict):
+            raise ValueError("paper strategy overrides must be an object")
+        for name, values in overlay.items():
+            if name not in REGISTRY or not isinstance(values, dict):
+                raise ValueError("invalid paper strategy overrides")
             params.setdefault(name, {}).update(values)
+            REGISTRY[name](**params[name])
     return params
 
 
