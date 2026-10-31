@@ -1,4 +1,5 @@
 import json
+import sqlite3
 from dataclasses import replace
 from datetime import date, datetime, time, timedelta
 
@@ -239,18 +240,59 @@ def test_spreads_wind_states_are_causal(bars):
 D2 = date(2026, 10, 16)
 
 
+D3 = date(2026, 10, 19)
+
+
 def test_spreads_open_across_missing_cache_day_is_excluded(tmp_path, monkeypatch):
-    # D1 has no cache directory: the D0 spread would otherwise take profit on D2's quotes.
+    # D1 has no cache directory: the D0 spread takes profit on D2's quotes, which
+    # frees SPY for a D2 re-entry the live book might not have taken. Neither counts,
+    # in the trades or in the drawdown, through a later cached session.
     cache = _spread_cache(tmp_path / "opt", {D0: [(0, 600.0), (389, 600.0)],
-                                             D2: [(0, 600.0), (60, 620.0), (389, 620.0)]})
-    monkeypatch.setattr(replay, "_wind_states", lambda bars, start, end: {"2026-10-13": "tailwind"})
-    result = replay.run("spreads", str(D0), str(D2), bars="bars", options_cache=cache,
+                                             D2: [(0, 600.0), (60, 620.0), (389, 620.0)],
+                                             D3: [(0, 620.0), (389, 560.0)]})
+    monkeypatch.setattr(replay, "_wind_states", lambda bars, start, end: {
+        "2026-10-13": "tailwind", "2026-10-15": "tailwind", "2026-10-16": "tailwind"})
+    result = replay.run("spreads", str(D0), str(D3), bars="bars", options_cache=cache,
                         cache_path=tmp_path / "evidence.sqlite", options_cfg=SPREAD_CFG)
     assert result["status"] == "ok" and result["n"] == 0 and result["trades"] == []
     assert result["missing_cache_dates"] == [str(D1)]
+    assert result["max_drawdown"] == 0
     assert {"missing_cache_days", "spreads_open_across_missing_day_excluded"} <= set(result["caveats"])
     spy = [d for d in result["decisions"] if d["underlying"] == "SPY" and d["status"] != "SKIPPED"]
-    assert (spy[0]["day"], spy[0]["status"]) == (str(D0), "CLOSED")  # closed on D2, not counted
+    # the D2 re-entry happened in the book (and later ones may follow): none counts
+    assert [d["day"] for d in spy][:2] == [str(D0), str(D2)]
+    assert spy[0]["status"] == "CLOSED"
+
+
+def test_spreads_warmup_gap_under_an_open_spread_is_recorded(tmp_path, monkeypatch):
+    # D0 (warmup) opens SPY, D1 (warmup) is missing, the window is D2: the gap is reported.
+    cache = _spread_cache(tmp_path / "opt", {D0: [(0, 600.0), (389, 600.0)],
+                                             D2: [(0, 600.0), (60, 620.0), (389, 620.0)]})
+    monkeypatch.setattr(replay, "_wind_states", lambda bars, start, end: {
+        "2026-10-13": "tailwind", "2026-10-15": "tailwind"})
+    result = replay.run("spreads", str(D2), str(D2), bars="bars", options_cache=cache,
+                        cache_path=tmp_path / "evidence.sqlite", options_cfg=SPREAD_CFG)
+    assert result["missing_cache_dates"] == [str(D1)] and result["n"] == 0
+    assert "spreads_open_across_missing_day_excluded" in result["caveats"]
+
+
+def test_spreads_cache_without_the_spread_chain_is_not_evidence(tmp_path, monkeypatch):
+    # A 0-3 day cache (what the options sleeve fetches) has no 7-21 day calls.
+    from stockmoney.desk.options._iface import occ_symbol
+    cache = _spread_cache(tmp_path / "opt", {D0: [(0, 600.0), (389, 600.0)]})
+    near = D0 + timedelta(days=1)
+    pd.DataFrame([{"occ": occ_symbol("SPY", near, "C", k), "underlying": "SPY", "right": "C",
+                   "strike": float(k), "expiry": str(near), "open_interest": 5000,
+                   "open_interest_date": str(D0)} for k in range(590, 611)]
+                 ).to_parquet(cache / str(D0) / "contracts.parquet", index=False)
+    monkeypatch.setattr(replay, "_wind_states", lambda bars, start, end: {"2026-10-13": "tailwind"})
+    evidence = tmp_path / "evidence.sqlite"
+    result = replay.run("spreads", str(D0), str(D0), bars="bars", options_cache=cache,
+                        cache_path=evidence, options_cfg=SPREAD_CFG)
+    assert result["status"] == "insufficient_cache" and result["n"] == 0
+    assert "spread_expiries_missing_from_cache" in result["caveats"]
+    with sqlite3.connect(evidence) as con:  # never frozen as evidence
+        assert con.execute("SELECT COUNT(*) FROM replay_results").fetchone()[0] == 0
 
 
 def test_spread_slots_stop_at_the_early_close():

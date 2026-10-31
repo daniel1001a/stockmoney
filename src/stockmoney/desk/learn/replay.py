@@ -188,16 +188,27 @@ def _spreads(start, end, cfg, cache_dir, feed, states):
 
     The book is rebuilt from ``_spread_warmup(start)`` so a spread opened before
     the window still blocks re-entry; only spreads entered inside the window
-    count. A trading day with no cache is not ticked, and a spread that was open
-    across it is kept out of the trades (its exit would be managed on a later
-    session's quotes). Slots stop at the close and after the day's last bar."""
+    count. A trading day with no cache is not ticked. A spread open across it
+    would have its exit managed on a later session's quotes, and that exit
+    frees the underlying for a re-entry the live book might not have taken, so
+    the underlying is tainted from that day on: none of its spreads entered on
+    or after the gap (nor the gapped one) count in the trades or the equity
+    curve. Slots stop at the close and after the day's last bar."""
     from stockmoney.desk import store, wind
     from stockmoney.desk.options import replay as options_replay
     from stockmoney.desk.options import spreads
-    trades, decisions, equity, missing = [], [], [25_000.0], []
+    trades, decisions, equity, missing, no_chain = [], [], [25_000.0], [], []
     gapped: set[int] = set()
+    snaps: list[list] = []
+    tainted: dict[str, str] = {}  # underlying -> first missing day it was open across
     mult = cfg.contract_multiplier
     first = date.fromisoformat(start)
+
+    def counted(r) -> bool:
+        if r["rid"] in gapped or (r["underlying"] in tainted and r["day"] >= tainted[r["underlying"]]):
+            return False
+        return not (r["status"] == "CLOSED" and r["exit_reason"] in SPREAD_EXCLUDED)
+
     with TemporaryDirectory(prefix="stockmoney-spreads-") as work, store.connect(Path(work) / "spreads.sqlite") as con:
         spreads.ensure_schema(con)
         wind.ensure_schema(con)
@@ -207,12 +218,21 @@ def _spreads(start, end, cfg, cache_dir, feed, states):
         while day <= date.fromisoformat(end):
             if is_trading_day(day):
                 if not (cache_dir / str(day)).is_dir():
-                    if day >= first:
+                    held = con.execute("SELECT rowid, underlying FROM options_spreads_shadow "
+                                       "WHERE status='OPEN'").fetchall()
+                    if day >= first or held:  # a warmup hole matters when it crosses an open spread
                         missing.append(str(day))
-                    gapped.update(r[0] for r in con.execute(
-                        "SELECT rowid FROM options_spreads_shadow WHERE status='OPEN'"))
+                    for rid, und in held:
+                        gapped.add(rid)
+                        tainted.setdefault(und, str(day))
                 else:
                     market = options_replay.ReplayMarket(cache_dir / str(day), feed, cfg)
+                    cached = {c.underlying for c in market.contracts.values()}
+                    if any(not any(c.underlying == u and c.right == "C" and spreads.DTE_MIN
+                                   <= (date.fromisoformat(str(c.expiry)[:10]) - day).days <= spreads.DTE_MAX
+                                   for c in market.contracts.values())
+                           for u in spreads.WIND_SYMBOLS if u in cached):
+                        no_chain.append(str(day))  # a 0-3 day cache: not evidence the sleeve sat out
                     bars_end = _bars_end(market)
                     clock = options_replay.SimClock(next(_spread_slots(day)))
                     data = _SpreadData(options_replay.ReplayBroker(market, clock))
@@ -223,26 +243,27 @@ def _spreads(start, end, cfg, cache_dir, feed, states):
                         spreads.tick(con, data, slot, cfg, slot)
                         if day < first:
                             continue
-                        realized = con.execute("SELECT COALESCE(SUM(pnl_usd),0) FROM options_spreads_shadow "
-                                               "WHERE status='CLOSED' AND day >= ?", (start,)).fetchone()[0]
-                        held = sum((((r["last_value"] if r["last_value"] is not None else r["entry_debit"])
-                                     - r["entry_debit"]) * mult - 2 * cfg.fee_per_contract) * r["qty"]
-                                   - r["fees_usd"] for r in con.execute(
-                                       "SELECT * FROM options_spreads_shadow WHERE status='OPEN' AND day >= ?",
-                                       (start,)))
-                        equity.append(25_000.0 + realized + held)
+                        # each row's book value at this slot; filtered once the run knows
+                        # which rows count, so the curve uses exactly the trades' rows
+                        snaps.append([(r, r["pnl_usd"] if r["status"] == "CLOSED" else
+                                       (((r["last_value"] if r["last_value"] is not None else r["entry_debit"])
+                                         - r["entry_debit"]) * mult - 2 * cfg.fee_per_contract) * r["qty"]
+                                       - r["fees_usd"]) for r in con.execute(
+                            "SELECT rowid AS rid, * FROM options_spreads_shadow "
+                            "WHERE status IN ('OPEN','CLOSED') AND day >= ?", (start,))])
             day += timedelta(days=1)
         rows = con.execute("SELECT rowid AS rid, * FROM options_spreads_shadow WHERE day >= ? AND day <= ? "
                            "ORDER BY day, underlying", (start, end)).fetchall()
+    equity += [25_000.0 + sum(v for r, v in snap if counted(r)) for snap in snaps]
     excluded = still_open = gap = 0
     for r in rows:
         decisions.append({k: r[k] for k in ("day", "underlying", "source", "wind", "status", "skip_reason",
                                             "expiry", "long_strike", "short_strike", "entry_debit", "qty",
                                             "exit_reason")})
-        if r["status"] == "OPEN":
-            still_open += 1
-        elif r["status"] == "CLOSED" and r["rid"] in gapped:
+        if r["status"] in ("OPEN", "CLOSED") and not counted(r) and r["exit_reason"] not in SPREAD_EXCLUDED:
             gap += 1
+        elif r["status"] == "OPEN":
+            still_open += 1
         elif r["status"] == "CLOSED" and r["exit_reason"] in SPREAD_EXCLUDED:
             excluded += 1
         elif r["status"] == "CLOSED":
@@ -256,6 +277,8 @@ def _spreads(start, end, cfg, cache_dir, feed, states):
         caveats.append("missing_cache_days")
     if gap:
         caveats.append("spreads_open_across_missing_day_excluded")
+    if no_chain:
+        caveats.append("spread_expiries_missing_from_cache")
     if excluded:
         caveats.append("expiry_settlements_excluded")
     if still_open:
@@ -332,8 +355,12 @@ def run(sleeve: str, start: str, end: str, variant="incumbent", *, bars=None,
             caveats += extra + ["synthetic_quotes", "snapshot_iv_not_pit", "replay_delta_from_synthetic_mid",
                                 "wind_from_adjusted_daily_bars", "signal_candidates_not_replayed",
                                 "r_is_return_on_debit"]
+            # a cache without the spread chain is not evidence that the sleeve did not trade
+            status = "insufficient_cache" if "spread_expiries_missing_from_cache" in extra else "ok"
             result = _result(sleeve, start, end, digest, trades, equity, caveats, costs, decisions,
-                             missing_cache_dates=missing)
+                             status=status, missing_cache_dates=missing)
+            if status != "ok":
+                return json.loads(json.dumps(result, sort_keys=True, allow_nan=False))  # never frozen
         else:
             trades, equity, decisions = _options(start, end, cfg, Path(options_cache), feed)
             caveats += ["synthetic_quotes", "snapshot_iv_not_pit", "contract_volume_filter_disabled",

@@ -293,8 +293,10 @@ def replay_cmd(day: date, cfg: OptionsConfig, feed: str, plan_file: Path | None,
     cache = cfg.replay_cache / str(day)
     if not (cache / "meta.json").exists():
         from stockmoney.desk.options.marketdata import fetch_replay_cache
+        from stockmoney.desk.options import spreads
         fetch_replay_cache(day, cfg.starting_universe(), cfg.replay_cache,
-                           [(b.min_days, b.max_days) for b in cfg.dte_buckets])
+                           [(b.min_days, b.max_days) for b in cfg.dte_buckets],
+                           spread_window=(spreads.DTE_MIN, spreads.DTE_MAX, spreads.DTE_TARGET))
     res = replay.run(day, cfg, cfg.replay_cache, cfg.replay_cache.parent / "replay", feed=feed, step_s=step,
                      plan_file=plan_file)
     cfg.report_dir.mkdir(parents=True, exist_ok=True)

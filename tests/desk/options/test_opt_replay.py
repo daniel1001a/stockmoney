@@ -51,3 +51,45 @@ def test_fetch_cache_without_option_bars_and_synthetic_quotes(tmp_path):
     q, src = m.quote(occ, now)
     assert q is not None and src == "bs_default_iv" and q.volume == 0 and q.ask > q.bid > 0
     assert q.as_of == now - timedelta(seconds=1)
+
+
+class SpreadFakeData(FakeData):
+    """Weekly calls 7 to 21 days out on every strike asked for."""
+
+    def __init__(self):
+        super().__init__()
+        self.asked = []
+
+    def contracts(self, und, lo, hi, status="active", **kw):
+        if (hi - lo).days < 7:
+            return super().contracts(und, lo, hi, status, **kw)
+        self.asked.append((lo, hi, float(kw["strike_price_gte"]), float(kw["strike_price_lte"])))
+        if status != "active":
+            return []
+        out = []
+        for exp in (DAY + timedelta(days=7), DAY + timedelta(days=14), DAY + timedelta(days=21)):
+            for k in range(int(float(kw["strike_price_gte"])) + 1, int(float(kw["strike_price_lte"])) + 1, 5):
+                for r in ("call", "put"):
+                    out.append({"symbol": f"SPY{exp:%y%m%d}{r[0].upper()}00{k}000", "underlying_symbol": "SPY",
+                                "type": r, "strike_price": str(k), "expiration_date": str(exp),
+                                "open_interest": "500", "open_interest_date": "2026-10-12"})
+        return out
+
+
+def test_fetch_cache_adds_the_spread_chain(tmp_path):
+    data = SpreadFakeData()
+    d = fetch_replay_cache(DAY, ["SPY"], tmp_path, [(0, 0), (1, 3)], data=data, history_sessions=21,
+                           spread_window=(7, 21, 14))
+    lo, hi, k_lo, k_hi = data.asked[0]
+    assert (lo, hi) == (DAY + timedelta(days=7), DAY + timedelta(days=21))
+    assert k_hi >= 600 * 1.10  # wide enough for a 0.30-delta short two weeks out
+    c = pd.read_parquet(d / "contracts.parquet")
+    spread = c[c.expiry == str(DAY + timedelta(days=14))]
+    assert len(spread) > 0 and set(spread.right) == {"C"}
+    assert not (c.expiry == str(DAY + timedelta(days=7))).any()  # only the target expiry
+
+
+def test_fetch_cache_without_spread_window_is_unchanged(tmp_path):
+    data = SpreadFakeData()
+    fetch_replay_cache(DAY, ["SPY"], tmp_path, [(0, 0), (1, 3)], data=data, history_sessions=21)
+    assert data.asked == []

@@ -186,7 +186,9 @@ class AlpacaOptionsData:
 # ------------------------------------------------------------------ replay cache
 
 def fetch_replay_cache(day: date, symbols: list[str], out_dir: Path, buckets: list[tuple[int, int]],
-                       data: AlpacaOptionsData | None = None, history_sessions: int = 21) -> Path:
+                       data: AlpacaOptionsData | None = None, history_sessions: int = 21,
+                       spread_window: tuple[int, int, int] | None = None,
+                       spread_symbols: tuple[str, ...] = ("SPY", "QQQ")) -> Path:
     """Download what a replay of ``day`` needs, read-only API calls only:
     1-minute stock bars (IEX and SIP, premarket included) for ``day`` and the
     ``history_sessions`` sessions before it (the RVOL profile and the
@@ -195,7 +197,12 @@ def fetch_replay_cache(day: date, symbols: list[str], out_dir: Path, buckets: li
     current indicative snapshot (taken NOW, i.e. after the day: the replay's
     synthetic quote model uses it as the IV level); and option 1-minute bars
     when the account may read them (this account may not: HTTP 403, logged
-    and left empty). Writes parquet + meta.json under ``out_dir/<day>/``."""
+    and left empty). Writes parquet + meta.json under ``out_dir/<day>/``.
+
+    ``spread_window`` (min, max, target calendar days) also stores, for each of
+    ``spread_symbols``, the calls of the expiry in that window nearest the
+    target, from 3% below the open to 15% above the morning high: the H6
+    spread replay needs a 7-21 day chain out to the 0.30-delta short strike."""
     from stockmoney.desk.options.engine import _prev_trading_day
     from stockmoney.desk.options.select import trading_day_offset
     data = data or AlpacaOptionsData()
@@ -257,6 +264,28 @@ def fetch_replay_cache(day: date, symbols: list[str], out_dir: Path, buckets: li
                         snap_iv[c.occ] = float(c.iv)
             except Exception as e:
                 log.warning("snapshot IV %s %s: %s", s, nearest, e)
+        if spread_window and s in spread_symbols:
+            mn, mx, target = spread_window
+            rows = []
+            for status in ("active", "inactive"):
+                try:
+                    rows += data.contracts(s, day + timedelta(days=mn), day + timedelta(days=mx), status=status,
+                                           strike_price_gte=str(round(open_px * 0.97, 2)),
+                                           strike_price_lte=str(round(hi_px * 1.15, 2)))
+                except Exception as e:
+                    log.warning("spread contracts %s %s: %s", s, status, e)
+            rows = [r for r in rows if r["type"] == "call"]
+            if rows:
+                exp = min({r["expiration_date"] for r in rows},
+                          key=lambda e: (abs((date.fromisoformat(e) - day).days - target), e))
+                contracts += sorted((r for r in rows if r["expiration_date"] == exp),
+                                    key=lambda r: float(r["strike_price"]))[:80]
+                try:
+                    for c in data.option_chain(s, date.fromisoformat(exp), date.fromisoformat(exp)):
+                        if c.iv:
+                            snap_iv[c.occ] = float(c.iv)
+                except Exception as e:
+                    log.warning("snapshot IV %s %s: %s", s, exp, e)
     seen = set()
     crow = []
     for c in contracts:
