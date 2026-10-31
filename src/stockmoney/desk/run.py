@@ -1063,7 +1063,7 @@ def premarket(con, broker: Broker, now: datetime, limits: Limits | None = None, 
             st.lines.append(f"未送出 {p['symbol']}:股票策略只給建議,不自動下單")
             continue
         if not paper_params_valid:
-            st.lines.append(f"未送出 {p['symbol']}:invalid paper overrides; plan retained for retry")
+            st.lines.append(f"未送出 {p['symbol']}:invalid paper overrides; plan kept for a premarket rerun today")
             held.append(p["symbol"])
             continue
         try:
@@ -1083,7 +1083,8 @@ def premarket(con, broker: Broker, now: datetime, limits: Limits | None = None, 
         _notify_once(con, f"muse:{note[:100]}", "Muse 警報", note, notify.WARN, today)
     if held:
         _notify_once(con, "badpaperparams:premarket", "Invalid paper strategy overrides",
-                     "Planned buys held back (plan retained for retry): " + ", ".join(held),
+                     "Planned buys held back: " + ", ".join(held) + ". Postopen does not send them: after repairing the"
+                     " overrides, rerun premarket before 10:30 ET today, otherwise the next premarket expires them.",
                      notify.WARN, today)
     if st.n:
         notify.send(f"Desk 盤前 {today}", msg, notify.INFO)

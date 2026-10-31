@@ -96,14 +96,7 @@ def current(con, key: str):
     item = REGISTRY[key]
     if item.location == "strategy_params":
         strategy, param = key.split(".")
-        try:
-            params = store.strategy_params(con, paper=True)
-        except (ValueError, TypeError):
-            params = store.strategy_params(con)
-        block = params.get(strategy) if isinstance(params, dict) else None
-        if not isinstance(block, dict):
-            block = {}  # a non-object entry reads as the code default, like the runtime fallback
-        return block.get(param, STRATEGIES[strategy].params[param])
+        return _paper_block(con, strategy).get(param, STRATEGIES[strategy].params[param])
     if item.location == "options_params":
         default = getattr(OptionsConfig(), _attr(key))
         if key.split(".")[1] in CLOCK_KNOBS:
@@ -122,6 +115,28 @@ def current(con, key: str):
     if key.startswith("risk."):
         return parameter_state.risk_default(key.split(".")[1])
     return parameter_state.switch_state(key)
+
+
+def _block(con, key: str, strategy: str) -> dict:
+    """One strategy's stored block; unparseable JSON or a non-object document
+    or entry reads as empty (the runtime then falls back the same way)."""
+    try:
+        doc = json.loads(store.get_setting(con, key, "{}"))
+    except ValueError:
+        return {}
+    block = doc.get(strategy) if isinstance(doc, dict) else None
+    return block if isinstance(block, dict) else {}
+
+
+def paper_overrides(con, strategy: str) -> dict:
+    """The stored paper overlay for one strategy (raw, unvalidated)."""
+    return _block(con, "paper_strategy_params", strategy)
+
+
+def _paper_block(con, strategy: str) -> dict:
+    """Owner block with the paper overlay on top, as stored (not validated), so
+    the listing shows the values the paper job actually tries to use."""
+    return {**_block(con, "strategy_params", strategy), **paper_overrides(con, strategy)}
 
 
 def _number(item: Tunable, value):
@@ -144,7 +159,9 @@ def validate(con, key: str, value):
         raise ValueError(f"{key}: exceeds max_step {item.max_step}")
     if item.location == "strategy_params":
         strategy, param = key.split(".")
-        STRATEGIES[strategy].validate_params({**store.strategy_params(con, paper=True).get(strategy, {}), param: value})
+        # the updated merge, not the stored one: a write that repairs a broken
+        # owner/paper combination must be accepted
+        STRATEGIES[strategy].validate_params({**_paper_block(con, strategy), param: value})
     return value
 
 

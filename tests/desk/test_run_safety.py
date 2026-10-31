@@ -482,6 +482,8 @@ def test_bad_paper_settings_retain_plan_until_repaired(desk, sent):
         run.premarket(con, desk.broker, WED, desk.limits)
         pages = [(t, m) for t, m, p in sent if p == run.notify.WARN and "paper" in t.lower()]
         assert len(pages) == 1 and "AAPL" in pages[0][1]
+        # postopen never sends a held buy; the page says how to release it
+        assert "rerun premarket before 10:30 ET" in pages[0][1] and "Postopen does not send" in pages[0][1]
         store.set_setting(con, "paper_strategy_params", "{}")
         run.premarket(con, desk.broker, WED + timedelta(minutes=1), desk.limits)
         assert len(market_orders(desk.broker, "AAPL", Side.BUY)) == 1

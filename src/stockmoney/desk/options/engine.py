@@ -176,13 +176,14 @@ class Engine:
     def __init__(self, con, broker, cfg: OptionsConfig | None = None, *, clock: Callable[[], datetime],
                  risk_gate: RiskGate, live: bool = False,
                  flags_fn: Callable[[datetime], dict[str, str]] | None = None,
-                 notifier: Callable[..., object] | None = None, config_resolved: bool = False):
+                 notifier: Callable[..., object] | None = None, config_resolved: bool = False,
+                 entries_blocked: bool = False):
         self.con = con
         self.broker = broker
         from stockmoney.desk.learn.registry import safe_options_config, options_settings_valid
 
         self.cfg = cfg or OptionsConfig()
-        self._invalid_overrides = getattr(broker, "is_paper", False) is True and not options_settings_valid(con)
+        self._invalid_overrides = entries_blocked or getattr(broker, "is_paper", False) is True and not options_settings_valid(con)
         if not config_resolved:
             self.cfg = safe_options_config(con, self.cfg, paper=getattr(broker, "is_paper", False) is True,
                                            on_error=notifier or notify.send)

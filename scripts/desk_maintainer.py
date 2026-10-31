@@ -17,7 +17,8 @@ def main(argv=None) -> None:
         try:
             store.strategy_params(con, paper=True)
         except (ValueError, TypeError):
-            print("# Invalid paper stock overrides: showing owner/default values; new paper stock entries disabled.")
+            print("# Invalid paper stock overrides: showing the stored owner+paper values, which do not validate together;"
+                  " new paper stock entries disabled until a registry change or owner edit repairs them.")
         if not options_settings_valid(con):
             print("# Invalid options overrides: showing code defaults; new paper options/spread entries disabled.")
         print("key\tsleeve\tcurrent\tbound\tmax_step\tai_tunable")

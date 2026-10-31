@@ -161,7 +161,8 @@ def test_bad_paper_overlay_preserves_owner_exits_and_blocks_entries(con, blob, m
     monkeypatch.setattr(run, "_notify_once", lambda *a, **kw: None)
     store.change_param(con, "pullback", "trail_atr", 3.25, "owner")
     store.set_setting(con, "paper_strategy_params", blob)
-    assert r.current(con, "pullback.trail_atr") == 3.25
+    # the listing shows what is stored; an unreadable overlay reads as the owner value
+    assert r.current(con, "pullback.trail_atr") == (-1 if "-1" in blob else 3.25)
     assert run._strategies(con, paper=True)["pullback"].params["trail_atr"] == 3.25
     assert not run._paper_params_valid(con, SimpleNamespace(is_paper=True))
     assert run._paper_params_valid(con, SimpleNamespace(is_paper=False))
@@ -236,3 +237,76 @@ def test_cli_registry_finishes_with_non_object_owner_entry(tmp_path, capsys):
     main(["--registry", "--db", str(path)])
     output = capsys.readouterr().out
     assert "breakout.max_hold_days" in output and "options.orb_min_day_rvol" in output
+
+
+def test_registry_can_repair_an_owner_paper_conflict(con, monkeypatch):
+    """A legal paper write, then a legal owner edit that breaks the merge: the
+    listing shows the stored paper value and a registry change that restores a
+    valid merge is accepted (finding: registry.change could not unwind it)."""
+    from types import SimpleNamespace
+    from stockmoney.desk import run
+    monkeypatch.setattr(run, "_notify_once", lambda *a, **kw: None)
+    store.set_setting(con, "strategy_params", json.dumps({"rotation": {"top_n": 9, "keep_rank": 10}}))
+    store.set_setting(con, "paper_strategy_params", json.dumps({"rotation": {"keep_rank": 8}}))
+    assert not run._paper_params_valid(con, SimpleNamespace(is_paper=True))
+    assert r.current(con, "rotation.keep_rank") == 8  # the stored paper value, not the owner 10
+    r.change(con, "rotation.keep_rank", 9, "repair the merge", account_kind="paper")
+    assert run._paper_params_valid(con, SimpleNamespace(is_paper=True))
+    assert store.strategy_params(con, paper=True)["rotation"]["keep_rank"] == 9
+
+
+def test_registry_validates_the_updated_merge(con):
+    store.set_setting(con, "strategy_params", json.dumps({"rotation": {"top_n": 9, "keep_rank": 10}}))
+    store.set_setting(con, "paper_strategy_params", json.dumps({"rotation": {"keep_rank": 8}}))
+    with pytest.raises(ValueError, match="keep_rank"):
+        r.change(con, "rotation.keep_rank", 7, "still below top_n", account_kind="paper")
+    assert json.loads(store.get_setting(con, "paper_strategy_params"))["rotation"]["keep_rank"] == 8
+
+
+def test_owner_edit_that_breaks_the_paper_overlay_is_refused(con):
+    from stockmoney.desk import console
+    r.change(con, "rotation.keep_rank", 9, "paper", account_kind="paper")
+    with pytest.raises(ValueError, match="paper"):
+        console.apply_strategy_changes(con, "rotation", {"top_n": 10.0, "keep_rank": 12.0}, True, "more names")
+    assert "rotation" not in store.strategy_params(con)
+    done = console.apply_strategy_changes(con, "rotation", {"top_n": 6.0, "keep_rank": 12.0}, True, "ok")
+    assert done and store.strategy_params(con, paper=True)["rotation"]["top_n"] == 6
+
+
+def test_replay_cmd_blocks_entries_when_desk_options_document_is_invalid(tmp_path, monkeypatch):
+    from stockmoney.desk.options import run as opt_run, replay
+    db = tmp_path / "desk.sqlite"
+    with store.connect(db) as con:
+        store.set_setting(con, "options_params", "{")
+    seen = {}
+    cfg = OptionsConfig(replay_cache=tmp_path / "cache")
+    (cfg.replay_cache / "2026-10-14").mkdir(parents=True)
+    (cfg.replay_cache / "2026-10-14" / "meta.json").write_text("{}")
+
+    class Stop(Exception):
+        pass
+
+    def fake_run(day, c, *a, **kw):
+        seen.update(kw)
+        raise Stop
+
+    monkeypatch.setattr(replay, "run", fake_run)
+    with pytest.raises(Stop):
+        opt_run.replay_cmd(date(2026, 10, 14), cfg, "iex", None, 60.0, db_path=db)
+    assert seen["entries_blocked"] is True
+    with store.connect(db) as con:
+        store.set_setting(con, "options_params", "{}")
+    with pytest.raises(Stop):
+        opt_run.replay_cmd(date(2026, 10, 14), cfg, "iex", None, 60.0, db_path=db)
+    assert seen["entries_blocked"] is False
+
+
+def test_engine_entries_blocked_flag(con):
+    from types import SimpleNamespace
+    from stockmoney.desk.options.engine import Engine
+    from stockmoney.desk.options import store as ostore
+    ostore.ensure_schema(con)
+    broker = SimpleNamespace(is_paper=True)
+    kw = dict(clock=lambda: None, risk_gate=None, config_resolved=True)
+    assert Engine(con, broker, OptionsConfig(), entries_blocked=True, **kw)._invalid_overrides
+    assert not Engine(con, broker, OptionsConfig(), **kw)._invalid_overrides

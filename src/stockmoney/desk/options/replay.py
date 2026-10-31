@@ -301,7 +301,10 @@ class ReplayResult:
 
 
 def run(day: date, cfg: OptionsConfig, cache_dir: Path, out_dir: Path, feed: str = "iex", step_s: float = 20.0,
-        plan_file: Path | None = None, plan_received_at: datetime | None = None) -> ReplayResult:
+        plan_file: Path | None = None, plan_received_at: datetime | None = None,
+        entries_blocked: bool = False) -> ReplayResult:
+    """``entries_blocked``: the desk's research settings did not validate, so
+    the live engine would take no new entries; the replay must not either."""
     from stockmoney.desk.options import report as oreport
     out_dir.mkdir(parents=True, exist_ok=True)
     db = out_dir / f"replay_{day}_{feed}.sqlite"
@@ -322,7 +325,7 @@ def run(day: date, cfg: OptionsConfig, cache_dir: Path, out_dir: Path, feed: str
         cfg = safe_options_config(con, cfg, paper=True, on_error=lambda *a: sent.append(a))
         gate = _iface.make_risk_gate(con, broker, cfg)
         eng = Engine(con, broker, cfg, clock=clock, risk_gate=gate, live=True, notifier=lambda *a: sent.append(a),
-                     config_resolved=True)
+                     config_resolved=True, entries_blocked=entries_blocked)
         end = eng.session_end(clock.now)  # the close (early-close aware)
         while clock.now <= end:
             eng.tick()

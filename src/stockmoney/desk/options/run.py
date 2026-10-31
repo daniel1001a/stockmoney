@@ -293,16 +293,17 @@ def ingest_plan(path: Path, cfg: OptionsConfig, db_path: Path = store.DEFAULT_PA
 def replay_cmd(day: date, cfg: OptionsConfig, feed: str, plan_file: Path | None, step: float,
                db_path: Path = store.DEFAULT_PATH) -> int:
     from stockmoney.desk.options import replay
-    from stockmoney.desk.learn.registry import safe_options_config
+    from stockmoney.desk.learn.registry import safe_options_config, options_settings_valid
     with store.connect(db_path) as con:
         cfg = safe_options_config(con, cfg, paper=True)
+        blocked = not options_settings_valid(con)
     cache = cfg.replay_cache / str(day)
     if not (cache / "meta.json").exists():
         from stockmoney.desk.options.marketdata import fetch_replay_cache
         fetch_replay_cache(day, cfg.starting_universe(), cfg.replay_cache,
                            [(b.min_days, b.max_days) for b in cfg.dte_buckets])
     res = replay.run(day, cfg, cfg.replay_cache, cfg.replay_cache.parent / "replay", feed=feed, step_s=step,
-                     plan_file=plan_file)
+                     plan_file=plan_file, entries_blocked=blocked)
     cfg.report_dir.mkdir(parents=True, exist_ok=True)
     out = cfg.report_dir / f"replay_{day}_{feed}.md"
     out.write_text(res.report, encoding="utf-8")
