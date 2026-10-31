@@ -24,7 +24,6 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from stockmoney.desk import broker as paper
 from stockmoney.desk import data, engine
 from stockmoney.desk.backtest import curve_stats, trade_stats
 from stockmoney.desk.broker import Account
@@ -57,9 +56,9 @@ def _init(drop=()):
     _BARS, _CTX = _load(drop)
 
 
-def simulate(strats: dict[str, Strategy], bars=None, ctxs=None) -> dict:
+def simulate(strats: dict[str, Strategy], bars=None, ctxs=None, *, slippage: float = 0.0005) -> dict:
     bars, ctxs = bars or _BARS, ctxs or _CTX
-    acct = Account("x", CAPITAL, CAPITAL)
+    acct = Account("x", CAPITAL, CAPITAL, slippage=slippage)
     for ctx in ctxs:
         engine.morning(acct, bars, ctx.t)
         sigs = [s for st in strats.values() for s in st.candidates(ctx)]
@@ -144,9 +143,7 @@ def costs() -> str:
     _init()
     rows = {}
     for bps in (5, 15, 30):
-        paper.SLIPPAGE = bps / 1e4
-        rows[f"{bps} bps/side"] = simulate(book())["stats"]
-    paper.SLIPPAGE = 0.0005
+        rows[f"{bps} bps/side"] = simulate(book(), slippage=bps / 1e4)["stats"]
     return "## Slippage sensitivity\n\n" + fmt(pd.DataFrame(rows).T[["CAGR", "MaxDD", "Sharpe", "n", "avg_ret", "PF"]])
 
 

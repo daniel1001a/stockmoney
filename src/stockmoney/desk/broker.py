@@ -65,6 +65,7 @@ class Account:
     orders: list[Order] = field(default_factory=list)
     trades: list[dict] = field(default_factory=list)
     equity_curve: list[dict] = field(default_factory=list)
+    slippage: float = SLIPPAGE
 
     # ------------------------------------------------------------- valuation
     def equity(self, close: pd.Series) -> float:
@@ -102,7 +103,7 @@ class Account:
             px = float(px)
             if o.side == "sell":
                 if o.symbol in self.positions:
-                    self._close(o.symbol, day, px * (1 - SLIPPAGE), o.reason)
+                    self._close(o.symbol, day, px * (1 - self.slippage), o.reason)
                 o.status = "filled"
             else:
                 if o.symbol in self.positions:
@@ -113,7 +114,7 @@ class Account:
                     o.status = "cancelled"
                     o.reason += " | 開盤已跌破停損價,放棄進場"
                     continue
-                fill = px * (1 + SLIPPAGE)
+                fill = px * (1 + self.slippage)
                 shares = min(o.shares, math.floor(self.cash / fill))
                 if shares <= 0:
                     o.status = "cancelled"
@@ -136,7 +137,7 @@ class Account:
             if low is None or pd.isna(low) or low > p.stop:
                 continue
             px = min(float(op), p.stop) if op is not None and not pd.isna(op) else p.stop
-            self._close(sym, day, px * (1 - SLIPPAGE), "觸發停損")
+            self._close(sym, day, px * (1 - self.slippage), "觸發停損")
 
     def mark(self, t: pd.Timestamp, close: pd.Series) -> float:
         for sym, p in self.positions.items():
