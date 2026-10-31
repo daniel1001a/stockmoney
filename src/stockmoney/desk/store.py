@@ -37,6 +37,10 @@ CREATE TABLE IF NOT EXISTS param_changes (
   id INTEGER PRIMARY KEY AUTOINCREMENT, strategy TEXT, param TEXT, old TEXT, new TEXT,
   reason TEXT, changed_at TEXT);
 CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT);
+CREATE TABLE IF NOT EXISTS rule_filters (
+  id INTEGER PRIMARY KEY, proposal_id INTEGER, json TEXT NOT NULL, status TEXT NOT NULL,
+  applied_at TEXT, reverted_at TEXT);
+CREATE TABLE IF NOT EXISTS rule_filter_contexts (plan_id TEXT PRIMARY KEY, json TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS runs (
   id INTEGER PRIMARY KEY AUTOINCREMENT, run_at TEXT, through_date TEXT, status TEXT, message TEXT);
 """

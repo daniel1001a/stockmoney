@@ -78,6 +78,33 @@ def test_trigger_opens_shadow_variants_and_one_live_order(tmp_path, con):
     assert r.gate.booked[0]["side"] == Side.BUY and r.gate.booked[0]["qty"] == 10
 
 
+@pytest.mark.parametrize("action,qty", [("skip", 0), ("shrink:0.5", 5)])
+def test_rule_filters_preserve_options_risk_gate(tmp_path, con, action, qty):
+    rule = {"name": "late_entry", "sleeve": "options", "strategies": ["orb15"],
+            "when": {"field": "minutes_since_open", "op": ">=", "value": 15}, "action": action}
+    con.execute("INSERT INTO rule_filters (json,status) VALUES (?, 'active')", (json.dumps(rule),))
+    r = Rig(tmp_path, con)
+    r.run(et(9, 52))
+    if qty:
+        assert r.gate_calls[0][0].qty == qty
+        assert r.pos("live")[0]["qty_initial"] == qty
+        assert all(p["qty_initial"] == qty for p in r.pos("shadow"))
+    else:
+        assert not r.gate_calls and not r.pos()
+        assert con.execute("SELECT count(*) FROM options_filtered WHERE reason LIKE '%late_entry%'").fetchone()[0] > 0
+
+
+def test_gap_filter_reads_playbook_gap_observation(tmp_path, con):
+    from test_opt_playbooks import gap_up_day
+    rule = {"name": "large_gap", "sleeve": "options", "strategies": ["gap_go"],
+            "when": {"field": "gap_pct", "op": ">", "value": 0.005}, "action": "skip"}
+    con.execute("INSERT INTO rule_filters (json,status) VALUES (?, 'active')", (json.dumps(rule),))
+    r = Rig(tmp_path, con, bars=gap_up_day())
+    r.run(et(10, 0))
+    assert con.execute("SELECT count(*) FROM options_filtered WHERE reason='rule_filter:large_gap'").fetchone()[0] > 0
+    assert not r.pos(source="gap_go")
+
+
 def test_shadow_buys_ask_sells_bid_take_profit_then_breakeven(tmp_path, con):
     r = Rig(tmp_path, con)
     r.run(et(9, 52))

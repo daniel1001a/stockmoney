@@ -925,6 +925,8 @@ def _plan_entries(con, day, ledger: Ledger, risk: RiskEngine, snap, ctx, signals
         if not _plan_buy(con, day, s.symbol, qty, s.strategy, round(s.stop, 2), s.ref_price, s.thesis,
                          engine.signal_id(s), status):
             continue  # this cid was already sent today; it is not a new entry
+        from stockmoney.desk.learn import filters
+        filters.record_stock_context(con, cid, s, ctx)
         invested += qty * s.ref_price
         cash -= qty * s.ref_price
         slots -= 1
@@ -1159,6 +1161,15 @@ def _premarket_one(con, broker: Broker, risk: RiskEngine, ledger: Ledger, snap: 
             qty = floor(qty * p["ref_price"] / px + 1e-9)  # never spend more than planned
         if qty <= 0:
             _mark(con, p, "blocked", f"以即時價 {px:g} 重算後股數為 0")
+            return
+        from stockmoney.desk.learn import filters
+        filtered = filters.active(con, "stocks", p["strategy"], filters.context(con, sym, c, cid),
+                                  paper=getattr(broker, "is_paper", False) is True
+                                  and AssetClass(p["asset_class"]) == AssetClass.EQUITY)
+        qty = floor(qty * filtered.size_factor)
+        if filtered.skip or qty <= 0:
+            _mark(con, p, "blocked", f"rule filter: {', '.join(filtered.names)}")
+            st.lines.append(f"擋下 {sym}:rule filter {', '.join(filtered.names)}")
             return
         intent = OrderIntent(cid, sym, AssetClass(p["asset_class"]), side, qty=qty,
                              order_type=OrderType.MARKET, tif=st.tif(et), strategy=p["strategy"], reason=p["reason"])
@@ -1454,9 +1465,20 @@ def _retry_opg_one(con, broker: Broker, risk: RiskEngine, snap: AccountSnapshot,
         allowed = floor(allowed * p["ref_price"] / px + 1e-9)  # the premarket scale-down, on the whole plan
     # the opening order was already scaled at premarket: cap what is held plus
     # the retry at today's allowed size, never rescale the remainder again
+    from stockmoney.desk.learn import filters
+    filtered = filters.active(con, "stocks", p["strategy"], filters.context(con, sym, c, cid),
+                              paper=getattr(broker, "is_paper", False) is True
+                              and AssetClass(p["asset_class"]) == AssetClass.EQUITY)
+    if filtered.skip:
+        return stop_here("blocked", f"rule filter: {', '.join(filtered.names)}")
+    # Scale the whole original plan, then subtract fills. Do not scale the
+    # remainder again, and never replenish size removed at premarket.
+    allowed = floor(allowed * filtered.size_factor)
     qty = min(rest, floor(allowed - filled + 1e-9))
     if qty <= 0:
-        return stop_here("blocked", f"以即時價 {px:g} 重算後股數為 0")
+        if filtered.names:
+            return stop_here("blocked", f"rule filter: {', '.join(filtered.names)}; no remaining shares")
+        return stop_here("blocked", "重算後股數為 0")
     intent = OrderIntent(rcid, sym, AssetClass(p["asset_class"]), Side.BUY, qty=qty,
                          order_type=OrderType.MARKET, tif=TIF.DAY, strategy=p["strategy"], reason=p["reason"])
     d = risk.check(intent, snap, ref_price=p["ref_price"], orders_this_run=st.n, market_price=px)
