@@ -93,3 +93,40 @@ def test_fetch_cache_without_spread_window_is_unchanged(tmp_path):
     data = SpreadFakeData()
     fetch_replay_cache(DAY, ["SPY"], tmp_path, [(0, 0), (1, 3)], data=data, history_sessions=21)
     assert data.asked == []
+
+
+class NoSpreadChainData(SpreadFakeData):
+    """A later session: bars for ``day``, and no 7-21 day calls on offer."""
+
+    def __init__(self, day):
+        FakeData.__init__(self)
+        self.asked = []
+        df = pd.concat([history_bars(day=day), day_bars([610.0 + 0.01 * i for i in range(390)], day=day)])
+        self.df = df[~df.index.duplicated(keep="last")].sort_index()
+
+    def contracts(self, und, lo, hi, status="active", **kw):
+        if (hi - lo).days < 7:
+            return FakeData.contracts(self, und, lo, hi, status, **kw)
+        return []
+
+
+def test_fetch_cache_carries_an_earlier_days_spread_chain_forward(tmp_path):
+    # A spread opened on DAY must still be quotable at its own strikes and
+    # expiry on the next session, whatever that session's own chain holds.
+    first = fetch_replay_cache(DAY, ["SPY"], tmp_path, [(0, 0), (1, 3)], data=SpreadFakeData(),
+                               history_sessions=21, spread_window=(7, 21, 14))
+    held = pd.read_parquet(first / "contracts.parquet")
+    held = set(held[held.expiry == str(DAY + timedelta(days=14))].occ)
+    nxt = date(2026, 10, 12)
+    d = fetch_replay_cache(nxt, ["SPY"], tmp_path, [(0, 0), (1, 3)], data=NoSpreadChainData(nxt),
+                           history_sessions=21, spread_window=(7, 21, 14))
+    c = pd.read_parquet(d / "contracts.parquet")
+    assert held and held <= set(c.occ)
+    m = replay.ReplayMarket(d, "iex", OptionsConfig())
+    q, _ = m.quote(sorted(held)[0], datetime.combine(nxt, time(10, 0), ET))
+    assert q is not None and q.ask > q.bid >= 0
+    # an expired call is not carried
+    later = fetch_replay_cache(DAY + timedelta(days=17), ["SPY"], tmp_path, [(0, 0), (1, 3)],
+                               data=NoSpreadChainData(DAY + timedelta(days=17)), history_sessions=21,
+                               spread_window=(7, 21, 14))
+    assert not set(pd.read_parquet(later / "contracts.parquet").occ) & held

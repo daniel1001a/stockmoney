@@ -185,6 +185,32 @@ class AlpacaOptionsData:
 
 # ------------------------------------------------------------------ replay cache
 
+def _carried_spread_contracts(out_dir: Path, day: date, lookback: int, symbols, snap_iv: dict) -> list[dict]:
+    """Spread-symbol calls stored on cached days in the last ``lookback``
+    calendar days that expire on or after ``day``, in the contracts-endpoint
+    shape (their snapshot IV goes into ``snap_iv`` unless already set)."""
+    out = []
+    for back in range(lookback, 0, -1):
+        f = out_dir / str(day - timedelta(days=back)) / "contracts.parquet"
+        if not f.exists():
+            continue
+        prior = pd.read_parquet(f)
+        if prior.empty:
+            continue
+        prior = prior[prior.underlying.isin(list(symbols)) & (prior.right == "C")
+                      & (prior.expiry.astype(str).str[:10] >= str(day))]
+        for r in prior.itertuples(index=False):
+            oi = getattr(r, "open_interest", None)
+            out.append({"symbol": r.occ, "underlying_symbol": r.underlying, "type": "call",
+                        "strike_price": str(r.strike), "expiration_date": str(r.expiry)[:10],
+                        "open_interest": None if oi is None or pd.isna(oi) else int(oi),
+                        "open_interest_date": getattr(r, "open_interest_date", None)})
+            iv = getattr(r, "iv_snapshot", None)
+            if iv is not None and not pd.isna(iv):
+                snap_iv.setdefault(r.occ, float(iv))
+    return out
+
+
 def fetch_replay_cache(day: date, symbols: list[str], out_dir: Path, buckets: list[tuple[int, int]],
                        data: AlpacaOptionsData | None = None, history_sessions: int = 21,
                        spread_window: tuple[int, int, int] | None = None,
@@ -202,7 +228,11 @@ def fetch_replay_cache(day: date, symbols: list[str], out_dir: Path, buckets: li
     ``spread_window`` (min, max, target calendar days) also stores, for each of
     ``spread_symbols``, the calls of the expiry in that window nearest the
     target, from 3% below the open to 15% above the morning high: the H6
-    spread replay needs a 7-21 day chain out to the 0.30-delta short strike."""
+    spread replay needs a 7-21 day chain out to the 0.30-delta short strike.
+    The spread calls stored on cached days up to ``max`` calendar days back
+    that have not expired are carried forward, so a spread opened on an
+    earlier day can still be marked at its own strikes and expiry: fetch the
+    days in date order."""
     from stockmoney.desk.options.engine import _prev_trading_day
     from stockmoney.desk.options.select import trading_day_offset
     data = data or AlpacaOptionsData()
@@ -286,6 +316,8 @@ def fetch_replay_cache(day: date, symbols: list[str], out_dir: Path, buckets: li
                             snap_iv[c.occ] = float(c.iv)
                 except Exception as e:
                     log.warning("snapshot IV %s %s: %s", s, exp, e)
+    if spread_window:
+        contracts += _carried_spread_contracts(out_dir, day, spread_window[1], spread_symbols, snap_iv)
     seen = set()
     crow = []
     for c in contracts:

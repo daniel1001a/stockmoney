@@ -193,11 +193,16 @@ def _spreads(start, end, cfg, cache_dir, feed, states):
     frees the underlying for a re-entry the live book might not have taken, so
     the underlying is tainted from that day on: none of its spreads entered on
     or after the gap (nor the gapped one) count in the trades or the equity
-    curve. Slots stop at the close and after the day's last bar."""
+    curve. A missing session whose wind state allowed an entry (tailwind)
+    taints every wind symbol the same way, warmup days included: the live
+    book could have opened a spread there and still hold it. A cached day
+    that lacks an open spread's legs is a hole for that spread too. Slots
+    stop at the close and after the day's last bar."""
     from stockmoney.desk import store, wind
     from stockmoney.desk.options import replay as options_replay
     from stockmoney.desk.options import spreads
     trades, decisions, equity, missing, no_chain = [], [], [25_000.0], [], []
+    unpriced = False
     gapped: set[int] = set()
     snaps: list[list] = []
     tainted: dict[str, str] = {}  # underlying -> first missing day it was open across
@@ -220,13 +225,28 @@ def _spreads(start, end, cfg, cache_dir, feed, states):
                 if not (cache_dir / str(day)).is_dir():
                     held = con.execute("SELECT rowid, underlying FROM options_spreads_shadow "
                                        "WHERE status='OPEN'").fetchall()
-                    if day >= first or held:  # a warmup hole matters when it crosses an open spread
+                    # a tailwind session could have opened a spread the live book would still hold
+                    entry_day = wind.state_before(con, str(day)) == "tailwind"
+                    if day >= first or held or entry_day:  # a warmup hole matters when it can carry over
                         missing.append(str(day))
                     for rid, und in held:
                         gapped.add(rid)
                         tainted.setdefault(und, str(day))
+                    if entry_day:
+                        for und in spreads.WIND_SYMBOLS:
+                            tainted.setdefault(und, str(day))
                 else:
                     market = options_replay.ReplayMarket(cache_dir / str(day), feed, cfg)
+                    # an open spread whose legs this day's cache lacks cannot be marked or exited
+                    for rid, und, long_occ, short_occ in con.execute(
+                            "SELECT rowid, underlying, long_occ, short_occ FROM options_spreads_shadow "
+                            "WHERE status='OPEN'").fetchall():
+                        if long_occ not in market.contracts or short_occ not in market.contracts:
+                            gapped.add(rid)
+                            tainted.setdefault(und, str(day))
+                            if str(day) not in missing:
+                                missing.append(str(day))
+                            unpriced = True
                     cached = {c.underlying for c in market.contracts.values()}
                     if any(not any(c.underlying == u and c.right == "C" and spreads.DTE_MIN
                                    <= (date.fromisoformat(str(c.expiry)[:10]) - day).days <= spreads.DTE_MAX
@@ -275,6 +295,8 @@ def _spreads(start, end, cfg, cache_dir, feed, states):
     caveats = []
     if missing:
         caveats.append("missing_cache_days")
+    if unpriced:
+        caveats.append("spread_legs_missing_from_cache")
     if gap:
         caveats.append("spreads_open_across_missing_day_excluded")
     if no_chain:
@@ -359,8 +381,8 @@ def run(sleeve: str, start: str, end: str, variant="incumbent", *, bars=None,
             status = "insufficient_cache" if "spread_expiries_missing_from_cache" in extra else "ok"
             result = _result(sleeve, start, end, digest, trades, equity, caveats, costs, decisions,
                              status=status, missing_cache_dates=missing)
-            if status != "ok":
-                return json.loads(json.dumps(result, sort_keys=True, allow_nan=False))  # never frozen
+            if status != "ok" or missing:  # the cache may be filled later: never frozen
+                return json.loads(json.dumps(result, sort_keys=True, allow_nan=False))
         else:
             trades, equity, decisions = _options(start, end, cfg, Path(options_cache), feed)
             caveats += ["synthetic_quotes", "snapshot_iv_not_pit", "contract_volume_filter_disabled",

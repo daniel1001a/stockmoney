@@ -324,3 +324,54 @@ def test_spreads_warm_up_keeps_a_spread_opened_before_the_window(tmp_path, monke
     assert alone["n"] == 0 and alone["missing_cache_dates"] == []
     assert not [d for d in alone["decisions"] if d["underlying"] == "SPY" and d["status"] == "OPEN"]
     assert all(d["day"] == str(D1) for d in alone["decisions"])
+
+
+def test_spreads_missing_tailwind_day_taints_later_entries(tmp_path, monkeypatch):
+    # The book is flat, D1 has no cache and its wind allowed an entry: the live
+    # book could still hold a spread from D1, so the D2 entry does not count,
+    # and a run with a hole is never frozen as evidence.
+    cache = _spread_cache(tmp_path / "opt", {D0: [(0, 600.0), (389, 600.0)],
+                                             D2: [(0, 600.0), (389, 600.0)],
+                                             D3: [(0, 600.0), (60, 620.0), (389, 620.0)]})
+    monkeypatch.setattr(replay, "_wind_states", lambda bars, start, end: {
+        "2026-10-13": "neutral", "2026-10-14": "tailwind", "2026-10-15": "tailwind", "2026-10-16": "neutral"})
+    evidence = tmp_path / "evidence.sqlite"
+    result = replay.run("spreads", str(D0), str(D3), bars="bars", options_cache=cache,
+                        cache_path=evidence, options_cfg=SPREAD_CFG)
+    spy = [d for d in result["decisions"] if d["underlying"] == "SPY" and d["status"] != "SKIPPED"]
+    assert [d["day"] for d in spy] == [str(D2)]  # entered in the book, not counted
+    assert result["n"] == 0 and result["trades"] == [] and result["max_drawdown"] == 0
+    assert result["missing_cache_dates"] == [str(D1)]
+    with sqlite3.connect(evidence) as con:
+        assert con.execute("SELECT COUNT(*) FROM replay_results").fetchone()[0] == 0
+
+
+def test_spreads_warmup_tailwind_gap_is_recorded_with_a_flat_book(tmp_path, monkeypatch):
+    cache = _spread_cache(tmp_path / "opt", {D0: [(0, 600.0), (389, 600.0)], D2: [(0, 600.0), (389, 600.0)]})
+    monkeypatch.setattr(replay, "_wind_states", lambda bars, start, end: {
+        "2026-10-13": "neutral", "2026-10-14": "tailwind", "2026-10-15": "tailwind"})
+    result = replay.run("spreads", str(D2), str(D2), bars="bars", options_cache=cache,
+                        cache_path=tmp_path / "evidence.sqlite", options_cfg=SPREAD_CFG)
+    assert result["missing_cache_dates"] == [str(D1)] and result["n"] == 0
+
+
+def test_spreads_cached_day_without_the_open_legs_is_a_hole(tmp_path, monkeypatch):
+    # D1's cache holds a different expiry only: the D0 spread cannot be marked
+    # there, so it is excluded instead of settling silently at expiry.
+    from stockmoney.desk.options._iface import occ_symbol
+    cache = _spread_cache(tmp_path / "opt", {D0: [(0, 600.0), (389, 600.0)],
+                                             D1: [(0, 600.0), (60, 620.0), (389, 620.0)]})
+    other = EXPIRY + timedelta(days=2)
+    pd.DataFrame([{"occ": occ_symbol("SPY", other, "C", k), "underlying": "SPY", "right": "C",
+                   "strike": float(k), "expiry": str(other), "open_interest": 5000,
+                   "open_interest_date": str(D1)} for k in range(580, 631)]
+                 ).to_parquet(cache / str(D1) / "contracts.parquet", index=False)
+    monkeypatch.setattr(replay, "_wind_states", lambda bars, start, end: {"2026-10-13": "tailwind",
+                                                                          "2026-10-14": "neutral"})
+    evidence = tmp_path / "evidence.sqlite"
+    result = replay.run("spreads", str(D0), str(D1), bars="bars", options_cache=cache,
+                        cache_path=evidence, options_cfg=SPREAD_CFG)
+    assert result["n"] == 0 and result["missing_cache_dates"] == [str(D1)]
+    assert "spread_legs_missing_from_cache" in result["caveats"]
+    with sqlite3.connect(evidence) as con:
+        assert con.execute("SELECT COUNT(*) FROM replay_results").fetchone()[0] == 0
