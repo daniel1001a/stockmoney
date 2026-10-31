@@ -126,7 +126,7 @@ D0, D1, EXPIRY = date(2026, 10, 14), date(2026, 10, 15), date(2026, 10, 28)
 SPREAD_CFG = OptionsConfig(index=("SPY",), mega_cap=(), high_vol=(), default_iv=0.15)
 
 
-def _spread_cache(root, path):
+def _spread_cache(root, path, minutes=None):
     """Synthetic SPY minute bars (``path``: day -> [(minute after 09:30, price)],
     linear between points) and 14-DTE calls 580 to 630 with no option bars, so
     every leg is quoted by the Black-Scholes model at ``default_iv``."""
@@ -135,7 +135,7 @@ def _spread_cache(root, path):
         d = root / str(day)
         d.mkdir(parents=True)
         rows = []
-        for m in range(390):
+        for m in range((minutes or {}).get(day, 390)):
             px = next((p0 + (p1 - p0) * (m - m0) / (m1 - m0)
                        for (m0, p0), (m1, p1) in zip(pts, pts[1:]) if m0 <= m <= m1), pts[-1][1])
             t = datetime.combine(day, time(9, 30), options_replay.ET) + timedelta(minutes=m)
@@ -234,3 +234,51 @@ def test_spreads_wind_states_are_causal(bars):
     cut = str(bars.dates[-15].date())
     early = replay._wind_states(bars.upto(pd.Timestamp(cut)), start, cut)
     assert early and all(full[d] == s for d, s in early.items())
+
+
+D2 = date(2026, 10, 16)
+
+
+def test_spreads_open_across_missing_cache_day_is_excluded(tmp_path, monkeypatch):
+    # D1 has no cache directory: the D0 spread would otherwise take profit on D2's quotes.
+    cache = _spread_cache(tmp_path / "opt", {D0: [(0, 600.0), (389, 600.0)],
+                                             D2: [(0, 600.0), (60, 620.0), (389, 620.0)]})
+    monkeypatch.setattr(replay, "_wind_states", lambda bars, start, end: {"2026-10-13": "tailwind"})
+    result = replay.run("spreads", str(D0), str(D2), bars="bars", options_cache=cache,
+                        cache_path=tmp_path / "evidence.sqlite", options_cfg=SPREAD_CFG)
+    assert result["status"] == "ok" and result["n"] == 0 and result["trades"] == []
+    assert result["missing_cache_dates"] == [str(D1)]
+    assert {"missing_cache_days", "spreads_open_across_missing_day_excluded"} <= set(result["caveats"])
+    spy = [d for d in result["decisions"] if d["underlying"] == "SPY" and d["status"] != "SKIPPED"]
+    assert (spy[0]["day"], spy[0]["status"]) == (str(D0), "CLOSED")  # closed on D2, not counted
+
+
+def test_spread_slots_stop_at_the_early_close():
+    early = list(replay._spread_slots(date(2026, 11, 27)))
+    assert early[0].time() == time(9, 45) and max(s.time() for s in early) < time(13, 0)
+    regular = list(replay._spread_slots(D0))
+    assert max(s.time() for s in regular) == time(15, 55) and len(regular) == 38
+
+
+def test_spreads_stop_ticking_after_the_last_bar(tmp_path, monkeypatch):
+    from stockmoney.desk.options import spreads
+    cache = _spread_cache(tmp_path / "opt", {D0: [(0, 600.0), (389, 600.0)]}, minutes={D0: 30})
+    monkeypatch.setattr(replay, "_wind_states", lambda bars, start, end: {"2026-10-13": "tailwind"})
+    seen, real = [], spreads.tick
+    monkeypatch.setattr(spreads, "tick", lambda con, data, now, cfg=None, slot=None:
+                        seen.append(now.time()) or real(con, data, now, cfg, slot))
+    replay.run("spreads", str(D0), str(D0), bars="bars", options_cache=cache,
+               cache_path=tmp_path / "evidence.sqlite", options_cfg=SPREAD_CFG)
+    assert seen == [time(9, 45), time(9, 55)]  # bars end 10:00, nothing ticks on a frozen spot
+
+
+def test_spreads_warm_up_keeps_a_spread_opened_before_the_window(tmp_path, monkeypatch):
+    # The D0 spread is still open on D1; a window starting at D1 must not re-enter SPY.
+    cache = _spread_cache(tmp_path / "opt", {D0: [(0, 600.0), (389, 600.0)], D1: [(0, 600.0), (389, 600.0)]})
+    monkeypatch.setattr(replay, "_wind_states", lambda bars, start, end: {"2026-10-13": "tailwind",
+                                                                          "2026-10-14": "tailwind"})
+    alone = replay.run("spreads", str(D1), str(D1), bars="bars", options_cache=cache,
+                       cache_path=tmp_path / "evidence.sqlite", options_cfg=SPREAD_CFG)
+    assert alone["n"] == 0 and alone["missing_cache_dates"] == []
+    assert not [d for d in alone["decisions"] if d["underlying"] == "SPY" and d["status"] == "OPEN"]
+    assert all(d["day"] == str(D1) for d in alone["decisions"])

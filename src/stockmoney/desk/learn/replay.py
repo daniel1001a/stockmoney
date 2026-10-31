@@ -69,7 +69,8 @@ def _drawdown(equity):
     return dd
 
 
-def _result(sleeve, start, end, digest, trades, equity, caveats, costs, decisions=(), status="ok"):
+def _result(sleeve, start, end, digest, trades, equity, caveats, costs, decisions=(), status="ok",
+            missing_cache_dates=()):
     rs = [t["r_multiple"] for t in trades]
     if any(not math.isfinite(r) for r in rs):
         raise ValueError("non-finite replay return")
@@ -78,7 +79,7 @@ def _result(sleeve, start, end, digest, trades, equity, caveats, costs, decision
             "avg_r": sum(rs) / len(rs) if rs else None,
             "win_rate": sum(t["pnl"] > 0 for t in trades) / len(trades) if trades else None,
             "max_drawdown": _drawdown(equity), "caveats": sorted(set(caveats)), "costs": costs,
-            "decisions": list(decisions)}
+            "decisions": list(decisions), "missing_cache_dates": list(missing_cache_dates)}
 
 
 def _options(start, end, cfg, cache_dir, feed):
@@ -117,12 +118,23 @@ SPREAD_EXCLUDED = ("expiry_late", "expiry_unpriced")  # excluded from the H6 sta
 
 
 def _spread_slots(day):
-    """The live schedule: every 10 minutes 09:45 to 15:55 ET (scripts/desk_job.sh)."""
+    """The live schedule: every 10 minutes from 09:45 ET (scripts/desk_job.sh),
+    only while the session is open (spreads.main returns outside regular hours,
+    which end at 13:00 on an early close)."""
+    from stockmoney.desk.calendar import close_time
     from stockmoney.desk.options import spreads
     t = datetime.combine(day, time(9, 45), spreads.ET)
-    while t.time() <= time(15, 55):
+    close = datetime.combine(day, time(*close_time(day)), spreads.ET)
+    while t.time() <= time(15, 55) and t < close:
         yield t
         t += timedelta(minutes=10)
+
+
+def _bars_end(market):
+    """When the day's stock minute bars stop (last bar start + 1 minute), or None."""
+    import pandas as pd
+    ends = [b.index[-1] for b in market.stock.values() if len(b)]
+    return (max(ends) + pd.Timedelta(minutes=1)).to_pydatetime() if ends else None
 
 
 def _wind_states(bars, start, end):
@@ -133,8 +145,15 @@ def _wind_states(bars, start, end):
 
     from stockmoney.desk import indicators, wind
     ind = indicators.compute(bars.upto(pd.Timestamp(end)))
-    frame = wind.series(ind, str(date.fromisoformat(start) - timedelta(days=10)), end)
+    frame = wind.series(ind, str(_spread_warmup(start) - timedelta(days=10)), end)
     return {} if frame.empty else {str(d): str(s) for d, s in frame["state"].items()}
+
+
+def _spread_warmup(start):
+    """First day ticked: a spread entered up to DTE_MAX calendar days before
+    ``start`` can still be open on it, so the book is rebuilt from there."""
+    from stockmoney.desk.options import spreads
+    return date.fromisoformat(start) - timedelta(days=spreads.DTE_MAX)
 
 
 class _SpreadData:
@@ -165,45 +184,65 @@ class _SpreadData:
 def _spreads(start, end, cfg, cache_dir, feed, states):
     """Replay the H6 spread shadow day by day through ``spreads.tick`` (same
     entry, leg, fill and exit rules), quoting each leg from the options replay
-    model: buys at the ask, sells at the bid, plus SLIP or shadow_slippage_pct."""
+    model: buys at the ask, sells at the bid, plus SLIP or shadow_slippage_pct.
+
+    The book is rebuilt from ``_spread_warmup(start)`` so a spread opened before
+    the window still blocks re-entry; only spreads entered inside the window
+    count. A trading day with no cache is not ticked, and a spread that was open
+    across it is kept out of the trades (its exit would be managed on a later
+    session's quotes). Slots stop at the close and after the day's last bar."""
     from stockmoney.desk import store, wind
     from stockmoney.desk.options import replay as options_replay
     from stockmoney.desk.options import spreads
     trades, decisions, equity, missing = [], [], [25_000.0], []
+    gapped: set[int] = set()
     mult = cfg.contract_multiplier
+    first = date.fromisoformat(start)
     with TemporaryDirectory(prefix="stockmoney-spreads-") as work, store.connect(Path(work) / "spreads.sqlite") as con:
         spreads.ensure_schema(con)
         wind.ensure_schema(con)
         con.executemany("INSERT INTO wind_daily (date, state, recorded_at) VALUES (?,?, 'replay:daily_bars')",
                         sorted(states.items()))
-        day = date.fromisoformat(start)
+        day = _spread_warmup(start)
         while day <= date.fromisoformat(end):
             if is_trading_day(day):
                 if not (cache_dir / str(day)).is_dir():
-                    missing.append(str(day))
+                    if day >= first:
+                        missing.append(str(day))
+                    gapped.update(r[0] for r in con.execute(
+                        "SELECT rowid FROM options_spreads_shadow WHERE status='OPEN'"))
                 else:
                     market = options_replay.ReplayMarket(cache_dir / str(day), feed, cfg)
+                    bars_end = _bars_end(market)
                     clock = options_replay.SimClock(next(_spread_slots(day)))
                     data = _SpreadData(options_replay.ReplayBroker(market, clock))
                     for slot in _spread_slots(day):
+                        if bars_end is None or slot > bars_end + timedelta(minutes=1):
+                            break  # no fresh underlying bar: the quotes would be frozen
                         clock.now = slot
                         spreads.tick(con, data, slot, cfg, slot)
+                        if day < first:
+                            continue
                         realized = con.execute("SELECT COALESCE(SUM(pnl_usd),0) FROM options_spreads_shadow "
-                                               "WHERE status='CLOSED'").fetchone()[0]
+                                               "WHERE status='CLOSED' AND day >= ?", (start,)).fetchone()[0]
                         held = sum((((r["last_value"] if r["last_value"] is not None else r["entry_debit"])
                                      - r["entry_debit"]) * mult - 2 * cfg.fee_per_contract) * r["qty"]
                                    - r["fees_usd"] for r in con.execute(
-                                       "SELECT * FROM options_spreads_shadow WHERE status='OPEN'"))
+                                       "SELECT * FROM options_spreads_shadow WHERE status='OPEN' AND day >= ?",
+                                       (start,)))
                         equity.append(25_000.0 + realized + held)
             day += timedelta(days=1)
-        rows = con.execute("SELECT * FROM options_spreads_shadow ORDER BY day, underlying").fetchall()
-    excluded = still_open = 0
+        rows = con.execute("SELECT rowid AS rid, * FROM options_spreads_shadow WHERE day >= ? AND day <= ? "
+                           "ORDER BY day, underlying", (start, end)).fetchall()
+    excluded = still_open = gap = 0
     for r in rows:
         decisions.append({k: r[k] for k in ("day", "underlying", "source", "wind", "status", "skip_reason",
                                             "expiry", "long_strike", "short_strike", "entry_debit", "qty",
                                             "exit_reason")})
         if r["status"] == "OPEN":
             still_open += 1
+        elif r["status"] == "CLOSED" and r["rid"] in gapped:
+            gap += 1
         elif r["status"] == "CLOSED" and r["exit_reason"] in SPREAD_EXCLUDED:
             excluded += 1
         elif r["status"] == "CLOSED":
@@ -215,11 +254,13 @@ def _spreads(start, end, cfg, cache_dir, feed, states):
     caveats = []
     if missing:
         caveats.append("missing_cache_days")
+    if gap:
+        caveats.append("spreads_open_across_missing_day_excluded")
     if excluded:
         caveats.append("expiry_settlements_excluded")
     if still_open:
         caveats.append("open_spreads_marked_in_drawdown_only")
-    return trades, equity, decisions, caveats
+    return trades, equity, decisions, caveats, missing
 
 
 def run(sleeve: str, start: str, end: str, variant="incumbent", *, bars=None,
@@ -256,7 +297,7 @@ def run(sleeve: str, start: str, end: str, variant="incumbent", *, bars=None,
         fingerprint.update(spread_rules={k: getattr(spreads, k) for k in (
             "SLIP", "DTE_MIN", "DTE_MAX", "DTE_TARGET", "LONG_DELTA", "LONG_BAND", "SHORT_DELTA", "SHORT_BAND",
             "TAKE_PROFIT_FRAC", "STOP_FRAC", "TIME_EXIT_DTE", "ENTRY_WINDOW", "WIND_SYMBOLS", "EXPIRY_SETTLE")},
-            wind_source="daily_bars")
+            wind_source="daily_bars", spread_replay=2)
     digest = hashlib.sha256(json.dumps(fingerprint, sort_keys=True, default=str).encode()).hexdigest()
     caveats = ["earnings_calendar_not_pit", "grok_plan_not_replayable", "grok_in_play_not_replayable"]
     if not_replayable:
@@ -286,12 +327,13 @@ def run(sleeve: str, start: str, end: str, variant="incumbent", *, bars=None,
         elif sleeve == "spreads":
             if bars is None:
                 raise ValueError("spreads replay requires locally cached daily bars (the wind state)")
-            trades, equity, decisions, extra = _spreads(start, end, cfg, Path(options_cache), feed,
+            trades, equity, decisions, extra, missing = _spreads(start, end, cfg, Path(options_cache), feed,
                                                         _wind_states(bars, start, end))
             caveats += extra + ["synthetic_quotes", "snapshot_iv_not_pit", "replay_delta_from_synthetic_mid",
                                 "wind_from_adjusted_daily_bars", "signal_candidates_not_replayed",
                                 "r_is_return_on_debit"]
-            result = _result(sleeve, start, end, digest, trades, equity, caveats, costs, decisions)
+            result = _result(sleeve, start, end, digest, trades, equity, caveats, costs, decisions,
+                             missing_cache_dates=missing)
         else:
             trades, equity, decisions = _options(start, end, cfg, Path(options_cache), feed)
             caveats += ["synthetic_quotes", "snapshot_iv_not_pit", "contract_volume_filter_disabled",
