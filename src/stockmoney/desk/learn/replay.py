@@ -21,7 +21,7 @@ from stockmoney.desk.strategies import REGISTRY
 
 OPTION_PARAMS = {
     "gap_min_pct_index", "gap_min_pct_stock", "gap_go_min_rvol", "orb_break_volume_mult",
-    "orb_min_day_rvol", "vwap_hold_bars", "vwap_slope_bars", "vwap_slope_min", "grok_min_rvol",
+    "orb_min_day_rvol", "vwap_hold_bars", "vwap_slope_bars", "vwap_slope_min",
 }
 SCHEMA = """CREATE TABLE IF NOT EXISTS replay_results (
     variant_hash TEXT, start TEXT, end TEXT, result_json TEXT NOT NULL,
@@ -40,7 +40,7 @@ def _variant(sleeve, variant):
     if not isinstance(key, str) or isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
         raise ValueError("invalid variant key or value")
     semantic = {"key": key, "new": value}
-    if GROK in key or "in_play" in key:
+    if GROK in key or "in_play" in key or key == "options.grok_min_rvol":
         return {}, OptionsConfig(), semantic, True
     if sleeve == "stocks":
         pieces = key.split(".")
@@ -48,13 +48,16 @@ def _variant(sleeve, variant):
             raise ValueError("unknown strategy parameter")
         name, param = pieces
         params = REGISTRY[name].validate_params({param: value})
+        semantic["new"] = params[param]
         return {name: params}, OptionsConfig(), semantic, False
     if sleeve == "options" and key.startswith("options.") and key[8:] in OPTION_PARAMS:
         attr = key[8:]
         default = getattr(OptionsConfig(), attr)
         if value <= 0 or (isinstance(default, int) and value != int(value)):
             raise ValueError("option threshold must be positive, and whole for bar counts")
-        return {}, replace(OptionsConfig(), **{attr: int(value) if isinstance(default, int) else value}), semantic, False
+        value = int(value) if isinstance(default, int) else float(value)
+        semantic["new"] = value
+        return {}, replace(OptionsConfig(), **{attr: value}), semantic, False
     raise ValueError("unknown or protected replay parameter")
 
 
@@ -121,18 +124,32 @@ def run(sleeve: str, start: str, end: str, variant="incumbent", *, bars=None,
         if variant != "incumbent":
             raise ValueError("cannot combine a proposal and a config override")
         cfg = options_cfg
-    if not math.isfinite(stock_bps) or not 0 < stock_bps < 10_000:
+    if sleeve == "stocks" and (not math.isfinite(stock_bps) or not 0 < stock_bps < 10_000):
         raise ValueError("stock cost must be positive bps per side")
-    if (not math.isfinite(cfg.fee_per_contract) or cfg.fee_per_contract <= 0
+    if sleeve != "stocks" and (not math.isfinite(cfg.fee_per_contract) or cfg.fee_per_contract <= 0
             or not math.isfinite(cfg.shadow_slippage_pct) or cfg.shadow_slippage_pct < 0):
         raise ValueError("options replay requires positive fees and nonnegative extra slippage")
-    costs = {"stock_bps_per_side": stock_bps, "option_fee_per_contract": cfg.fee_per_contract,
-             "option_extra_slippage_pct": cfg.shadow_slippage_pct, "option_spread": "synthetic_bid_ask"}
+    costs = ({"stock_bps_per_side": stock_bps} if sleeve == "stocks" else
+             {"option_fee_per_contract": cfg.fee_per_contract,
+              "option_extra_slippage_pct": cfg.shadow_slippage_pct, "option_spread": "synthetic_bid_ask"})
     # Config fingerprint prevents a test/custom config reusing an incumbent's cache.
     from dataclasses import asdict
-    fingerprint = {"schema": 1, "sleeve": sleeve, "variant": semantic, "costs": costs,
-                   "options_config": asdict(cfg), "feed": feed}
+    fingerprint = {"schema": 2, "sleeve": sleeve, "variant": semantic, "costs": costs}
+    if sleeve != "stocks":
+        ignored = {"halt_file", "lock_path", "report_dir", "replay_cache", "paper_only", "live_sources",
+                   "capital_budget", "sleeve_pct", "max_open_positions", "max_live_per_underlying",
+                   "entry_limit_offset", "entry_timeout_s", "exit_timeout_s", "exit_max_limit_attempts",
+                   "cancel_max_failures", "cancel_page_every_min", "order_status_max_failures",
+                   "flatten_budget_s", "flat_broker_max_attempts", "min_live_minutes_before_flat", "not_flat_alert_min"}
+        fingerprint.update(options_config={k: v for k, v in asdict(cfg).items() if k not in ignored}, feed=feed)
     digest = hashlib.sha256(json.dumps(fingerprint, sort_keys=True, default=str).encode()).hexdigest()
+    caveats = ["earnings_calendar_not_pit", "grok_plan_not_replayable", "grok_in_play_not_replayable"]
+    if not_replayable or sleeve == "spreads":
+        caveats.append("not_replayable")
+        if sleeve == "spreads":
+            caveats.append("spreads_replay_pending_issue_37")
+        # A refusal is not evidence. Do not freeze it across later implementations.
+        return _result(sleeve, start, end, digest, [], [], caveats, costs, status="not_replayable")
     cache_path = Path(cache_path)
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     with sqlite3.connect(cache_path, timeout=1800) as cache:
@@ -143,19 +160,14 @@ def run(sleeve: str, start: str, end: str, variant="incumbent", *, bars=None,
                                (digest, start, end)).fetchone()
         if cached:
             return json.loads(cached[0])
-        caveats = ["earnings_calendar_not_pit", "grok_plan_not_replayable", "grok_in_play_not_replayable"]
-        if not_replayable or sleeve == "spreads":
-            caveats.append("not_replayable")
-            if sleeve == "spreads":
-                caveats.append("spreads_replay_pending_issue_37")
-            result = _result(sleeve, start, end, digest, [], [], caveats, costs, status="not_replayable")
-        elif sleeve == "stocks":
+        if sleeve == "stocks":
             if bars is None:
                 raise ValueError("stocks replay requires locally cached daily bars")
             replay = backtest.run(bars.upto(end), start, end, strategy_sets={"combined": list(REGISTRY)},
                                   params=params, slippage=stock_bps / 10_000)
             account = replay["accounts"]["combined"]
-            caveats += ["current_universe_survivorship", "adjusted_daily_bars", "daily_decisions_after_close"]
+            caveats += ["current_universe_survivorship", "adjusted_daily_bars", "daily_decisions_after_close",
+                        "trade_stats_closed_only_open_positions_marked_in_drawdown"]
             result = _result(sleeve, start, end, digest, account.trades,
                              [p["equity"] for p in account.equity_curve], caveats, costs, replay["decisions"])
         else:

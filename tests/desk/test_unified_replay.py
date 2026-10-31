@@ -27,6 +27,8 @@ def test_stock_shape_costs_and_holdout_cache(tmp_path, bars):
     assert result["max_drawdown"] >= 0
     # No bars supplied: cache must return the previously frozen evidence.
     assert replay.run("stocks", "2021-01-01", "2021-07-13", cache_path=cache) == result
+    assert replay.run("stocks", "2021-01-01", "2021-07-13", cache_path=cache, feed="sip",
+                      options_cfg=replace(OptionsConfig(), report_dir=tmp_path, fee_per_contract=0.1)) == result
     higher_cost = replay.run("stocks", "2021-01-01", "2021-07-13", bars=bars, cache_path=cache, stock_bps=20)
     assert higher_cost["variant_hash"] != result["variant_hash"]
     assert higher_cost["trades"] != result["trades"]
@@ -73,6 +75,10 @@ def test_grok_and_spreads_are_explicitly_not_replayable(tmp_path):
     spreads = replay.run("spreads", "2026-10-14", "2026-10-14", cache_path=tmp_path / "c.sqlite")
     assert spreads.keys() == result.keys()
     assert spreads["status"] == "not_replayable"
+    proposal["param"]["key"] = "options.grok_min_rvol"
+    assert replay.run("options", "2026-10-14", "2026-10-14", proposal,
+                      cache_path=tmp_path / "c.sqlite")["status"] == "not_replayable"
+    assert not (tmp_path / "c.sqlite").exists()
 
 
 def test_options_shared_engine_shape_and_future_bar_isolation(tmp_path, bars):
@@ -88,6 +94,9 @@ def test_options_shared_engine_shape_and_future_bar_isolation(tmp_path, bars):
     assert "synthetic_quotes" in result["caveats"]
     assert "snapshot_iv_not_pit" in result["caveats"]
     assert result["max_drawdown"] > 0
+    assert replay.run("options", str(day), str(day), options_cache=tmp_path / "missing",
+                      cache_path=tmp_path / "evidence.sqlite", stock_bps=99,
+                      options_cfg=replace(cfg, report_dir=tmp_path, halt_file=tmp_path / "unused")) == result
     market = options_replay.ReplayMarket(cache / str(day), "iex", cfg)
     now = datetime(2026, 10, 14, 10, 0, tzinfo=options_replay.ET)
     clock = options_replay.SimClock(now)
