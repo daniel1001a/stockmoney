@@ -1608,7 +1608,7 @@ def crypto(con, broker: Broker, now: datetime) -> str:
 
 
 def _grok_outbound(con, now: datetime, box, config) -> list[str]:
-    """DESK_BRIEF / RESEARCH_REQUEST to Grok; a failure is logged, never fatal."""
+    """DESK_BRIEF / PLAN_REMINDER / RESEARCH_REQUEST to Grok; a failure is logged, never fatal."""
     from stockmoney.desk import grok_outbound
     try:
         return grok_outbound.run(con, box, now, config)
