@@ -267,7 +267,7 @@ def test_trading_code_does_not_read_the_scoreboard():
     assert len(paths) > 8
     for p in paths:
         text = p.read_text()
-        assert "scoreboard" not in text and "source_scores" not in text, p
+        assert "scoreboard" not in text and "source_scores" not in text and "grok_delivery" not in text, p
     code = ("import sys; import stockmoney.desk.bridge.policy, stockmoney.desk.run; "
             "assert 'stockmoney.desk.learn.scoreboard' not in sys.modules")
     subprocess.run([sys.executable, "-c", code], check=True, env={**os.environ, "PYTHONPATH": "src"})
@@ -287,3 +287,130 @@ def test_alerts_scored_per_sender(con):
     got = sorted(o["source"] for o in sb.alert_obs(con, bars))
     assert got == ["grok_alert", "grok_alert:legacy", "muse_alert"]
     assert "grok_alert" in sb.FIXED and "grok_alert" in sb.LABEL
+
+
+# ---- Grok delivery (GROK_RELIABILITY_SPEC A.6 / B.4) ----
+
+DAY = "2026-10-29"
+SESSIONS = pd.bdate_range("2026-10-26", "2026-10-30")
+
+
+def et_iso(day, hhmm):
+    from zoneinfo import ZoneInfo
+    h, m = map(int, hhmm.split(":"))
+    t = datetime.fromisoformat(f"{day}T{h:02d}:{m:02d}:00").replace(tzinfo=ZoneInfo("America/New_York"))
+    return t.astimezone(timezone.utc).isoformat(timespec="seconds")
+
+
+def daily_at(con, mid, day, hhmm, collected=None, source="grok_verified"):
+    at = et_iso(day, hhmm)
+    body = {"type": "GROK_DAILY", "summary": "s", "collected_at": collected or f"{day}T{hhmm}:00-04:00"}
+    con.execute("INSERT INTO bridge_messages (msg_id, type, sender, sent_at, received_at, raw_body, parsed_json, source) "
+                "VALUES (?,?,?,?,?,?,?,?)", (mid, "GROK_DAILY", "g", at, at, "{}", json.dumps(body), source))
+
+
+def plan_at(con, pid, day, hhmm, status="accepted", source="grok_verified"):
+    con.execute("INSERT INTO options_plans (plan_id, for_date, received_at, status, shadow_only, error, sha, raw, "
+                "source) VALUES (?,?,?,?,?,?,?,?,?)",
+                (pid, day, et_iso(day, hhmm), status, 0, "", pid, '{"plans": []}', source))
+
+
+def delivery(con, day=DAY):
+    return {r[0]: (r[1], r[2], r[3]) for r in con.execute(
+        "SELECT type, msg_id, status, reminded FROM grok_delivery WHERE day=?", (day,))}
+
+
+@pytest.fixture
+def dcon(con):
+    from stockmoney.desk import muse_ops
+    muse_ops.ensure_schema(con)
+    return con
+
+
+@pytest.mark.parametrize("hhmm,status", [("08:30", "on_time"), ("08:31", "late"), ("12:00", "late"),
+                                         ("12:01", "missing")])
+def test_daily_boundaries(dcon, hhmm, status):
+    daily_at(dcon, "d1", DAY, hhmm, collected=f"{DAY}T08:00:00-04:00")
+    sb.refresh_delivery(dcon, SESSIONS, pd.Timestamp(DAY))
+    assert delivery(dcon)["GROK_DAILY"][1] == status
+
+
+@pytest.mark.parametrize("hhmm,status", [("08:10", "on_time"), ("09:00", "on_time"), ("09:01", "late_live"),
+                                         ("09:20", "late_live"), ("09:21", "late_shadow")])
+def test_plan_boundaries(dcon, hhmm, status):
+    plan_at(dcon, "p1", DAY, hhmm)  # an empty plans list: on time is on_time
+    sb.refresh_delivery(dcon, SESSIONS, pd.Timestamp(DAY))
+    assert delivery(dcon)["OPTIONS_PLAN"][:2] == ("p1", status)
+
+
+def test_only_verified_accepted_morning_deliveries_count(dcon):
+    plan_at(dcon, "early", "2026-10-28", "08:00")  # starts the scored range
+    daily_at(dcon, "legacy", DAY, "07:00", source="grok_legacy")
+    daily_at(dcon, "digest", DAY, "06:00", collected="2026-10-28T20:00:00-04:00")  # last night's digest
+    plan_at(dcon, "bad", DAY, "08:00", status="rejected")
+    plan_at(dcon, "muse", DAY, "08:00", source="muse")
+    plan_at(dcon, "fixed", DAY, "09:10")
+    sb.refresh_delivery(dcon, SESSIONS, pd.Timestamp(DAY))
+    d = delivery(dcon)
+    assert d["GROK_DAILY"] == (None, "missing", 0)
+    assert d["OPTIONS_PLAN"] == ("fixed", "late_live", 0)
+
+
+def test_reminder_flags_and_missing_plan(dcon):
+    daily_at(dcon, "d1", DAY, "08:00")
+    dcon.execute("INSERT INTO bridge_ops VALUES (?,?)", (f"planrm:{DAY}", "2026-10-29T12:45:00+00:00"))
+    dcon.execute("INSERT INTO bridge_ops VALUES (?,?)", ("planrm:2026-10-30", "skipped_late"))
+    sb.refresh_delivery(dcon, SESSIONS, pd.Timestamp("2026-10-30"))
+    assert delivery(dcon)["OPTIONS_PLAN"] == (None, "missing", 1)
+    assert delivery(dcon, "2026-10-30")["OPTIONS_PLAN"] == (None, "missing", -1)
+
+
+def test_rerun_does_not_duplicate_and_starts_at_first_grok_day(dcon):
+    daily_at(dcon, "d1", DAY, "08:00")
+    plan_at(dcon, "p1", DAY, "08:30")
+    for _ in range(3):
+        sb.refresh_delivery(dcon, SESSIONS, pd.Timestamp("2026-10-30"))
+    rows = dcon.execute("SELECT day, COUNT(*) FROM grok_delivery GROUP BY day ORDER BY day").fetchall()
+    assert [tuple(r) for r in rows] == [(DAY, 2), ("2026-10-30", 2)]
+
+
+def test_no_grok_messages_scores_nothing(dcon):
+    assert sb.refresh_delivery(dcon, SESSIONS, pd.Timestamp(DAY)) == {"days": 0}
+    assert sb.delivery_line(dcon, DAY) is None
+
+
+def test_weekly_delivery_line(dcon):
+    days = [str(d.date()) for d in SESSIONS]
+    for d in days[:4]:
+        daily_at(dcon, f"d{d}", d, "08:00")
+    plan_at(dcon, "a", days[0], "08:00")
+    plan_at(dcon, "b", days[1], "08:55")
+    plan_at(dcon, "c", days[2], "08:59")
+    plan_at(dcon, "e", days[3], "09:30")
+    for d in days[2:4]:
+        dcon.execute("INSERT INTO bridge_ops VALUES (?,?)", (f"planrm:{d}", "2026-10-29T12:45:00+00:00"))
+    sb.refresh_delivery(dcon, SESSIONS, SESSIONS[-1])
+    assert sb.delivery_line(dcon, days[-1]) == ("grok delivery 5d: daily 4/5 on time, plan 3/5 on time "
+                                                "(1 late_shadow, 1 missing), reminders 2")
+
+
+def test_learn_job_scores_grok_delivery(con, monkeypatch, tmp_path):
+    from stockmoney.desk import muse_ops
+    from stockmoney.desk.learn import job, links
+    from test_learn import make_bars as long_bars
+    muse_ops.ensure_schema(con)
+    monkeypatch.setattr(job.notify, "send", lambda *a, **k: True)
+    monkeypatch.setattr(job, "OUT_DIR", tmp_path / "out")
+    monkeypatch.setattr(job.earnings, "refresh", lambda *a, **k: None)
+    monkeypatch.setattr(job.filings, "refresh", lambda *a, **k: None)
+    monkeypatch.setattr(links, "default_fetch", lambda url, timeout=0: (_ for _ in ()).throw(OSError("offline")))
+    bars = long_bars(423)
+    d = bars.dates
+    last = str(d[-1].date())
+    plan_at(con, "p1", last, "08:50")
+    now = datetime(d[-1].year, d[-1].month, d[-1].day, 21, 15, tzinfo=timezone.utc)
+    body = job.run(con, now, bars=bars, shadow_start=str(d[-200].date()), with_allocator=False)
+    assert "grok delivery 1d: daily 0/1 on time, plan 1/1 on time, reminders 0" in body
+    assert delivery(con, last)["OPTIONS_PLAN"][1] == "on_time"
+    body2 = job.run(con, now, bars=bars, shadow_start=str(d[-200].date()), with_allocator=False)
+    assert con.execute("SELECT COUNT(*) FROM grok_delivery").fetchone()[0] == 2 and "grok delivery 1d" in body2

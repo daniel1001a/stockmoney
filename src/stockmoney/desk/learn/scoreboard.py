@@ -34,6 +34,23 @@ for (or made on), and the rolling windows select on it:
   as options/report.py). Plan items that never triggered have no position and
   no score.
 
+Grok delivery (GROK_RELIABILITY_SPEC A.6 / B.4), table ``grok_delivery``, one
+row per session and type, verified channel (``grok_verified``) only:
+- GROK_DAILY: the first verified daily received on the session (ET) by noon
+  whose collected_at is that ET date before noon (the GROK_AM rule, so last
+  night's digest is not this morning's daily). on_time <= 08:30 ET, late <=
+  12:00 ET, else missing.
+- OPTIONS_PLAN: the first accepted verified plan for that for_date. on_time <=
+  09:00 ET (an empty plan counts), late_live <= 09:20 ET (the shadow-only
+  cutoff, options/plan.is_shadow_only), late_shadow after it, else missing. A
+  rejected plan is not a delivery.
+- reminded (OPTIONS_PLAN row; the GROK_DAILY row copies it): 1 when
+  ``planrm:<day>`` records a sent PLAN_REMINDER, -1 when it is ``skipped_late``
+  (the desk slept through the window, nothing sent), 0 when none.
+Days start at the first verified Grok message, so the months before the Grok
+channel existed are not counted as missing. Like source_scores, nothing in
+trading code reads it; the weekly line feeds the owner's EDGE_PLAN 3.7 review.
+
 Windows: the last 20 and 60 sessions of the price cache up to ``through``, and
 all-time. Trend compares the 20-session value to the 60-session one and needs
 MIN_N observations in the 20-session window, else it reads 樣本不足.
@@ -62,6 +79,9 @@ SCHEMA = """
 CREATE TABLE IF NOT EXISTS source_scores (
   day TEXT, source TEXT, metric TEXT, n INTEGER, value REAL, window TEXT, computed_at TEXT,
   PRIMARY KEY (day, source, metric, window));
+CREATE TABLE IF NOT EXISTS grok_delivery (
+  day TEXT, type TEXT, msg_id TEXT, received_at TEXT, status TEXT, reminded INTEGER,
+  PRIMARY KEY (day, type));
 """
 
 # always listed, in this order, so a silent source is visible as 0
@@ -412,3 +432,137 @@ def report(con, day: str) -> str:
     lines += ["", "Grok in_play 只用日線計算開盤到收盤報酬;desk 沒有保存分鐘 K,前 60 分鐘報酬未計算。"
               "Grok 期權劇本只計已觸發並出場的項目,未觸發的項目不計分。"]
     return "\n".join(lines)
+
+
+# ---- Grok delivery (GROK_RELIABILITY_SPEC A.6 / B.4) ----
+
+DAILY_ON_TIME = time(8, 30)
+DAILY_LATE = time(12, 0)
+PLAN_ON_TIME = time(9, 0)
+PLAN_LIVE = time(9, 20)  # OptionsConfig.plan_cutoff default; later plans are shadow only
+DELIVERY_DAYS = 20  # sessions recomputed each run (late resends and upgraded sources settle)
+
+
+def _in_day(ts: str, day) -> datetime | None:
+    try:
+        et = _et(ts)
+    except (TypeError, ValueError):
+        return None
+    return et if et.date() == day else None
+
+
+def daily_delivery(con, day) -> tuple[str | None, str | None, str]:
+    if not _has(con, "bridge_messages"):
+        return None, None, "missing"
+    lo = datetime.combine(day, time(0, 0), ET).astimezone(timezone.utc).isoformat(timespec="seconds")
+    hi = datetime.combine(day, DAILY_LATE, ET).astimezone(timezone.utc).isoformat(timespec="seconds")
+    rows = con.execute("SELECT msg_id, received_at, parsed_json FROM bridge_messages WHERE type='GROK_DAILY' "
+                       "AND source='grok_verified' AND received_at>=? AND received_at<=?", (lo, hi)).fetchall()
+    best = None
+    for mid, at, parsed in rows:
+        et = _in_day(at, day)
+        if et is None or et.time() > DAILY_LATE:
+            continue
+        try:
+            collected = str(json.loads(parsed).get("collected_at") or "")
+        except (TypeError, ValueError, AttributeError):
+            continue
+        if collected[:10] != day.isoformat() or collected[11:16] >= f"{DAILY_LATE:%H:%M}":
+            continue
+        if best is None or et < best[2]:
+            best = (mid, at, et)
+    if best is None:
+        return None, None, "missing"
+    return best[0], best[1], "on_time" if best[2].time() <= DAILY_ON_TIME else "late"
+
+
+def plan_delivery(con, day) -> tuple[str | None, str | None, str]:
+    if not _has(con, "options_plans"):
+        return None, None, "missing"
+    if "source" not in {r[1] for r in con.execute("PRAGMA table_info(options_plans)")}:
+        return None, None, "missing"
+    best = None
+    for pid, at in con.execute("SELECT plan_id, received_at FROM options_plans WHERE for_date=? "
+                               "AND status='accepted' AND source='grok_verified'", (day.isoformat(),)).fetchall():
+        try:
+            et = _et(at)
+        except (TypeError, ValueError):
+            continue
+        if best is None or et < best[2]:
+            best = (pid, at, et)
+    if best is None:
+        return None, None, "missing"
+    cut = best[2]
+    on = datetime.combine(day, PLAN_ON_TIME, ET)
+    live = datetime.combine(day, PLAN_LIVE, ET)
+    status = "on_time" if cut <= on else "late_live" if cut <= live else "late_shadow"
+    return best[0], best[1], status
+
+
+def reminded(con, day) -> int:
+    if not _has(con, "bridge_ops"):
+        return 0
+    row = con.execute("SELECT at FROM bridge_ops WHERE key=?", (f"planrm:{day.isoformat()}",)).fetchone()
+    if row is None:
+        return 0
+    return -1 if row[0] == "skipped_late" else 1
+
+
+def _first_grok_day(con):
+    firsts = []
+    if _has(con, "bridge_messages"):
+        r = con.execute("SELECT MIN(received_at) FROM bridge_messages WHERE source='grok_verified'").fetchone()
+        if r and r[0]:
+            firsts.append(r[0])
+    if _has(con, "options_plans") and "source" in {r[1] for r in con.execute("PRAGMA table_info(options_plans)")}:
+        r = con.execute("SELECT MIN(received_at) FROM options_plans WHERE source='grok_verified'").fetchone()
+        if r and r[0]:
+            firsts.append(r[0])
+    days = []
+    for ts in firsts:
+        try:
+            days.append(_et(ts).date())
+        except (TypeError, ValueError):
+            pass
+    return min(days) if days else None
+
+
+def refresh_delivery(con, sessions: pd.DatetimeIndex, through: pd.Timestamp) -> dict:
+    """Score the last DELIVERY_DAYS sessions up to ``through``. Idempotent:
+    each (day, type) row is replaced, never duplicated."""
+    ensure_schema(con)
+    first = _first_grok_day(con)
+    if first is None:
+        return {"days": 0}
+    days = [d.date() for d in sessions[(sessions <= through) & (sessions >= pd.Timestamp(first))]][-DELIVERY_DAYS:]
+    for day in days:
+        rm = reminded(con, day)
+        for typ, fn in (("GROK_DAILY", daily_delivery), ("OPTIONS_PLAN", plan_delivery)):
+            mid, at, status = fn(con, day)
+            con.execute("INSERT OR REPLACE INTO grok_delivery (day, type, msg_id, received_at, status, reminded) "
+                        "VALUES (?,?,?,?,?,?)", (day.isoformat(), typ, mid, at, status, rm))
+    return {"days": len(days)}
+
+
+def delivery_line(con, through: str, n: int = 5) -> str | None:
+    """``grok delivery 5d: daily 4/5 on time, plan 3/5 on time (1 late_shadow,
+    1 missing), reminders 2`` over the last ``n`` scored sessions up to
+    ``through``. None when nothing is scored yet."""
+    if not _has(con, "grok_delivery"):
+        return None
+    days = [r[0] for r in con.execute("SELECT DISTINCT day FROM grok_delivery WHERE day<=? ORDER BY day DESC LIMIT ?",
+                                      (through, n)).fetchall()]
+    if not days:
+        return None
+    q = ",".join("?" * len(days))
+    rows = con.execute(f"SELECT day, type, status, reminded FROM grok_delivery WHERE day IN ({q})", days).fetchall()
+    daily = [r[2] for r in rows if r[1] == "GROK_DAILY"]
+    plan = [r[2] for r in rows if r[1] == "OPTIONS_PLAN"]
+    rem = sum(1 for r in rows if r[1] == "OPTIONS_PLAN" and r[3] == 1)
+    other = [f"{plan.count(s)} {s}" for s in ("late_live", "late_shadow", "missing") if plan.count(s)]
+    k = len(days)
+    line = (f"grok delivery {k}d: daily {daily.count('on_time')}/{k} on time, "
+            f"plan {plan.count('on_time')}/{k} on time")
+    if other:
+        line += f" ({', '.join(other)})"
+    return line + f", reminders {rem}"

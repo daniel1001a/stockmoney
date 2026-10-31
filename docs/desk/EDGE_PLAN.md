@@ -282,6 +282,8 @@ H1 已在 2.1(a) 登記(出場放寬,對應影子帳戶 `shadow:combined_t35`)�
 
 **規則**:每個來源的權限(能不能擋單、能不能提出候選、Grok 劇本能不能用於實單)每週依這張表檢討,由你決定;記分板本身不自動改任何權限或參數。
 
+**Grok 交付準時度**(2026-10-31,`GROK_RELIABILITY_SPEC.md` A.6 / B.4):同一步驟寫入 `grok_delivery` 表(每個交易日各一列 GROK_DAILY 與 OPTIONS_PLAN,只計已驗證通道 `grok_verified`)。GROK_DAILY 08:30 ET 前 `on_time`、12:00 前 `late`,否則 `missing`;OPTIONS_PLAN 09:00 前 `on_time`(空劇本也算)、09:20 前 `late_live`、之後 `late_shadow`,沒收到或只有被拒的劇本是 `missing`;`reminded` 為 1(08:45 已寄提醒)、-1(desk 睡過窗口,`skipped_late`)、0。日報與週五推播附一行 `grok delivery 5d: daily 4/5 on time, plan 3/5 on time (1 late_shadow, 1 missing), reminders 2`,每週檢討時與上表準確度並列閱讀;不自動改 Grok 的權限,由你決定。
+
 ## 4. 時程
 
 | 時間 | 做什麼 | 完成的標準 |

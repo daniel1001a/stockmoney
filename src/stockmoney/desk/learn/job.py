@@ -17,7 +17,8 @@ Steps (each isolated, a failure in one does not stop the others):
   3e. H1 / H2 shadow comparison reports; a changed verdict is logged as a DRAFT in param_changes
   3f. research flags (earnings, SEC 8-K / Form 4) for the buy-only research veto; EDGAR needs SEC_USER_AGENT
   3g. Fridays: weekly hypotheses recorded in weekly_hypotheses (record only, changes no parameter)
-  3h. per-source credibility scoreboard (source_scores, read-only; last 20 / 60 sessions and all-time)
+  3h. per-source credibility scoreboard (source_scores, read-only; last 20 / 60 sessions and all-time),
+      and Grok delivery timeliness (grok_delivery; weekly line in the report and the Friday push)
   3i. wind layer: log wind_daily for each new session, options outcomes sliced by prior-day wind (H5, record only)
   3j. defined-risk spread shadow report (H6; the spreads are opened and marked by options/spreads.py intraday)
   4. allocator recommendation (Fridays or when none logged this week)
@@ -180,6 +181,9 @@ def run(con, now: datetime, bars: data.Bars | None = None, shadow_start: str | N
                      f"失敗 {ps['error']};深度分析完成 {ps['deep_done']}。")
     guarded("scoreboard", lambda: scoreboard.refresh(con, bars, through))
     con.commit()
+    guarded("grok_delivery", lambda: scoreboard.refresh_delivery(con, bars.dates, through))
+    con.commit()
+    delivery = guarded("grok_delivery_line", lambda: scoreboard.delivery_line(con, day))
 
     friday = through.weekday() == 4
     hyp_text = guarded("hypotheses", lambda: hypotheses.run(con, day, include_weekly=False)) if friday else None
@@ -216,6 +220,7 @@ def run(con, now: datetime, bars: data.Bars | None = None, shadow_start: str | N
               guarded("market_risk_report", lambda: market_risk.report(con)) or "", "",
               guarded("veto_report", lambda: veto.report(con, (through - pd.Timedelta(days=7)).date().isoformat())) or "", "",
               guarded("scoreboard_report", lambda: scoreboard.report(con, day)) or "", "",
+              f"Grok 交付(只記錄,不改權限):{delivery}" if delivery else "", "",
               guarded("wind_report", lambda: wind.report(con)) or "", "",
               guarded("spreads_report", lambda: spreads.report(con)) or "", "",
               guarded("h_reports", lambda: h_reports.run_all(con, bars)) or ""]
@@ -237,7 +242,7 @@ def run(con, now: datetime, bars: data.Bars | None = None, shadow_start: str | N
         notify.send(f"Desk 學習任務有失敗步驟 {day}",
                     "\n".join(problems + ([weekly] if weekly else []))[:1000], notify.WARN)
     elif friday:
-        lines = [weekly] + hyps + ([alloc_text.split("\n")[-6]] if alloc_text else [])
+        lines = [weekly] + ([delivery] if delivery else []) + hyps + ([alloc_text.split("\n")[-6]] if alloc_text else [])
         _notify_once(con, "learn_weekly", f"Desk 學習週報 {day}", "\n".join(lines)[:900], notify.INFO, day)
         con.commit()
     return body
