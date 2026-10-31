@@ -37,6 +37,7 @@ class Profile:
 PROFILES: dict[str, Profile] = {
     "standard": Profile("standard", 0.0075, 8, 2, 0.20, 0.25, 0.30),
     "paper_aggressive": Profile("paper_aggressive", 0.015, 12, 3, 0.25, 0.30, 0.40),
+    "paper_wide": Profile("paper_wide", 0.009, 20, 4, 0.25, 0.30, 0.40),
 }
 
 

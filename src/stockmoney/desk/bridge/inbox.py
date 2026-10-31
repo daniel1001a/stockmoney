@@ -13,7 +13,7 @@ sleeve's OptionsPlan, whose plan_id plays the msg_id role (see _process_plan).
 
 Senders: MUSE_ADDRESS (Muse types, and Grok types on the legacy channel) and,
 when GROK_ADDRESS + GROK_SHARED_TOKEN are both set, GROK_ADDRESS
-(GROK_SENDER_TYPES: GROK_DAILY, OPTIONS_PLAN, ALERT, RESEARCH_REPLY, PONG). Each
+(GROK_SENDER_TYPES: GROK_DAILY, OPTIONS_PLAN, ALERT, RESEARCH_REPLY, PONG, NOTICE_ACK). Each
 stored row carries ``source``: ``muse``, ``grok_verified`` (mail over Grok's own
 channel, Grok's token, and a Gmail-written dkim=pass for the GROK_ADDRESS
 domain) or ``grok_legacy`` (Grok type over the Muse channel, or Grok's channel
@@ -64,11 +64,12 @@ EXCERPT_CHARS = 2000
 SUBJECT_RE = re.compile(r"^((?:(?i:re|fw|fwd)\s*:\s*)*)\[SMD/([A-Z_]{1,32})/([A-Za-z0-9_\-]{6,64})\] (\S{1,256})\s*$")
 # Types only the desk sends. Mail carrying one is an echo of our own mail (a reply
 # or forward whose client stripped the prefix) and is never correctable.
-OUTBOUND_ONLY_TYPES = frozenset({"WATCHLIST", "RESEARCH_REQUEST", "REPORT", "FEEDBACK", "PING", "DESK_BRIEF"})
+OUTBOUND_ONLY_TYPES = frozenset({"WATCHLIST", "RESEARCH_REQUEST", "REPORT", "FEEDBACK", "PING", "DESK_BRIEF",
+                               "GROK_NOTICE", "PLAN_REMINDER"})
 _INBOUND = TypeAdapter(Inbound)
 
 SOURCE_MUSE, SOURCE_GROK_VERIFIED, SOURCE_GROK_LEGACY = "muse", "grok_verified", "grok_legacy"
-GROK_TYPES = frozenset({"GROK_DAILY", "OPTIONS_PLAN"})  # Grok-only types (source_of fallback)
+GROK_TYPES = frozenset({"GROK_DAILY", "OPTIONS_PLAN", "NOTICE_ACK"})  # Grok-only types (source_of fallback)
 # everything GROK_ADDRESS may send; ALERT / RESEARCH_REPLY / PONG are shared with Muse
 GROK_SENDER_TYPES = GROK_TYPES | {"ALERT", "RESEARCH_REPLY", "PONG"}
 # information-only types: stored, never an order input; these may be pruned (see above)
@@ -262,7 +263,7 @@ def _process(con, mail: RawMail, config: BridgeConfig, received_at: datetime) ->
         # because is_echo_subject() recognises the stored subject.
         _reject(con, received_at, mail, "schema_invalid outbound_only_type", config, subj_id)
         return False
-    if from_grok and subj_type not in GROK_SENDER_TYPES:
+    if (from_grok and subj_type not in GROK_SENDER_TYPES) or (subj_type == "NOTICE_ACK" and not from_grok):
         # not in muse_ops.FIXES: never answered with feedback
         _reject(con, received_at, mail, "type_not_allowed_for_sender", config, subj_id)
         return False
@@ -468,7 +469,7 @@ def _process_plan(con, mail: RawMail, config: BridgeConfig, received_at: datetim
     except (ValueError, RecursionError):
         return fail("body_not_json")
     if p.plan_id != subj_id:
-        return fail("msg_id_mismatch")
+        return fail("msg_id_mismatch OPTIONS_PLAN")
     if p.plan_id.lower().startswith("grok-"):
         return fail("schema_invalid OPTIONS_PLAN.plan_id:reserved_prefix_grok-")
     other = con.execute("SELECT type FROM bridge_messages WHERE msg_id=?", (p.plan_id,)).fetchone()
