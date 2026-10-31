@@ -497,3 +497,17 @@ def test_non_object_owner_entry_with_paper_overlay_keeps_postclose_running(desk,
         assert con.execute("SELECT 1 FROM equity_history WHERE date=?", (str(t.date()),)).fetchone()
         assert "paper 策略參數覆寫無效" in out and "股票策略只給建議" not in out
     assert any("paper" in title.lower() and p == run.notify.WARN for title, _, p in sent)
+
+
+def test_invalid_overlay_postclose_rerun_keeps_planned_rows(desk, sent, monkeypatch):
+    bars, t, b = _bars_and_broker()
+    called = []
+    real = run._plan_entries
+    monkeypatch.setattr(run, "_plan_entries", lambda *a, **kw: called.append(kw) or real(*a, **kw))
+    with store.connect(desk.path) as con:
+        plan(con, "AAPL", day=str(t.date()))
+        store.set_setting(con, "paper_strategy_params", "[]")
+        run.postclose(con, b, _at(t, 17, 0), bars=bars, limits=desk.limits)
+        run.postclose(con, b, _at(t, 18, 0), bars=bars, limits=desk.limits)  # same-evening rerun
+        assert called == []  # neither planned nor advisory rows are written
+        assert con.execute("SELECT status FROM planned_orders WHERE symbol='AAPL'").fetchone()[0] == "planned"

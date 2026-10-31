@@ -218,3 +218,21 @@ def test_replay_cmd_survives_corrupt_options_document(tmp_path, monkeypatch):
     with pytest.raises(Stop):
         opt_run.replay_cmd(date(2026, 10, 14), cfg, "iex", None, 60.0, db_path=db)
     assert seen["cfg"] is cfg
+
+
+@pytest.mark.parametrize("owner", ['{"pullback": null}', '{"pullback": []}', '{"pullback": 3}'])
+def test_current_reads_non_object_owner_entry_as_default(con, owner):
+    store.set_setting(con, "strategy_params", owner)
+    from stockmoney.desk.strategies import REGISTRY as STRATEGIES
+    assert r.current(con, "pullback.trail_atr") == STRATEGIES["pullback"].params["trail_atr"]
+
+
+def test_cli_registry_finishes_with_non_object_owner_entry(tmp_path, capsys):
+    from scripts.desk_maintainer import main
+    path = tmp_path / "bad-owner.sqlite"
+    with store.connect(path) as con:
+        store.set_setting(con, "strategy_params", '{"breakout": null}')
+        store.set_setting(con, "paper_strategy_params", '{"pullback": {"trail_atr": 3.5}}')
+    main(["--registry", "--db", str(path)])
+    output = capsys.readouterr().out
+    assert "breakout.max_hold_days" in output and "options.orb_min_day_rvol" in output

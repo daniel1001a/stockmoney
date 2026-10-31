@@ -812,7 +812,9 @@ def postclose(con, broker: Broker, now: datetime, bars: data.Bars | None = None,
             signals = engine.scan(strats, ctx)
             for s in signals:
                 store.save_signal(con, engine.signal_id(s), s)
-            if entries_on:
+            if not paper_ok:
+                pass  # invalid paper overlay: plan nothing and leave same-day planned rows for a retry
+            elif entries_on:
                 planned = _plan_entries(con, day, ledger, risk, snap, ctx, signals, set(exits))
             else:  # sized exactly like a real plan, written as advisory, never sent
                 advisory = _plan_entries(con, day, ledger, risk, snap, ctx, signals, set(exits), status=ADVISORY)
@@ -1586,7 +1588,10 @@ def postopen(con, broker: Broker, now: datetime, limits: Limits | None = None, m
         events.append("市場未開,出場計畫留待下一次執行:" + "、".join(r["symbol"] for r in sells))
     events += _expire_unretried_opg(con, broker, now)
     retries = _opg_retry_candidates(con, today)
-    if retries and not (stock_entries_enabled(con) and _paper_params_valid(con, broker)):
+    if retries and not _paper_params_valid(con, broker):
+        # repairable: the remainder stays eligible until 10:30 ET once the overlay is fixed
+        events.append("paper 策略參數覆寫無效,開盤單剩餘股數暫不補單:" + "、".join(r["symbol"] for r in retries))
+    elif retries and not stock_entries_enabled(con):
         # no remainder is bought; _expire_unretried_opg closes the window after 10:30 ET
         events.append("股票策略只給建議,開盤單剩餘股數不補單:" + "、".join(r["symbol"] for r in retries))
     elif retries and broker.is_equity_market_open():

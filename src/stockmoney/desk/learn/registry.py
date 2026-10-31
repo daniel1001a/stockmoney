@@ -100,7 +100,10 @@ def current(con, key: str):
             params = store.strategy_params(con, paper=True)
         except (ValueError, TypeError):
             params = store.strategy_params(con)
-        return params.get(strategy, {}).get(param, STRATEGIES[strategy].params[param])
+        block = params.get(strategy) if isinstance(params, dict) else None
+        if not isinstance(block, dict):
+            block = {}  # a non-object entry reads as the code default, like the runtime fallback
+        return block.get(param, STRATEGIES[strategy].params[param])
     if item.location == "options_params":
         default = getattr(OptionsConfig(), _attr(key))
         if key.split(".")[1] in CLOCK_KNOBS:
