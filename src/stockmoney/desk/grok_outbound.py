@@ -14,6 +14,12 @@ successful send, so a failed send is retried on the next bridge run.
   closed a losing trade today or that is held / traded and moved more than 3%
   today; "why did X move", deadline 21:00 ET. Grok answers with RESEARCH_REPLY
   (request_id = the request's msg_id); muse_ops.check_deliveries reports a late one.
+- PLAN_REMINDER (GROK_RELIABILITY_SPEC.md B.2), from 08:45 to before 09:20 ET on
+  trading days when no OPTIONS_PLAN for today (any status) has arrived over the
+  verified Grok channel: one per day (``planrm:<day>``), listing GROK_DAILY as
+  missing too when no verified morning daily arrived by 08:30. The owner gets
+  one push. A first poll at or after 09:20 sends nothing and records
+  ``planrm:<day>`` = ``skipped_late``. Rule playbooks trade the same either way.
 
 Pure reporting: nothing here reads Grok's answers into a decision, places an
 order or changes a parameter. Daily returns come from the ohlcv cache
@@ -34,6 +40,9 @@ ET = muse_ops.ET
 BRIEF_AT = time(6, 30)
 REQUEST_AT = time(17, 45)
 REPLY_BY = time(21, 0)
+REMIND_AT = time(8, 45)
+LIVE_CUTOFF = time(9, 20)  # ET; a plan received later is shadow only
+DAILY_BY = time(8, 30)  # ET; the morning GROK_DAILY on_time cutoff (spec A.6)
 MOVE = 0.03
 MAX_REQUESTS = 10
 MAX_QUESTIONS = 5
@@ -236,6 +245,72 @@ def build_requests(con, now: datetime, returns: Returns) -> list:
     return out
 
 
+def _grok_plan_received(con, day: date) -> bool:
+    """An OPTIONS_PLAN for ``day`` stored from the verified Grok channel, any status."""
+    if not _has(con, "options_plans"):
+        return False
+    cols = {r[1] for r in con.execute("PRAGMA table_info(options_plans)")}
+    if "source" not in cols:
+        return False
+    return con.execute("SELECT 1 FROM options_plans WHERE for_date=? AND source='grok_verified' LIMIT 1",
+                       (day.isoformat(),)).fetchone() is not None
+
+
+def _morning_daily(con, day: date) -> bool:
+    """A verified GROK_DAILY received on ``day`` (ET) at or before 08:30 ET and
+    collected that morning. The collected_at test is the GROK_AM rule: last
+    night's 20:00 digest polled at 06:00 is not this morning's daily."""
+    if not _has(con, "bridge_messages"):
+        return False
+    e = muse_ops.EXPECTATIONS["GROK_AM"]
+    start = datetime.combine(day, time(0, 0), ET)
+    by = datetime.combine(day, DAILY_BY, ET)
+    return con.execute("SELECT 1 FROM bridge_messages WHERE type='GROK_DAILY' AND source='grok_verified' "
+                       "AND received_at>=? AND received_at<=? "
+                       "AND substr(json_extract(parsed_json,'$.collected_at'),1,10)=? "
+                       "AND substr(json_extract(parsed_json,'$.collected_at'),12,5)<? LIMIT 1",
+                       (muse_ops._iso(start), muse_ops._iso(by), day.isoformat(),
+                        f"{e.collected_before:%H:%M}")).fetchone() is not None
+
+
+def build_reminder(con, now: datetime):
+    from stockmoney.desk.bridge import outbox
+    from stockmoney.desk.bridge.schema import PlanReminder
+    day = now.astimezone(ET).date()
+    missing = ["OPTIONS_PLAN"] + ([] if _morning_daily(con, day) else ["GROK_DAILY"])
+    note = ("No OPTIONS_PLAN for today has reached the desk. If you have not sent it, send it now "
+            "(empty plans is fine). If you sent it, check for a FEEDBACK and resend with a new plan_id. "
+            "Plans received after 09:20 ET are shadow only.")
+    return PlanReminder(msg_id=outbox.new_msg_id("planrm"), sent_at=now, for_date=day, missing=missing, note=note)
+
+
+def _remind(con, box, now: datetime, config) -> str | None:
+    from stockmoney.desk import notify
+    from stockmoney.desk.bridge import outbox
+    local = now.astimezone(ET)
+    day = local.date()
+    key = f"planrm:{day}"
+    if local.time() < REMIND_AT or _done(con, key) or _grok_plan_received(con, day):
+        return None
+    if local.time() >= LIVE_CUTOFF:
+        # desk was asleep through the window: record it for the scoreboard, send nothing
+        con.execute("INSERT INTO bridge_ops (key, at) VALUES (?,?)", (key, "skipped_late"))
+        con.commit()
+        return None
+    msg = build_reminder(con, now)
+    outbox.send(box, msg, config, channel="grok")
+    muse_ops.log_outbound(con, msg, "grok")
+    muse_ops._once(con, key)
+    # commit now: a later failure in the same bridge run must not roll the
+    # marker back, or the next poll inside the window sends a second reminder
+    con.commit()
+    try:
+        notify.send("Grok plan missing", "Grok plan missing at 08:45, reminder sent", notify.WARN)
+    except Exception:  # a failed push never re-sends the reminder
+        log.exception("grok outbound: plan reminder push failed")
+    return f"PLAN_REMINDER 已寄給 Grok({msg.msg_id},缺:{', '.join(msg.missing)})"
+
+
 def _done(con, key: str) -> bool:
     return con.execute("SELECT 1 FROM bridge_ops WHERE key=?", (key,)).fetchone() is not None
 
@@ -275,6 +350,9 @@ def run(con, box, now: datetime, config=None, returns: Returns | None = None) ->
         muse_ops.log_outbound(con, msg, "grok")
         muse_ops._once(con, f"brief:{day}")
         lines.append(f"DESK_BRIEF 已寄給 Grok({msg.msg_id})")
+    reminded = _remind(con, box, now, config)
+    if reminded:
+        lines.append(reminded)
     booked = _postclose_done(con, day)
     if local.time() >= REQUEST_AT and not _done(con, f"grokrq:{day}") and (booked or local.time() >= REPLY_BY):
         # past the reply deadline without postclose: close the day unsent
