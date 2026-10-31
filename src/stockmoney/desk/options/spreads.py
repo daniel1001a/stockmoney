@@ -68,9 +68,6 @@ SLIP = 0.03
 DTE_MIN, DTE_MAX, DTE_TARGET = 7, 21, 14
 LONG_DELTA, LONG_BAND = 0.50, (0.40, 0.60)
 SHORT_DELTA, SHORT_BAND = 0.30, (0.20, 0.40)
-TAKE_PROFIT_FRAC = 0.5   # of the maximum profit
-STOP_FRAC = 0.5          # value <= this x debit
-TIME_EXIT_DTE = 2
 ENTRY_WINDOW = (time(9, 45), time(11, 0))
 WIND_SYMBOLS = ("SPY", "QQQ")
 MIN_SAMPLES = 30
@@ -296,9 +293,9 @@ def mark_and_exit(con, data, now: datetime, cfg: OptionsConfig) -> list[tuple[st
         if day <= date.fromisoformat(row["day"]):
             continue  # exits start the next session
         debit = row["entry_debit"]
-        reason = ("take_profit" if value >= debit + TAKE_PROFIT_FRAC * (row["width"] - debit)
-                  else "stop" if value <= STOP_FRAC * debit
-                  else "time" if (expiry - day).days <= TIME_EXIT_DTE else None)
+        reason = ("take_profit" if value >= debit + cfg.spread_take_profit_frac * (row["width"] - debit)
+                  else "stop" if value <= cfg.spread_stop_frac * debit
+                  else "time" if (expiry - day).days <= cfg.spread_time_exit_dte else None)
         if reason:
             _close(con, row, now, value, reason, cfg)
             closed.append((row["underlying"], reason))
@@ -314,13 +311,17 @@ def regular_hours(now: datetime) -> bool:
 
 def tick(con, data, now: datetime, cfg: OptionsConfig | None = None,
          slot: datetime | None = None) -> tuple[list[str], list[tuple[str, str]]]:
-    cfg = cfg or OptionsConfig()
+    from stockmoney.desk.learn.registry import safe_options_config, options_settings_valid
+    from stockmoney.desk import notify
+
+    # This module has no broker/order path: all spread books are simulated.
+    cfg = safe_options_config(con, cfg or OptionsConfig(), paper=True, sleeve="spreads", on_error=notify.send)
     ensure_schema(con)
     wind.ensure_schema(con)
     record_missed(con, now, cfg, slot)  # before any quote, so a failing mark cannot skip it
     closed = mark_and_exit(con, data, now, cfg)
     con.commit()
-    opened = open_new(con, data, now, cfg, slot)
+    opened = open_new(con, data, now, cfg, slot) if options_settings_valid(con) else []
     con.commit()
     return opened, closed
 

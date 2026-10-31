@@ -154,6 +154,16 @@ def ensure_schema(con) -> None:
     con.executescript(SCHEMA)
 
 
+def _paper_params_valid(con, broker) -> bool:
+    if getattr(broker, "is_paper", False) is not True:
+        return True
+    try:
+        store.strategy_params(con, paper=True)
+        return True
+    except (ValueError, TypeError):
+        return False
+
+
 def record_profile(con) -> None:
     """Audit the effective process profile once per transition, before job work.
 
@@ -274,12 +284,20 @@ def _lift_reconcile_halt(con, day: str) -> None:
     notify.send("Desk 已解除暫停新進場", f"{day}:{why}。", notify.WARN)
 
 
-def _strategies(con, day: str | None = None) -> dict[str, Strategy]:
+def _strategies(con, day: str | None = None, *, paper: bool = False) -> dict[str, Strategy]:
     """Build the enabled strategies from stored parameters. A stored parameter
     the strategy rejects (stale or hand-edited setting) must not crash every
     job: that strategy falls back to its defaults and the owner is warned once
     per day."""
-    params = store.strategy_params(con)
+    try:
+        params = store.strategy_params(con, paper=paper)
+    except (ValueError, TypeError):
+        if not paper:
+            raise
+        params = store.strategy_params(con)
+        _notify_once(con, "badpaperparams", "Invalid paper strategy overrides",
+                     "Using owner parameters for exits; new stock entries are disabled until repaired.",
+                     notify.WARN, day or _today(datetime.now(timezone.utc)))
     disabled = set(json.loads(store.get_setting(con, "disabled_strategies", "[]")))
     day = day or _today(datetime.now(timezone.utc))
     out: dict[str, Strategy] = {}
@@ -737,7 +755,7 @@ def postclose(con, broker: Broker, now: datetime, bars: data.Bars | None = None,
     bars = bars.upto(through)
     ind = compute(bars)
     ctx = engine.day_context(ind, through)
-    strats = _strategies(con, day)
+    strats = _strategies(con, day, paper=getattr(broker, "is_paper", False) is True)
     close = ind.close.loc[through]
 
     # manage open stock positions: trail stops, rule exits (reconciled symbols only)
@@ -785,7 +803,8 @@ def postclose(con, broker: Broker, now: datetime, bars: data.Bars | None = None,
     # new entries for the next open; a failure here must not undo the stop bookkeeping above
     planned: list[dict] = []
     advisory: list[dict] = []
-    entries_on = stock_entries_enabled(con)
+    paper_ok = _paper_params_valid(con, broker)
+    entries_on = stock_entries_enabled(con) and paper_ok
     if bad:
         events.append("對帳不一致,今天不規劃新進場")
     else:
@@ -793,7 +812,9 @@ def postclose(con, broker: Broker, now: datetime, bars: data.Bars | None = None,
             signals = engine.scan(strats, ctx)
             for s in signals:
                 store.save_signal(con, engine.signal_id(s), s)
-            if entries_on:
+            if not paper_ok:
+                pass  # invalid paper overlay: plan nothing and leave same-day planned rows for a retry
+            elif entries_on:
                 planned = _plan_entries(con, day, ledger, risk, snap, ctx, signals, set(exits))
             else:  # sized exactly like a real plan, written as advisory, never sent
                 advisory = _plan_entries(con, day, ledger, risk, snap, ctx, signals, set(exits), status=ADVISORY)
@@ -816,7 +837,7 @@ def postclose(con, broker: Broker, now: datetime, bars: data.Bars | None = None,
     store.set_setting(con, PLAN_THROUGH_KEY, day)
 
     report = head + _report(day, ctx, sys_eq, limits.capital_budget, mode, why, ledger, events, planned, exits,
-                            advisory=advisory, entries_on=entries_on)
+                            advisory=advisory, entries_on=entries_on, paper_params_invalid=not paper_ok)
     report += _slot_skip_report(con, day, "planned" if entries_on else ADVISORY)
     report += _reconcile_summary(con, broker, day)
     con.execute(
@@ -1031,6 +1052,8 @@ def premarket(con, broker: Broker, now: datetime, limits: Limits | None = None, 
     # lost to a failure is restored here, before any new money goes in.
     st.lines += _premarket_stops(con, broker, risk, today, bad, st)
     entries_on = stock_entries_enabled(con)
+    paper_params_valid = _paper_params_valid(con, broker)
+    held: list[str] = []
     for p in plans:
         if p["side"] != Side.BUY.value:
             continue
@@ -1038,6 +1061,10 @@ def premarket(con, broker: Broker, now: datetime, limits: Limits | None = None, 
             _mark(con, p, ADVISORY, "股票策略改為只給建議(2026-10-27),未送出")
             con.commit()
             st.lines.append(f"未送出 {p['symbol']}:股票策略只給建議,不自動下單")
+            continue
+        if not paper_params_valid:
+            st.lines.append(f"未送出 {p['symbol']}:invalid paper overrides; plan kept for a premarket rerun today")
+            held.append(p["symbol"])
             continue
         try:
             _premarket_one(con, broker, risk, ledger, snap, p, st, **kw)
@@ -1054,6 +1081,11 @@ def premarket(con, broker: Broker, now: datetime, limits: Limits | None = None, 
     msg = f"{today} 盤前送單 {st.n} 筆\n" + "\n".join(st.lines)
     for note in flags.notify:
         _notify_once(con, f"muse:{note[:100]}", "Muse 警報", note, notify.WARN, today)
+    if held:
+        _notify_once(con, "badpaperparams:premarket", "Invalid paper strategy overrides",
+                     "Planned buys held back: " + ", ".join(held) + ". Postopen does not send them: after repairing the"
+                     " overrides, rerun premarket before 10:30 ET today, otherwise the next premarket expires them.",
+                     notify.WARN, today)
     if st.n:
         notify.send(f"Desk 盤前 {today}", msg, notify.INFO)
     return msg
@@ -1557,7 +1589,10 @@ def postopen(con, broker: Broker, now: datetime, limits: Limits | None = None, m
         events.append("市場未開,出場計畫留待下一次執行:" + "、".join(r["symbol"] for r in sells))
     events += _expire_unretried_opg(con, broker, now)
     retries = _opg_retry_candidates(con, today)
-    if retries and not stock_entries_enabled(con):
+    if retries and not _paper_params_valid(con, broker):
+        # repairable: the remainder stays eligible until 10:30 ET once the overlay is fixed
+        events.append("paper 策略參數覆寫無效,開盤單剩餘股數暫不補單:" + "、".join(r["symbol"] for r in retries))
+    elif retries and not stock_entries_enabled(con):
         # no remainder is bought; _expire_unretried_opg closes the window after 10:30 ET
         events.append("股票策略只給建議,開盤單剩餘股數不補單:" + "、".join(r["symbol"] for r in retries))
     elif retries and broker.is_equity_market_open():
@@ -1728,7 +1763,8 @@ def _opens_today(broker: Broker, now: datetime) -> bool:
 
 
 def _report(day, ctx, sys_eq, budget, mode, why, ledger: Ledger, events, planned, exits,
-            advisory: list[dict] | None = None, entries_on: bool = True) -> str:
+            advisory: list[dict] | None = None, entries_on: bool = True,
+            paper_params_invalid: bool = False) -> str:
     lines = [f"## {day} 盤後報告", "",
              f"**系統淨值** {sys_eq:,.0f}({sys_eq / budget - 1:+.2%}),狀態 {mode}:{why}", "",
              f"**大盤**:{REGIME_LABEL[ctx.market.regime]};{ctx.market.note}",
@@ -1745,7 +1781,10 @@ def _report(day, ctx, sys_eq, budget, mode, why, ledger: Ledger, events, planned
     if entries_on:
         lines.append("**明天開盤進場計畫**:" + ("、".join(f"{p['symbol']} {p['qty']} 股({p['strategy']})" for p in planned) or "無"))
         return "\n".join(lines)
-    lines.append("**明天開盤進場計畫**:無(股票策略只給建議,不自動下單)")
+    if paper_params_invalid:
+        lines.append("**明天開盤進場計畫**:無(paper 策略參數覆寫無效,修正前不規劃新進場;出場照常使用 owner 參數)")
+    else:
+        lines.append("**明天開盤進場計畫**:無(股票策略只給建議,不自動下單)")
     lines += ["", "**中長期建議(不自動下單)**"]
     lines += [f"- {p['symbol']} {p['qty']:g} 股 參考價 {p['ref']:.2f} 停損 {p['stop']:.2f}({p['strategy']})"
               + (f":{str(p['reason'])[:120]}" if p.get("reason") else "") for p in advisory or []] or ["- 無"]

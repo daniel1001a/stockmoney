@@ -30,6 +30,13 @@ def apply_strategy_changes(con, name: str, edited: dict, enabled: bool, reason: 
         raise ValueError(f"unknown strategy {name!r}")
     cls = REGISTRY[name]
     clean = cls.validate_params(edited)  # raises with the offending parameter named
+    from stockmoney.desk.learn.registry import paper_overrides
+    overlay = paper_overrides(con, name)  # an unreadable overlay reads as {} and blocks only paper entries
+    if overlay:
+        try:
+            cls.validate_params({**clean, **overlay})
+        except ValueError as e:
+            raise ValueError(f"{e}(paper 覆寫值 {overlay} 仍有效,請先調整 paper 覆寫或改用相容的值)") from None
     stored = store.strategy_params(con).get(name, {})
     current = {**cls.params, **stored}
     changes = {k: v for k, v in clean.items() if v != current[k]}

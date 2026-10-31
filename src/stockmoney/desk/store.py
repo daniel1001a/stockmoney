@@ -92,15 +92,31 @@ def set_setting(con, key: str, value: str) -> None:
     con.execute("INSERT INTO settings VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, value))
 
 
-def strategy_params(con) -> dict[str, dict]:
-    return json.loads(get_setting(con, "strategy_params", "{}"))
+def strategy_params(con, *, paper: bool = False) -> dict[str, dict]:
+    params = json.loads(get_setting(con, "strategy_params", "{}"))
+    if paper:
+        from stockmoney.desk.strategies import REGISTRY
+        overlay = json.loads(get_setting(con, "paper_strategy_params", "{}"))
+        if not isinstance(overlay, dict):
+            raise ValueError("paper strategy overrides must be an object")
+        if overlay and not isinstance(params, dict):
+            raise ValueError("owner strategy parameters must be an object to take paper overrides")
+        for name, values in overlay.items():
+            if name not in REGISTRY or not isinstance(values, dict):
+                raise ValueError("invalid paper strategy overrides")
+            if not isinstance(params.setdefault(name, {}), dict):
+                raise ValueError(f"owner parameters for {name} must be an object to take paper overrides")
+            params[name].update(values)
+            REGISTRY[name](**params[name])
+    return params
 
 
 def change_param(con, strategy: str, param: str, new, reason: str) -> None:
-    params = strategy_params(con)
+    key = "strategy_params"
+    params = json.loads(get_setting(con, key, "{}"))
     old = params.get(strategy, {}).get(param)
     params.setdefault(strategy, {})[param] = new
-    set_setting(con, "strategy_params", json.dumps(params))
+    set_setting(con, key, json.dumps(params))
     con.execute(
         "INSERT INTO param_changes (strategy, param, old, new, reason, changed_at) VALUES (?,?,?,?,?,?)",
         (strategy, param, json.dumps(old), json.dumps(new), reason, now()),
