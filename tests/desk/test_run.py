@@ -48,6 +48,7 @@ def _simulate(tmp_path, n_days=130):
 
 def test_full_cycle_trades_and_stays_reconciled(tmp_path):
     con, broker, log = _simulate(tmp_path)
+    assert any("skipped for slots:" in report for job, _, report in log if job == "post")
     with store.connect(tmp_path / "desk.sqlite") as con:
         fills = con.execute("SELECT side, COUNT(*) FROM fills GROUP BY side").fetchall()
         counts = {r[0]: r[1] for r in fills}
