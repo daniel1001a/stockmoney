@@ -157,17 +157,18 @@ def change(con, key: str, value, reason: str, *, account_kind: str) -> None:
         _checked_settings(con)  # refuse a corrupt shared document without an audit/write
         value = validate(con, key, value)
         item = REGISTRY[key]
+        old = current(con, key)
+        sleeve, param = key.split(".")
         if item.location == "strategy_params":
-            strategy, param = key.split(".")
-            store.change_param(con, strategy, param, value, reason, paper=True)
+            values = json.loads(store.get_setting(con, "paper_strategy_params", "{}"))
+            values.setdefault(sleeve, {})[param] = value
+            store.set_setting(con, "paper_strategy_params", json.dumps(values))
         else:
-            old = current(con, key)
             values = _settings(con)
             values[key] = value
             store.set_setting(con, "options_params", json.dumps(values))
-            sleeve, param = key.split(".")
-            con.execute("INSERT INTO param_changes (strategy,param,old,new,reason,changed_at) VALUES (?,?,?,?,?,?)",
-                        (sleeve, param, json.dumps(old), json.dumps(value), reason, store.now()))
+        con.execute("INSERT INTO param_changes (strategy,param,old,new,reason,changed_at) VALUES (?,?,?,?,?,?)",
+                    (sleeve, param, json.dumps(old), json.dumps(value), reason, store.now()))
         con.execute("RELEASE registry_change")
     except Exception:
         con.execute("ROLLBACK TO registry_change")

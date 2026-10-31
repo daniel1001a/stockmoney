@@ -70,6 +70,19 @@ def test_nonpaper_write_refused(con):
     assert r.current(con, "options.orb_min_day_rvol") == 1.5
 
 
+@pytest.mark.parametrize("owner_value", [None, 3.25])
+def test_stock_audit_records_effective_previous_value(con, owner_value):
+    if owner_value is not None:
+        store.change_param(con, "pullback", "trail_atr", owner_value, "owner")
+    r.change(con, "pullback.trail_atr", 3.5, "paper", account_kind="paper")
+    row = con.execute("SELECT old,new FROM param_changes ORDER BY id DESC LIMIT 1").fetchone()
+    assert json.loads(row["old"]) == (3.0 if owner_value is None else owner_value)
+    assert json.loads(row["new"]) == 3.5
+    r.change(con, "pullback.trail_atr", 3.75, "second paper", account_kind="paper")
+    row = con.execute("SELECT old FROM param_changes ORDER BY id DESC LIMIT 1").fetchone()
+    assert json.loads(row["old"]) == 3.5
+
+
 def test_clock_override(con):
     r.change(con, "options.entry_window_start", 580, "later entry", account_kind="paper")
     assert r.options_config(con, OptionsConfig(), paper=True).entry_window_start == (9, 40)
