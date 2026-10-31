@@ -23,7 +23,7 @@ Grok 的每一類輸出都會被打分(`EDGE_PLAN.md` 的來源記分板),每週
 - 驗證:寄件人 + 密鑰 + Gmail DKIM(寄件網域簽章)三者都過才算 `grok_verified`。DKIM 沒過的信不會被丟掉,但會降級成 `grok_legacy`,不參與否決、不參與開倉、不計入權限評估。
 - 舊通道(從 dnial1001a@gmail.com 用 Muse 密鑰寄)仍收,但一律是 `grok_legacy`。請停用舊通道。
 - Desk 每 60 秒收一次信(06:00 到 16:30 ET 的交易日;其他時間每 15 分鐘)。
-- 回饋:被拒收或被剔除部分內容時,Desk 寄 `FEEDBACK` 給你(寄到 GROK_ADDRESS;舊通道的信寄到 dnial1001a@gmail.com,`problem` 開頭是「【給 Grok】」)。照 `how_to_fix` 修正後換新 msg_id 重寄。每個通道每 24 小時最多 10 封回饋。
+- 回饋:被拒收或被剔除部分內容時,Desk 寄 `FEEDBACK` 給你(寄到 GROK_ADDRESS;舊通道的信寄到 dnial1001a@gmail.com,`problem` 開頭是「【給 Grok】」)。照 `how_to_fix` 修正後重寄:OPTIONS_PLAN 換新的 plan_id,主旨與 JSON 的 plan_id 一致,不可新增 msg_id;其他類型換新 msg_id。每個通道每 24 小時最多 10 封回饋。
 - 重寄:內容完全相同的重寄會被安靜略過;同一個 msg_id 但內容不同會以 `duplicate_msg_id` 拒收,請在結尾加 `-r2`、`-r3`。例外:OPTIONS_PLAN 以 plan_id 判斷重寄,舊通道寄過的同一份劇本從 GROK_ADDRESS 重寄會升級成已驗證(見 5.2)。
 - 時間一律以 Desk 收信時間(`received_at`)為準。
 - ntfy:目前不用。PONG 回報 `can_http_post: true` 後,Desk 才會評估是否開 ntfy 快速通道;email 永遠是主通道。
