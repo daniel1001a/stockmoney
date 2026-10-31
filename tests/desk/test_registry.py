@@ -57,7 +57,8 @@ def test_round_trip_and_audit(con):
 
 def test_stock_writer_and_cross_parameter_validation(con):
     r.change(con, "pullback.trail_atr", 3.5, "test", account_kind="paper")
-    assert store.strategy_params(con)["pullback"]["trail_atr"] == 3.5
+    assert store.strategy_params(con, paper=True)["pullback"]["trail_atr"] == 3.5
+    assert "pullback" not in store.strategy_params(con)
     store.change_param(con, "rotation", "keep_rank", 5, "fixture")
     with pytest.raises(ValueError, match="keep_rank"):
         r.change(con, "rotation.top_n", 6, "invalid combination", account_kind="paper")
@@ -120,3 +121,19 @@ def test_invalid_shared_document_refused_by_writer_but_exits_can_load(con, blob)
     for _ in range(2):
         assert r.safe_options_config(con, cfg, paper=True, on_error=lambda *a: reports.append(a)) is cfg
     assert len(reports) == 1
+    assert r.current(con, "options.orb_min_day_rvol") == 1.5
+
+
+def test_paper_stock_override_never_reaches_nonpaper_strategy(con):
+    from stockmoney.desk.run import _strategies
+    r.change(con, "pullback.trail_atr", 3.5, "paper test", account_kind="paper")
+    assert _strategies(con, paper=True)["pullback"].params["trail_atr"] == 3.5
+    assert _strategies(con, paper=False)["pullback"].params["trail_atr"] == 3.0
+
+
+def test_change_remains_in_callers_transaction(con):
+    con.commit()
+    r.change(con, "options.orb_min_day_rvol", 1.75, "test", account_kind="paper")
+    assert con.in_transaction
+    con.rollback()
+    assert r.current(con, "options.orb_min_day_rvol") == 1.5

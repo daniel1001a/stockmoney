@@ -100,6 +100,13 @@ def test_corrupt_overrides_do_not_prevent_flattening(tmp_path, con):
     assert r.eng.cfg.max_premium_per_trade == r.cfg.max_premium_per_trade
 
 
+def test_corrupt_overrides_disable_new_entries(tmp_path, con):
+    store.set_setting(con, "options_params", '{"options.orb_min_day_rvol":0.5}')
+    r = Rig(tmp_path, con)
+    r.run(et(9, 52))
+    assert not r.pos() and not r.gate_calls
+
+
 def test_shadow_buys_ask_sells_bid_take_profit_then_breakeven(tmp_path, con):
     r = Rig(tmp_path, con)
     r.run(et(9, 52))

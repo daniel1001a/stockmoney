@@ -290,8 +290,12 @@ def ingest_plan(path: Path, cfg: OptionsConfig, db_path: Path = store.DEFAULT_PA
     return 0
 
 
-def replay_cmd(day: date, cfg: OptionsConfig, feed: str, plan_file: Path | None, step: float) -> int:
+def replay_cmd(day: date, cfg: OptionsConfig, feed: str, plan_file: Path | None, step: float,
+               db_path: Path = store.DEFAULT_PATH) -> int:
     from stockmoney.desk.options import replay
+    from stockmoney.desk.learn.registry import options_config
+    with store.connect(db_path) as con:
+        cfg = options_config(con, cfg, paper=True)
     cache = cfg.replay_cache / str(day)
     if not (cache / "meta.json").exists():
         from stockmoney.desk.options.marketdata import fetch_replay_cache

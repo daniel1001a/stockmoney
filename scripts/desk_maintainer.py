@@ -5,7 +5,7 @@ import argparse
 from pathlib import Path
 
 from stockmoney.desk import store
-from stockmoney.desk.learn.registry import REGISTRY, current
+from stockmoney.desk.learn.registry import REGISTRY, current, options_settings_valid
 
 
 def main(argv=None) -> None:
@@ -14,6 +14,8 @@ def main(argv=None) -> None:
     parser.add_argument("--db", type=Path, default=store.DEFAULT_PATH)
     args = parser.parse_args(argv)
     with store.connect(args.db) as con:
+        if not options_settings_valid(con):
+            print("# Invalid options overrides: showing code defaults; new paper options/spread entries disabled.")
         print("key\tsleeve\tcurrent\tbound\tmax_step\tai_tunable")
         for key, item in sorted(REGISTRY.items()):
             print(f"{key}\t{item.sleeve}\t{current(con, key)}\t{item.bound.describe()}"

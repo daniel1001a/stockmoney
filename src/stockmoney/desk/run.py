@@ -242,12 +242,12 @@ def _lift_reconcile_halt(con, day: str) -> None:
     notify.send("Desk 已解除暫停新進場", f"{day}:{why}。", notify.WARN)
 
 
-def _strategies(con, day: str | None = None) -> dict[str, Strategy]:
+def _strategies(con, day: str | None = None, *, paper: bool = False) -> dict[str, Strategy]:
     """Build the enabled strategies from stored parameters. A stored parameter
     the strategy rejects (stale or hand-edited setting) must not crash every
     job: that strategy falls back to its defaults and the owner is warned once
     per day."""
-    params = store.strategy_params(con)
+    params = store.strategy_params(con, paper=paper)
     disabled = set(json.loads(store.get_setting(con, "disabled_strategies", "[]")))
     day = day or _today(datetime.now(timezone.utc))
     out: dict[str, Strategy] = {}
@@ -705,7 +705,7 @@ def postclose(con, broker: Broker, now: datetime, bars: data.Bars | None = None,
     bars = bars.upto(through)
     ind = compute(bars)
     ctx = engine.day_context(ind, through)
-    strats = _strategies(con, day)
+    strats = _strategies(con, day, paper=getattr(broker, "is_paper", False) is True)
     close = ind.close.loc[through]
 
     # manage open stock positions: trail stops, rule exits (reconciled symbols only)

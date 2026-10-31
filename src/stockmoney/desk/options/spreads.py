@@ -311,7 +311,7 @@ def regular_hours(now: datetime) -> bool:
 
 def tick(con, data, now: datetime, cfg: OptionsConfig | None = None,
          slot: datetime | None = None) -> tuple[list[str], list[tuple[str, str]]]:
-    from stockmoney.desk.learn.registry import safe_options_config
+    from stockmoney.desk.learn.registry import safe_options_config, options_settings_valid
     from stockmoney.desk import notify
 
     # This module has no broker/order path: all spread books are simulated.
@@ -321,7 +321,7 @@ def tick(con, data, now: datetime, cfg: OptionsConfig | None = None,
     record_missed(con, now, cfg, slot)  # before any quote, so a failing mark cannot skip it
     closed = mark_and_exit(con, data, now, cfg)
     con.commit()
-    opened = open_new(con, data, now, cfg, slot)
+    opened = open_new(con, data, now, cfg, slot) if options_settings_valid(con) else []
     con.commit()
     return opened, closed
 

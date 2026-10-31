@@ -96,12 +96,16 @@ def current(con, key: str):
     item = REGISTRY[key]
     if item.location == "strategy_params":
         strategy, param = key.split(".")
-        return store.strategy_params(con).get(strategy, {}).get(param, STRATEGIES[strategy].params[param])
+        return store.strategy_params(con, paper=True).get(strategy, {}).get(param, STRATEGIES[strategy].params[param])
     if item.location == "options_params":
         default = getattr(OptionsConfig(), _attr(key))
         if key.split(".")[1] in CLOCK_KNOBS:
             default = default[0] * 60 + default[1]
-        return _settings(con).get(key, default)
+        try:
+            values = _checked_settings(con)
+        except (ValueError, TypeError):
+            values = {}  # same effective values as the exit-only runtime fallback
+        return values.get(key, default)
     if key.startswith("profiles."):
         return getattr(profiles.active(), key.split(".")[1])
     if key.startswith("options."):
@@ -133,7 +137,7 @@ def validate(con, key: str, value):
         raise ValueError(f"{key}: exceeds max_step {item.max_step}")
     if item.location == "strategy_params":
         strategy, param = key.split(".")
-        STRATEGIES[strategy].validate_params({**store.strategy_params(con).get(strategy, {}), param: value})
+        STRATEGIES[strategy].validate_params({**store.strategy_params(con, paper=True).get(strategy, {}), param: value})
     return value
 
 
@@ -145,6 +149,8 @@ def change(con, key: str, value, reason: str, *, account_kind: str) -> None:
         raise ValueError("a change reason is required")
     # Acquire the SQLite write lock before reading the current value/document.
     # SAVEPOINT also works inside the caller's existing transaction.
+    if not con.in_transaction:
+        con.execute("BEGIN IMMEDIATE")
     con.execute("SAVEPOINT registry_change")
     try:
         con.execute("UPDATE settings SET value=value WHERE key='options_params'")
@@ -153,7 +159,7 @@ def change(con, key: str, value, reason: str, *, account_kind: str) -> None:
         item = REGISTRY[key]
         if item.location == "strategy_params":
             strategy, param = key.split(".")
-            store.change_param(con, strategy, param, value, reason)
+            store.change_param(con, strategy, param, value, reason, paper=True)
         else:
             old = current(con, key)
             values = _settings(con)
@@ -199,10 +205,10 @@ def safe_options_config(con, cfg: OptionsConfig, *, paper: bool, sleeve: str = "
     try:
         result = options_config(con, cfg, paper=paper, sleeve=sleeve)
     except (ValueError, TypeError):
-        log.error("Invalid paper overrides ignored; continuing with caller config for exits")
+        log.error("Invalid paper overrides: new entries disabled; caller config retained for exits")
         if on_error is not None and store.get_setting(con, "registry_override_alert", "0") != "1":
             try:
-                on_error("Desk paper overrides invalid", "Using code configuration; exit handling remains enabled.")
+                on_error("Desk paper overrides invalid", "New entries disabled; code configuration retained for exit handling.")
                 store.set_setting(con, "registry_override_alert", "1")
             except Exception:
                 log.warning("Could not report invalid paper overrides")
@@ -211,3 +217,11 @@ def safe_options_config(con, cfg: OptionsConfig, *, paper: bool, sleeve: str = "
         if store.get_setting(con, "registry_override_alert", "0") == "1":
             store.set_setting(con, "registry_override_alert", "0")
     return result
+
+
+def options_settings_valid(con) -> bool:
+    try:
+        _checked_settings(con)
+        return True
+    except (ValueError, TypeError):
+        return False

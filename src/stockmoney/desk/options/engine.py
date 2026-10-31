@@ -179,9 +179,10 @@ class Engine:
                  notifier: Callable[..., object] | None = None, config_resolved: bool = False):
         self.con = con
         self.broker = broker
-        from stockmoney.desk.learn.registry import safe_options_config
+        from stockmoney.desk.learn.registry import safe_options_config, options_settings_valid
 
         self.cfg = cfg or OptionsConfig()
+        self._invalid_overrides = getattr(broker, "is_paper", False) is True and not options_settings_valid(con)
         if not config_resolved:
             self.cfg = safe_options_config(con, self.cfg, paper=getattr(broker, "is_paper", False) is True,
                                            on_error=notifier or notify.send)
@@ -676,6 +677,8 @@ class Engine:
         return ""
 
     def _on_signal(self, s: dict, sig: pb.Signal, bars: pd.DataFrame, now: datetime, halted: bool) -> None:
+        if self._invalid_overrides:
+            return self._skip(s, now, "invalid_research_settings_exit_only")
         cfg, d, sid, sym = self.cfg, self._dstr, s["setup_id"], s["underlying"]
         _, rth = pb.split_session(bars, cfg)
         rv = pb.day_rvol(rth, pd.Timestamp(sig.at).tz_convert(ET), self._profiles.get(sym), cfg)
