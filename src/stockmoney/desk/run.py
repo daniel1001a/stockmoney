@@ -803,7 +803,8 @@ def postclose(con, broker: Broker, now: datetime, bars: data.Bars | None = None,
     # new entries for the next open; a failure here must not undo the stop bookkeeping above
     planned: list[dict] = []
     advisory: list[dict] = []
-    entries_on = stock_entries_enabled(con) and _paper_params_valid(con, broker)
+    paper_ok = _paper_params_valid(con, broker)
+    entries_on = stock_entries_enabled(con) and paper_ok
     if bad:
         events.append("對帳不一致,今天不規劃新進場")
     else:
@@ -834,7 +835,7 @@ def postclose(con, broker: Broker, now: datetime, bars: data.Bars | None = None,
     store.set_setting(con, PLAN_THROUGH_KEY, day)
 
     report = head + _report(day, ctx, sys_eq, limits.capital_budget, mode, why, ledger, events, planned, exits,
-                            advisory=advisory, entries_on=entries_on)
+                            advisory=advisory, entries_on=entries_on, paper_params_invalid=not paper_ok)
     report += _slot_skip_report(con, day, "planned" if entries_on else ADVISORY)
     report += _reconcile_summary(con, broker, day)
     con.execute(
@@ -1050,6 +1051,7 @@ def premarket(con, broker: Broker, now: datetime, limits: Limits | None = None, 
     st.lines += _premarket_stops(con, broker, risk, today, bad, st)
     entries_on = stock_entries_enabled(con)
     paper_params_valid = _paper_params_valid(con, broker)
+    held: list[str] = []
     for p in plans:
         if p["side"] != Side.BUY.value:
             continue
@@ -1060,6 +1062,7 @@ def premarket(con, broker: Broker, now: datetime, limits: Limits | None = None, 
             continue
         if not paper_params_valid:
             st.lines.append(f"未送出 {p['symbol']}:invalid paper overrides; plan retained for retry")
+            held.append(p["symbol"])
             continue
         try:
             _premarket_one(con, broker, risk, ledger, snap, p, st, **kw)
@@ -1076,6 +1079,10 @@ def premarket(con, broker: Broker, now: datetime, limits: Limits | None = None, 
     msg = f"{today} 盤前送單 {st.n} 筆\n" + "\n".join(st.lines)
     for note in flags.notify:
         _notify_once(con, f"muse:{note[:100]}", "Muse 警報", note, notify.WARN, today)
+    if held:
+        _notify_once(con, "badpaperparams:premarket", "Invalid paper strategy overrides",
+                     "Planned buys held back (plan retained for retry): " + ", ".join(held),
+                     notify.WARN, today)
     if st.n:
         notify.send(f"Desk 盤前 {today}", msg, notify.INFO)
     return msg
@@ -1750,7 +1757,8 @@ def _opens_today(broker: Broker, now: datetime) -> bool:
 
 
 def _report(day, ctx, sys_eq, budget, mode, why, ledger: Ledger, events, planned, exits,
-            advisory: list[dict] | None = None, entries_on: bool = True) -> str:
+            advisory: list[dict] | None = None, entries_on: bool = True,
+            paper_params_invalid: bool = False) -> str:
     lines = [f"## {day} 盤後報告", "",
              f"**系統淨值** {sys_eq:,.0f}({sys_eq / budget - 1:+.2%}),狀態 {mode}:{why}", "",
              f"**大盤**:{REGIME_LABEL[ctx.market.regime]};{ctx.market.note}",
@@ -1767,7 +1775,10 @@ def _report(day, ctx, sys_eq, budget, mode, why, ledger: Ledger, events, planned
     if entries_on:
         lines.append("**明天開盤進場計畫**:" + ("、".join(f"{p['symbol']} {p['qty']} 股({p['strategy']})" for p in planned) or "無"))
         return "\n".join(lines)
-    lines.append("**明天開盤進場計畫**:無(股票策略只給建議,不自動下單)")
+    if paper_params_invalid:
+        lines.append("**明天開盤進場計畫**:無(paper 策略參數覆寫無效,修正前不規劃新進場;出場照常使用 owner 參數)")
+    else:
+        lines.append("**明天開盤進場計畫**:無(股票策略只給建議,不自動下單)")
     lines += ["", "**中長期建議(不自動下單)**"]
     lines += [f"- {p['symbol']} {p['qty']:g} 股 參考價 {p['ref']:.2f} 停損 {p['stop']:.2f}({p['strategy']})"
               + (f":{str(p['reason'])[:120]}" if p.get("reason") else "") for p in advisory or []] or ["- 無"]

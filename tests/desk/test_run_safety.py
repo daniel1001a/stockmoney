@@ -471,13 +471,29 @@ def test_postclose_after_midnight_still_manages_the_last_session(desk):
         assert con.execute("SELECT 1 FROM equity_history WHERE date=?", (str(t.date()),)).fetchone()
 
 
-def test_bad_paper_settings_retain_plan_until_repaired(desk):
+def test_bad_paper_settings_retain_plan_until_repaired(desk, sent):
     with store.connect(desk.path) as con:
         plan(con, "AAPL")
         store.set_setting(con, "paper_strategy_params", "[]")
         run.premarket(con, desk.broker, WED, desk.limits)
         assert not market_orders(desk.broker, "AAPL", Side.BUY)
         assert con.execute("SELECT status FROM planned_orders").fetchone()[0] == "planned"
+        # every buy held back by paper settings still pages the owner, once per day
+        run.premarket(con, desk.broker, WED, desk.limits)
+        pages = [(t, m) for t, m, p in sent if p == run.notify.WARN and "paper" in t.lower()]
+        assert len(pages) == 1 and "AAPL" in pages[0][1]
         store.set_setting(con, "paper_strategy_params", "{}")
         run.premarket(con, desk.broker, WED + timedelta(minutes=1), desk.limits)
         assert len(market_orders(desk.broker, "AAPL", Side.BUY)) == 1
+
+
+@pytest.mark.parametrize("owner", ['{"breakout": null}', '{"breakout": []}', '{"breakout": 3}'])
+def test_non_object_owner_entry_with_paper_overlay_keeps_postclose_running(desk, sent, owner):
+    bars, t, b = _bars_and_broker()
+    with store.connect(desk.path) as con:
+        store.set_setting(con, "strategy_params", owner)
+        store.set_setting(con, "paper_strategy_params", '{"breakout": {"max_hold_days": 10}}')
+        out = run.postclose(con, b, _at(t, 17, 0), bars=bars, limits=desk.limits)
+        assert con.execute("SELECT 1 FROM equity_history WHERE date=?", (str(t.date()),)).fetchone()
+        assert "paper 策略參數覆寫無效" in out and "股票策略只給建議" not in out
+    assert any("paper" in title.lower() and p == run.notify.WARN for title, _, p in sent)

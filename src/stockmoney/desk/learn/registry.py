@@ -158,14 +158,17 @@ def change(con, key: str, value, reason: str, *, account_kind: str) -> None:
     con.execute("SAVEPOINT registry_change")
     try:
         con.execute("UPDATE settings SET value=value WHERE key='options_params'")
-        _checked_settings(con)  # refuse a corrupt shared document without an audit/write
         value = validate(con, key, value)
         item = REGISTRY[key]
+        if item.location == "options_params":
+            _checked_settings(con)  # refuse a corrupt shared document without an audit/write
         old = current(con, key)
         sleeve, param = key.split(".")
         if item.location == "strategy_params":
             values = json.loads(store.get_setting(con, "paper_strategy_params", "{}"))
-            values.setdefault(sleeve, {})[param] = value
+            if not isinstance(values, dict) or not isinstance(values.setdefault(sleeve, {}), dict):
+                raise ValueError("invalid paper strategy overrides")
+            values[sleeve][param] = value
             store.set_setting(con, "paper_strategy_params", json.dumps(values))
         else:
             values = _settings(con)

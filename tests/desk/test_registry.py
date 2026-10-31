@@ -1,5 +1,6 @@
 """Registry boundaries and persistence, against the real desk store."""
 import json
+from datetime import date
 from dataclasses import fields
 
 import pytest
@@ -175,3 +176,45 @@ def test_cli_warns_for_bad_paper_overlay(tmp_path, capsys):
     output = capsys.readouterr().out
     assert "Invalid paper stock overrides" in output
     assert "pullback.trail_atr" in output
+
+
+@pytest.mark.parametrize("owner", ['{"pullback": null}', '{"pullback": []}', '{"pullback": 3}'])
+def test_non_object_owner_entry_is_an_invalid_overlay(con, owner, monkeypatch):
+    from types import SimpleNamespace
+    from stockmoney.desk import run
+    monkeypatch.setattr(run, "_notify_once", lambda *a, **kw: None)
+    store.set_setting(con, "strategy_params", owner)
+    store.set_setting(con, "paper_strategy_params", '{"pullback": {"trail_atr": 3.5}}')
+    with pytest.raises(ValueError):
+        store.strategy_params(con, paper=True)
+    assert "pullback" in run._strategies(con, paper=True)
+    assert not run._paper_params_valid(con, SimpleNamespace(is_paper=True))
+
+
+def test_corrupt_options_document_does_not_block_stock_change(con):
+    store.set_setting(con, "options_params", "[]")
+    r.change(con, "pullback.trail_atr", 3.5, "test", account_kind="paper")
+    assert json.loads(store.get_setting(con, "paper_strategy_params"))["pullback"]["trail_atr"] == 3.5
+    assert store.get_setting(con, "options_params") == "[]"
+
+
+def test_replay_cmd_survives_corrupt_options_document(tmp_path, monkeypatch):
+    from stockmoney.desk.options import run as opt_run, replay
+    db = tmp_path / "desk.sqlite"
+    with store.connect(db) as con:
+        store.set_setting(con, "options_params", "{")
+    seen = {}
+    cfg = OptionsConfig(replay_cache=tmp_path / "cache")
+    (cfg.replay_cache / "2026-10-14").mkdir(parents=True)
+    (cfg.replay_cache / "2026-10-14" / "meta.json").write_text("{}")
+    class Stop(Exception):
+        pass
+
+    def fake_run(day, c, *a, **kw):
+        seen["cfg"] = c
+        raise Stop  # only the config load matters here
+
+    monkeypatch.setattr(replay, "run", fake_run)
+    with pytest.raises(Stop):
+        opt_run.replay_cmd(date(2026, 10, 14), cfg, "iex", None, 60.0, db_path=db)
+    assert seen["cfg"] is cfg

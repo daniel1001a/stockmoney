@@ -99,10 +99,14 @@ def strategy_params(con, *, paper: bool = False) -> dict[str, dict]:
         overlay = json.loads(get_setting(con, "paper_strategy_params", "{}"))
         if not isinstance(overlay, dict):
             raise ValueError("paper strategy overrides must be an object")
+        if overlay and not isinstance(params, dict):
+            raise ValueError("owner strategy parameters must be an object to take paper overrides")
         for name, values in overlay.items():
             if name not in REGISTRY or not isinstance(values, dict):
                 raise ValueError("invalid paper strategy overrides")
-            params.setdefault(name, {}).update(values)
+            if not isinstance(params.setdefault(name, {}), dict):
+                raise ValueError(f"owner parameters for {name} must be an object to take paper overrides")
+            params[name].update(values)
             REGISTRY[name](**params[name])
     return params
 
