@@ -630,3 +630,119 @@ def test_policy_names_grok_for_a_grok_alert(con):
     notes = active_flags(con, NOW + timedelta(minutes=1), held={"NVDA", "AMD"}).notify
     assert any(n.startswith("Grok ALERT") and "NVDA" in n for n in notes)
     assert any(n.startswith("Muse ALERT") and "AMD" in n for n in notes)
+
+
+# ---------------------------------------------------------------- 08:45 plan reminder (spec B.2)
+
+def _briefed(con, d="2026-10-27"):
+    con.execute("INSERT INTO bridge_ops VALUES (?, 'x')", (f"brief:{d}",))
+
+
+def _plan_row(con, status="accepted", source="grok_verified", for_date="2026-10-27"):
+    con.execute("INSERT INTO options_plans (plan_id, for_date, received_at, status, shadow_only, error, sha, raw, "
+                "source) VALUES (?,?,?,?,?,?,?,?,?)", ("p-20261027", for_date, et(8, 10).isoformat(), status, 0, "",
+                                                     "s", "{}", source))
+
+
+def _daily_row(con, at, source="grok_verified", msg_id="grok-20261027-0730"):
+    con.execute("INSERT INTO bridge_messages (msg_id, type, sender, received_at, raw_body, parsed_json, source) "
+                "VALUES (?,?,?,?,?,?,?)", (msg_id, "GROK_DAILY", GROK, muse_ops._iso(at), "{}", "{}", source))
+
+
+def test_plan_reminder_sent_at_0845(desk, pages):
+    _briefed(desk)
+    _daily_row(desk, et(7, 30))
+    box = FakeMailbox()
+    assert grok_outbound.run(desk, box, et(8, 44), CONFIG, returns) == []
+    lines = grok_outbound.run(desk, box, et(8, 45), CONFIG, returns)
+    assert len(lines) == 1 and "PLAN_REMINDER" in lines[0]
+    (body,) = _bodies(box, "PLAN_REMINDER")
+    assert body["for_date"] == "2026-10-27" and body["missing"] == ["OPTIONS_PLAN"]
+    assert body["live_cutoff"] == "09:20:00" and body["msg_id"].startswith("planrm-")
+    assert OUTBOUND.validate_python(body).type == "PLAN_REMINDER"
+    assert all(to == GROK for to, _, _ in box.sent)
+    assert desk.execute("SELECT channel FROM bridge_outbox WHERE type='PLAN_REMINDER'").fetchone()[0] == "grok"
+    assert grok_outbound._done(desk, "planrm:2026-10-27")
+    assert [p[1] for p in pages] == ["Grok plan missing at 08:45, reminder sent"]
+    # never twice
+    assert grok_outbound.run(desk, box, et(9, 0), CONFIG, returns) == []
+    assert len(_bodies(box, "PLAN_REMINDER")) == 1 and len(pages) == 1
+
+
+@pytest.mark.parametrize("status", ["accepted", "rejected"])
+def test_no_reminder_when_a_verified_plan_exists(desk, pages, status):
+    _briefed(desk)
+    _plan_row(desk, status=status)
+    box = FakeMailbox()
+    assert grok_outbound.run(desk, box, et(8, 50), CONFIG, returns) == []
+    assert box.sent == [] and pages == []
+    assert not grok_outbound._done(desk, "planrm:2026-10-27")
+
+
+def test_unverified_or_other_day_plan_does_not_stop_the_reminder(desk, pages):
+    _briefed(desk)
+    _plan_row(desk, source="grok_legacy")
+    desk.execute("UPDATE options_plans SET plan_id='p-old'")
+    _plan_row(desk, for_date="2026-10-26")
+    box = FakeMailbox()
+    assert len(grok_outbound.run(desk, box, et(8, 50), CONFIG, returns)) == 1
+    assert len(_bodies(box, "PLAN_REMINDER")) == 1
+
+
+def test_grok_daily_listed_only_when_absent_at_0830(desk, pages):
+    _briefed(desk)
+    _daily_row(desk, et(8, 31))  # late daily
+    _daily_row(desk, et(7, 0), source="grok_legacy", msg_id="grok-20261027-0700")  # unverified
+    _daily_row(desk, et(7, 0, PREV), msg_id="grok-20261026-0700")  # yesterday's
+    box = FakeMailbox()
+    grok_outbound.run(desk, box, et(8, 45), CONFIG, returns)
+    assert _bodies(box, "PLAN_REMINDER")[0]["missing"] == ["OPTIONS_PLAN", "GROK_DAILY"]
+
+    desk.execute("DELETE FROM bridge_ops WHERE key='planrm:2026-10-27'")
+    _daily_row(desk, et(8, 30), msg_id="grok-20261027-0830")  # exactly 08:30 is on time
+    box = FakeMailbox()
+    grok_outbound.run(desk, box, et(8, 46), CONFIG, returns)
+    assert _bodies(box, "PLAN_REMINDER")[0]["missing"] == ["OPTIONS_PLAN"]
+
+
+def test_first_poll_after_0920_skips_late(desk, pages):
+    _briefed(desk)
+    box = FakeMailbox()
+    assert grok_outbound.run(desk, box, et(9, 20), CONFIG, returns) == []
+    assert box.sent == [] and pages == []
+    assert desk.execute("SELECT at FROM bridge_ops WHERE key='planrm:2026-10-27'").fetchone()[0] == "skipped_late"
+    assert grok_outbound.run(desk, box, et(9, 25), CONFIG, returns) == [] and box.sent == []
+
+
+def test_no_reminder_on_holiday_or_without_grok(desk, pages):
+    box = FakeMailbox()
+    assert grok_outbound.run(desk, box, et(8, 50, date(2026, 11, 26)), CONFIG, returns) == []
+    assert grok_outbound.run(desk, box, et(8, 50, date(2026, 10, 31)), CONFIG, returns) == []  # Saturday
+    assert grok_outbound.run(desk, box, et(8, 50), MUSE_ONLY, returns) == []
+    assert box.sent == [] and pages == []
+    assert desk.execute("SELECT COUNT(*) FROM bridge_ops WHERE key LIKE 'planrm:%'").fetchone()[0] == 0
+
+
+def test_failed_reminder_send_is_retried(desk, pages):
+    _briefed(desk)
+
+    class Broken(FakeMailbox):
+        def send(self, *a, **k):
+            raise OSError("smtp down")
+    with pytest.raises(OSError):
+        grok_outbound.run(desk, Broken(), et(8, 45), CONFIG, returns)
+    assert not grok_outbound._done(desk, "planrm:2026-10-27") and pages == []
+    box = FakeMailbox()
+    assert len(grok_outbound.run(desk, box, et(8, 50), CONFIG, returns)) == 1
+
+
+def test_failed_owner_push_does_not_resend(desk, monkeypatch):
+    _briefed(desk)
+
+    def boom(*a, **k):
+        raise RuntimeError("ntfy down")
+    monkeypatch.setattr(muse_ops.notify, "send", boom)
+    box = FakeMailbox()
+    assert len(grok_outbound.run(desk, box, et(8, 45), CONFIG, returns)) == 1
+    assert grok_outbound.run(desk, box, et(8, 50), CONFIG, returns) == []
+    assert len(_bodies(box, "PLAN_REMINDER")) == 1
