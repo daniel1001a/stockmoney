@@ -539,6 +539,8 @@ def run_checks(con, now: datetime, box=None) -> str:
     for m in check_grok_scope(con, now - timedelta(days=2)):
         notify.send("Grok 範圍", m, notify.INFO)
         lines.append(m)
+    from stockmoney.desk import grok_notice  # lazy: grok_notice imports muse_ops
+    lines += grok_notice.check_acks(con, now)  # pushes the owner itself, once per notice
     return "\n".join(lines)
 
 

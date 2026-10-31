@@ -331,6 +331,9 @@ def _process(con, mail: RawMail, config: BridgeConfig, received_at: datetime) ->
          source, source_reason,
          json.dumps({"dropped": dropped, "feedback": not replied}) if dropped else None),
     )
+    if msg.type == "NOTICE_ACK":
+        from stockmoney.desk import grok_notice  # lazy: grok_notice imports the bridge
+        grok_notice.record_ack(con, msg, source)
     return True
 
 
