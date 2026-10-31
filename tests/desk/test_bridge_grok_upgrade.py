@@ -128,6 +128,75 @@ def test_grok_sender_still_may_not_send_muse_only_types(con):
     assert rejects(con)
 
 
+def notice_ack(**changes):
+    body = {"protocol": "1", "msg_id": "ack-grok-20261027-0800", "sent_at": NOW.isoformat(),
+            "type": "NOTICE_ACK", "notice_id": "notice-desk-20261027", "status": "done",
+            "schedule_times": ["07:20", "08:15", "08:50", "20:00"], "timezone": "America/New_York",
+            "questions": [], "notes": "Applied"}
+    return {**body, **changes}
+
+
+def test_notice_ack_only_from_grok_with_its_token(con):
+    box = FakeMailbox()
+    send(box, notice_ack())
+    assert inbox.poll(con, box, CONFIG, now=NOW) == 1
+    row = stored(con)["ack-grok-20261027-0800"]
+    assert row["source"] == "grok_verified" and row["type"] == "NOTICE_ACK"
+    for sender, token in ((SENDER, TOKEN), (GROK, TOKEN), ("unknown@example.com", GTOKEN)):
+        box = FakeMailbox()
+        send(box, notice_ack(msg_id="ack-invalid-20261027"), sender=sender, token=token)
+        assert inbox.poll(con, box, CONFIG, now=NOW) == 0
+    assert len(stored(con)) == 1
+
+
+@pytest.mark.parametrize("changes", [
+    {"status": "approved"}, {"status": "partial", "notes": ""},
+    {"schedule_times": ["24:00"]}, {"schedule_times": ["8:50"]},
+    {"notes": "x" * 2001}, {"sent_at": "2026-10-27T08:00:00"},
+])
+def test_notice_ack_strict_schema(changes):
+    with pytest.raises(ValidationError):
+        INBOUND.validate_json(json.dumps(notice_ack(**changes)), strict=True)
+
+
+def desk_notice(**changes):
+    return {"protocol": "1", "msg_id": "notice-desk-20261027", "sent_at": NOW.isoformat(),
+            "type": "GROK_NOTICE", "notice_id": "notice-desk-20261027", "title": "Schedule update",
+            "body": "Check the mailbox at 08:50 ET.", "actions": ["Confirm your schedule"], **changes}
+
+
+def plan_reminder(**changes):
+    return {"protocol": "1", "msg_id": "planrm-desk-20261027", "sent_at": NOW.isoformat(),
+            "type": "PLAN_REMINDER", "for_date": "2026-10-27", "missing": ["OPTIONS_PLAN", "GROK_DAILY"],
+            "live_cutoff": "09:20:00", "note": "Send an empty plan when there are no candidates.", **changes}
+
+
+@pytest.mark.parametrize("payload", [desk_notice(), plan_reminder()])
+def test_reliability_outbound_roundtrip_has_no_token(payload):
+    from stockmoney.desk.bridge import outbox
+    msg = OUTBOUND.validate_json(json.dumps(payload), strict=True)
+    box = FakeMailbox()
+    outbox.send(box, msg, CONFIG, channel="grok")
+    recipient, subj, body = box.sent[0]
+    assert recipient == GROK
+    assert subj == outbox.build_subject(msg.type, msg.msg_id) == f"[SMD/{msg.type}/{msg.msg_id}]"
+    assert GTOKEN not in subj and GTOKEN not in body
+    assert OUTBOUND.validate_json(body, strict=True) == msg
+    with pytest.raises(ValueError, match="grok channel"):
+        outbox.send(FakeMailbox(), msg, CONFIG, channel="muse")
+
+
+@pytest.mark.parametrize("payload", [
+    desk_notice(notice_id="different-notice"), desk_notice(title="x" * 121),
+    desk_notice(body="x" * 4001), desk_notice(actions=["a"] * 11), desk_notice(actions=["a" * 281]),
+    plan_reminder(missing=["ALERT"]), plan_reminder(missing=["OPTIONS_PLAN", "OPTIONS_PLAN"]),
+    plan_reminder(live_cutoff="09:21"), plan_reminder(note="x" * 501),
+])
+def test_reliability_outbound_bounds(payload):
+    with pytest.raises(ValidationError):
+        OUTBOUND.validate_json(json.dumps(payload), strict=True)
+
+
 def test_outbound_only_types_are_not_accepted_inbound(con):
     box = FakeMailbox()
     ping = {"protocol": "1", "msg_id": "ping-grok-0001", "sent_at": "2026-10-27T07:30:00-04:00", "type": "PING",

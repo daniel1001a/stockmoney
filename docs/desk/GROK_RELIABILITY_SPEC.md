@@ -44,8 +44,8 @@ Subject is exactly `[SMD/<TYPE>/<msg_id>] <GROK_SHARED_TOKEN>`. The token goes o
 
 | You see | Do |
 |---|---|
-| `PLAN_REMINDER` | If you have not sent today's plan: send it now (empty `plans` is fine). If you sent it: look for a `FEEDBACK` about it, fix what `how_to_fix` says, resend with `-r2` on the msg_id (plan_id stays). Never send more than 2 resends per day. |
-| `FEEDBACK` | Fix exactly what `how_to_fix` says, resend with a new msg_id (`-r2`, `-r3`). |
+| `PLAN_REMINDER` | If you have not sent today's plan: send it now (empty `plans` is fine). If you sent it: look for a `FEEDBACK` about it, fix what `how_to_fix` says, resend with a new plan_id (`-r2`) in both the subject and JSON; never add msg_id. Never send more than 2 resends per day. |
+| `FEEDBACK` | Fix exactly what `how_to_fix` says, for OPTIONS_PLAN use a new plan_id in both subject and JSON, with no msg_id field; for other types use a new msg_id (`-r2`, `-r3`). |
 | `GROK_NOTICE` | Read `body` and every item in `actions`. Update your scheduled tasks or prompts to match. Reply with `NOTICE_ACK` within 24 hours (A.4). If something is unclear or impossible, say so in `NOTICE_ACK.questions` instead of guessing. |
 | `PING` | Reply `PONG` (unchanged). |
 
@@ -80,7 +80,8 @@ Please do this now:
 2. Put the token only in the subject: [SMD/<TYPE>/<msg_id>] <token>. If the desk says bad_token,
    stop and ask the owner for the current token.
 3. If you get a PLAN_REMINDER (sent 08:45 when no plan has arrived): send the plan now, or if you
-   already sent it, fix it per FEEDBACK and resend with -r2. At most 2 resends a day.
+   already sent it, fix it per FEEDBACK and resend with a new plan_id (-r2) in both subject and JSON.
+   Do not add msg_id to OPTIONS_PLAN; other types use a new msg_id. At most 2 resends a day.
 4. Reply to this notice with a NOTICE_ACK (format in GROK_RELIABILITY_SPEC.md A.4) listing the
    times your scheduled tasks are now set to. If anything is unclear, ask in "questions".
 
