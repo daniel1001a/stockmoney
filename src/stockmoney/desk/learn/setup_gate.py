@@ -9,7 +9,9 @@ owner's decision.
 
 Scope: EXITED options_positions rows of both modes (live and shadow), per
 source and optionally per source x dte_label. Only the live exit variant
-(cfg.live_exit) is counted: every shadow entry is booked once per exit
+(cfg.live_exit) is counted, and a shadow row whose setup_id and
+dte_label match a live row is dropped (same event, Grok Build review
+2026-11-05): every shadow entry is booked once per exit
 variant, so counting A and B would count the same entry twice. Exits with
 unknown P&L (options/report.py UNKNOWN_PNL) are left out.
 
@@ -127,14 +129,18 @@ def rows(con, by_dte: bool = False, cfg: OptionsConfig | None = None) -> list[di
     con.row_factory = sqlite3.Row
     try:
         got = con.execute(
-            "SELECT source, dte_label, mode, day, realized_usd, fees_usd, entry_price, entry_bid, entry_ask, "
+            "SELECT setup_id, source, dte_label, mode, day, realized_usd, fees_usd, entry_price, entry_bid, entry_ask, "
             "qty_initial, exit_variant, flags_json FROM options_positions WHERE state='EXITED' "
             f"AND COALESCE(exit_reason,'') NOT IN ({marks}) AND COALESCE(exit_variant, ?) = ? "
             "ORDER BY source, dte_label, day", (*UNKNOWN_PNL, cfg.live_exit, cfg.live_exit)).fetchall()
     finally:
         con.row_factory = prev
+    # a live fill and its live-exit shadow twin are one event: keep the live row
+    live_keys = {(r["setup_id"], r["dte_label"]) for r in got if r["mode"] == "live" and r["setup_id"]}
     groups: dict[tuple, list[dict]] = {}
     for r in got:
+        if r["mode"] != "live" and (r["setup_id"], r["dte_label"]) in live_keys:
+            continue
         key = (r["source"], r["dte_label"] or "?") if by_dte else (r["source"], None)
         groups.setdefault(key, []).append(_trade(r, cfg))
     return [{"source": s, "dte_label": d, **metrics(ts)} for (s, d), ts in sorted(groups.items())]

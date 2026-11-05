@@ -62,11 +62,11 @@ def test_stressed_risk_formula():
 
 
 def _pos(con, pid, *, source="vwap_reclaim", mode="shadow", day="2026-11-02", state="EXITED", realized=100.0,
-         fees=0.6, ev="A", dte="1-3dte", reason="take_profit", qty=10, flags=None):
-    con.execute("INSERT INTO options_positions (position_id, day, mode, source, dte_label, state, realized_usd, "
-                "fees_usd, exit_variant, exit_reason, entry_price, entry_bid, entry_ask, qty_initial, flags_json) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                (pid, day, mode, source, dte, state, realized, fees, ev, reason, 1.0, 0.95, 1.05, qty,
+         fees=0.6, ev="A", dte="1-3dte", reason="take_profit", qty=10, flags=None, setup=None):
+    con.execute("INSERT INTO options_positions (position_id, setup_id, day, mode, source, dte_label, state, "
+                "realized_usd, fees_usd, exit_variant, exit_reason, entry_price, entry_bid, entry_ask, qty_initial, "
+                "flags_json) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (pid, setup, day, mode, source, dte, state, realized, fees, ev, reason, 1.0, 0.95, 1.05, qty,
                  json.dumps(flags or {})))
 
 
@@ -87,6 +87,16 @@ def test_rows_filter_pnl_and_stressed(con):
     assert by == {("vwap_reclaim", "0dte"), ("vwap_reclaim", "1-3dte"), ("orb15", "1-3dte")}
     text = sg.report(con)
     assert "逐策略實盤關卡" in text and "| vwap_reclaim | 全部 | 2 |" in text and "FAIL" in text
+
+
+def test_live_row_and_its_shadow_twin_count_once(con):
+    _pos(con, "live1", mode="live", setup="s1", realized=-100.0)
+    _pos(con, "twin1", setup="s1", realized=-90.0)            # same setup and dte: dropped
+    _pos(con, "other", setup="s1", dte="0dte", realized=40.0)  # other dte bucket of the setup: kept
+    _pos(con, "solo", setup="s2", realized=30.0)               # shadow-only setup: kept
+    v = {r["source"]: r for r in sg.rows(con)}["vwap_reclaim"]
+    assert v["n"] == 3 and v["live"] == 1 and v["shadow"] == 2
+    assert v["total"] == pytest.approx(-100.6 + 39.4 + 29.4)
 
 
 def test_report_on_a_database_without_options_tables(tmp_path):

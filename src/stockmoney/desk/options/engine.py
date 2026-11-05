@@ -730,6 +730,7 @@ class Engine:
         band = cfg.delta_band(sym)
         live_choice = None
         opened = 0
+        spread_todo: list[tuple[sel.Choice, list[OptionContract]]] = []
         for bucket in cfg.dte_buckets:
             chain = self._chain(sym, bucket)
             if chain is None:
@@ -742,7 +743,7 @@ class Engine:
             for ev in cfg.exit_variants:
                 opened += self._open_shadow(s, sig, choice, ev, now, max_hold, ctx)
             if s["source"] in sv.SOURCES:
-                self._open_spread_variant(s, choice, chain, spot, now)
+                spread_todo.append((choice, chain))  # opened after the live submit: its short-leg quote must not delay it
             if bucket.label == cfg.live_dte:
                 live_choice = choice
         pending = False
@@ -754,6 +755,8 @@ class Engine:
                                         "macro": regime["macro_events"]})
             else:
                 pending = self._open_live(s, sig, live_choice, now, halted, flags, max_hold, ctx)
+        for choice, chain in spread_todo:
+            self._open_spread_variant(s, choice, chain, spot, now)
         ostore.update_setup(self.con, sid, state=ENTERED if (opened or pending) else SKIPPED)
 
     def _grok_stance(self, s: dict, direction: str) -> tuple[str | None, int]:
