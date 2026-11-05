@@ -140,11 +140,14 @@ class VolProfile:
     """Volume of the previous sessions (same feed), built before the open.
     ``cum[k-1]`` = mean cumulative regular-session volume after k minutes
     (k = 1..120); ``pm_mean`` = mean premarket (04:00 to 09:30) volume;
-    ``atr_daily`` = simple mean of the last 14 daily true ranges."""
+    ``atr_daily`` = simple mean of the last 14 daily true ranges;
+    ``first5_mean`` = mean volume of the first 5 regular-session minutes over
+    the last ``orb5_rvol_lookback`` sessions (None with fewer)."""
     sessions: int
     cum: tuple[float, ...]
     pm_mean: float | None
     atr_daily: float | None
+    first5_mean: float | None = None
 
     def to_json(self) -> dict:
         return asdict(self)
@@ -153,7 +156,8 @@ class VolProfile:
     def from_json(cls, d: dict | None) -> "VolProfile | None":
         if not d:
             return None
-        return cls(int(d["sessions"]), tuple(float(x) for x in d["cum"]), d.get("pm_mean"), d.get("atr_daily"))
+        return cls(int(d["sessions"]), tuple(float(x) for x in d["cum"]), d.get("pm_mean"), d.get("atr_daily"),
+                   d.get("first5_mean"))  # absent in profiles stored before 2026-11-05
 
 
 def build_profile(hist: pd.DataFrame, day: date, cfg: OptionsConfig) -> VolProfile:
@@ -187,7 +191,9 @@ def build_profile(hist: pd.DataFrame, day: date, cfg: OptionsConfig) -> VolProfi
     cum = tuple(float(x) for x in np.mean(np.vstack(rows), axis=0))
     trs = [max(h - l, abs(h - ohlc[i - 1][2]), abs(l - ohlc[i - 1][2])) for i, (h, l, _) in enumerate(ohlc) if i]
     atr_d = float(np.mean(trs[-14:])) if len(trs) >= 14 else None
-    return VolProfile(len(rows), cum, float(np.mean(pms)), atr_d)
+    n5 = cfg.orb5_rvol_lookback
+    f5 = float(np.mean([r[4] for r in rows[-n5:]])) if len(rows) >= n5 else None
+    return VolProfile(len(rows), cum, float(np.mean(pms)), atr_d, f5 if f5 and f5 > 0 else None)
 
 
 def day_rvol(rth: pd.DataFrame, upto: pd.Timestamp, profile: VolProfile | None, cfg: OptionsConfig) -> float | None:
@@ -407,8 +413,74 @@ def orb15_5m(bars: pd.DataFrame, now: datetime, prev_close: float | None, symbol
     return None if sig is None else replace(sig, source="orb15_5m")
 
 
+def first5_volume(bars: pd.DataFrame, now: datetime, cfg: OptionsConfig) -> float | None:
+    """Volume of today's 09:30 to 09:34 bars, once all five have closed at
+    ``now`` (None before, or without a 09:30 bar)."""
+    _, rth = split_session(completed(bars, now), cfg)
+    if rth.empty or rth.index[0] != _at(rth.index[0].date(), cfg.open_time):
+        return None
+    end = rth.index[0] + pd.Timedelta(minutes=5)
+    if pd.Timestamp(now).tz_convert(ET) < end:
+        return None
+    return float(rth[rth.index < end]["volume"].astype(float).sum())
+
+
+def orb5_rvol(bars: pd.DataFrame, now: datetime, prev_close: float | None, symbol: str,
+              cfg: OptionsConfig, ctx: dict | None = None) -> Signal | None:
+    """SHADOW ONLY (owner 2026-11-05). 5-minute opening range on a stock in
+    play. The first 5-minute bar (09:30 to 09:34) up (close > open) = long
+    calls on a trade above its high; down = long puts on a trade below its
+    low; close == open (doji) = no trade. Only for names in ``ctx
+    ["orb5_top"]`` ({symbol: {"rank", "rvol5"}}): the engine's top
+    orb5_top_n universe names by rvol5 with rvol5 >= orb5_min_rvol, ranked
+    once after 09:35. Trigger: the first completed 1-minute bar inside 09:35
+    to 11:30 whose high (low) goes beyond the range (a stop entry at the
+    range level). Invalidation (stop): orb5_stop_atr_frac x daily ATR(14)
+    beyond the range level. Other exits are the sleeve's own; flat by the
+    forced-flat time like every position."""
+    ctx = ctx or {}
+    top = ctx.get("orb5_top")
+    if not top or symbol not in top:
+        return None
+    profile = ctx.get("profile")
+    atr_d = profile.atr_daily if profile is not None else None
+    if not atr_d or not math.isfinite(atr_d) or atr_d <= 0:
+        return None
+    b = completed(bars, now)
+    _, rth = split_session(b, cfg)
+    if rth.empty or rth.index[0] != _at(rth.index[0].date(), cfg.open_time):
+        return None
+    end = rth.index[0] + pd.Timedelta(minutes=5)
+    rng, later = rth[rth.index < end], rth[rth.index >= end]
+    if later.empty or len(rng) == 0:
+        return None  # the opening 5-minute bar is not complete yet
+    o, c = float(rng["open"].iloc[0]), float(rng["close"].iloc[-1])
+    if c == o:
+        return None  # doji: no direction
+    direction = "long" if c > o else "short"
+    hi, lo = float(rng["high"].max()), float(rng["low"].min())
+    stop = cfg.orb5_stop_atr_frac * atr_d
+    info = top.get(symbol) if isinstance(top, dict) else None
+    info = info if isinstance(info, dict) else {}
+    meta = {"rvol5": _r(info.get("rvol5")), "rank": info.get("rank"), "range_hi": hi, "range_lo": lo,
+            "bar5_open": o, "bar5_close": c, "atr_daily": round(atr_d, 4), "stop_dist": round(stop, 4)}
+    for ts, r in later.iterrows():
+        if _past(ts, cfg.orb5_window, cfg):
+            break
+        if not _in(ts, cfg.orb5_window, cfg):
+            continue
+        if direction == "long" and float(r["high"]) > hi:
+            return _sig("orb5_rvol", symbol, "long", ts, r["close"], hi - stop,
+                        f"5m bar up, trade above {hi:.2f}, rvol5 {meta['rvol5']}", meta=meta)
+        if direction == "short" and float(r["low"]) < lo:
+            return _sig("orb5_rvol", symbol, "short", ts, r["close"], lo + stop,
+                        f"5m bar down, trade below {lo:.2f}, rvol5 {meta['rvol5']}", meta=meta)
+    return None
+
+
 RULES: dict[str, Callable[..., Signal | None]] = {
     "gap_go": gap_go, "gap_fade": gap_fade, "orb15": orb15, "orb15_5m": orb15_5m, "vwap_reclaim": vwap_reclaim,
+    "orb5_rvol": orb5_rvol,
 }
 
 

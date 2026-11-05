@@ -17,6 +17,7 @@ import json
 from datetime import datetime
 
 from stockmoney.desk import store
+from stockmoney.desk.options.config import SCAN_CANDIDATES
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS options_plans (
@@ -281,6 +282,7 @@ def universe(con, day: str) -> list[dict]:
 AUDIT_20261027 = "2026-10-27 audit: stop-the-bleeding step 1"
 AUDIT_20261104 = ("2026-11-04 owner approval: orb15, vwap_reclaim, gap_fade back to paper live orders; "
                   "caps unchanged; sample-based per-setup live gate")
+AUDIT_20261105 = "2026-11-05 owner approved: stocks-in-play scan + orb5_rvol shadow"
 PARAM_CHANGES = (
     ("live_sources", ["gap_go", "orb15", "grok_plan"], ["gap_go", "grok_plan"], AUDIT_20261027),
     ("rule_playbooks", ["gap_go", "gap_fade", "orb15", "vwap_reclaim"],
@@ -294,6 +296,17 @@ PARAM_CHANGES = (
     ("poll_seconds_in_position", None, 5.0, AUDIT_20261027),
     ("live_sources", ["gap_go", "grok_plan"],
      ["gap_go", "orb15", "vwap_reclaim", "gap_fade", "grok_plan"], AUDIT_20261104),
+    # EDGE_PLAN 7.4 item 4: live_sources and caps unchanged; orb5_rvol is shadow only
+    ("rule_playbooks", ["gap_go", "gap_fade", "orb15", "orb15_5m", "vwap_reclaim"],
+     ["gap_go", "gap_fade", "orb15", "orb15_5m", "vwap_reclaim", "orb5_rvol"], AUDIT_20261105),
+    ("shadow_only_sources", ["orb15_5m"], ["orb15_5m", "orb5_rvol"], AUDIT_20261105),
+    ("scan_candidates", [], list(SCAN_CANDIDATES), AUDIT_20261105),
+    ("orb5_rvol_lookback", None, 14, AUDIT_20261105),
+    ("orb5_min_rvol", None, 1.0, AUDIT_20261105),
+    ("orb5_top_n", None, 10, AUDIT_20261105),
+    ("orb5_stop_atr_frac", None, 0.10, AUDIT_20261105),
+    ("orb5_window", None, [[9, 35], [11, 30]], AUDIT_20261105),
+    ("orb5_rank_deadline", None, [9, 37], AUDIT_20261105),
 )
 
 

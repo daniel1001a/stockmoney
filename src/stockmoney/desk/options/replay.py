@@ -335,7 +335,7 @@ def run(day: date, cfg: OptionsConfig, cache_dir: Path, out_dir: Path, feed: str
             # as shadow fills. Do not pool the experimental duplicate orb arm.
             rows = con.execute("SELECT realized_usd,fees_usd,qty_open,last_bid,entry_price FROM options_positions "
                                "WHERE mode='shadow' AND dte_label=? AND exit_variant=? "
-                               "AND source NOT IN ('grok_plan','orb15_5m')",
+                               "AND source NOT IN ('grok_plan','orb15_5m','orb5_rvol')",
                                (cfg.live_dte, cfg.live_exit)).fetchall()
             pnl = sum((r[0] or 0) - (r[1] or 0) + (r[2] or 0) * (
                 ((r[3] or 0) * (1 - cfg.shadow_slippage_pct) - (r[4] or 0)) * cfg.contract_multiplier
