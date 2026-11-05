@@ -96,6 +96,7 @@ from stockmoney.desk.options import plan as oplan
 from stockmoney.desk.options import playbooks as pb
 from stockmoney.desk.options import select as sel
 from stockmoney.desk.options import shadow as sh
+from stockmoney.desk.options import spread_variant as sv
 from stockmoney.desk.options import store as ostore
 from stockmoney.desk.options import universe as uni
 from stockmoney.desk.options._iface import (
@@ -740,6 +741,8 @@ class Engine:
                 continue
             for ev in cfg.exit_variants:
                 opened += self._open_shadow(s, sig, choice, ev, now, max_hold, ctx)
+            if s["source"] in sv.SOURCES:
+                self._open_spread_variant(s, choice, chain, spot, now)
             if bucket.label == cfg.live_dte:
                 live_choice = choice
         pending = False
@@ -796,9 +799,56 @@ class Engine:
         row = self._position_row(s, sig, ch, pid, "shadow", ev, max_hold, ctx)
         row.update(qty_initial=qty, qty_open=qty, state=ENTERED, entry_time=ostore.iso(now), entry_price=price,
                    fees_usd=cfg.fee_per_contract * qty, spread_cost_usd=sh.half_spread_cost(c.bid, c.ask, qty, cfg))
+        self._add_stressed(row, price, ev)
         if ostore.insert_position(self.con, row):
             ostore.add_fill(self.con, pid, now, "buy", qty, price, c.bid, c.ask, "entry")
         return 1
+
+    def _add_stressed(self, row: dict, entry: float, ev: str) -> None:
+        """flags_json["stressed"]: per-contract stressed loss at the premium
+        stop and the qty a $1,000 risk budget would allow, next to the actual
+        qty_initial. Report only; nothing reads it to size an order. Live
+        uses the limit (the fill is not known yet)."""
+        cfg = self.cfg
+        try:
+            flags = json.loads(row["flags_json"] or "{}")
+            stop = cfg.premium_stop_pct_b if ev == "B" else cfg.premium_stop_pct
+            flags["stressed"] = {**sh.stressed_risk(entry, row["entry_bid"], row["entry_ask"], stop, cfg),
+                                 "actual_qty": row.get("qty_initial")}
+            row["flags_json"] = json.dumps(flags, ensure_ascii=False, default=str)
+        except Exception as e:  # a report field must never block an entry
+            self._error("stressed_flags", f"{row.get('position_id')}: {type(e).__name__}: {e}")
+
+    def _open_spread_variant(self, s: dict, ch: sel.Choice, chain: list[OptionContract], spot: float,
+                             now: datetime) -> None:
+        """Shadow debit spread paired with the live-exit-variant shadow leg
+        (spread_variant.py). One extra quote (the short leg). Never affects
+        the single leg or any order: a failure is logged and dropped."""
+        pid = f"{s['setup_id']}:shadow:{ch.dte_label}:{self.cfg.live_exit}"
+        try:
+            linked = ostore.position(self.con, pid)
+            if linked is None or linked["state"] != ENTERED or sv.get(self.con, pid) is not None:
+                return
+            picked = sv.pick_short(chain, ch.contract, spot, now)
+            if picked is None:
+                return
+            short, d, src = picked
+            q = self._quote(short.occ)
+            if not self._fresh(q, now):
+                return
+            sv.open_spread(self.con, self.cfg, linked, ch.contract, q, d, src, now)
+        except Exception as e:
+            self._error("spread_variant", f"{pid}: {type(e).__name__}: {e}")
+
+    def _mirror_spread_variant(self, p: dict, qty: float, price: float, reason: str, now: datetime) -> None:
+        try:
+            row = sv.get(self.con, p["position_id"])
+            if row is None or row["status"] != sv.OPEN or not p["qty_initial"]:
+                return
+            q = self._quote(row["short_occ"])
+            sv.mirror_exit(self.con, self.cfg, row, qty / p["qty_initial"], price, q, self._fresh(q, now), reason, now)
+        except Exception as e:
+            self._error("spread_variant", f"{p['position_id']}: {type(e).__name__}: {e}")
 
     def _position_row(self, s, sig, ch: sel.Choice, pid, mode, ev, max_hold, ctx) -> dict:
         c = ch.contract
@@ -865,6 +915,7 @@ class Engine:
             return block("risk_gate_bad_intent", {"reason": dec.reason})
         row = self._position_row(s, sig, ch, pid, "live", cfg.live_exit, max_hold, ctx)
         row.update(qty_initial=final.qty, qty_open=0, state=PENDING)
+        self._add_stressed(row, limit, cfg.live_exit)
         if not ostore.insert_position(self.con, row):
             return True  # already exists (re-run): the pending order is resolved by _manage_pending
         self._submit(pid, final, "entry", "entry", now, quote=c)
@@ -1340,6 +1391,8 @@ class Engine:
         if note:
             fields["note"] = ((p["note"] or "") + "; " + note).strip("; ")[:500]
         ostore.update_position(self.con, pid, **fields)
+        if p["mode"] == "shadow":
+            self._mirror_spread_variant(p, qty, price, reason, now)
 
     def _send_exit(self, p: dict, qty: float, reason: str, q: OptionContract | None, now: datetime,
                    force_market: bool = False) -> bool:
@@ -1905,6 +1958,14 @@ class Engine:
         for p in ostore.positions(self.con, self._dstr, "shadow", (ENTERED,)):
             self._book_exit(p, p["qty_open"], sh.sell_price(p["last_bid"] or 0.0, self.cfg), p["last_bid"],
                             p["last_ask"], "session_end", now, "closed at last known bid")
+        try:  # a spread whose leg closed without a mirror (an error); never stops the flat check
+            for row in sv.open_rows(self.con, self._dstr):
+                leg = ostore.position(self.con, row["position_id"])
+                long_bid = (leg or {}).get("last_bid") or 0.0
+                sv.mirror_exit(self.con, self.cfg, row, row["open_frac"], sh.sell_price(long_bid, self.cfg), None,
+                               False, "session_end", now)
+        except Exception as e:
+            self._error("spread_variant", f"finish: {type(e).__name__}: {e}")
         self._roll_setups()
         problems = self._flat_problems()
         self.con.commit()

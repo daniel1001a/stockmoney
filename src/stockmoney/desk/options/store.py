@@ -37,6 +37,12 @@ CREATE TABLE IF NOT EXISTS options_positions (
   max_bid REAL, min_bid REAL, last_bid REAL, last_ask REAL, flags_json TEXT, note TEXT, updated_at TEXT,
   exit_variant TEXT, inv_close REAL, inv_vwap INTEGER DEFAULT 0, trail_ref REAL);
 CREATE INDEX IF NOT EXISTS options_positions_day ON options_positions(day, mode, state);
+CREATE TABLE IF NOT EXISTS options_spread_variants (
+  position_id TEXT PRIMARY KEY, variant TEXT, day TEXT, source TEXT, mode TEXT, underlying TEXT, dte_label TEXT,
+  expiry TEXT, right TEXT, long_occ TEXT, short_occ TEXT, long_strike REAL, short_strike REAL, width REAL,
+  short_delta REAL, short_delta_source TEXT, qty INTEGER, long_price REAL, short_price REAL, entry_debit REAL,
+  entry_time TEXT, open_frac REAL, last_short_ask REAL, status TEXT, exit_time TEXT, exit_reason TEXT,
+  realized_usd REAL, fees_usd REAL, pnl_usd REAL, stale_exits INTEGER DEFAULT 0);
 CREATE TABLE IF NOT EXISTS options_fills (
   id INTEGER PRIMARY KEY AUTOINCREMENT, position_id TEXT, at TEXT, side TEXT, qty REAL,
   price REAL, bid REAL, ask REAL, reason TEXT, client_order_id TEXT,
@@ -273,6 +279,8 @@ def universe(con, day: str) -> list[dict]:
 # The options config is code (config.py), so its changes are logged here, once,
 # in the desk's param_changes (strategy 'options'): (param, old, new, reason).
 AUDIT_20261027 = "2026-10-27 audit: stop-the-bleeding step 1"
+AUDIT_20261104 = ("2026-11-04 owner approval: orb15, vwap_reclaim, gap_fade back to paper live orders; "
+                  "caps unchanged; sample-based per-setup live gate")
 PARAM_CHANGES = (
     ("live_sources", ["gap_go", "orb15", "grok_plan"], ["gap_go", "grok_plan"], AUDIT_20261027),
     ("rule_playbooks", ["gap_go", "gap_fade", "orb15", "vwap_reclaim"],
@@ -284,6 +292,8 @@ PARAM_CHANGES = (
     ("exit_max_limit_attempts", 3, 1, AUDIT_20261027),
     ("exit_latch", False, True, AUDIT_20261027),
     ("poll_seconds_in_position", None, 5.0, AUDIT_20261027),
+    ("live_sources", ["gap_go", "grok_plan"],
+     ["gap_go", "orb15", "vwap_reclaim", "gap_fade", "grok_plan"], AUDIT_20261104),
 )
 
 

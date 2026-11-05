@@ -207,9 +207,11 @@ class OptionsConfig:
     spread_time_exit_dte: int = 2
 
     # --- live eligibility: only these sources may send a (paper) order;
-    # vwap_reclaim, gap_fade, orb15 and orb15_5m are shadow only (orb15
-    # moved to shadow by the 2026-10-27 audit: 14 live trades, net -1,164)
-    live_sources: tuple[str, ...] = ("gap_go", GROK)
+    # orb15_5m is shadow only (SHADOW_ONLY_SOURCES). orb15 went to shadow in
+    # the 2026-10-27 audit (14 live trades, net -1,164); the owner put orb15,
+    # vwap_reclaim and gap_fade back on paper live orders on 2026-11-04, caps
+    # unchanged, judged by the learn job's per-setup live gate (report only)
+    live_sources: tuple[str, ...] = ("gap_go", "orb15", "vwap_reclaim", "gap_fade", GROK)
     paper_only: bool = True
 
     # --- paths
