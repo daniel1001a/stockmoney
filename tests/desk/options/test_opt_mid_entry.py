@@ -59,6 +59,15 @@ def test_fallback_at_the_ask_after_the_wait(con):  # noqa: F811
     assert r["fill_price"] == 1.00 and r["saved_per_contract"] == pytest.approx(-0.03)
 
 
+def test_touch_after_the_wait_is_a_fallback_at_that_ask(con):  # noqa: F811
+    t0 = et(9, 40)
+    row = _row(con, t0)
+    assert me.resolve(con, CFG, row, _q(0.90, 0.94), False, t0 + timedelta(seconds=30)) == me.PENDING  # stale
+    assert me.resolve(con, CFG, row, _q(0.90, 0.94), True, t0 + timedelta(seconds=80)) == me.FALLBACK
+    r = me.get(con, row["position_id"])
+    assert r["fill_price"] == 0.94 and r["saved_per_contract"] == pytest.approx(0.03)
+
+
 def test_no_quote_after_twice_the_wait_or_exit(con):  # noqa: F811
     t0 = et(9, 40)
     row = _row(con, t0)

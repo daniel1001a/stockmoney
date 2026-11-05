@@ -8,7 +8,7 @@ At every shadow entry of the live exit variant (position_id
 limit at the mid of the entry quote. The row is then resolved from the
 quotes the engine already takes of that position (no extra data call):
 
-- FILLED: a fresh quote within ``cfg.mid_entry_wait_s`` has ask <= the limit
+- FILLED: a fresh quote strictly before ``cfg.mid_entry_wait_s`` has ask <= the limit
   (a conservative touch rule: a resting mid order may fill earlier on a
   print between bid and ask, which this does not count). Fill = the limit.
 - FALLBACK: no touch by the wait; the order is replaced at the ask of the
@@ -65,7 +65,7 @@ def resolve(con, cfg: OptionsConfig, row: dict, q: OptionContract | None, fresh:
         return row["status"]
     waited = (now - datetime.fromisoformat(row["signal_time"])).total_seconds()
     status, fill = PENDING, None
-    if fresh and q is not None and q.ask is not None and q.ask <= row["mid_limit"] and waited > 0:
+    if fresh and q is not None and q.ask is not None and q.ask <= row["mid_limit"] and 0 < waited < cfg.mid_entry_wait_s:
         status, fill = FILLED, row["mid_limit"]
     elif fresh and q is not None and q.ask is not None and waited >= cfg.mid_entry_wait_s:
         status, fill = FALLBACK, q.ask

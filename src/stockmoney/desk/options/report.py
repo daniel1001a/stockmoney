@@ -20,12 +20,16 @@ holding the other at its live value.
 from __future__ import annotations
 
 import json
+import logging
+import sqlite3
 from collections import defaultdict
 
 from stockmoney.desk.options import exit_shadow
 from stockmoney.desk.options import mid_entry
 from stockmoney.desk.options import store as ostore
 from stockmoney.desk.options.config import FEED_CAVEAT, GROK, OptionsConfig
+
+log = logging.getLogger(__name__)
 
 CLASS_LABEL = {"index": "指數/槓桿 ETF", "mega_cap": "大型個股", "high_vol": "高波動股"}
 STATE_LABEL = {"WAITING": "等待", "TRIGGERED": "已觸發", "ENTERED": "持倉中", "EXITED": "已出場", "EXPIRED": "未觸發",
@@ -344,8 +348,10 @@ def build(con, day: str, cfg: OptionsConfig | None = None, header: str = "") -> 
     # ---- mid-price entry shadow (all days to date; shadow only)
     try:
         lines += mid_entry.report_lines(con, cfg)
-    except Exception:  # older database without the table: no section
+    except sqlite3.OperationalError:  # older database without the table: no section
         pass
+    except Exception:  # never break the report, but do not hide a real bug
+        log.exception("mid_entry report section failed")
 
     # ---- anomalies
     ev = con.execute("SELECT level, kind, COUNT(*) n, MAX(message) m FROM options_events WHERE day=? AND level<>'info' "
