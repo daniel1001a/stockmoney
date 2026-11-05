@@ -23,6 +23,13 @@ day-block bootstrap (resample whole sessions), each the 5th percentile of
 PASS needs all of: n >= 100, lower bound > 0, distinct days >= 15, and the
 best single day <= 50% of total P&L (n/a when total <= 0, which fails).
 
+Variant registry (EDGE_PLAN 7.4 item 5, learn/variants.py): a source's
+trades dated before its registered date are excluded (they are not its
+sample); an unregistered source keeps all its rows. The report prints the
+family size K and the out-of-sample mean (trades on the last third of the
+source's distinct trading days), since with K variants about K x 5% pass a
+90% one-sided lower bound by luck.
+
 Stressed-stop sizing (report only): stressed cost per contract = premium-stop
 loss + half the entry spread + fees for both legs; stressed qty = floor($1,000
 / stressed cost). Hypothetical P&L = trade P&L per contract x stressed qty.
@@ -39,6 +46,7 @@ from pathlib import Path
 
 import numpy as np
 
+from stockmoney.desk.learn import variants
 from stockmoney.desk.options import spread_variant as sv
 from stockmoney.desk.options.config import OptionsConfig
 from stockmoney.desk.options.shadow import stressed_risk
@@ -79,7 +87,7 @@ def metrics(trades: list[dict]) -> dict:
     out = {"n": n, "days": len({t["day"] for t in trades}),
            "live": sum(t["mode"] == "live" for t in trades), "shadow": sum(t["mode"] != "live" for t in trades),
            "mean": None, "lb_trade": None, "lb_day": None, "lb": None, "total": 0.0, "day_share": None,
-           "stressed_total": None, "verdict": "FAIL"}
+           "stressed_total": None, "oos_mean": None, "verdict": "FAIL"}
     if not n:
         return out
     pnl = np.array([float(t["pnl"]) for t in trades])
@@ -95,6 +103,10 @@ def metrics(trades: list[dict]) -> dict:
         for t in trades:
             per_day[t["day"]] = per_day.get(t["day"], 0.0) + float(t["pnl"])
         out["day_share"] = max(per_day.values()) / out["total"]
+    keys = sorted(set(days))
+    tail = set(keys[len(keys) - (len(keys) + 2) // 3:])  # last third of distinct days, rounded up
+    oos = [float(t["pnl"]) for t in trades if t["day"] in tail]
+    out["oos_mean"] = float(np.mean(oos)) if oos else None
     st = [t["pnl_stressed"] for t in trades if t.get("pnl_stressed") is not None]
     out["stressed_total"] = float(sum(st)) if st else None
     ok = (n >= MIN_N and out["lb"] > 0 and out["days"] >= MIN_DAYS
@@ -139,6 +151,9 @@ def rows(con, by_dte: bool = False, cfg: OptionsConfig | None = None) -> list[di
     live_keys = {(r["setup_id"], r["dte_label"]) for r in got if r["mode"] == "live" and r["setup_id"]}
     groups: dict[tuple, list[dict]] = {}
     for r in got:
+        since = variants.registered_since(r["source"])
+        if since and (r["day"] or "") < since:
+            continue  # before the variant was registered: not its sample
         if r["mode"] != "live" and (r["setup_id"], r["dte_label"]) in live_keys:
             continue
         key = (r["source"], r["dte_label"] or "?") if by_dte else (r["source"], None)
@@ -152,18 +167,22 @@ def _f(x, fmt="{:+.0f}") -> str:
 
 def report(con, by_dte: bool = False) -> str:
     rs = rows(con, by_dte)
+    k = variants.family_size()
     lines = ["## 逐策略實盤關卡(per-setup live gate,唯讀)", "",
+             f"變體家族大小 K = {k}(learn/variants.py)。同時跑 K 個變體,約 K x 5% = {k * 0.05:.1f} 個會靠運氣"
+             "通過 90% 單邊下界;PASS 之後單日占比與樣本外段(最後 1/3 交易日)平均仍須為正。"
+             "登記日之前的資料不算該變體的樣本。", "",
              f"PASS 需同時滿足:n >= {MIN_N}、90% bootstrap 下界(逐筆與逐日區塊取較保守者)> 0、"
              f"交易日 >= {MIN_DAYS}、單日占總損益 <= {MAX_DAY_SHARE:.0%}。單筆損益 = realized - fees,"
              "只計 live exit 變體,live 與影子都算。壓力部位:以 $1,000 風險預算與權利金停損反推口數(僅報告)。", ""]
     if not rs:
         return "\n".join(lines + ["(尚無已出場部位)"] + _spread_lines(con))
-    lines += ["| 來源 | DTE | n | 天數 | live/影子 | 平均 | 下界(逐筆/逐日) | 總損益 | 單日占比 | 壓力部位損益 | 判定 |",
-              "|---|---|---|---|---|---|---|---|---|---|---|"]
+    lines += ["| 來源 | DTE | n | 天數 | live/影子 | 平均 | 下界(逐筆/逐日) | 總損益 | 單日占比 | 後段(最後 1/3 交易日)平均 | 壓力部位損益 | 判定 |",
+              "|---|---|---|---|---|---|---|---|---|---|---|---|"]
     for r in rs:
         lines.append(f"| {r['source']} | {r['dte_label'] or '全部'} | {r['n']} | {r['days']} | {r['live']}/{r['shadow']} "
                      f"| {_f(r['mean'])} | {_f(r['lb'])} ({_f(r['lb_trade'])}/{_f(r['lb_day'])}) | {_f(r['total'])} "
-                     f"| {_f(r['day_share'], '{:.0%}')} | {_f(r['stressed_total'])} | {r['verdict']} |")
+                     f"| {_f(r['day_share'], '{:.0%}')} | {_f(r['oos_mean'])} | {_f(r['stressed_total'])} | {r['verdict']} |")
     return "\n".join(lines + _spread_lines(con))
 
 
