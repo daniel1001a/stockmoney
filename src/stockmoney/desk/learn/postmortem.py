@@ -46,6 +46,7 @@ stock weekly counts or the stock hypotheses.
 from __future__ import annotations
 
 import json
+import logging
 import math
 import sqlite3
 from collections import Counter, defaultdict
@@ -56,11 +57,12 @@ import pandas as pd
 from stockmoney.desk import store, veto, wind
 from stockmoney.desk.data import Bars
 from stockmoney.desk.indicators import Ind, market_state, sector_ranking
-from stockmoney.desk.learn import corroboration
+from stockmoney.desk.learn import corroboration, process_review
 from stockmoney.desk.learn.trades import ClosedTrade, _table_exists, closed_trades
 from stockmoney.desk.options.config import FEED_CAVEAT
 from stockmoney.desk.universe import MARKET, sector_of
 
+log = logging.getLogger(__name__)
 WHIPSAW_SESSIONS = 10
 GM_WINDOW_DAYS = 3  # Grok and Muse must both name the symbol within this many days before the entry
 OPTION_PREFIX = "opt:"
@@ -482,4 +484,8 @@ def symptom_report(con, today: str, weeks: int = 4) -> tuple[str, list[str]]:
     hyp = [hypothesis_text(c) for c, _ in top_candidates(con, today)]
     if hyp:
         lines += ["", "### 候選假設", *[f"- {h}" for h in hyp]]
+    try:  # EDGE_PLAN 7.4 item 7, appended only; a failure never breaks the report
+        lines += process_review.lines(con, today)
+    except Exception:  # noqa: BLE001
+        log.exception("process_review failed")
     return "\n".join(lines), hyp

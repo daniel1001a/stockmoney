@@ -97,7 +97,9 @@ def test_fast_ticks_make_no_market_data_calls(tmp_path, con):
 
 
 def test_exits_run_when_low_priority_work_is_starved(tmp_path, con):
-    cfg, clock, b, eng, _ = full_universe(tmp_path, con, max_data_calls_per_min=1)
+    # orb5_rvol kept unarmed: its shadow position would spend the one call a
+    # minute this test leaves, and the point here is the live orb15 exit
+    cfg, clock, b, eng, _ = full_universe(tmp_path, con, max_data_calls_per_min=1, orb5_min_rvol=float("inf"))
     while clock.now < et(9, 55):
         eng.tick()
         clock.advance(20)

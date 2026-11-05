@@ -95,7 +95,7 @@ def _options(start, end, cfg, cache_dir, feed):
                     con.row_factory = sqlite3.Row
                     # Exactly one DTE/exit arm per rule, never duplicate its variants.
                     rows = con.execute("SELECT * FROM options_positions WHERE mode='shadow' AND state='EXITED' "
-                                       "AND dte_label=? AND exit_variant=? AND source NOT IN (?, 'orb15_5m') "
+                                       "AND dte_label=? AND exit_variant=? AND source NOT IN (?, 'orb15_5m', 'orb5_rvol') "
                                        "ORDER BY exit_time, position_id", (cfg.live_dte, cfg.live_exit, GROK)).fetchall()
                     for row in rows:
                         risk = row["entry_price"] * row["qty_initial"] * cfg.contract_multiplier

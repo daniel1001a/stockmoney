@@ -19,6 +19,20 @@ from test_opt_engine import Rig, _plan
 ROOT = Path(__file__).resolve().parents[3]
 
 
+def test_replay_command_uses_current_paper_overrides(tmp_path):
+    from dataclasses import replace
+    from stockmoney.desk.learn import registry
+    from stockmoney.desk.options import replay
+
+    cfg = replace(spy_cfg(tmp_path), replay_cache=tmp_path / "cache")
+    replay.synthetic_cache(cfg.replay_cache, DAY)
+    db_path = tmp_path / "desk.sqlite"
+    with store.connect(db_path) as con:
+        registry.change(con, "options.grok_min_rvol", 1.75, "test", account_kind="paper")
+    assert orun.replay_cmd(DAY, cfg, "iex", None, 20, db_path=db_path) == 0
+    assert "RVOL >= 1.75" in (cfg.report_dir / f"replay_{DAY}_iex.md").read_text()
+
+
 def test_ingest_plan_cli(tmp_path, monkeypatch):
     sent = []
     monkeypatch.setattr(orun.notify, "send", lambda *a, **k: sent.append(a))
@@ -97,6 +111,25 @@ def test_session_engine_wires_line_a_broker_and_gate(tmp_path, monkeypatch):
         monkeypatch.delenv("DESK_OPTIONS_ORDERS")
         eng, mode = orun.make_session_engine(con, spy_cfg(tmp_path))
         assert mode == "shadow" and eng.live is False  # never trades through a non-paper broker
+
+
+def test_session_override_reaches_gate_and_report(tmp_path, monkeypatch):
+    from datetime import time
+    from stockmoney.desk.learn import registry
+    from stockmoney.desk.options import _iface
+
+    broker = FakeOptionsBroker(Clock(et(9, 20)))
+    monkeypatch.setattr(_iface, "make_trading_broker", lambda: broker)
+    monkeypatch.delenv("DESK_OPTIONS_ORDERS", raising=False)
+    with store.connect(tmp_path / "registry.sqlite") as con:
+        registry.change(con, "options.entry_window_start", 580, "test", account_kind="paper")
+        registry.change(con, "options.grok_min_rvol", 1.75, "test", account_kind="paper")
+        eng, _ = orun.make_session_engine(con, spy_cfg(tmp_path))
+        assert eng.cfg.entry_window_start == (9, 40)
+        assert eng.risk_gate.engine.limits.entry_start == time(9, 40)
+        ostore.ensure_schema(con)
+        report = orun.write_report(con, str(DAY), eng.cfg).read_text()
+        assert "RVOL >= 1.75" in report
 
 
 def test_report_sections(tmp_path):

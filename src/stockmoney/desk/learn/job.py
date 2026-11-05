@@ -20,6 +20,8 @@ Steps (each isolated, a failure in one does not stop the others):
   3h. per-source credibility scoreboard (source_scores, read-only; last 20 / 60 sessions and all-time)
   3i. wind layer: log wind_daily for each new session, options outcomes sliced by prior-day wind (H5, record only)
   3j. defined-risk spread shadow report (H6; the spreads are opened and marked by options/spreads.py intraday)
+  3k. per-setup live gate report (learn/setup_gate.py, read-only; n, bootstrap lower bound, days, day share)
+  3l. variant registry (learn/variants.py) and 30-day exit check (learn/exit_check.py), both read-only
   4. allocator recommendation (Fridays or when none logged this week)
   5. report -> data/desk/learn/<date>.md and learn_reports; Friday push summary
 """
@@ -36,9 +38,9 @@ import pandas as pd
 
 from stockmoney.desk import data, notify, store, veto, wind
 from stockmoney.desk.indicators import compute
-from stockmoney.desk.learn import (allocator, calls, chains, corroboration, counterfactual, earnings, filings,
+from stockmoney.desk.learn import (allocator, calls, chains, corroboration, counterfactual, earnings, exit_check, filings,
                                    h_reports, hypotheses, invalidation, links, market_risk, options_postmortem,
-                                   postmortem, prescreen, scoreboard, shadow, tables)
+                                   postmortem, prescreen, scoreboard, setup_gate, shadow, tables, variants)
 from stockmoney.desk.options import spreads
 
 log = logging.getLogger(__name__)
@@ -216,6 +218,9 @@ def run(con, now: datetime, bars: data.Bars | None = None, shadow_start: str | N
               guarded("market_risk_report", lambda: market_risk.report(con)) or "", "",
               guarded("veto_report", lambda: veto.report(con, (through - pd.Timedelta(days=7)).date().isoformat())) or "", "",
               guarded("scoreboard_report", lambda: scoreboard.report(con, day)) or "", "",
+              guarded("setup_gate_report", lambda: setup_gate.report(con)) or "", "",
+              guarded("variants_report", lambda: variants.report(day)) or "", "",
+              guarded("exit_check_report", lambda: exit_check.report(con, 30, day)) or "", "",
               guarded("wind_report", lambda: wind.report(con)) or "", "",
               guarded("spreads_report", lambda: spreads.report(con)) or "", "",
               guarded("h_reports", lambda: h_reports.run_all(con, bars)) or ""]

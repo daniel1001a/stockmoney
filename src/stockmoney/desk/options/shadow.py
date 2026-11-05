@@ -33,6 +33,20 @@ def half_spread_cost(bid: float | None, ask: float | None, qty: float, cfg: Opti
     return max(ask - bid, 0.0) / 2 * qty * cfg.contract_multiplier
 
 
+def stressed_risk(entry: float, bid: float | None, ask: float | None, stop_pct: float, cfg: OptionsConfig,
+                  budget: float = 1000.0) -> dict:
+    """Stressed per-contract dollar loss: the premium stop filling at its
+    level, plus half the entry spread, plus fees for both legs; and the
+    contract count that loss fits in ``budget``. Report only (the learn
+    job's per-setup gate); it never sizes an order and is not capped by
+    max_premium_per_trade."""
+    m = cfg.contract_multiplier
+    half = max(ask - bid, 0.0) / 2 if bid is not None and ask is not None else 0.0
+    cost = entry * stop_pct * m + half * m + 2 * cfg.fee_per_contract
+    qty = floor(budget / cost + 1e-9) if cost > 0 else 0
+    return {"cost": round(cost, 4), "qty": qty, "budget": budget, "stop_pct": stop_pct}
+
+
 def round_tick(price: float, tick: float, up: bool) -> float:
     """Round a limit to the tick (up for buys, down for sells), so a buy limit
     at the ask is never accidentally below it."""
