@@ -275,3 +275,4 @@
   - 盤前活躍股掃描:`scan_candidates` 填入 30 檔不在起始名單內的流動性標的(股價 > 5 美元、20 日均量 >= 100 萬股、ATR14 > 0.50 美元、有近期到期選擇權,用 `scripts/options_scan_candidates_check.py` 只讀驗證)。每檔在建立名單時只花一次資料呼叫;命中者照舊排在起始名單之後,整體上限仍為 25 檔。單檔失敗只記錄,不影響其他標的與當日流程。
   - 新增只進影子的 `orb5_rvol`(列在 `SHADOW_ONLY_SOURCES`,寫進 `live_sources` 也不下單):09:35 後依 rvol5(開盤前 5 分鐘量 / 過去 14 個交易日同時段均量)排名一次,取 rvol5 >= 1.0 的前 10 名;第一根 5 分鐘 K 線收紅,之後突破其高點買買權,收黑跌破低點買賣權,十字線不交易。停損為區間價位外 0.1 倍日 ATR14,其餘出場照舊,15:45 前平倉。排名不另花資料呼叫,寫入事件表,重啟沿用。任何錯誤只記錄,不擋其他劇本、出場與收盤平倉。
   - 寫入 `param_changes`(`AUDIT_20261105`,重複執行不會重複寫)。測試:`tests/desk/options/test_opt_orb5_rvol_1105.py`。
+  - 中價進場影子(`EDGE_PLAN.md` 7.4 第 2 項,`options/mid_entry.py`,表 `options_mid_entry`):只記錄,不送單、不改實單進場方式。等待時間 `mid_entry_wait_s` = 60 秒(影子專用,不影響任何訂單)。任何錯誤只記錄,不擋進場。測試:`tests/desk/options/test_opt_mid_entry.py`。

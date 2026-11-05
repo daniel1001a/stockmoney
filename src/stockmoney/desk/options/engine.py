@@ -96,6 +96,7 @@ from stockmoney.desk.options import plan as oplan
 from stockmoney.desk.options import playbooks as pb
 from stockmoney.desk.options import select as sel
 from stockmoney.desk.options import shadow as sh
+from stockmoney.desk.options import mid_entry as me
 from stockmoney.desk.options import spread_variant as sv
 from stockmoney.desk.options import store as ostore
 from stockmoney.desk.options import universe as uni
@@ -909,6 +910,11 @@ class Engine:
         self._add_stressed(row, price, ev)
         if ostore.insert_position(self.con, row):
             ostore.add_fill(self.con, pid, now, "buy", qty, price, c.bid, c.ask, "entry")
+            if ev == cfg.live_exit:
+                try:  # mid-price entry shadow: a report row, never blocks the entry
+                    me.open_row(self.con, row, c, now)
+                except Exception as e:
+                    self._error("mid_entry", f"{pid}: {type(e).__name__}: {e}")
         return 1
 
     def _add_stressed(self, row: dict, entry: float, ev: str) -> None:
@@ -946,6 +952,17 @@ class Engine:
             sv.open_spread(self.con, self.cfg, linked, ch.contract, q, d, src, now)
         except Exception as e:
             self._error("spread_variant", f"{pid}: {type(e).__name__}: {e}")
+
+    def _resolve_mid_entry(self, p: dict, q: OptionContract | None, fresh: bool, now: datetime,
+                           exited: bool = False) -> None:
+        """Mid-price entry shadow (mid_entry.py): resolved from the quote this
+        position already took; no extra call. Never affects the position."""
+        try:
+            row = me.get(self.con, p["position_id"])
+            if row is not None and row["status"] == me.PENDING:
+                me.resolve(self.con, self.cfg, row, q, fresh, now, exited)
+        except Exception as e:
+            self._error("mid_entry", f"{p['position_id']}: {type(e).__name__}: {e}")
 
     def _mirror_spread_variant(self, p: dict, qty: float, price: float, reason: str, now: datetime) -> None:
         try:
@@ -1297,6 +1314,8 @@ class Engine:
             ostore.update_position(self.con, p["position_id"], last_bid=q.bid, last_ask=q.ask,
                                    max_bid=max(p["max_bid"] or q.bid, q.bid), min_bid=min(p["min_bid"] or q.bid, q.bid))
             p = ostore.position(self.con, p["position_id"])
+        if p["mode"] == "shadow" and p["exit_variant"] == self.cfg.live_exit:
+            self._resolve_mid_entry(p, q, fresh, now)
         if p["tp_done"] and p["exit_variant"] == "B":  # variant B trails the best underlying price since +40%
             spot = self._spot(p["underlying"], now)
             ref = p["trail_ref"]
@@ -2065,6 +2084,11 @@ class Engine:
         for p in ostore.positions(self.con, self._dstr, "shadow", (ENTERED,)):
             self._book_exit(p, p["qty_open"], sh.sell_price(p["last_bid"] or 0.0, self.cfg), p["last_bid"],
                             p["last_ask"], "session_end", now, "closed at last known bid")
+        try:  # mid-entry rows still pending at the close: no comparison
+            for row in me.pending_rows(self.con, self._dstr):
+                me.resolve(self.con, self.cfg, row, None, False, now, exited=True)
+        except Exception as e:
+            self._error("mid_entry", f"finish: {type(e).__name__}: {e}")
         try:  # a spread whose leg closed without a mirror (an error); never stops the flat check
             for row in sv.open_rows(self.con, self._dstr):
                 leg = ostore.position(self.con, row["position_id"])

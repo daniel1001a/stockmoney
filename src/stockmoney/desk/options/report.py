@@ -23,6 +23,7 @@ import json
 from collections import defaultdict
 
 from stockmoney.desk.options import exit_shadow
+from stockmoney.desk.options import mid_entry
 from stockmoney.desk.options import store as ostore
 from stockmoney.desk.options.config import FEED_CAVEAT, GROK, OptionsConfig
 
@@ -339,6 +340,12 @@ def build(con, day: str, cfg: OptionsConfig | None = None, header: str = "") -> 
         lines += ["| 階段 | 原因 | 次數 |", "|---|---|---|"] + [f"| {r['stage']} | {r['reason']} | {r['n']} |" for r in rows]
     else:
         lines.append("(無)")
+
+    # ---- mid-price entry shadow (all days to date; shadow only)
+    try:
+        lines += mid_entry.report_lines(con, cfg)
+    except Exception:  # older database without the table: no section
+        pass
 
     # ---- anomalies
     ev = con.execute("SELECT level, kind, COUNT(*) n, MAX(message) m FROM options_events WHERE day=? AND level<>'info' "

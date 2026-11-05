@@ -126,6 +126,9 @@ class OptionsConfig:
 
     # --- data safety
     max_quote_age_s: float = 30.0            # never enter on an older option quote
+    # mid-price entry shadow (owner 2026-11-05, options/mid_entry.py): a hypothetical
+    # buy at the mid, replaced at the ask after this wait; measured only, never sent
+    mid_entry_wait_s: float = 60.0
     max_bar_age_s: float = 180.0             # last completed underlying bar must be this fresh
     max_signal_age_s: float = 120.0          # a trigger seen later than this (e.g. after a restart) is missed, not chased
     max_consecutive_errors: int = 5          # then notify (exits keep being retried)

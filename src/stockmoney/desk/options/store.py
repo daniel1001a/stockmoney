@@ -44,6 +44,10 @@ CREATE TABLE IF NOT EXISTS options_spread_variants (
   short_delta REAL, short_delta_source TEXT, qty INTEGER, long_price REAL, short_price REAL, entry_debit REAL,
   entry_time TEXT, open_frac REAL, last_short_ask REAL, status TEXT, exit_time TEXT, exit_reason TEXT,
   realized_usd REAL, fees_usd REAL, pnl_usd REAL, stale_exits INTEGER DEFAULT 0);
+CREATE TABLE IF NOT EXISTS options_mid_entry (
+  position_id TEXT PRIMARY KEY, day TEXT, source TEXT, underlying TEXT, uclass TEXT, dte_label TEXT, occ TEXT,
+  signal_time TEXT, signal_bid REAL, signal_ask REAL, mid_limit REAL, status TEXT, resolved_at TEXT,
+  waited_s REAL, fill_price REAL, saved_per_contract REAL);
 CREATE TABLE IF NOT EXISTS options_fills (
   id INTEGER PRIMARY KEY AUTOINCREMENT, position_id TEXT, at TEXT, side TEXT, qty REAL,
   price REAL, bid REAL, ask REAL, reason TEXT, client_order_id TEXT,
