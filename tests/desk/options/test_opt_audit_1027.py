@@ -208,16 +208,17 @@ def test_slippage_ratio_skips_a_position_with_an_unquoted_leg(con):
 # ------------------------------------------------------------------ param_changes
 def test_param_changes_written_once(con):
     ostore.ensure_schema(con)
-    assert ostore.record_param_changes(con) == len(ostore.PARAM_CHANGES) == 9
+    assert ostore.record_param_changes(con) == len(ostore.PARAM_CHANGES) == 18
     assert ostore.record_param_changes(con) == 0
     rows = con.execute("SELECT param, old, new, reason FROM param_changes WHERE strategy='options' "
                        "ORDER BY id").fetchall()
-    assert len(rows) == 9 and {r[3] for r in rows} == {ostore.AUDIT_20261027, ostore.AUDIT_20261104}
+    assert len(rows) == 18 and {r[3] for r in rows} == {ostore.AUDIT_20261027, ostore.AUDIT_20261104,
+                                                         ostore.AUDIT_20261105}
     audit = {r[0]: (json.loads(r[1]), json.loads(r[2])) for r in rows if r[3] == ostore.AUDIT_20261027}
     assert len(audit) == 8
     assert audit["live_sources"] == (["gap_go", "orb15", "grok_plan"], ["gap_go", "grok_plan"])
     assert audit["exit_max_limit_attempts"] == (3, 1)
-    last = rows[-1]  # the newer live_sources row is written after the audit's
+    last = [r for r in rows if r[0] == "live_sources"][-1]  # the newer live_sources row is written after the audit's
     assert (last[0], last[3]) == ("live_sources", ostore.AUDIT_20261104)
     assert (json.loads(last[1]), json.loads(last[2])) == (
         ["gap_go", "grok_plan"], ["gap_go", "orb15", "vwap_reclaim", "gap_fade", "grok_plan"])
@@ -230,7 +231,7 @@ def test_param_changes_1104_added_to_a_db_that_already_has_the_audit(con):
     for param, old, new, reason in ostore.PARAM_CHANGES[:8]:
         con.execute("INSERT INTO param_changes (strategy, param, old, new, reason, changed_at) VALUES (?,?,?,?,?,?)",
                     ("options", param, json.dumps(old), json.dumps(new), reason, "2026-10-27T09:00:00"))
-    assert ostore.record_param_changes(con) == 1
+    assert ostore.record_param_changes(con) == 1 + 9  # the 1104 row and the nine 1105 rows
     assert ostore.record_param_changes(con) == 0
 
 

@@ -224,6 +224,9 @@ class Engine:
         self._quote_at: dict[str, tuple[datetime, OptionContract | None]] = {}
         self._spot_at: dict[str, tuple[datetime, float | None]] = {}
         self._bars_at: dict[str, datetime] = {}
+        # orb5_rvol (shadow only): the day's top rvol5 names, ranked once after 09:35
+        self._orb5_top: dict[str, dict] | None = None
+        self._orb5_day: str | None = None
         self._rng = random.Random()
         self._sleep = time_mod.sleep  # injectable (tests): the bounded re-read after a cancel at the flat
         ostore.ensure_schema(con)
@@ -288,6 +291,10 @@ class Engine:
                     self._scan_symbol(m, now, halted)
                 except Exception as e:  # one symbol's bad data must not stop the loop
                     self._error("scan", f"{m['symbol']}: {type(e).__name__}: {e}")
+            try:  # orb5_rvol (shadow only): never blocks the tick, other playbooks or exits
+                self._orb5_rank(now, halted)
+            except Exception as e:
+                self._error("orb5_rank", f"{type(e).__name__}: {e}")
         self._roll_setups()
         self._errors = 0 if self._tick_errors == 0 else self._errors
         self.con.commit()
@@ -442,23 +449,12 @@ class Engine:
             ostore.filtered(self.con, d, now, "universe", s, "prior_cap")
             plan_syms.remove(s)
         prior_only = prior_only[:cfg.prior_symbol_cap]
-        hits = []
+        hits: list[str] = []
         prev: dict[str, float | None] = {}
-        for s in cfg.scan_candidates:
-            prev[s] = self._prev_close(s)
-            try:
-                self._io()
-                self._spend(force=True)  # day setup: never skipped, counted
-                b = pb.completed(self.broker.minute_bars(s, _at(self._day, (4, 0)), now), now)
-            except Exception as e:
-                self._error("scan", f"{s}: {e}")
-                continue
-            pm, _ = pb.split_session(b, cfg)
-            ok, why, detail = uni.scan_hit(pm, prev[s], cfg)
-            if ok:
-                hits.append(s)
-            else:
-                ostore.filtered(self.con, d, now, "universe", s, why, detail=detail)
+        try:  # a failed scan never blocks the day: the plan and starting names still load
+            self._scan_candidates(now, hits, prev)
+        except Exception as e:
+            self._error("scan", f"stocks-in-play scan failed: {type(e).__name__}: {e}")
         members, dropped = uni.build(cfg, plan_syms, hits)
         for s, why in dropped:
             ostore.filtered(self.con, d, now, "universe", s, why)
@@ -476,6 +472,41 @@ class Engine:
                 self._new_setup(f"{d}:{src}:{m.symbol}", src, m.symbol, m.uclass, now, avoid=avoid)
         ostore.event(self.con, d, now, "info", "universe", f"{len(members)} underlyings: "
                      + ",".join(m.symbol for m in members))
+
+    def _scan_candidates(self, now: datetime, hits: list[str], prev: dict[str, float | None]) -> None:
+        """Stocks-in-play scan of cfg.scan_candidates at the universe build
+        (~09:25). ONE data call per name: the previous session's last minutes
+        (15:50 to 16:00, for the previous close) through ``now`` (today's
+        premarket). Each name is guarded on its own; a failure is logged and
+        the name is skipped."""
+        cfg, d = self.cfg, self._dstr
+        pd_ = _prev_trading_day(self._day)
+        prev_end = pd.Timestamp(_at(pd_, (16, 0)))
+        today_start = pd.Timestamp(_at(self._day, (4, 0)))
+        for s in cfg.scan_candidates:
+            try:
+                self._io()
+                self._spend(force=True)  # day setup: never skipped, counted
+                raw = self.broker.minute_bars(s, _at(pd_, (15, 50)), now)
+                b = pb.completed(raw, now) if raw is not None else pd.DataFrame()
+                if b.empty:
+                    prev[s] = None
+                    ostore.filtered(self.con, d, now, "universe", s, "scan_no_bars")
+                    continue
+                b = b.copy()
+                b.index = pd.DatetimeIndex(b.index).tz_convert(ET)
+                old = b[b.index < prev_end]
+                prev[s] = float(old["close"].iloc[-1]) if not old.empty else None
+                pm, _ = pb.split_session(b[b.index >= today_start], cfg)
+                ok, why, detail = uni.scan_hit(pm, prev[s], cfg)
+                if ok:
+                    hits.append(s)
+                else:
+                    ostore.filtered(self.con, d, now, "universe", s, why, detail=detail)
+            except Exception as e:
+                self._rate_limited(e)
+                self._error("scan", f"{s}: {type(e).__name__}: {e}")
+                prev.pop(s, None)
 
     def _add_plan(self, active, now: datetime) -> None:
         """Create grok_plan setups for the plan in force (items WITH a
@@ -546,7 +577,7 @@ class Engine:
         return ""
 
     # ================================================================ triggers
-    def _scan_symbol(self, m: dict, now: datetime, halted: bool) -> None:
+    def _scan_symbol(self, m: dict, now: datetime, halted: bool, only: str | None = None) -> None:
         sym = m["symbol"]
         waiting = [s for s in ostore.setups(self.con, self._dstr) if s["underlying"] == sym and s["state"] == WAITING]
         if not waiting:
@@ -568,11 +599,84 @@ class Engine:
                 return
         bench = self.cfg.benchmark(sym)
         ctx = {"pm_dollar_vol": m.get("pm_dollar_vol"), "profile": self._profile(sym, now),
-               "bench": self._bars_now(bench, now) if bench != sym else None}
+               "bench": self._bars_now(bench, now) if bench != sym else None,
+               "orb5_top": self._orb5_top if self._orb5_day == self._dstr else None}
         for s in waiting:
-            sig = self._evaluate(s, done, now, m.get("prev_close"), ctx)
+            if only is not None and s["source"] != only:
+                continue
+            if s["source"] == "orb5_rvol":
+                try:  # shadow-only variant: a failure here never stops the other setups
+                    sig = self._evaluate(s, done, now, m.get("prev_close"), ctx)
+                except Exception as e:
+                    self._error("orb5_rvol", f"{sym}: {type(e).__name__}: {e}")
+                    continue
+            else:
+                sig = self._evaluate(s, done, now, m.get("prev_close"), ctx)
             if sig is not None:
                 self._on_signal(s, sig, done, now, halted)
+
+    def _orb5_rank(self, now: datetime, halted: bool) -> None:
+        """Once a day after the first 5 minutes: rank the universe by rvol5 =
+        today's 09:30 to 09:34 volume / the profile's mean of the same minutes
+        over orb5_rvol_lookback sessions. The top orb5_top_n names with rvol5
+        >= orb5_min_rvol arm their orb5_rvol setups; the others are skipped
+        (orb5_not_in_play). Ranked when every member's bars hold the 09:34 bar,
+        or at orb5_rank_deadline with the members ready by then. Uses only bars
+        and profiles already fetched this day (no extra data call). The result
+        is stored as an event, so a restart reloads the same ranking."""
+        cfg, d = self.cfg, self._dstr
+        if self._orb5_day == d:
+            return
+        if "orb5_rvol" not in RULE_PLAYBOOKS:
+            return
+        et = _et(now)
+        first_end = _at(self._day, cfg.open_time) + timedelta(minutes=5)
+        if et < first_end:
+            return
+        row = self.con.execute("SELECT message FROM options_events WHERE day=? AND kind='orb5_rank' "
+                               "ORDER BY id DESC LIMIT 1", (d,)).fetchone()
+        if row is not None:  # restart: the ranking of the day is fixed
+            try:
+                got = json.loads(row["message"]).get("top") or {}
+            except ValueError:
+                got = {}
+            self._orb5_top, self._orb5_day = {k: v for k, v in got.items() if isinstance(v, dict)}, d
+            return
+        members = ostore.universe(self.con, d)
+        last5 = pd.Timestamp(first_end - timedelta(minutes=1))
+        ratios: dict[str, float | None] = {}
+        ready = True
+        for m in members:
+            sym = m["symbol"]
+            b = self._bars.get(sym)
+            if b is None or b.empty or last5 not in b.index:
+                ratios[sym] = None
+                ready = False
+                continue
+            prof = self._profiles.get(sym)
+            f5 = pb.first5_volume(b, now, cfg)
+            base = getattr(prof, "first5_mean", None) if prof is not None else None
+            ratios[sym] = round(f5 / base, 4) if f5 is not None and base else None
+        if not ready and et < _at(self._day, cfg.orb5_rank_deadline):
+            return
+        ok = sorted(((r, s) for s, r in ratios.items() if r is not None and r >= cfg.orb5_min_rvol),
+                    key=lambda x: (-x[0], x[1]))[:cfg.orb5_top_n]
+        top = {s: {"rank": i + 1, "rvol5": r} for i, (r, s) in enumerate(ok)}
+        self._orb5_top, self._orb5_day = top, d
+        # the top list (at most orb5_top_n short rows) fits the 1000-character event message;
+        # every other name's ratio is in its skip row (options_filtered)
+        ostore.event(self.con, d, now, "info", "orb5_rank", json.dumps({"top": top}))
+        for s in ostore.setups(self.con, d):
+            if s["source"] == "orb5_rvol" and s["state"] == WAITING and s["underlying"] not in top:
+                self._skip(s, now, "orb5_not_in_play", {"rvol5": ratios.get(s["underlying"]),
+                                                        "min_rvol": cfg.orb5_min_rvol, "top_n": cfg.orb5_top_n})
+        for m in members:  # the armed names are evaluated now (bars of this tick: no new call)
+            if m["symbol"] not in top:
+                continue
+            try:
+                self._scan_symbol(m, now, halted, only="orb5_rvol")
+            except Exception as e:
+                self._error("orb5_rvol", f"{m['symbol']}: {type(e).__name__}: {e}")
 
     def _evaluate(self, s: dict, bars: pd.DataFrame, now: datetime, prev_close, ctx: dict) -> pb.Signal | None:
         if s["source"] == GROK:
