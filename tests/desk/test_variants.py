@@ -31,7 +31,8 @@ def test_every_recorded_variant_is_registered():
         assert s in names, s
     for ev in cfg.exit_variants:
         assert f"exit_{ev}" in names
-    assert {sv.VARIANT, "stressed_sizing", "mid_entry"} <= names
+    assert {"stressed_sizing", "mid_entry"} <= names
+    assert sv.VARIANT not in names  # retired 2026-11-10 (EVOLUTION_PLAN section 6 item 6)
     assert len(names) == len(va.REGISTRY)  # no duplicate names
     for v in va.REGISTRY:
         assert v.kind in va.KINDS and len(v.registered) == 10 and v.gate and v.cost_assumption
@@ -43,9 +44,10 @@ def test_registered_since_and_family_size():
     assert va.registered_since("mid_entry") == "2026-11-05"
     assert va.registered_since("nope") is None
     assert va.family_size("2026-10-11") == 0
-    assert va.family_size("2026-10-12") == 7   # 5 sources + exit A/B
-    assert va.family_size("2026-10-27") == 8
-    assert va.family_size("2026-11-05") == len(va.REGISTRY) == va.family_size()
+    assert va.family_size("2026-10-12") == 6   # 5 sources + exit A (exit_B retired 2026-11-10)
+    assert va.family_size("2026-10-27") == 7
+    assert va.family_size("2026-11-05") == 10
+    assert va.family_size("2026-11-10") == len(va.REGISTRY) == va.family_size() == 13
     assert "K = " in va.report()
 
 

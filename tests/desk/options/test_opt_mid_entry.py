@@ -144,7 +144,7 @@ def test_failure_never_blocks_the_entry(rig, con, monkeypatch):  # noqa: F811
         raise RuntimeError("x")
     monkeypatch.setattr(me, "open_row", boom)
     rig.run(et(9, 52))
-    assert len(rig.pos("shadow")) == 4 and len(rig.pos("live")) == 1
+    assert len(rig.pos("shadow")) == 2 and len(rig.pos("live")) == 1  # 0dte/A, 1-3dte/A (exit_variants default since 2026-11-10)
     assert con.execute("SELECT COUNT(*) FROM options_mid_entry").fetchone()[0] == 0
 
 

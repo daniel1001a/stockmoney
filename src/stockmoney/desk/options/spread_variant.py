@@ -36,7 +36,13 @@ from stockmoney.desk.options._iface import OptionContract
 from stockmoney.desk.options.config import OptionsConfig
 
 VARIANT = "vwap_reclaim_spread"
-SOURCES = ("vwap_reclaim",)
+# Stopped opening new spreads 2026-11-10 (EVOLUTION_PLAN section 6 item E07,
+# owner decision): both DTE arms were negative in the 5.1 gate (0dte 12
+# trades -2,214; 1-3dte 17 trades -2,345). Empty, not removed, so
+# engine._open_spread_variant's `if s["source"] in SOURCES` check stays the
+# single place this is gated and any still-OPEN rows keep being mirrored and
+# exited by mirror_exit below; summary() still reports the historical rows.
+SOURCES: tuple[str, ...] = ()
 SHORT_DELTA = 0.30
 OPEN, EXITED = "OPEN", "EXITED"
 

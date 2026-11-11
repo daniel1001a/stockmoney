@@ -22,7 +22,11 @@ GROK = "grok_plan"
 # a 5-minute close invalidation, recorded in shadow to compare (2026-10-27 audit).
 # orb5_rvol (5-minute opening range on the day's top relative-volume names,
 # owner 2026-11-05) is recorded in shadow only until its own sample gate passes.
-SHADOW_ONLY_SOURCES = ("orb15_5m", "orb5_rvol")
+# gap_go, gap_fade (EVOLUTION_PLAN section 6 items E08/E01, owner decision
+# 2026-11-10): gate FAIL with no statistical support (gap_go n=1 total -104;
+# gap_fade n=28 mean -36 lb -186 total -1014). Demoted from live/paper back
+# to shadow; data keeps being recorded so the gate can be rechecked.
+SHADOW_ONLY_SOURCES = ("gap_go", "gap_fade", "orb15_5m", "orb5_rvol")
 # scan candidates (owner 2026-11-05, EDGE_PLAN 7.4 item 4): liquid optionable
 # names outside the starting universe, each checked on 2026-11-05 with
 # scripts/options_scan_candidates_check.py (price > $5, 20-day mean SIP volume
@@ -97,7 +101,11 @@ class OptionsConfig:
     #   B: premium stop -30%; +40% sells half, the rest trails the underlying
     #      by trail_atr_mult x ATR(atr_period) of its 1-minute bars
     # Both: underlying invalidation, time stop, flat by force_flat.
-    exit_variants: tuple[str, ...] = ("A", "B")
+    # B stopped collecting new samples 2026-11-10 (EVOLUTION_PLAN section 6
+    # item E05, owner decision): never a gate arm of its own, and dropping it
+    # frees a family slot (learn/variants.py). Historical B rows are kept and
+    # still compared by the 7.4 item 6 monthly exit check.
+    exit_variants: tuple[str, ...] = ("A",)
     live_exit: str = "A"
     premium_stop_pct: float = 0.35           # variant A
     premium_stop_pct_b: float = 0.30         # variant B
@@ -237,8 +245,26 @@ class OptionsConfig:
     # the 2026-10-27 audit (14 live trades, net -1,164); the owner put orb15,
     # vwap_reclaim and gap_fade back on paper live orders on 2026-11-04, caps
     # unchanged, judged by the learn job's per-setup live gate (report only)
-    live_sources: tuple[str, ...] = ("gap_go", "orb15", "vwap_reclaim", "gap_fade", GROK)
+    # gap_go and gap_fade came off this list 2026-11-10 (EVOLUTION_PLAN
+    # section 6 items E08/E01, owner decision): both shadow gate FAIL, see
+    # SHADOW_ONLY_SOURCES above.
+    live_sources: tuple[str, ...] = ("orb15", "vwap_reclaim", GROK)
     paper_only: bool = True
+
+    # --- account-level risk limits (EVOLUTION_PLAN section 6 item 10, owner
+    # decision 2026-11-10, "modify, more conservative, grok"): daily 3% /
+    # weekly 6% / drawdown-brake 10% of ACCOUNT equity (capital_budget), not
+    # the sleeve. OFF by default: while disabled, execution/options_risk.py's
+    # existing sleeve-based limits (including the $1,000 sleeve daily stop)
+    # behave exactly as before this decision. Flipping this on must never
+    # loosen the current sleeve limits (3% of a ~$50k account would be
+    # $1,500, looser than today's $1,000 sleeve stop) -- options_risk.py
+    # runs the sleeve check and this account check as two independent
+    # gates, so whichever is stricter is the one that actually fires.
+    account_limits_enabled: bool = False
+    account_daily_loss_pct: float = 0.03
+    account_weekly_loss_pct: float = 0.06
+    account_dd_halt_pct: float = 0.10
 
     # --- paths
     halt_file: Path = Path("data/desk/HALT")

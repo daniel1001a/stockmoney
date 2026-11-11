@@ -65,10 +65,13 @@ def test_audit_live_sources_exclude_orb15_and_orb15_5m_is_shadow_only(tmp_path, 
 
 
 def test_production_live_sources_since_1104(tmp_path, con):
-    """2026-11-04 owner approval: orb15, vwap_reclaim, gap_fade back on paper
-    live orders; orb15_5m stays shadow only; caps unchanged."""
+    """2026-11-04 owner approval put orb15, vwap_reclaim, gap_fade back on
+    paper live orders; 2026-11-10 (EVOLUTION_PLAN section 6 items E01/E08)
+    demoted gap_go and gap_fade back to shadow (both gate FAIL, no
+    statistical support); orb15_5m stays shadow only; caps unchanged."""
     cfg = OptionsConfig()
-    assert set(cfg.live_sources) == {"gap_go", "orb15", "vwap_reclaim", "gap_fade", "grok_plan"}
+    assert set(cfg.live_sources) == {"orb15", "vwap_reclaim", "grok_plan"}
+    assert {"gap_go", "gap_fade"} <= set(SHADOW_ONLY_SOURCES)
     assert "orb15_5m" not in cfg.live_sources and "orb15_5m" in SHADOW_ONLY_SOURCES
     assert (cfg.max_premium_per_trade, cfg.max_open_positions, cfg.paper_only) == (1000.0, 3, True)
     r = Rig(tmp_path, con, live_sources=cfg.live_sources)
@@ -222,7 +225,12 @@ def test_param_changes_written_once(con):
     assert (last[0], last[3]) == ("live_sources", ostore.AUDIT_20261104)
     assert (json.loads(last[1]), json.loads(last[2])) == (
         ["gap_go", "grok_plan"], ["gap_go", "orb15", "vwap_reclaim", "gap_fade", "grok_plan"])
-    assert json.loads(last[2]) == list(OptionsConfig().live_sources)
+    # PARAM_CHANGES is a frozen historical audit trail of the 2026-11-04 change,
+    # not a mirror of today's config: the 2026-11-10 decision (EVOLUTION_PLAN
+    # section 6 items E01/E08) moved gap_go and gap_fade back to shadow
+    # without adding a new param_changes row, so this no longer equals the
+    # live default and must not be asserted against OptionsConfig().live_sources.
+    assert set(OptionsConfig().live_sources) == {"orb15", "vwap_reclaim", "grok_plan"}
 
 
 def test_param_changes_1104_added_to_a_db_that_already_has_the_audit(con):

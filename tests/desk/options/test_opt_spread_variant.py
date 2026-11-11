@@ -72,7 +72,7 @@ def test_spread_failure_never_touches_the_single_leg(rig, con, monkeypatch):  # 
         raise RuntimeError("x")
     monkeypatch.setattr(sv, "pick_short", boom)
     rig.run(et(9, 52))
-    assert len(rig.pos("shadow")) == 4 and len(rig.pos("live")) == 1
+    assert len(rig.pos("shadow")) == 2 and len(rig.pos("live")) == 1  # 0dte/A, 1-3dte/A (exit_variants default since 2026-11-10)
     assert con.execute("SELECT COUNT(*) FROM options_spread_variants").fetchone()[0] == 0
 
 
