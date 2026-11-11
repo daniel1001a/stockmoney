@@ -96,6 +96,8 @@ from stockmoney.desk.options import plan as oplan
 from stockmoney.desk.options import playbooks as pb
 from stockmoney.desk.options import select as sel
 from stockmoney.desk.options import shadow as sh
+from stockmoney.desk.options import mid_entry as me
+from stockmoney.desk.options import spread_variant as sv
 from stockmoney.desk.options import store as ostore
 from stockmoney.desk.options import universe as uni
 from stockmoney.desk.options._iface import (
@@ -176,10 +178,17 @@ class Engine:
     def __init__(self, con, broker, cfg: OptionsConfig | None = None, *, clock: Callable[[], datetime],
                  risk_gate: RiskGate, live: bool = False,
                  flags_fn: Callable[[datetime], dict[str, str]] | None = None,
-                 notifier: Callable[..., object] | None = None):
+                 notifier: Callable[..., object] | None = None, config_resolved: bool = False,
+                 entries_blocked: bool = False):
         self.con = con
         self.broker = broker
+        from stockmoney.desk.learn.registry import safe_options_config, options_settings_valid
+
         self.cfg = cfg or OptionsConfig()
+        self._invalid_overrides = entries_blocked or getattr(broker, "is_paper", False) is True and not options_settings_valid(con)
+        if not config_resolved:
+            self.cfg = safe_options_config(con, self.cfg, paper=getattr(broker, "is_paper", False) is True,
+                                           on_error=notifier or notify.send)
         self.clock = clock
         self.risk_gate = risk_gate
         paper_ok = bool(getattr(broker, "is_paper", False)) or not self.cfg.paper_only
@@ -216,6 +225,9 @@ class Engine:
         self._quote_at: dict[str, tuple[datetime, OptionContract | None]] = {}
         self._spot_at: dict[str, tuple[datetime, float | None]] = {}
         self._bars_at: dict[str, datetime] = {}
+        # orb5_rvol (shadow only): the day's top rvol5 names, ranked once after 09:35
+        self._orb5_top: dict[str, dict] | None = None
+        self._orb5_day: str | None = None
         self._rng = random.Random()
         self._sleep = time_mod.sleep  # injectable (tests): the bounded re-read after a cancel at the flat
         ostore.ensure_schema(con)
@@ -280,6 +292,10 @@ class Engine:
                     self._scan_symbol(m, now, halted)
                 except Exception as e:  # one symbol's bad data must not stop the loop
                     self._error("scan", f"{m['symbol']}: {type(e).__name__}: {e}")
+            try:  # orb5_rvol (shadow only): never blocks the tick, other playbooks or exits
+                self._orb5_rank(now, halted)
+            except Exception as e:
+                self._error("orb5_rank", f"{type(e).__name__}: {e}")
         self._roll_setups()
         self._errors = 0 if self._tick_errors == 0 else self._errors
         self.con.commit()
@@ -434,23 +450,12 @@ class Engine:
             ostore.filtered(self.con, d, now, "universe", s, "prior_cap")
             plan_syms.remove(s)
         prior_only = prior_only[:cfg.prior_symbol_cap]
-        hits = []
+        hits: list[str] = []
         prev: dict[str, float | None] = {}
-        for s in cfg.scan_candidates:
-            prev[s] = self._prev_close(s)
-            try:
-                self._io()
-                self._spend(force=True)  # day setup: never skipped, counted
-                b = pb.completed(self.broker.minute_bars(s, _at(self._day, (4, 0)), now), now)
-            except Exception as e:
-                self._error("scan", f"{s}: {e}")
-                continue
-            pm, _ = pb.split_session(b, cfg)
-            ok, why, detail = uni.scan_hit(pm, prev[s], cfg)
-            if ok:
-                hits.append(s)
-            else:
-                ostore.filtered(self.con, d, now, "universe", s, why, detail=detail)
+        try:  # a failed scan never blocks the day: the plan and starting names still load
+            self._scan_candidates(now, hits, prev)
+        except Exception as e:
+            self._error("scan", f"stocks-in-play scan failed: {type(e).__name__}: {e}")
         members, dropped = uni.build(cfg, plan_syms, hits)
         for s, why in dropped:
             ostore.filtered(self.con, d, now, "universe", s, why)
@@ -468,6 +473,41 @@ class Engine:
                 self._new_setup(f"{d}:{src}:{m.symbol}", src, m.symbol, m.uclass, now, avoid=avoid)
         ostore.event(self.con, d, now, "info", "universe", f"{len(members)} underlyings: "
                      + ",".join(m.symbol for m in members))
+
+    def _scan_candidates(self, now: datetime, hits: list[str], prev: dict[str, float | None]) -> None:
+        """Stocks-in-play scan of cfg.scan_candidates at the universe build
+        (~09:25). ONE data call per name: the previous session's last minutes
+        (15:50 to 16:00, for the previous close) through ``now`` (today's
+        premarket). Each name is guarded on its own; a failure is logged and
+        the name is skipped."""
+        cfg, d = self.cfg, self._dstr
+        pd_ = _prev_trading_day(self._day)
+        prev_end = pd.Timestamp(_at(pd_, (16, 0)))
+        today_start = pd.Timestamp(_at(self._day, (4, 0)))
+        for s in cfg.scan_candidates:
+            try:
+                self._io()
+                self._spend(force=True)  # day setup: never skipped, counted
+                raw = self.broker.minute_bars(s, _at(pd_, (15, 50)), now)
+                b = pb.completed(raw, now) if raw is not None else pd.DataFrame()
+                if b.empty:
+                    prev[s] = None
+                    ostore.filtered(self.con, d, now, "universe", s, "scan_no_bars")
+                    continue
+                b = b.copy()
+                b.index = pd.DatetimeIndex(b.index).tz_convert(ET)
+                old = b[b.index < prev_end]
+                prev[s] = float(old["close"].iloc[-1]) if not old.empty else None
+                pm, _ = pb.split_session(b[b.index >= today_start], cfg)
+                ok, why, detail = uni.scan_hit(pm, prev[s], cfg)
+                if ok:
+                    hits.append(s)
+                else:
+                    ostore.filtered(self.con, d, now, "universe", s, why, detail=detail)
+            except Exception as e:
+                self._rate_limited(e)
+                self._error("scan", f"{s}: {type(e).__name__}: {e}")
+                prev.pop(s, None)
 
     def _add_plan(self, active, now: datetime) -> None:
         """Create grok_plan setups for the plan in force (items WITH a
@@ -538,7 +578,7 @@ class Engine:
         return ""
 
     # ================================================================ triggers
-    def _scan_symbol(self, m: dict, now: datetime, halted: bool) -> None:
+    def _scan_symbol(self, m: dict, now: datetime, halted: bool, only: str | None = None) -> None:
         sym = m["symbol"]
         waiting = [s for s in ostore.setups(self.con, self._dstr) if s["underlying"] == sym and s["state"] == WAITING]
         if not waiting:
@@ -560,11 +600,84 @@ class Engine:
                 return
         bench = self.cfg.benchmark(sym)
         ctx = {"pm_dollar_vol": m.get("pm_dollar_vol"), "profile": self._profile(sym, now),
-               "bench": self._bars_now(bench, now) if bench != sym else None}
+               "bench": self._bars_now(bench, now) if bench != sym else None,
+               "orb5_top": self._orb5_top if self._orb5_day == self._dstr else None}
         for s in waiting:
-            sig = self._evaluate(s, done, now, m.get("prev_close"), ctx)
+            if only is not None and s["source"] != only:
+                continue
+            if s["source"] == "orb5_rvol":
+                try:  # shadow-only variant: a failure here never stops the other setups
+                    sig = self._evaluate(s, done, now, m.get("prev_close"), ctx)
+                except Exception as e:
+                    self._error("orb5_rvol", f"{sym}: {type(e).__name__}: {e}")
+                    continue
+            else:
+                sig = self._evaluate(s, done, now, m.get("prev_close"), ctx)
             if sig is not None:
                 self._on_signal(s, sig, done, now, halted)
+
+    def _orb5_rank(self, now: datetime, halted: bool) -> None:
+        """Once a day after the first 5 minutes: rank the universe by rvol5 =
+        today's 09:30 to 09:34 volume / the profile's mean of the same minutes
+        over orb5_rvol_lookback sessions. The top orb5_top_n names with rvol5
+        >= orb5_min_rvol arm their orb5_rvol setups; the others are skipped
+        (orb5_not_in_play). Ranked when every member's bars hold the 09:34 bar,
+        or at orb5_rank_deadline with the members ready by then. Uses only bars
+        and profiles already fetched this day (no extra data call). The result
+        is stored as an event, so a restart reloads the same ranking."""
+        cfg, d = self.cfg, self._dstr
+        if self._orb5_day == d:
+            return
+        if "orb5_rvol" not in RULE_PLAYBOOKS:
+            return
+        et = _et(now)
+        first_end = _at(self._day, cfg.open_time) + timedelta(minutes=5)
+        if et < first_end:
+            return
+        row = self.con.execute("SELECT message FROM options_events WHERE day=? AND kind='orb5_rank' "
+                               "ORDER BY id DESC LIMIT 1", (d,)).fetchone()
+        if row is not None:  # restart: the ranking of the day is fixed
+            try:
+                got = json.loads(row["message"]).get("top") or {}
+            except ValueError:
+                got = {}
+            self._orb5_top, self._orb5_day = {k: v for k, v in got.items() if isinstance(v, dict)}, d
+            return
+        members = ostore.universe(self.con, d)
+        last5 = pd.Timestamp(first_end - timedelta(minutes=1))
+        ratios: dict[str, float | None] = {}
+        ready = True
+        for m in members:
+            sym = m["symbol"]
+            b = self._bars.get(sym)
+            if b is None or b.empty or last5 not in b.index:
+                ratios[sym] = None
+                ready = False
+                continue
+            prof = self._profiles.get(sym)
+            f5 = pb.first5_volume(b, now, cfg)
+            base = getattr(prof, "first5_mean", None) if prof is not None else None
+            ratios[sym] = round(f5 / base, 4) if f5 is not None and base else None
+        if not ready and et < _at(self._day, cfg.orb5_rank_deadline):
+            return
+        ok = sorted(((r, s) for s, r in ratios.items() if r is not None and r >= cfg.orb5_min_rvol),
+                    key=lambda x: (-x[0], x[1]))[:cfg.orb5_top_n]
+        top = {s: {"rank": i + 1, "rvol5": r} for i, (r, s) in enumerate(ok)}
+        self._orb5_top, self._orb5_day = top, d
+        # the top list (at most orb5_top_n short rows) fits the 1000-character event message;
+        # every other name's ratio is in its skip row (options_filtered)
+        ostore.event(self.con, d, now, "info", "orb5_rank", json.dumps({"top": top}))
+        for s in ostore.setups(self.con, d):
+            if s["source"] == "orb5_rvol" and s["state"] == WAITING and s["underlying"] not in top:
+                self._skip(s, now, "orb5_not_in_play", {"rvol5": ratios.get(s["underlying"]),
+                                                        "min_rvol": cfg.orb5_min_rvol, "top_n": cfg.orb5_top_n})
+        for m in members:  # the armed names are evaluated now (bars of this tick: no new call)
+            if m["symbol"] not in top:
+                continue
+            try:
+                self._scan_symbol(m, now, halted, only="orb5_rvol")
+            except Exception as e:
+                self._error("orb5_rvol", f"{m['symbol']}: {type(e).__name__}: {e}")
 
     def _evaluate(self, s: dict, bars: pd.DataFrame, now: datetime, prev_close, ctx: dict) -> pb.Signal | None:
         if s["source"] == GROK:
@@ -671,6 +784,8 @@ class Engine:
         return ""
 
     def _on_signal(self, s: dict, sig: pb.Signal, bars: pd.DataFrame, now: datetime, halted: bool) -> None:
+        if self._invalid_overrides:
+            return self._skip(s, now, "invalid_research_settings_exit_only")
         cfg, d, sid, sym = self.cfg, self._dstr, s["setup_id"], s["underlying"]
         _, rth = pb.split_session(bars, cfg)
         rv = pb.day_rvol(rth, pd.Timestamp(sig.at).tz_convert(ET), self._profiles.get(sym), cfg)
@@ -720,6 +835,7 @@ class Engine:
         band = cfg.delta_band(sym)
         live_choice = None
         opened = 0
+        spread_todo: list[tuple[sel.Choice, list[OptionContract]]] = []
         for bucket in cfg.dte_buckets:
             chain = self._chain(sym, bucket)
             if chain is None:
@@ -731,6 +847,8 @@ class Engine:
                 continue
             for ev in cfg.exit_variants:
                 opened += self._open_shadow(s, sig, choice, ev, now, max_hold, ctx)
+            if s["source"] in sv.SOURCES:
+                spread_todo.append((choice, chain))  # opened after the live submit: its short-leg quote must not delay it
             if bucket.label == cfg.live_dte:
                 live_choice = choice
         pending = False
@@ -742,6 +860,8 @@ class Engine:
                                         "macro": regime["macro_events"]})
             else:
                 pending = self._open_live(s, sig, live_choice, now, halted, flags, max_hold, ctx)
+        for choice, chain in spread_todo:
+            self._open_spread_variant(s, choice, chain, spot, now)
         ostore.update_setup(self.con, sid, state=ENTERED if (opened or pending) else SKIPPED)
 
     def _grok_stance(self, s: dict, direction: str) -> tuple[str | None, int]:
@@ -787,9 +907,72 @@ class Engine:
         row = self._position_row(s, sig, ch, pid, "shadow", ev, max_hold, ctx)
         row.update(qty_initial=qty, qty_open=qty, state=ENTERED, entry_time=ostore.iso(now), entry_price=price,
                    fees_usd=cfg.fee_per_contract * qty, spread_cost_usd=sh.half_spread_cost(c.bid, c.ask, qty, cfg))
+        self._add_stressed(row, price, ev)
         if ostore.insert_position(self.con, row):
             ostore.add_fill(self.con, pid, now, "buy", qty, price, c.bid, c.ask, "entry")
+            if ev == cfg.live_exit:
+                try:  # mid-price entry shadow: a report row, never blocks the entry
+                    me.open_row(self.con, row, c, now)
+                except Exception as e:
+                    self._error("mid_entry", f"{pid}: {type(e).__name__}: {e}")
         return 1
+
+    def _add_stressed(self, row: dict, entry: float, ev: str) -> None:
+        """flags_json["stressed"]: per-contract stressed loss at the premium
+        stop and the qty a $1,000 risk budget would allow, next to the actual
+        qty_initial. Report only; nothing reads it to size an order. Live
+        uses the limit (the fill is not known yet)."""
+        cfg = self.cfg
+        try:
+            flags = json.loads(row["flags_json"] or "{}")
+            stop = cfg.premium_stop_pct_b if ev == "B" else cfg.premium_stop_pct
+            flags["stressed"] = {**sh.stressed_risk(entry, row["entry_bid"], row["entry_ask"], stop, cfg),
+                                 "actual_qty": row.get("qty_initial")}
+            row["flags_json"] = json.dumps(flags, ensure_ascii=False, default=str)
+        except Exception as e:  # a report field must never block an entry
+            self._error("stressed_flags", f"{row.get('position_id')}: {type(e).__name__}: {e}")
+
+    def _open_spread_variant(self, s: dict, ch: sel.Choice, chain: list[OptionContract], spot: float,
+                             now: datetime) -> None:
+        """Shadow debit spread paired with the live-exit-variant shadow leg
+        (spread_variant.py). One extra quote (the short leg). Never affects
+        the single leg or any order: a failure is logged and dropped."""
+        pid = f"{s['setup_id']}:shadow:{ch.dte_label}:{self.cfg.live_exit}"
+        try:
+            linked = ostore.position(self.con, pid)
+            if linked is None or linked["state"] != ENTERED or sv.get(self.con, pid) is not None:
+                return
+            picked = sv.pick_short(chain, ch.contract, spot, now)
+            if picked is None:
+                return
+            short, d, src = picked
+            q = self._quote(short.occ)
+            if not self._fresh(q, now):
+                return
+            sv.open_spread(self.con, self.cfg, linked, ch.contract, q, d, src, now)
+        except Exception as e:
+            self._error("spread_variant", f"{pid}: {type(e).__name__}: {e}")
+
+    def _resolve_mid_entry(self, p: dict, q: OptionContract | None, fresh: bool, now: datetime,
+                           exited: bool = False) -> None:
+        """Mid-price entry shadow (mid_entry.py): resolved from the quote this
+        position already took; no extra call. Never affects the position."""
+        try:
+            row = me.get(self.con, p["position_id"])
+            if row is not None and row["status"] == me.PENDING:
+                me.resolve(self.con, self.cfg, row, q, fresh, now, exited)
+        except Exception as e:
+            self._error("mid_entry", f"{p['position_id']}: {type(e).__name__}: {e}")
+
+    def _mirror_spread_variant(self, p: dict, qty: float, price: float, reason: str, now: datetime) -> None:
+        try:
+            row = sv.get(self.con, p["position_id"])
+            if row is None or row["status"] != sv.OPEN or not p["qty_initial"]:
+                return
+            q = self._quote(row["short_occ"])
+            sv.mirror_exit(self.con, self.cfg, row, qty / p["qty_initial"], price, q, self._fresh(q, now), reason, now)
+        except Exception as e:
+            self._error("spread_variant", f"{p['position_id']}: {type(e).__name__}: {e}")
 
     def _position_row(self, s, sig, ch: sel.Choice, pid, mode, ev, max_hold, ctx) -> dict:
         c = ch.contract
@@ -856,6 +1039,7 @@ class Engine:
             return block("risk_gate_bad_intent", {"reason": dec.reason})
         row = self._position_row(s, sig, ch, pid, "live", cfg.live_exit, max_hold, ctx)
         row.update(qty_initial=final.qty, qty_open=0, state=PENDING)
+        self._add_stressed(row, limit, cfg.live_exit)
         if not ostore.insert_position(self.con, row):
             return True  # already exists (re-run): the pending order is resolved by _manage_pending
         self._submit(pid, final, "entry", "entry", now, quote=c)
@@ -1130,6 +1314,8 @@ class Engine:
             ostore.update_position(self.con, p["position_id"], last_bid=q.bid, last_ask=q.ask,
                                    max_bid=max(p["max_bid"] or q.bid, q.bid), min_bid=min(p["min_bid"] or q.bid, q.bid))
             p = ostore.position(self.con, p["position_id"])
+        if p["mode"] == "shadow" and p["exit_variant"] == self.cfg.live_exit:
+            self._resolve_mid_entry(p, q, fresh, now)
         if p["tp_done"] and p["exit_variant"] == "B":  # variant B trails the best underlying price since +40%
             spot = self._spot(p["underlying"], now)
             ref = p["trail_ref"]
@@ -1331,6 +1517,8 @@ class Engine:
         if note:
             fields["note"] = ((p["note"] or "") + "; " + note).strip("; ")[:500]
         ostore.update_position(self.con, pid, **fields)
+        if p["mode"] == "shadow":
+            self._mirror_spread_variant(p, qty, price, reason, now)
 
     def _send_exit(self, p: dict, qty: float, reason: str, q: OptionContract | None, now: datetime,
                    force_market: bool = False) -> bool:
@@ -1896,6 +2084,19 @@ class Engine:
         for p in ostore.positions(self.con, self._dstr, "shadow", (ENTERED,)):
             self._book_exit(p, p["qty_open"], sh.sell_price(p["last_bid"] or 0.0, self.cfg), p["last_bid"],
                             p["last_ask"], "session_end", now, "closed at last known bid")
+        try:  # mid-entry rows still pending at the close: no comparison
+            for row in me.pending_rows(self.con, self._dstr):
+                me.resolve(self.con, self.cfg, row, None, False, now, exited=True)
+        except Exception as e:
+            self._error("mid_entry", f"finish: {type(e).__name__}: {e}")
+        try:  # a spread whose leg closed without a mirror (an error); never stops the flat check
+            for row in sv.open_rows(self.con, self._dstr):
+                leg = ostore.position(self.con, row["position_id"])
+                long_bid = (leg or {}).get("last_bid") or 0.0
+                sv.mirror_exit(self.con, self.cfg, row, row["open_frac"], sh.sell_price(long_bid, self.cfg), None,
+                               False, "session_end", now)
+        except Exception as e:
+            self._error("spread_variant", f"finish: {type(e).__name__}: {e}")
         self._roll_setups()
         problems = self._flat_problems()
         self.con.commit()

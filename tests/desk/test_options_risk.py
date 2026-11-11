@@ -11,8 +11,8 @@ from stockmoney.desk import store
 from stockmoney.desk.execution.broker import FakeBroker
 from stockmoney.desk.execution.ledger import Ledger
 from stockmoney.desk.execution.options_risk import (
-    HALT_KEY, OptionsBook, OptionsBookError, OptionsLimits, OptionsRiskEngine, et_day_bounds, muse_blocked,
-    options_mismatches, sleeve_state,
+    HALT_KEY, OptionsBook, OptionsBookError, OptionsLimits, OptionsRiskEngine, et_day_bounds, et_week_bounds,
+    muse_blocked, options_mismatches, sleeve_state,
 )
 from stockmoney.desk.execution.types import (
     TIF, AccountSnapshot, AssetClass, BrokerOrder, BrokerPosition, OptionContract, OrderIntent, OrderStatus,
@@ -561,6 +561,125 @@ def test_engine_with_fake_broker_round_trip(eng):
                       qty=o.filled_qty, price=o.filled_avg_price, filled_at=later)
     assert e.book.realized() == pytest.approx((2.00 - 2.10) * 4 * 100)  # the spread is the cost
     assert b.account().positions == []
+
+
+# ---- account-level limits (EVOLUTION_PLAN section 6 item 10, owner 2026-11-10) ----------------------
+
+def test_account_limit_defaults_and_properties():
+    l = OptionsLimits()
+    assert l.account_limits_enabled is False
+    assert l.account_daily_loss_stop == pytest.approx(1_500) and l.account_weekly_loss_stop == pytest.approx(3_000)
+    assert l.account_dd_halt == pytest.approx(5_000)
+
+
+def test_bad_account_limits_only_block_entries_when_enabled(eng):
+    assert chk(eng(account_daily_loss_pct=-1)).allow  # disabled: an invalid account pct is not even checked
+    d = chk(eng(account_daily_loss_pct=-1, account_limits_enabled=True))
+    assert not d.allow and "invalid limits" in d.reason and "account_daily_loss_pct" in d.reason
+
+
+def test_et_week_bounds():
+    s, e = et_week_bounds(date(2026, 10, 13))  # Tuesday -> the Monday that starts its ET week
+    assert s == "2026-10-12T04:00:00+00:00" and e == "2026-10-19T04:00:00+00:00"
+
+
+def test_sleeve_state_week_fields(con):
+    l = OptionsLimits()
+    b = OptionsBook(con)
+    mon = NOW - timedelta(days=1)  # Monday of NOW's ET week, not today
+    b.apply_fill(client_order_id="w1", occ=OCC, strategy="x", side=Side.BUY, qty=2, price=2.0, filled_at=mon)
+    b.apply_fill(client_order_id="w2", occ=OCC, strategy="x", side=Side.SELL, qty=2, price=1.0, filled_at=mon)  # -200
+    st = sleeve_state(con, l, {}, NOW)
+    assert st.realized_today == 0.0 and st.realized_week == pytest.approx(-200) and st.weekly_pnl == pytest.approx(-200)
+
+
+def test_account_daily_loss_disabled_is_a_no_op(eng):
+    # sleeve_pct=0.30: sleeve daily stop 3,000; account daily stop (disabled) would be 1,500
+    e = eng(sleeve_pct=0.30)
+    book_open(e, qty=10, price=4.0, cid="ad1")
+    e.book.apply_fill(client_order_id="ad2", occ=OCC, strategy="orb15", side=Side.SELL, qty=10, price=2.0,
+                      filled_at=NOW)  # realized -2,000: beyond the (disabled) account stop, within the sleeve's
+    assert chk(e).allow
+
+
+def test_account_daily_loss_triggers_when_enabled(eng):
+    e = eng(sleeve_pct=0.30, account_limits_enabled=True)
+    book_open(e, qty=10, price=4.0, cid="ad3")
+    e.book.apply_fill(client_order_id="ad4", occ=OCC, strategy="orb15", side=Side.SELL, qty=10, price=2.0,
+                      filled_at=NOW)  # same -2,000: now blocked by the account's 1,500 stop
+    d = chk(e)
+    assert not d.allow and "account daily loss" in d.reason
+
+
+def test_account_limits_never_loosen_the_tighter_sleeve_stop(eng):
+    # default sleeve_pct=0.10: sleeve daily stop 1,000 is tighter than the account's 1,500
+    e = eng(account_limits_enabled=True)
+    book_open(e, qty=5, price=4.0, cid="al1")
+    e.book.apply_fill(client_order_id="al2", occ=OCC, strategy="orb15", side=Side.SELL, qty=5, price=2.0,
+                      filled_at=NOW)  # -1,000: the sleeve stop fires first, not the account one
+    d = chk(e)
+    assert not d.allow and "daily loss" in d.reason and "account" not in d.reason
+
+
+def test_account_weekly_loss_triggers_and_is_scoped_to_the_et_week(eng):
+    # sleeve_pct=0.30: sleeve daily stop 3,000 (no fill today, so it never fires); account weekly
+    # stop is 6% of capital_budget = 3,000, scoped to Monday..Sunday ET, not to a 90-day lookback.
+    e = eng(sleeve_pct=0.30, account_limits_enabled=True)
+    mon = NOW - timedelta(days=1)  # Monday of NOW's ET week
+    book_open(e, qty=15, price=4.0, cid="aw1", at=mon)
+    e.book.apply_fill(client_order_id="aw2", occ=OCC, strategy="orb15", side=Side.SELL, qty=15, price=2.0,
+                      filled_at=mon)  # -3,000, dated Monday: counts this week, not today
+    d = chk(e)
+    assert not d.allow and "account weekly loss" in d.reason
+
+
+def test_account_weekly_loss_resets_across_weeks(eng):
+    e = eng(sleeve_pct=0.30, account_limits_enabled=True)
+    last_week = NOW - timedelta(days=8)  # the Monday before NOW's ET week
+    book_open(e, qty=15, price=4.0, cid="pw1", at=last_week)
+    e.book.apply_fill(client_order_id="pw2", occ=OCC, strategy="orb15", side=Side.SELL, qty=15, price=2.0,
+                      filled_at=last_week)  # -3,000 last week: does not count this week
+    assert chk(e).allow
+
+
+def test_account_drawdown_triggers_when_tighter_than_the_sleeve(eng):
+    # sleeve_pct=0.30, daily_loss_pct=1.0 isolates this from the daily stop (as in
+    # test_drawdown_halt_latches_until_rearmed): sleeve dd_halt = 35% of 15,000 = 5,250;
+    # account dd_halt = 10% of 50,000 = 5,000 (tighter).
+    e = eng(sleeve_pct=0.30, daily_loss_pct=1.0, account_limits_enabled=True)
+    for i in range(2):
+        at = NOW - timedelta(days=2 - i)
+        book_open(e, qty=10, price=4.0, cid=f"ad{i}b", at=at)
+        e.book.apply_fill(client_order_id=f"ad{i}s", occ=OCC, strategy="orb15", side=Side.SELL, qty=10, price=1.4,
+                          filled_at=at)  # -2,600 each day, -5,200 total
+    d = chk(e)
+    assert not d.allow and "account drawdown" in d.reason
+    assert e.halted()
+
+
+def test_account_drawdown_disabled_is_a_no_op(eng):
+    e = eng(sleeve_pct=0.30, daily_loss_pct=1.0)  # account_limits_enabled defaults to False
+    for i in range(2):
+        at = NOW - timedelta(days=2 - i)
+        book_open(e, qty=10, price=4.0, cid=f"add{i}b", at=at)
+        e.book.apply_fill(client_order_id=f"add{i}s", occ=OCC, strategy="orb15", side=Side.SELL, qty=10, price=1.4,
+                          filled_at=at)
+    assert chk(e).allow and e.halted() is None  # -5,200 is below the sleeve's own dd_halt (5,250)
+
+
+def test_account_drawdown_rearm_resets_like_the_sleeve_one(eng):
+    e = eng(sleeve_pct=0.30, daily_loss_pct=1.0, account_limits_enabled=True)
+    for i in range(2):
+        at = NOW - timedelta(days=2 - i)
+        book_open(e, qty=10, price=4.0, cid=f"adr{i}b", at=at)
+        e.book.apply_fill(client_order_id=f"adr{i}s", occ=OCC, strategy="orb15", side=Side.SELL, qty=10, price=1.4,
+                          filled_at=at)
+    assert not chk(e).allow and e.halted()
+    e2 = eng(sleeve_pct=0.30, daily_loss_pct=1.0, account_limits_enabled=True)
+    assert "re-armed" in chk(e2).reason  # latched in the table, survives a new engine
+    st = sleeve_state(e2.con, e2.limits, {}, NOW)
+    e2.rearm(st)
+    assert e2.halted() is None and chk(e2).allow
 
 
 def test_book_tables_coexist_with_the_sleeve_engine_tables(tmp_path):

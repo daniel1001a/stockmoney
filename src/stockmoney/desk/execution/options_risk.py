@@ -105,6 +105,15 @@ def et_day_bounds(day: date) -> tuple[str, str]:
     return _utc_iso(start), _utc_iso(start + timedelta(days=1))
 
 
+def et_week_bounds(day: date) -> tuple[str, str]:
+    """[start, end) of the ET calendar week (Monday 00:00 through the
+    following Monday 00:00) containing ``day``, as stored-format UTC
+    strings. EVOLUTION_PLAN section 6 item 10 (account-level weekly loss)."""
+    monday = day - timedelta(days=day.weekday())
+    start = datetime.combine(monday, time(0, 0), tzinfo=ET)
+    return _utc_iso(start), _utc_iso(start + timedelta(days=7))
+
+
 class OptionsBookError(ValueError):
     pass
 
@@ -302,6 +311,22 @@ class OptionsLimits:
     exit_band: float = 0.50             # a limit sell below mid * (1 - exit_band) is a fat finger
     halt_file: Path = Path("data/desk/HALT")  # shared kill switch with the stock book
 
+    # --- account-level limits (EVOLUTION_PLAN section 6 item 10, owner
+    # decision 2026-11-10, "modify, more conservative, grok's addition"):
+    # daily 3% / weekly 6% / drawdown-brake 10%, fraction of capital_budget
+    # (the account, not the sleeve). OFF by default (account_limits_enabled):
+    # while disabled, nothing below changes and the sleeve-only checks above
+    # behave exactly as before this decision. When enabled, _check_entry runs
+    # BOTH the sleeve check and this account check as independent gates, so
+    # whichever is stricter is the one that blocks -- never looser than the
+    # sleeve-only behavior (at sleeve_pct=10%, account_daily_loss_pct=3% of
+    # 50,000 = 1,500, looser than the sleeve's 1,000 stop, but the sleeve
+    # check still fires at 1,000 regardless of whether this is enabled).
+    account_limits_enabled: bool = False
+    account_daily_loss_pct: float = 0.03
+    account_weekly_loss_pct: float = 0.06
+    account_dd_halt_pct: float = 0.10
+
     @property
     def sleeve_budget(self) -> float:
         return self.capital_budget * self.sleeve_pct
@@ -317,6 +342,18 @@ class OptionsLimits:
     @property
     def dd_halt(self) -> float:
         return self.sleeve_budget * self.dd_halt_pct
+
+    @property
+    def account_daily_loss_stop(self) -> float:
+        return self.capital_budget * self.account_daily_loss_pct
+
+    @property
+    def account_weekly_loss_stop(self) -> float:
+        return self.capital_budget * self.account_weekly_loss_pct
+
+    @property
+    def account_dd_halt(self) -> float:
+        return self.capital_budget * self.account_dd_halt_pct
 
     def problems(self) -> list[str]:
         """Configuration errors; the engine refuses every entry while any exist."""
@@ -334,6 +371,11 @@ class OptionsLimits:
                 out.append(f"{name} must be a non-negative int, got {v!r}")
         if not (self.entry_start < self.entry_end <= self.flat_by):
             out.append("need entry_start < entry_end <= flat_by")
+        if self.account_limits_enabled:
+            for name in ("account_daily_loss_pct", "account_weekly_loss_pct", "account_dd_halt_pct"):
+                v = getattr(self, name)
+                if not (_num(v) and v > 0):
+                    out.append(f"{name} must be positive and finite, got {v!r}")
         return out
 
 
@@ -348,6 +390,13 @@ class SleeveState:
     equity: float           # budget + realized_total + unrealized
     n_open: int
     unmarked: tuple[str, ...]  # open positions without a usable mark (valued at cost)
+    # account-level (EVOLUTION_PLAN section 6 item 10): realized this ET
+    # calendar week (Monday through Sunday) and that same week plus the
+    # current unrealized. Trailing, defaulted fields: no call site other
+    # than sleeve_state() below constructs this, but defaults keep any other
+    # positional construction from breaking.
+    realized_week: float = 0.0
+    weekly_pnl: float = 0.0
 
 
 def sleeve_state(con: sqlite3.Connection, limits: OptionsLimits, marks: Mapping[str, float],
@@ -356,7 +405,9 @@ def sleeve_state(con: sqlite3.Connection, limits: OptionsLimits, marks: Mapping[
     (mid). An open position without a finite mark >= 0 is valued at cost and
     listed in ``unmarked``. Read-only: does not touch the persisted peak."""
     book = OptionsBook(con)
-    start, end = et_day_bounds(now.astimezone(ET).date())
+    day = now.astimezone(ET).date()
+    start, end = et_day_bounds(day)
+    wstart, wend = et_week_bounds(day)
     unreal, cost, unmarked = 0.0, 0.0, []
     positions = book.positions()
     for occ, p in positions.items():
@@ -368,8 +419,10 @@ def sleeve_state(con: sqlite3.Connection, limits: OptionsLimits, marks: Mapping[
             unmarked.append(occ)
     total = book.realized()
     today = book.realized(start, end)
+    week = book.realized(wstart, wend)
     return SleeveState(limits.sleeve_budget, total, today, unreal, cost, today + unreal,
-                       limits.sleeve_budget + total + unreal, len(positions), tuple(unmarked))
+                       limits.sleeve_budget + total + unreal, len(positions), tuple(unmarked),
+                       week, week + unreal)
 
 
 def options_mismatches(book: OptionsBook | sqlite3.Connection, snapshot: AccountSnapshot) -> dict[str, str]:
@@ -634,10 +687,27 @@ class OptionsRiskEngine:
         if st.daily_pnl <= -l.daily_loss_stop:
             return self._block(f"buy blocked: daily loss {st.daily_pnl:,.0f} reached the stop "
                                f"-{l.daily_loss_stop:,.0f}")
+        if l.account_limits_enabled:
+            if not _num(st.weekly_pnl):
+                return self._block("buy blocked: sleeve P&L is not finite")
+            if st.daily_pnl <= -l.account_daily_loss_stop:
+                return self._block(f"buy blocked: account daily loss {st.daily_pnl:,.0f} reached the account "
+                                   f"stop -{l.account_daily_loss_stop:,.0f} "
+                                   f"({l.account_daily_loss_pct:.0%} of capital_budget {l.capital_budget:,.0f})")
+            if st.weekly_pnl <= -l.account_weekly_loss_stop:
+                return self._block(f"buy blocked: account weekly loss {st.weekly_pnl:,.0f} reached the weekly "
+                                   f"stop -{l.account_weekly_loss_stop:,.0f} "
+                                   f"({l.account_weekly_loss_pct:.0%} of capital_budget {l.capital_budget:,.0f})")
         pk = self.peak(st.equity)
         if pk - st.equity >= l.dd_halt:
             why = (f"sleeve equity {st.equity:,.0f} is {pk - st.equity:,.0f} below its peak {pk:,.0f} "
                    f"(limit {l.dd_halt:,.0f}) at {now.isoformat(timespec='seconds')}")
+            self.book.set_state(HALT_KEY, why)
+            return self._block(f"buy blocked: drawdown halt latched: {why}")
+        if l.account_limits_enabled and pk - st.equity >= l.account_dd_halt:
+            why = (f"account drawdown: sleeve equity {st.equity:,.0f} is {pk - st.equity:,.0f} below its peak "
+                   f"{pk:,.0f} (account limit {l.account_dd_halt:,.0f} = {l.account_dd_halt_pct:.0%} of "
+                   f"capital_budget {l.capital_budget:,.0f}) at {now.isoformat(timespec='seconds')}")
             self.book.set_state(HALT_KEY, why)
             return self._block(f"buy blocked: drawdown halt latched: {why}")
 

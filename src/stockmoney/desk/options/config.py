@@ -16,11 +16,24 @@ INDEX = ("SPY", "QQQ", "TQQQ")
 MEGA_CAP = ("NVDA", "TSLA", "AMD", "AAPL", "MSFT", "META", "AMZN", "GOOGL", "AVGO", "PLTR", "MU", "NFLX")
 HIGH_VOL = ("COIN", "SMCI")
 
-RULE_PLAYBOOKS = ("gap_go", "gap_fade", "orb15", "orb15_5m", "vwap_reclaim")
+RULE_PLAYBOOKS = ("gap_go", "gap_fade", "orb15", "orb15_5m", "vwap_reclaim", "orb5_rvol")
 GROK = "grok_plan"
 # never live, even if listed in live_sources: orb15_5m is orb15's trigger with
-# a 5-minute close invalidation, recorded in shadow to compare (2026-10-27 audit)
-SHADOW_ONLY_SOURCES = ("orb15_5m",)
+# a 5-minute close invalidation, recorded in shadow to compare (2026-10-27 audit).
+# orb5_rvol (5-minute opening range on the day's top relative-volume names,
+# owner 2026-11-05) is recorded in shadow only until its own sample gate passes.
+# gap_go, gap_fade (EVOLUTION_PLAN section 6 items E08/E01, owner decision
+# 2026-11-10): gate FAIL with no statistical support (gap_go n=1 total -104;
+# gap_fade n=28 mean -36 lb -186 total -1014). Demoted from live/paper back
+# to shadow; data keeps being recorded so the gate can be rechecked.
+SHADOW_ONLY_SOURCES = ("gap_go", "gap_fade", "orb15_5m", "orb5_rvol")
+# scan candidates (owner 2026-11-05, EDGE_PLAN 7.4 item 4): liquid optionable
+# names outside the starting universe, each checked on 2026-11-05 with
+# scripts/options_scan_candidates_check.py (price > $5, 20-day mean SIP volume
+# >= 1M, daily ATR(14) > $0.50, contracts expiring within 10 days)
+SCAN_CANDIDATES = ("HOOD", "SOFI", "RIOT", "MSTR", "INTC", "BA", "UBER", "SHOP", "SNOW", "CRWD", "PANW", "ORCL",
+                   "ARM", "DELL", "ANET", "MRVL", "QCOM", "TSM", "LRCX", "AMAT", "WDC", "APP", "IONQ", "OKLO",
+                   "VST", "CVNA", "AFRM", "RBLX", "LLY", "MRNA")
 # printed on every options report (daily report, weekly option cards); decided by the account owner 2026-10-21
 FEED_CAVEAT = "報價為 indicative,滑價量測僅供參考"
 # orb15 benchmark: QQQ for tech / growth names, SPY for everything else
@@ -88,7 +101,11 @@ class OptionsConfig:
     #   B: premium stop -30%; +40% sells half, the rest trails the underlying
     #      by trail_atr_mult x ATR(atr_period) of its 1-minute bars
     # Both: underlying invalidation, time stop, flat by force_flat.
-    exit_variants: tuple[str, ...] = ("A", "B")
+    # B stopped collecting new samples 2026-11-10 (EVOLUTION_PLAN section 6
+    # item E05, owner decision): never a gate arm of its own, and dropping it
+    # frees a family slot (learn/variants.py). Historical B rows are kept and
+    # still compared by the 7.4 item 6 monthly exit check.
+    exit_variants: tuple[str, ...] = ("A",)
     live_exit: str = "A"
     premium_stop_pct: float = 0.35           # variant A
     premium_stop_pct_b: float = 0.30         # variant B
@@ -117,6 +134,9 @@ class OptionsConfig:
 
     # --- data safety
     max_quote_age_s: float = 30.0            # never enter on an older option quote
+    # mid-price entry shadow (owner 2026-11-05, options/mid_entry.py): a hypothetical
+    # buy at the mid, replaced at the ask after this wait; measured only, never sent
+    mid_entry_wait_s: float = 60.0
     max_bar_age_s: float = 180.0             # last completed underlying bar must be this fresh
     max_signal_age_s: float = 120.0          # a trigger seen later than this (e.g. after a restart) is missed, not chased
     max_consecutive_errors: int = 5          # then notify (exits keep being retried)
@@ -135,7 +155,9 @@ class OptionsConfig:
     index: tuple[str, ...] = INDEX
     mega_cap: tuple[str, ...] = MEGA_CAP
     high_vol: tuple[str, ...] = HIGH_VOL
-    scan_candidates: tuple[str, ...] = ()    # extra tickers the gap / relative volume scan may add
+    # extra tickers the premarket gap / dollar-volume scan may add; one data
+    # call each at ~09:25 (prev close and premarket from the same request)
+    scan_candidates: tuple[str, ...] = SCAN_CANDIDATES
     scan_min_gap_pct: float = 0.03
     scan_min_premarket_dollar_vol: float = 20_000_000.0
     daily_universe_cap: int = 25
@@ -184,6 +206,18 @@ class OptionsConfig:
     vwap_slope_min: float = 0.0005           # |VWAP change over vwap_slope_bars| / VWAP; unfitted starting value
     vwap_window: tuple[tuple[int, int], tuple[int, int]] = ((9, 45), (11, 30))
     gap_fade_window: tuple[tuple[int, int], tuple[int, int]] = ((9, 35), (11, 30))
+    # orb5_rvol (SHADOW ONLY, owner 2026-11-05): direction of the first
+    # 5-minute bar, entry on a break of its high (bullish) / low (bearish),
+    # only on the orb5_top_n universe names with the highest rvol5 = volume
+    # of the first 5 minutes / mean of the same minutes over the previous
+    # orb5_rvol_lookback sessions (same feed), and only rvol5 >= orb5_min_rvol.
+    # Stop: orb5_stop_atr_frac x daily ATR(14) beyond the range level.
+    orb5_rvol_lookback: int = 14
+    orb5_min_rvol: float = 1.0
+    orb5_top_n: int = 10
+    orb5_stop_atr_frac: float = 0.10
+    orb5_window: tuple[tuple[int, int], tuple[int, int]] = ((9, 35), (11, 30))
+    orb5_rank_deadline: tuple[int, int] = (9, 37)  # rank with the bars in hand by then
 
     # --- Grok plans: live only for these playbooks and with day RVOL at the
     # trigger >= max(grok_min_rvol, the plan's own min_rvol); else shadow only
@@ -201,11 +235,36 @@ class OptionsConfig:
     shadow_slippage_pct: float = 0.0         # extra, on top of buying the ask / selling the bid
     fee_per_contract: float = 0.03           # regulatory fees; Alpaca charges no commission
 
+    # --- defined-risk spread shadow exits (same defaults as the original H6)
+    spread_take_profit_frac: float = 0.5
+    spread_stop_frac: float = 0.5
+    spread_time_exit_dte: int = 2
+
     # --- live eligibility: only these sources may send a (paper) order;
-    # vwap_reclaim, gap_fade, orb15 and orb15_5m are shadow only (orb15
-    # moved to shadow by the 2026-10-27 audit: 14 live trades, net -1,164)
-    live_sources: tuple[str, ...] = ("gap_go", GROK)
+    # orb15_5m is shadow only (SHADOW_ONLY_SOURCES). orb15 went to shadow in
+    # the 2026-10-27 audit (14 live trades, net -1,164); the owner put orb15,
+    # vwap_reclaim and gap_fade back on paper live orders on 2026-11-04, caps
+    # unchanged, judged by the learn job's per-setup live gate (report only)
+    # gap_go and gap_fade came off this list 2026-11-10 (EVOLUTION_PLAN
+    # section 6 items E08/E01, owner decision): both shadow gate FAIL, see
+    # SHADOW_ONLY_SOURCES above.
+    live_sources: tuple[str, ...] = ("orb15", "vwap_reclaim", GROK)
     paper_only: bool = True
+
+    # --- account-level risk limits (EVOLUTION_PLAN section 6 item 10, owner
+    # decision 2026-11-10, "modify, more conservative, grok"): daily 3% /
+    # weekly 6% / drawdown-brake 10% of ACCOUNT equity (capital_budget), not
+    # the sleeve. OFF by default: while disabled, execution/options_risk.py's
+    # existing sleeve-based limits (including the $1,000 sleeve daily stop)
+    # behave exactly as before this decision. Flipping this on must never
+    # loosen the current sleeve limits (3% of a ~$50k account would be
+    # $1,500, looser than today's $1,000 sleeve stop) -- options_risk.py
+    # runs the sleeve check and this account check as two independent
+    # gates, so whichever is stricter is the one that actually fires.
+    account_limits_enabled: bool = False
+    account_daily_loss_pct: float = 0.03
+    account_weekly_loss_pct: float = 0.06
+    account_dd_halt_pct: float = 0.10
 
     # --- paths
     halt_file: Path = Path("data/desk/HALT")

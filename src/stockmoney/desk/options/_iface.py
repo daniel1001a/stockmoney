@@ -110,7 +110,9 @@ def limits_from_config(cfg) -> OptionsLimits:
         max_positions=cfg.max_open_positions, max_spread_pct=cfg.max_spread_pct, min_mid=cfg.min_mid,
         min_open_interest=cfg.min_open_interest, min_volume=cfg.min_volume, max_quote_age_s=cfg.max_quote_age_s,
         entry_start=time(*cfg.entry_window_start), entry_end=time(*cfg.entry_window_end),
-        flat_by=time(*cfg.force_flat), halt_file=cfg.halt_file)
+        flat_by=time(*cfg.force_flat), halt_file=cfg.halt_file,
+        account_limits_enabled=cfg.account_limits_enabled, account_daily_loss_pct=cfg.account_daily_loss_pct,
+        account_weekly_loss_pct=cfg.account_weekly_loss_pct, account_dd_halt_pct=cfg.account_dd_halt_pct)
 
 
 class LineAGate:

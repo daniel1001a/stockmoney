@@ -62,8 +62,11 @@ def test_trigger_opens_shadow_variants_and_one_live_order(tmp_path, con):
     setup = next(s for s in ostore.setups(con, str(DAY)) if s["source"] == "orb15")
     assert setup["state"] == "ENTERED" and json.loads(setup["signal_json"])["direction"] == "long"
     shadow = r.pos("shadow")
-    assert {(p["dte_label"], p["exit_variant"]) for p in shadow} == {("0dte", "A"), ("0dte", "B"), ("1-3dte", "A"),
-                                                                    ("1-3dte", "B")}
+    # exit_variants default is ("A",) since 2026-11-10 (EVOLUTION_PLAN section 6 item E05:
+    # stop adding exit_B samples); test_premium_stop_differs_by_exit_variant and
+    # test_variant_b_trails_underlying_after_take_profit still exercise the B mechanism
+    # directly via an explicit exit_variants=("A", "B") override.
+    assert {(p["dte_label"], p["exit_variant"]) for p in shadow} == {("0dte", "A"), ("1-3dte", "A")}
     assert all(p["band_label"] == "d40-55" and p["state"] == "ENTERED" for p in shadow)
     assert {p["occ"] for p in shadow} == {C601, C601N}
     live = r.pos("live")
@@ -76,6 +79,35 @@ def test_trigger_opens_shadow_variants_and_one_live_order(tmp_path, con):
     assert contract.occ == C601N and contract.as_of is not None
     assert r.gate.reserved == [(C601N, 10, 0.97)] and r.gate.released == [C601N]
     assert r.gate.booked[0]["side"] == Side.BUY and r.gate.booked[0]["qty"] == 10
+
+
+def test_paper_engine_loads_registry_override_but_nonpaper_does_not(tmp_path, con):
+    from stockmoney.desk.learn import registry
+
+    registry.change(con, "options.orb_min_day_rvol", 1.75, "test proposal", account_kind="paper")
+    r = Rig(tmp_path, con)
+    assert r.eng.cfg.orb_min_day_rvol == 1.75
+    assert r.cfg.orb_min_day_rvol != 1.75  # caller's frozen config is untouched
+    r.broker.is_paper = False
+    assert r.new_engine().cfg.orb_min_day_rvol == r.cfg.orb_min_day_rvol
+
+
+def test_corrupt_overrides_do_not_prevent_flattening(tmp_path, con):
+    r = Rig(tmp_path, con)
+    r.run(et(9, 52))
+    assert r.broker.positions
+    store.set_setting(con, "options_params", '{"options.max_premium_per_trade":9999}')
+    r.eng = r.new_engine()
+    r.eng.flatten_now()
+    assert not r.broker.positions
+    assert r.eng.cfg.max_premium_per_trade == r.cfg.max_premium_per_trade
+
+
+def test_corrupt_overrides_disable_new_entries(tmp_path, con):
+    store.set_setting(con, "options_params", '{"options.orb_min_day_rvol":0.5}')
+    r = Rig(tmp_path, con)
+    r.run(et(9, 52))
+    assert not r.pos() and not r.gate_calls
 
 
 def test_shadow_buys_ask_sells_bid_take_profit_then_breakeven(tmp_path, con):
@@ -115,12 +147,15 @@ def test_premium_stop(tmp_path, con):
     r.broker.mult[C601] = r.broker.mult[C601N] = 0.6  # mid 0.57 <= 0.97 * 0.65 (A) and 0.97 * 0.70 (B)
     r.run(et(9, 54))
     ps = r.pos()
-    assert len(ps) == 5 and all(p["state"] == "EXITED" and p["exit_reason"] == "premium_stop" for p in ps)
+    # exit_variants default is ("A",) since 2026-11-10 (E05): 1 live + 2 shadow (0dte/A, 1-3dte/A)
+    assert len(ps) == 3 and all(p["state"] == "EXITED" and p["exit_reason"] == "premium_stop" for p in ps)
     assert C601N not in r.broker.positions
 
 
 def test_premium_stop_differs_by_exit_variant(tmp_path, con):
-    r = Rig(tmp_path, con)
+    # exit_B is shadow-sample-frozen since 2026-11-10 (E05) but the mechanism still exists
+    # and is exercised here via an explicit override, not the ("A",) production default.
+    r = Rig(tmp_path, con, exit_variants=("A", "B"))
     r.run(et(9, 52))
     r.broker.mult[C601] = 0.70  # mid 0.665, bid ~0.645 (stops use the bid): below B's -30% (0.679), above A's -35% (0.6305)
     r.run(et(9, 54))
@@ -129,10 +164,11 @@ def test_premium_stop_differs_by_exit_variant(tmp_path, con):
 
 
 def test_variant_b_trails_underlying_after_take_profit(tmp_path, con):
+    # Same note as above: B's mechanism, exercised via an explicit override.
     b = orb_breakout_day()
     late = b.index >= pd.Timestamp(et(10, 5))
     b.loc[late, ["open", "high", "low", "close"]] = 601.6  # pulls back ~0.6, still above the range high
-    r = Rig(tmp_path, con, bars=b)
+    r = Rig(tmp_path, con, bars=b, exit_variants=("A", "B"))
     r.run(et(9, 52))
     r.broker.mult[C601] = 1.5
     r.run(et(10, 8))
@@ -231,14 +267,14 @@ def test_unfilled_entry_cancelled_after_20s(tmp_path, con):
     assert lp["state"] == "ABANDONED" and lp["exit_reason"] == "entry_unfilled"
     o = r.broker.orders[ostore.cid(lp["position_id"], "e")]
     assert o.status.value == "canceled"
-    assert len(r.pos("shadow")) == 4
+    assert len(r.pos("shadow")) == 2  # 0dte/A, 1-3dte/A (exit_variants default ("A",) since 2026-11-10)
 
 
 def test_risk_gate_deny_shrink_and_grow(tmp_path, con):
     deny = FnGate(lambda i, c, n: RiskDecision(False, "daily loss stop"))
     r = Rig(tmp_path, con, gate=deny)
     r.run(et(9, 52))
-    assert not r.pos("live") and len(r.pos("shadow")) == 4 and not r.broker.submit_calls
+    assert not r.pos("live") and len(r.pos("shadow")) == 2 and not r.broker.submit_calls
     assert con.execute("SELECT detail_json FROM options_filtered WHERE reason='risk_gate'").fetchone()[0].find("daily") > 0
 
 
@@ -443,7 +479,7 @@ def test_live_never_uses_a_contract_expiring_today(tmp_path, con):
 def test_unknown_rvol_is_shadow_only(tmp_path, con):
     r = Rig(tmp_path, con, history=False)  # no previous sessions: RVOL unknown
     r.run(et(9, 52))
-    assert not r.pos("live") and len(r.pos("shadow")) == 4
+    assert not r.pos("live") and len(r.pos("shadow")) == 2
     assert _filtered(con, "rvol_unknown") == 1
     s = next(s for s in ostore.setups(con, str(DAY)) if s["source"] == "orb15")
     assert s["rvol"] is None and json.loads(s["signal_json"])["meta"]["day_rvol"] is None
@@ -454,8 +490,12 @@ def test_shadow_only_playbooks(tmp_path, con):
     r.run(et(9, 26))
     notes = {s["source"]: (s["live_eligible"], s["live_note"]) for s in ostore.setups(con, str(DAY))}
     assert notes["vwap_reclaim"] == (0, "source not live-eligible")
-    assert notes["gap_fade"] == (0, "source not live-eligible")
-    assert notes["orb15"] == (1, "") and notes["gap_go"] == (1, "")
+    # gap_fade and gap_go are both SHADOW_ONLY_SOURCES as of 2026-11-10 (EVOLUTION_PLAN
+    # section 6 items E01/E08, gate FAIL): "shadow-only variant" beats the fixture's
+    # explicit live_sources=("gap_go", "orb15", "grok_plan") override.
+    assert notes["gap_fade"] == (0, "shadow-only variant")
+    assert notes["gap_go"] == (0, "shadow-only variant")
+    assert notes["orb15"] == (1, "")
 
 
 def test_grok_live_needs_gap_go_or_orb_playbook(tmp_path, con):
@@ -482,7 +522,7 @@ def test_macro_event_blocks_live_not_shadow(tmp_path, con):
     oplan.ingest(con, _plan(level=650.0, events=("10:15",)), et(8, 0))  # orb15 triggers 09:51: within 30 min
     r = Rig(tmp_path, con)
     r.run(et(9, 52))
-    assert not r.pos("live") and len(r.pos("shadow")) == 4
+    assert not r.pos("live") and len(r.pos("shadow")) == 2
     assert _filtered(con, "macro_event_window") == 1
     s = next(s for s in ostore.setups(con, str(DAY)) if s["source"] == "orb15")
     reg = json.loads(s["regime_json"])

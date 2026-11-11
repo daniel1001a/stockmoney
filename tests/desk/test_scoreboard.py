@@ -257,6 +257,7 @@ def test_learn_job_writes_scoreboard_section(con, monkeypatch, tmp_path):
     assert "## 來源記分板" in body and "規則劇本 vwap_reclaim(影子)" in body
     failed = body.split("## 本次失敗的步驟")[1] if "## 本次失敗的步驟" in body else ""
     assert "scoreboard" not in failed
+    assert "## 逐策略實盤關卡" in body and "setup_gate" not in failed
     assert scores(con, str(d[-1].date()), "playbook:vwap_reclaim:shadow", "all")["pnl_total"][1] == 40.0
 
 
