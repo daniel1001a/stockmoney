@@ -13,23 +13,44 @@ Nothing in risk, veto, execution, broker or the options engine imports this
 module: a registration never opens, blocks or sizes anything.
 
 How each registered date was found:
-  - gap_go, gap_fade, orb15, vwap_reclaim, grok_plan, exit_A, exit_B:
+  - gap_go, gap_fade, orb15, vwap_reclaim, grok_plan, exit_A:
     git log -S on options/config.py; the four rule playbooks and GROK are in
-    5b7168a (2026-10-12) and the A/B exit variants in 8ef25a4 (2026-10-12).
+    5b7168a (2026-10-12) and exit_A in 8ef25a4 (2026-10-12).
     First recorded rows in options_positions are 2026-10-14 (vwap_reclaim)
     and 2026-10-15 (the others), after registration.
   - orb15_5m: 06d5adb (2026-10-27, stop-the-bleeding audit); first row 2026-10-28.
   - orb5_rvol: 04f1a0d (2026-11-05, owner approved 7.4 item 4).
-  - stressed_sizing, vwap_reclaim_spread: ad1b87a (2026-11-05, OPTIONS_PLAN 16).
+  - stressed_sizing: ad1b87a (2026-11-05, OPTIONS_PLAN 16).
   - mid_entry: registered 2026-11-05 per EDGE_PLAN 7.4 item 2 and the owner's
     2026-11-05 decision; built separately, only registered here.
+  - v03_cutoff_highvol, v05_spread_cap_5pct, v06_10k_scale: registered
+    2026-11-10 (EVOLUTION_PLAN.md section 6 item 8, owner decision, grok's
+    narrower cut of the five P1 candidates). Derived, forward-only shadow
+    filters on columns options already records (learn/v_variants.py); no new
+    DB table or engine hook. V01/V02/V04 need data the project does not have
+    yet (minute-bar replay, point-in-time trend columns, R01) and are
+    documented only in EVOLUTION_PLAN.md, not registered here.
+
+Retired, removed from the registry (owner decision 2026-11-10, EVOLUTION_PLAN
+section 6 items 5 and 6; family size K goes down, freeing family slots):
+  - exit_B (registered 2026-10-12, removed 2026-11-10): no new samples; A was
+    better per the plan (+11.1k vs +1.5k over 236 trades each; plan figure, not re-verified in the 2026-11-10 review) and B was never a
+    gate arm of its own (7.4 item 6 monthly exit check only). Historical B
+    rows stay in options_positions and keep being compared there; they are
+    simply no longer part of the live family size.
+  - vwap_reclaim_spread (registered 2026-11-05, removed 2026-11-10): both
+    arms negative (0dte 12 trades -2,214; 1-3dte 17 trades -2,345);
+    options/spread_variant.py's SOURCES is emptied so no new rows are
+    created, but options_spread_variants keeps its historical rows and
+    learn/setup_gate.report() still prints them (_spread_lines), independent
+    of this registry.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date
 
-KINDS = ("playbook source", "exit variant", "sizing", "spread", "entry")
+KINDS = ("playbook source", "exit variant", "sizing", "spread", "entry", "filter")
 
 
 @dataclass(frozen=True)
@@ -66,20 +87,27 @@ REGISTRY: tuple[Variant, ...] = (
     Variant("exit_A", "exit variant", "2026-10-12", "every entry",
             "premium stop -35%, +40% sells half, rest stops at cost; invalidation, time stop, force flat",
             _FILL, "5.1 setup gate (live exit)"),
-    Variant("exit_B", "exit variant", "2026-10-12", "every entry",
-            "premium stop -30%, +40% sells half, rest trails 0.4 x ATR(14) of 1-minute bars",
-            _FILL, "7.4 item 6 monthly exit check"),
     Variant("stressed_sizing", "sizing", "2026-11-05", "every live-exit entry",
             "same as the entry's exit variant",
             "premium stop at its level + half the entry spread + fees both legs; qty = floor($1,000 / cost)",
             "5.1 setup gate (report column)"),
-    Variant("vwap_reclaim_spread", "spread", "2026-11-05", "vwap_reclaim entry, short leg near 0.30 delta",
-            "spread take profit 50%, stop 50%, time exit 2 DTE", _FILL + ", both legs",
-            "5.1 setup gate"),
     Variant("mid_entry", "entry", "2026-11-05", "every entry (shadow comparison)",
             "same as the entry's exit variant",
             "limit at the mid, fall back to the ask after a wait; fill rate from recorded quotes",
             "30+ filled comparisons per underlying class (owner 2026-11-05)"),
+    Variant("v03_cutoff_highvol", "filter", "2026-11-10",
+            "entry_time < 10:00 ET and uclass != 'high_vol' (existing column, forward-only, no backfill)",
+            "same as the entry's exit variant (live_exit)", _FILL,
+            "5.1 setup gate (derived report, learn/v_variants.py)"),
+    Variant("v05_spread_cap_5pct", "filter", "2026-11-10",
+            "entry quote (ask-bid)/mid <= 5% (current cap is 8%, forward-only)",
+            "same as the entry's exit variant (live_exit)", _FILL,
+            "5.1 setup gate (derived report, learn/v_variants.py)"),
+    Variant("v06_10k_scale", "filter", "2026-11-10",
+            "entry_price * contract_multiplier <= $250 (shadow version of E04's 10k-scale premium cap); "
+            "P&L rescaled to 1 contract",
+            "same as the entry's exit variant (live_exit)", _FILL,
+            "5.1 setup gate (derived report, learn/v_variants.py)"),
 )
 
 _BY_NAME = {v.name: v for v in REGISTRY}
