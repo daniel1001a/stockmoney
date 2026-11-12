@@ -46,6 +46,7 @@ DAILY_BY = time(8, 30)  # ET; the morning GROK_DAILY on_time cutoff (spec A.6)
 MOVE = 0.03
 MAX_REQUESTS = 10
 MAX_QUESTIONS = 5
+OPTION_CARD = "opt:%"  # learn/options_postmortem cards share trade_postmortem; options come from options_positions
 
 Returns = Callable[[date], dict]  # day -> {symbol: close-to-close return}
 
@@ -137,7 +138,7 @@ def closed_trades(con, day: date) -> list[dict]:
     pm = {}
     if _has(con, "trade_postmortem"):
         for r in con.execute("SELECT symbol, strategy, entry_px, exit_px, qty, pnl, exit_reason FROM trade_postmortem "
-                             "WHERE exit_day=?", (day.isoformat(),)).fetchall():
+                             "WHERE exit_day=? AND trade_id NOT LIKE ?", (day.isoformat(), OPTION_CARD)).fetchall():
             pm.setdefault(r[0], []).append(r)
     sells: dict[str, list] = {}
     for r in _stock_fills(con, day):
