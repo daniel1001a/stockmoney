@@ -798,3 +798,12 @@ def test_a_verified_plan_rejected_for_a_reused_id_stops_the_reminder(desk, pages
     box = FakeMailbox()
     assert grok_outbound.run(desk, box, et(8, 50), CONFIG, returns) == []
     assert box.sent == [] and pages == []
+
+
+def test_option_card_in_postmortem_is_not_a_second_trade(desk):
+    """learn/options_postmortem writes 'opt:' cards into trade_postmortem; the
+    brief and the research requests take options from options_positions only."""
+    desk.execute("INSERT INTO trade_postmortem (trade_id, symbol, strategy, entry_day, exit_day, entry_px, exit_px, "
+                 "qty, pnl) VALUES ('opt:p1','QQQ','options:orb15','2026-10-26','2026-10-26',1.5,1.2,2,-61.3)")
+    rows = [t for t in grok_outbound.closed_trades(desk, date(2026, 10, 26)) if t["symbol"] == "QQQ"]
+    assert len(rows) == 1 and rows[0]["sleeve"] == "options" and rows[0]["strategy"] == "orb15"
