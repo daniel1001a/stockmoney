@@ -385,6 +385,9 @@ def main(argv: list[str], *, clock=lambda: datetime.now(timezone.utc), data_fact
         slot = datetime.fromtimestamp(a.slot_at, timezone.utc)
         if not 0 <= (now - slot).total_seconds() <= MAX_SLOT_LAG_S:
             slot = None  # implausible: fall back to the process clock
+    from stockmoney.desk import switches
+    if a.cmd == "tick" and not switches.options_enabled():
+        return 0  # OPTIONS_ENABLED off: the spread shadow is part of the options sleeve
     if a.cmd == "tick" and not regular_hours(now):
         return 0  # holiday or outside the session: nothing to quote
 

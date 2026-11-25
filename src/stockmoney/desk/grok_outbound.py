@@ -335,8 +335,9 @@ def run(con, box, now: datetime, config=None, returns: Returns | None = None) ->
             config = BridgeConfig.from_env()
         except ConfigError:
             return []
-    if not config.grok_enabled:
-        return []
+    from stockmoney.desk import switches
+    if not config.grok_enabled or not switches.grok_mail_enabled():
+        return []  # GROK_MAIL_ENABLED off: no DESK_BRIEF, PLAN_REMINDER or RESEARCH_REQUEST
     returns = returns or ohlcv_returns
     muse_ops.ensure_schema(con)
     local = now.astimezone(ET)

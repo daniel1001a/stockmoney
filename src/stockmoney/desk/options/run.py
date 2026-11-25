@@ -39,7 +39,7 @@ from datetime import date, datetime, time as dtime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from stockmoney.desk import notify, store
+from stockmoney.desk import notify, store, switches
 from stockmoney.desk.calendar import is_trading_day
 from stockmoney.desk.options import _iface
 from stockmoney.desk.options import plan as oplan
@@ -365,6 +365,11 @@ def main(argv: list[str]) -> int:
     p.add_argument("day", nargs="?", type=date.fromisoformat, default=None)
     sub.add_parser("selftest")
     a = ap.parse_args(argv[1:])
+    if a.cmd in ("session", "recover") and not switches.options_enabled():
+        # OPTIONS_ENABLED off (the default): no session, no leftover cleanup, no
+        # broker call, no wait for Grok's OPTIONS_PLAN. Turn it on in .env.
+        print(f"options sleeve disabled ({switches.OPTIONS} is off): {a.cmd} not run")
+        return 0
     cfg = OptionsConfig()
     if a.cmd == "ingest-plan":
         return ingest_plan(a.file, cfg)

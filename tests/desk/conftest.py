@@ -16,6 +16,11 @@ def legacy_desk_defaults(monkeypatch):
     Jev catalyst filter (every flagged item counts, no network)."""
     from stockmoney.desk import run, veto
     monkeypatch.setattr(run, "STOCK_ENTRIES_DEFAULT", True)
+    # the owner switches of 2026-11-25 default off; the older tests exercise the
+    # Grok mail and the options sleeve, so they run with both on
+    # (tests/desk/test_owner_switches.py covers the off state)
+    monkeypatch.setenv("GROK_MAIL_ENABLED", "1")
+    monkeypatch.setenv("OPTIONS_ENABLED", "1")
     monkeypatch.setattr(veto, "jev_client", lambda: None)
 
 

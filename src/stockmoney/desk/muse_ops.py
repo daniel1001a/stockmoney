@@ -283,7 +283,11 @@ def send_feedback(con, box, now: datetime, config=None) -> int:
     n = 0
     left = {"muse": 0, "grok": 0}
     budget = {c: FEEDBACK_CAP - len(feedback_sent_since(con, now - FEEDBACK_WINDOW, c)) for c in left}
+    from stockmoney.desk import switches
+    grok_mail = switches.grok_mail_enabled()
     for key, channel, fields in items:
+        if channel == "grok" and not grok_mail:
+            continue  # GROK_MAIL_ENABLED off: never mailed, never counted against the cap
         if budget[channel] <= 0:
             left[channel] += 1
             continue
