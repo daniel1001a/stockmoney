@@ -37,10 +37,17 @@ def build_subject(msg_type: str, msg_id: str, token: str = "") -> str:
 CHANNELS = ("muse", "grok")
 
 
+class GrokMailDisabled(ValueError):
+    """The owner switched mail to Grok off (switches.GROK_MAIL_ENABLED)."""
+
+
 def send(mailbox: Mailbox, msg, config: BridgeConfig | None = None, channel: str = "muse") -> None:
     """Validate ``msg`` against the Outbound schema and mail it to ``channel``."""
     config = config or BridgeConfig.from_env()
     if channel == "grok":
+        from stockmoney.desk import switches
+        if not switches.grok_mail_enabled():
+            raise GrokMailDisabled(f"{switches.GROK_MAIL} is off: nothing is mailed to Grok")
         if not config.grok_enabled:
             raise ValueError("GROK_ADDRESS / GROK_SHARED_TOKEN are not configured")
         to, token = config.grok_address, config.grok_token
